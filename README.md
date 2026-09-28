@@ -87,17 +87,17 @@ uv run modal run deploy/modal_gpt_oss.py --mode download --model 20b
 
 # Run one prompt on H200. Quote the prompt so Modal receives it as one argument.
 uv run modal run deploy/modal_gpt_oss.py \
-  --mode run --model 120b \
+  --mode run --model 20b \
   --prompt "Explain why batching improves language-model throughput." \
   --temperature 1.0 --top-p 0.95 --top-k 40 --seed 7
 
 # Sweep 8k prompt / 256 output at batch sizes 1,2,8,16,32.
 uv run modal run deploy/modal_gpt_oss.py \
-  --mode bench --model 120b --cache-mode prewarm
+  --mode bench --model 20b --cache-mode prewarm
 
 # Re-run the benchmark without changing saved kernel artifacts.
 uv run modal run deploy/modal_gpt_oss.py \
-  --mode bench --model 120b --cache-mode verify
+  --mode bench --model 20b --cache-mode verify
 ```
 
 Both GPU modes also accept `--schedule-conservativeness`; larger values leave
