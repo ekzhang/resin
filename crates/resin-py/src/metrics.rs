@@ -1,98 +1,64 @@
-//! Python snapshot access and runner extraction; export policy lives in resin-http.
+//! Thin Python inspection and runner hooks over native core observations.
 
-use crate::{
-    cache_metrics::CacheMetrics,
-    metrics_types::{Histogram, RequestMetrics},
-};
+use crate::Engine;
 use pyo3::{exceptions::PyValueError, prelude::*, types::PyBytes};
+use pythonize::{depythonize, pythonize};
 use resin_core::{
-    metrics::{EngineMetricsSnapshot, RunnerMetricsSnapshot},
+    metrics::{EngineMetricsSnapshot, Histogram, RunnerMetricsSnapshot},
     resources::paged_kv,
 };
 use resin_http::MetricsEncoder;
 
-/// An immutable logical-engine snapshot and optional physical-runner observations.
-/// Reading this snapshot never synchronizes the accelerator. Cache inventory is
-/// scanned, so collect periodically rather than once per token.
-#[pyclass(frozen, module = "resin._resin", skip_from_py_object)]
+/// Assemble core snapshots without duplicating their field definitions.
+#[derive(serde::Serialize)]
 pub(crate) struct EngineMetrics {
-    pub(crate) requests: EngineMetricsSnapshot,
-    #[pyo3(get)]
-    pub(crate) generation_throughput: f64,
-    pub(crate) cache: Option<paged_kv::CacheMetrics>,
-    #[pyo3(get)]
-    pub(crate) runner: Option<Py<PyAny>>,
+    requests: EngineMetricsSnapshot,
+    generation_throughput: f64,
+    cache: Option<paged_kv::CacheMetrics>,
+    runner: Option<RunnerMetricsSnapshot>,
 }
 
-#[pymethods]
-impl EngineMetrics {
-    #[getter]
-    fn requests(&self) -> RequestMetrics {
-        self.requests.clone().into()
-    }
-
-    #[getter]
-    fn cache(&self) -> Option<CacheMetrics> {
-        self.cache.clone().map(Into::into)
-    }
-
-    /// Human-readable metrics. Histogram distributions require the protobuf export.
-    #[pyo3(signature = (*, model_name, rank = 0, attn_dp_rank = 0, include_runner = true))]
-    fn prometheus(
-        &self,
+impl Engine {
+    pub(crate) fn collect_metrics(
+        &mut self,
         py: Python<'_>,
-        model_name: &str,
-        rank: u32,
-        attn_dp_rank: u32,
         include_runner: bool,
-    ) -> PyResult<String> {
-        let families = self
-            .encoder(py, model_name, rank, attn_dp_rank, include_runner)?
-            .finish();
-        resin_http::metrics_text(&families)
-            .map_err(|error| PyValueError::new_err(error.to_string()))
-    }
-
-    /// Length-delimited Prometheus protobuf, including native exponential histograms.
-    #[pyo3(signature = (*, model_name, rank = 0, attn_dp_rank = 0, include_runner = true))]
-    fn prometheus_protobuf<'py>(
-        &self,
-        py: Python<'py>,
-        model_name: &str,
-        rank: u32,
-        attn_dp_rank: u32,
-        include_runner: bool,
-    ) -> PyResult<Bound<'py, PyBytes>> {
-        Ok(PyBytes::new(
-            py,
-            &self.encode_protobuf(py, model_name, rank, attn_dp_rank, include_runner)?,
-        ))
+    ) -> PyResult<Option<EngineMetrics>> {
+        let Some(requests) = self.core.metrics_snapshot() else {
+            return Ok(None);
+        };
+        let elapsed = self.metrics_sample.0.elapsed().as_secs_f64();
+        if elapsed >= 1.0 {
+            self.metrics_sample = (
+                std::time::Instant::now(),
+                requests.decode_tokens,
+                (requests.decode_tokens - self.metrics_sample.1) as f64 / elapsed,
+            );
+        }
+        let runner = if include_runner {
+            self.runner_metrics
+                .as_ref()
+                .map(|hook| runner_snapshot(&hook.bind(py).call0()?))
+                .transpose()?
+        } else {
+            None
+        };
+        Ok(Some(EngineMetrics {
+            generation_throughput: self.metrics_sample.2,
+            requests,
+            cache: self.core.cache_metrics(),
+            runner,
+        }))
     }
 }
 
 impl EngineMetrics {
     pub(crate) fn encode_protobuf(
         &self,
-        py: Python<'_>,
         model_name: &str,
         rank: u32,
         attn_dp_rank: u32,
-        include_runner: bool,
     ) -> PyResult<Vec<u8>> {
-        let families = self
-            .encoder(py, model_name, rank, attn_dp_rank, include_runner)?
-            .finish();
-        Ok(resin_http::encode_metrics(&families))
-    }
-
-    fn encoder(
-        &self,
-        py: Python<'_>,
-        model_name: &str,
-        rank: u32,
-        attn_dp_rank: u32,
-        include_runner: bool,
-    ) -> PyResult<MetricsEncoder> {
         let mut encoder = MetricsEncoder::new(model_name, rank, attn_dp_rank);
         encoder
             .engine(
@@ -101,13 +67,19 @@ impl EngineMetrics {
                 self.cache.as_ref(),
             )
             .map_err(|error| PyValueError::new_err(error.to_string()))?;
-        if include_runner && let Some(runner) = &self.runner {
+        if let Some(runner) = &self.runner {
             encoder
-                .runner(&runner_snapshot(runner.bind(py))?)
+                .runner(runner)
                 .map_err(|error| PyValueError::new_err(error.to_string()))?;
         }
-        Ok(encoder)
+        Ok(resin_http::encode_metrics(&encoder.finish()))
     }
+}
+
+fn histogram(value: &Bound<'_, PyAny>) -> PyResult<Histogram> {
+    let histogram: Histogram = depythonize(value)?;
+    histogram.validate().map_err(PyValueError::new_err)?;
+    Ok(histogram)
 }
 
 fn runner_snapshot(snapshot: &Bound<'_, PyAny>) -> PyResult<RunnerMetricsSnapshot> {
@@ -121,7 +93,7 @@ fn runner_snapshot(snapshot: &Bound<'_, PyAny>) -> PyResult<RunnerMetricsSnapsho
         dp_sync: if wait.is_none() {
             None
         } else {
-            Some(wait.extract::<PyRef<'_, Histogram>>()?.native())
+            Some(histogram(&wait)?)
         },
     })
 }
@@ -143,4 +115,41 @@ pub(crate) fn _runner_metrics_prometheus_protobuf<'py>(
         snapshot.py(),
         &resin_http::encode_metrics(&encoder.finish()),
     ))
+}
+
+/// Native accumulator; snapshots are plain Python dictionaries.
+#[pyclass(name = "_HistogramAccumulator", module = "resin._resin")]
+#[derive(Default)]
+pub(crate) struct HistogramAccumulator(Histogram);
+
+#[pymethods]
+impl HistogramAccumulator {
+    #[new]
+    fn new() -> Self {
+        Self::default()
+    }
+
+    #[pyo3(signature = (value, *, weight = 1))]
+    fn observe(&mut self, value: f64, weight: u64) -> PyResult<()> {
+        if !value.is_finite() || value < 0.0 {
+            return Err(PyValueError::new_err(
+                "histogram observations must be finite and nonnegative",
+            ));
+        }
+        self.0.observe_weighted(value, weight);
+        Ok(())
+    }
+
+    #[pyo3(signature = (*, additional = None))]
+    fn snapshot<'py>(
+        &self,
+        py: Python<'py>,
+        additional: Option<&Bound<'py, PyAny>>,
+    ) -> PyResult<Bound<'py, PyAny>> {
+        let mut snapshot = self.0.clone();
+        if let Some(additional) = additional {
+            snapshot.merge(&histogram(additional)?);
+        }
+        Ok(pythonize(py, &snapshot)?)
+    }
 }

@@ -4,8 +4,9 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from dataclasses import dataclass, field
+from typing import Any
 
-from resin._resin import Histogram, _HistogramAccumulator
+from resin._resin import _HistogramAccumulator
 
 FORWARD_CATEGORIES = ("prefill", "target_verify", "draft", "decode", "idle")
 CUDA_GRAPH_MODES = (
@@ -32,7 +33,7 @@ class RunnerMetrics:
     speculative_drafts: int = 0
     speculative_accepted: int = 0
     speculative_rows: int = 0
-    dp_sync: Histogram | None = None
+    dp_sync: dict[str, Any] | None = None
 
 
 class DpSyncMetrics:
@@ -44,5 +45,5 @@ class DpSyncMetrics:
     def observe(self, seconds: float) -> None:
         self._histogram.observe(seconds)
 
-    def snapshot(self) -> Histogram:
-        return self._histogram.snapshot()
+    def snapshot(self, *, additional: dict[str, Any] | None = None) -> dict[str, Any]:
+        return self._histogram.snapshot(additional=additional)

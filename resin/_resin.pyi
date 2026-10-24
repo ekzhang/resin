@@ -250,57 +250,6 @@ class CacheGroupLayout:
         """
 
 @final
-class CacheGroupMetrics:
-    """
-    Physical usage for one runner-declared group in the unified cache pool.
-    Groups share slab capacity; they are not separate capacity partitions.
-    """
-    @property
-    def block_tokens(self, /) -> int: ...
-    @property
-    def blocks_per_slab(self, /) -> int: ...
-    @property
-    def cached_blocks(self, /) -> int:
-        """
-        Blocks held by cached prefixes, including those shared with requests.
-        """
-    @property
-    def free_blocks(self, /) -> int:
-        """
-        Unoccupied slots in slabs already bound to this group.
-        """
-    @property
-    def group(self, /) -> int: ...
-    @property
-    def occupied_blocks(self, /) -> int: ...
-    @property
-    def occupied_slabs(self, /) -> int: ...
-    @property
-    def occupied_tokens(self, /) -> int | None:
-        """
-        Block-rounded token capacity, or ``None`` for recurrent checkpoints.
-        """
-    @property
-    def pinned_blocks(self, /) -> int:
-        """
-        Blocks with outstanding device read or write leases.
-        """
-    @property
-    def pool(self, /) -> str:
-        """
-        ``kv``, ``swa``, or ``recurrent``.
-        """
-    @property
-    def reclaimable_blocks(self, /) -> int:
-        """
-        Blocks freed by evicting every cached prefix with requests unchanged.
-        """
-    @property
-    def reclaimable_slabs(self, /) -> int: ...
-    @property
-    def reclaimable_tokens(self, /) -> int | None: ...
-
-@final
 class CacheGroupPlan:
     """
     Plan for one type of cache in a BatchPlan.
@@ -452,25 +401,6 @@ class CacheLayout:
         """
 
 @final
-class CacheMetrics:
-    """
-    Shared physical cache capacity. Reclaimable slabs exclude live requests
-    and outstanding device access, including retired overlapped executions.
-    """
-    @property
-    def capacity_slabs(self, /) -> int: ...
-    @property
-    def free_slabs(self, /) -> int: ...
-    @property
-    def groups(self, /) -> list[CacheGroupMetrics]: ...
-    @property
-    def occupied_slabs(self, /) -> int: ...
-    @property
-    def prefix(self, /) -> PrefixCacheMetrics | None: ...
-    @property
-    def reclaimable_slabs(self, /) -> int: ...
-
-@final
 class CacheRetention:
     """
     Cache-block lifetime policy.
@@ -572,6 +502,18 @@ class Engine:
         enable_metrics: bool = True,
     ) -> Engine: ...
     def __repr__(self, /) -> str: ...
+    def _metrics_prometheus_protobuf(
+        self,
+        /,
+        *,
+        model_name: str,
+        rank: int = 0,
+        attn_dp_rank: int = 0,
+        include_runner: bool = True,
+    ) -> bytes | None:
+        """
+        Native serving export; avoids constructing Python inspector dictionaries.
+        """
     @property
     def active_request_count(self, /) -> int: ...
     @property
@@ -599,9 +541,9 @@ class Engine:
     def max_running_requests(self, /) -> int: ...
     @property
     def metrics_enabled(self, /) -> bool: ...
-    def metrics_snapshot(self, /) -> EngineMetrics | None:
+    def metrics_snapshot(self, /) -> dict[str, Any] | None:
         """
-        Collect native counters and optional nonblocking runner observations.
+        Inspect native observations as independent Python dictionaries and lists.
         Call periodically: cache inventory requires a scan of allocated blocks.
         """
     @property
@@ -649,46 +591,6 @@ class Engine:
         media: MediaInput | None = None,
         prompt_target_logprobs: Sequence[Sequence[int]] | None = None,
     ) -> RequestLease: ...
-
-@final
-class EngineMetrics:
-    """
-    An immutable logical-engine snapshot and optional physical-runner observations.
-    Reading this snapshot never synchronizes the accelerator. Cache inventory is
-    scanned, so collect periodically rather than once per token.
-    """
-    @property
-    def cache(self, /) -> CacheMetrics | None: ...
-    @property
-    def generation_throughput(self, /) -> float: ...
-    def prometheus(
-        self,
-        /,
-        *,
-        model_name: str,
-        rank: int = 0,
-        attn_dp_rank: int = 0,
-        include_runner: bool = True,
-    ) -> str:
-        """
-        Human-readable metrics. Histogram distributions require the protobuf export.
-        """
-    def prometheus_protobuf(
-        self,
-        /,
-        *,
-        model_name: str,
-        rank: int = 0,
-        attn_dp_rank: int = 0,
-        include_runner: bool = True,
-    ) -> bytes:
-        """
-        Length-delimited Prometheus protobuf, including native exponential histograms.
-        """
-    @property
-    def requests(self, /) -> RequestMetrics: ...
-    @property
-    def runner(self, /) -> RunnerMetrics | None: ...
 
 @final
 class ForwardOutput:
@@ -816,44 +718,6 @@ class GptOssRecipe(_NativeRecipe):
         options: RenderOptions | None = None,
         media_config: Any | None = None,
     ) -> GptOssRecipe: ...
-
-@final
-class Histogram:
-    """
-    Immutable exponential histogram. Bucket counts are noncumulative;
-    `offset` is the Prometheus bucket index of the first positive bucket.
-    """
-    def __new__(
-        cls,
-        /,
-        *,
-        schema: int = 4,
-        zero_count: int = 0,
-        offset: int = 0,
-        counts: Sequence[int] | None = None,
-        count: int = 0,
-        sum: float = 0.0,
-    ) -> Histogram: ...
-    def as_dict(self, /) -> dict:
-        """
-        Plain numeric fields for explicit JSON transport; no Python pickling.
-        """
-    @property
-    def count(self, /) -> int: ...
-    @property
-    def counts(self, /) -> list[int]: ...
-    def merge(self, /, other: Histogram) -> Histogram:
-        """
-        Combine cumulative distributions without mutating either snapshot.
-        """
-    @property
-    def offset(self, /) -> int: ...
-    @property
-    def schema(self, /) -> int: ...
-    @property
-    def sum(self, /) -> float: ...
-    @property
-    def zero_count(self, /) -> int: ...
 
 @final
 class Image:
@@ -1010,25 +874,6 @@ class ParserEvent:
     def token_spans(self, /) -> tuple[TokenSpan, ...]: ...
     @property
     def type(self, /) -> str: ...
-
-@final
-class PrefixCacheMetrics:
-    """
-    Prefix LRU statistics. Reclaimed counters measure physical frees during
-    eviction; removing a shared ancestor or a live request's prefix can free zero.
-    """
-    @property
-    def entries(self, /) -> int: ...
-    @property
-    def evictions(self, /) -> int: ...
-    @property
-    def hits(self, /) -> int: ...
-    @property
-    def misses(self, /) -> int: ...
-    @property
-    def reclaimed_blocks(self, /) -> int: ...
-    @property
-    def reclaimed_slabs(self, /) -> int: ...
 
 @final
 class Qwen35Media:
@@ -1223,59 +1068,6 @@ class RequestLease:
         """
         Consume the completed token buffer exactly once.
         """
-
-@final
-class RequestMetrics:
-    """
-    Cumulative request observations and current scheduler state for one engine.
-
-    Completed-request totals exclude cancellations. Live token counters include
-    all committed work; prefill compute includes replay after retraction.
-    """
-    @property
-    def aborted_requests(self, /) -> int: ...
-    @property
-    def accepted_requests(self, /) -> int: ...
-    @property
-    def cached_tokens(self, /) -> int: ...
-    @property
-    def completed_requests(self, /) -> int: ...
-    @property
-    def decode_tokens(self, /) -> int: ...
-    @property
-    def e2e_request_latency_seconds(self, /) -> Histogram: ...
-    @property
-    def elapsed_seconds(self, /) -> float: ...
-    @property
-    def generation_tokens(self, /) -> int: ...
-    @property
-    def generation_tokens_histogram(self, /) -> Histogram: ...
-    @property
-    def inter_token_latency_seconds(self, /) -> Histogram: ...
-    @property
-    def prefill_cache_tokens(self, /) -> int: ...
-    @property
-    def prefill_compute_tokens(self, /) -> int: ...
-    @property
-    def prompt_tokens(self, /) -> int: ...
-    @property
-    def prompt_tokens_histogram(self, /) -> Histogram: ...
-    @property
-    def queue_time_seconds(self, /) -> Histogram: ...
-    @property
-    def request_time_per_output_token_seconds(self, /) -> Histogram: ...
-    @property
-    def retracted_requests(self, /) -> int: ...
-    @property
-    def running_requests(self, /) -> int: ...
-    @property
-    def scheduler_idle_seconds(self, /) -> float: ...
-    @property
-    def time_to_first_token_seconds(self, /) -> Histogram: ...
-    @property
-    def uncached_prompt_tokens_histogram(self, /) -> Histogram: ...
-    @property
-    def waiting_requests(self, /) -> int: ...
 
 @final
 class ResourceBinding:
@@ -1560,11 +1352,13 @@ class Video:
 @final
 class _HistogramAccumulator:
     """
-    Mutable native accumulator shared by host execution observations.
+    Native accumulator; snapshots are plain Python dictionaries.
     """
     def __new__(cls, /) -> _HistogramAccumulator: ...
     def observe(self, /, value: float, *, weight: int = 1) -> None: ...
-    def snapshot(self, /) -> Histogram: ...
+    def snapshot(
+        self, /, *, additional: dict[str, Any] | None = None
+    ) -> dict[str, Any]: ...
 
 @final
 class _HttpEvents:

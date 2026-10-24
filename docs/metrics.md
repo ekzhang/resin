@@ -28,14 +28,14 @@ Applications without HTTP can collect the same data directly:
 ```python
 snapshot = engine.metrics_snapshot()
 if snapshot is not None:
-    print(snapshot.requests.running_requests)
-    print(snapshot.prometheus(model_name="my-model"))
+    print(snapshot["requests"]["running_requests"])
+    print(snapshot["cache"])
 ```
 
-`EngineMetrics` contains native `requests`, optional `cache`, and optional
-`runner` observations. Native snapshot properties are read-only and independent
-of later execution. Cache inventory scans physical allocation metadata, so poll
-periodically rather than on every generated token.
+The inspector returns plain dictionaries and lists, with `requests`, optional
+`cache`, optional `runner`, and `generation_throughput` fields. Each snapshot is
+independent of later execution. Cache inventory scans physical allocation
+metadata, so poll periodically rather than on every generated token.
 
 ## Exponential histograms and scraping
 
@@ -61,17 +61,17 @@ scrape_configs:
 `/metrics` negotiates its representation from the `Accept` header. Protobuf
 scrapes receive complete native distributions. The default text view retains
 counters, gauges, histogram counts and sums, and the `+Inf` bucket for inspection;
-it has no finite buckets and cannot provide useful percentiles. For programmatic
-export, `snapshot.prometheus_protobuf(model_name="my-model")` returns the same
-length-delimited Prometheus protobuf format. `snapshot.prometheus(...)` returns
-the text view.
+it has no finite buckets and cannot provide useful percentiles. The server
+encodes native snapshots directly for publication; the Python inspector is
+separate from this export path.
 
 ## Ownership and timing
 
 Rust records request and scheduler observations after transactional commit.
 `resin-core` owns observations and snapshots. `resin-http` owns the Prometheus
-metric schema, descriptions, and encoding. `resin-py` exposes native snapshots
-and adapts Python runner observations, without defining exporter policy.
+metric schema, descriptions, and encoding. `resin-py` serializes inspection
+snapshots and adapts Python runner observations, without duplicating their Rust
+schemas or defining exporter policy.
 Rejected work, failed commits, speculative padding, stop-clipped output, and
 discarded overlap successors do not become generated-token observations.
 Zero-output prompt scoring completes normally but contributes no TTFT or TPOT.

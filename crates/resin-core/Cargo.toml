@@ -5,11 +5,9 @@ edition = "2024"
 license = "Apache-2.0"
 description = "Pure Rust scheduling and resource ownership for Resin"
 
-[features]
-archive = ["dep:rkyv"]
-
 [dependencies]
-rkyv = { workspace = true, optional = true }
+rkyv.workspace = true
+serde.workspace = true
 
 [dev-dependencies]
 prometheus-client.workspace = true

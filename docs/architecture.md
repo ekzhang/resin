@@ -8,7 +8,7 @@ are cloned once per dispatched row; native applications should use `Arc` for
 large shared data.
 
 `resin-py` converts Python inputs, binds the runner once, and adapts native plans,
-errors, handles, and events. The core's optional archive feature provides the
+errors, handles, and events. The core uses `rkyv` for the
 distributed plan wire format. Native applications can use `resin-core` without
 Python, Torch, or HTTP.
 

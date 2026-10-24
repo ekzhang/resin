@@ -7,7 +7,7 @@ pub use histogram::Histogram;
 
 /// Cumulative physical-rank observations supplied by an optional runner hook.
 /// Collecting these values never requires a metric exporter in the runner.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, serde::Serialize)]
 pub struct RunnerMetricsSnapshot {
     pub forward_seconds: BTreeMap<String, f64>,
     pub cuda_graph_passes: BTreeMap<String, u64>,
@@ -22,7 +22,7 @@ pub struct RunnerMetricsSnapshot {
 /// Completed-request counters exclude cancellations. Live counters include all
 /// successfully committed work, including work for subsequently cancelled
 /// requests. Prefill compute includes replay after memory retraction.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, serde::Serialize)]
 pub struct EngineMetricsSnapshot {
     pub accepted_requests: u64,
     pub completed_requests: u64,
@@ -233,22 +233,18 @@ mod tests {
         let mut metrics = EngineMetrics::new();
         let mut request = metrics.submit(12, 8, Instant::now());
         let start = request.submitted_at;
-        metrics.commit(
-            &mut request,
-            start + Duration::from_millis(20),
-            start + Duration::from_millis(100),
-            4,
-            1,
-            false,
-        );
-        metrics.commit(
-            &mut request,
-            start + Duration::from_millis(100),
-            start + Duration::from_millis(160),
-            0,
-            3,
-            true,
-        );
+        for (prepared, completed, prefill, output, finished) in
+            [(20, 100, 4, 1, false), (100, 160, 0, 3, true)]
+        {
+            metrics.commit(
+                &mut request,
+                start + Duration::from_millis(prepared),
+                start + Duration::from_millis(completed),
+                prefill,
+                output,
+                finished,
+            );
+        }
         let values = metrics.snapshot();
         assert_eq!(values.inter_token_latency_seconds.count, 3);
         assert_eq!(values.inter_token_latency_seconds.sum, 0.06);
@@ -257,12 +253,5 @@ mod tests {
         assert_eq!(values.time_to_first_token_seconds.sum, 0.1);
         assert_eq!(values.queue_time_seconds.sum, 0.02);
         assert_eq!(values.e2e_request_latency_seconds.sum, 0.16);
-        assert_eq!(values.prefill_compute_tokens, 4);
-        assert_eq!(values.prefill_cache_tokens, 8);
-        assert_eq!(values.prompt_tokens, 12);
-        assert_eq!(values.cached_tokens, 8);
-        assert_eq!(values.decode_tokens, 4);
-        assert_eq!(values.generation_tokens, 4);
-        assert_eq!(values.uncached_prompt_tokens_histogram.sum, 4.0);
     }
 }

@@ -15,7 +15,6 @@ use pyo3::types::{PyDict, PyTuple};
 
 mod arrays;
 mod cache;
-mod cache_metrics;
 mod http;
 mod http_distributed;
 mod http_logprobs;
@@ -25,7 +24,6 @@ mod http_stop;
 mod media_payload;
 mod media_preprocess;
 mod metrics;
-mod metrics_types;
 mod output;
 mod parallelism;
 mod planning;
@@ -1698,30 +1696,30 @@ impl Engine {
         Ok(events)
     }
 
-    /// Collect native counters and optional nonblocking runner observations.
+    /// Inspect native observations as independent Python dictionaries and lists.
     /// Call periodically: cache inventory requires a scan of allocated blocks.
-    fn metrics_snapshot(&mut self, py: Python<'_>) -> PyResult<Option<metrics::EngineMetrics>> {
-        let Some(requests) = self.core.metrics_snapshot() else {
-            return Ok(None);
-        };
-        let elapsed = self.metrics_sample.0.elapsed().as_secs_f64();
-        if elapsed >= 1.0 {
-            self.metrics_sample = (
-                std::time::Instant::now(),
-                requests.decode_tokens,
-                (requests.decode_tokens - self.metrics_sample.1) as f64 / elapsed,
-            );
-        }
-        Ok(Some(metrics::EngineMetrics {
-            generation_throughput: self.metrics_sample.2,
-            requests,
-            cache: self.core.cache_metrics(),
-            runner: self
-                .runner_metrics
-                .as_ref()
-                .map(|hook| hook.bind(py).call0().map(Bound::unbind))
-                .transpose()?,
-        }))
+    fn metrics_snapshot<'py>(&mut self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        Ok(pythonize::pythonize(py, &self.collect_metrics(py, true)?)?)
+    }
+
+    /// Native serving export; avoids constructing Python inspector dictionaries.
+    #[pyo3(signature = (*, model_name, rank = 0, attn_dp_rank = 0, include_runner = true))]
+    fn _metrics_prometheus_protobuf<'py>(
+        &mut self,
+        py: Python<'py>,
+        model_name: &str,
+        rank: u32,
+        attn_dp_rank: u32,
+        include_runner: bool,
+    ) -> PyResult<Option<Bound<'py, pyo3::types::PyBytes>>> {
+        self.collect_metrics(py, include_runner)?
+            .map(|snapshot| {
+                Ok(pyo3::types::PyBytes::new(
+                    py,
+                    &snapshot.encode_protobuf(model_name, rank, attn_dp_rank)?,
+                ))
+            })
+            .transpose()
     }
 
     #[getter]
@@ -2035,11 +2033,7 @@ mod _resin {
     };
 
     #[pymodule_export]
-    use crate::cache_metrics::{CacheGroupMetrics, CacheMetrics, PrefixCacheMetrics};
-    #[pymodule_export]
-    use crate::metrics::{_runner_metrics_prometheus_protobuf, EngineMetrics};
-    #[pymodule_export]
-    use crate::metrics_types::{Histogram, HistogramAccumulator, RequestMetrics};
+    use crate::metrics::{_runner_metrics_prometheus_protobuf, HistogramAccumulator};
 
     #[pymodule_export]
     use crate::http::NativeHttpServer;

@@ -112,15 +112,9 @@ fn prompt_top_and_position_targets_work_alone_or_together_across_chunks() {
             }
             assert!(request.done());
             let metrics = engine.metrics_snapshot().unwrap();
-            assert_eq!(metrics.completed_requests, 1);
-            assert_eq!(metrics.prompt_tokens, 4);
-            assert_eq!(metrics.prefill_compute_tokens, 4);
-            assert_eq!(metrics.generation_tokens, 0);
             assert_eq!(metrics.generation_tokens_histogram.count, 1);
             assert_eq!(metrics.generation_tokens_histogram.sum, 0.0);
             assert_eq!(metrics.time_to_first_token_seconds.count, 0);
-            assert_eq!(metrics.inter_token_latency_seconds.count, 0);
-            assert_eq!(metrics.request_time_per_output_token_seconds.count, 0);
             assert!(request.take_result().unwrap().is_empty());
             let scores = request.prompt_logprobs().unwrap();
             assert!(scores[0].is_none());

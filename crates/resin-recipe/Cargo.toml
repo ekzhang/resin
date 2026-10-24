@@ -10,7 +10,7 @@ aho-corasick = "1.1"
 base64 = "0.22"
 half = "2"
 image = { version = "0.25", default-features = false, features = ["bmp", "gif", "jpeg", "png", "tiff", "webp"] }
-serde = { version = "1", features = ["derive"] }
+serde.workspace = true
 serde_json = { version = "1", features = ["preserve_order", "float_roundtrip"] }
 tokenizers = { version = "0.23.2", default-features = false, features = ["fancy-regex"] }
 unicode-general-category = "=0.6.0"

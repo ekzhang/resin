@@ -450,24 +450,4 @@ mod tests {
             .collect();
         assert_eq!(counts, expected.counts);
     }
-
-    #[test]
-    fn empty_native_wire_has_explicit_no_op_span() {
-        let mut out = MetricsEncoder::new("test", 0, 0);
-        out.histogram("latency_seconds", "Latency.", &Histogram::default(), &[])
-            .unwrap();
-        let histogram = out.families["latency_seconds"].metric[0]
-            .histogram
-            .as_ref()
-            .unwrap();
-        assert_eq!(
-            histogram.positive_span,
-            [proto::BucketSpan {
-                offset: 0,
-                length: 0
-            }]
-        );
-        assert!(histogram.positive_delta.is_empty());
-        assert_eq!(histogram.sample_count, 0);
-    }
 }

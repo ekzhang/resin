@@ -294,9 +294,9 @@ fn engine_actor(
                     engine
                         .bind(py)
                         .borrow_mut()
-                        .metrics_snapshot(py)?
+                        .collect_metrics(py, true)?
                         .expect("enabled metrics")
-                        .encode_protobuf(py, model, 0, 0, true)
+                        .encode_protobuf(model, 0, 0)
                 })
                 .map_err(|error| format_python_error("metrics collection failed", error))?;
                 endpoint

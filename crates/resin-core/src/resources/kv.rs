@@ -337,11 +337,7 @@ impl fmt::Display for KvLayoutError {
 impl std::error::Error for KvLayoutError {}
 
 /// Executor-facing block table and append locations for one cache group.
-#[derive(Clone, Debug, Eq, PartialEq)]
-#[cfg_attr(
-    feature = "archive",
-    derive(rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)
-)]
+#[derive(Clone, Debug, Eq, PartialEq, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
 pub struct KvGroupPlan {
     pub group_index: u32,
     pub blocks_per_slab: u32,

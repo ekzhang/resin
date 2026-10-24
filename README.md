@@ -331,7 +331,7 @@ The native layer currently provides:
 
 `crates/resin-core` is Python-independent Rust containing request
 lifecycle, scheduling, token-range planning, grouped cache allocation, and
-execution transactions. Its optional archive feature supplies the distributed
+execution transactions. It uses `rkyv` for the distributed
 plan wire format. `crates/resin-py` converts Python inputs and adapts runner
 callbacks, plans, errors, handles, and events to that core. `crates/resin-recipe`
 owns conversation formats and CPU media preparation; `crates/resin-http` owns

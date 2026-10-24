@@ -71,6 +71,7 @@ PARAMETERS = {
     ("Engine", "__new__"): {"runner": "Runner"},
     ("Engine", "cancel"): {"request": "RequestLease"},
     ("Engine", "submit"): {"media": "MediaInput | None"},
+    ("_HistogramAccumulator", "snapshot"): {"additional": "dict[str, Any] | None"},
     ("ForwardOutput", "__new__"): OUTPUT_COLUMNS,
     ("_HttpServer", "__new__"): {"recipe": "Recipe"},
     ("_HttpSession", "__new__"): {"recipe": "Recipe"},
@@ -83,7 +84,8 @@ PARAMETERS = {
 }
 
 RETURNS = {
-    ("EngineMetrics", "runner"): "RunnerMetrics | None",
+    ("Engine", "metrics_snapshot"): "dict[str, Any] | None",
+    ("_HistogramAccumulator", "snapshot"): "dict[str, Any]",
     ("SamplingParams", "stop_token_ids"): "tuple[int, ...]",
     ("", "_media_to_buffers"): "tuple[bytes, tuple[npt.NDArray[Any], ...]]",
     ("", "_media_from_buffers"): "MediaInput",

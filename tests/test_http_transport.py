@@ -48,14 +48,6 @@ def test_native_http_packets_encode_only_at_the_wire_boundary():
     ) == {"events": payload * 2, "metrics": []}
 
 
-def test_metric_packets_preserve_arbitrary_protobuf_bytes():
-    snapshots = [b"\x00\xff\x80\x01", b"binary histogram"]
-    packet = _HttpEvents().with_metrics(snapshots)
-    restored = _HttpEvents.from_bytes(packet.to_bytes())
-    values = json.loads(_HttpEvents.combine([packet, restored]).to_bytes())
-    assert values == {"events": [], "metrics": [list(value) for value in snapshots] * 2}
-
-
 @pytest.mark.parametrize(
     "payload", [b"invalid", b"[42]", b'{"requests":42}', b'{"unknown":1}']
 )

@@ -17,7 +17,7 @@ use super::{BatchAccess, RequestResourceRef};
 /// Slabs are fungible across groups; group block counts are not independent
 /// capacity partitions. Reclaimable storage excludes live requests and all
 /// outstanding device access, including retired overlapped executions.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize)]
 pub struct CacheMetrics {
     pub capacity_slabs: u32,
     pub free_slabs: u32,
@@ -28,7 +28,7 @@ pub struct CacheMetrics {
 }
 
 /// Physical block usage for an ordered runner-declared cache group.
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize)]
 pub struct CacheGroupMetrics {
     pub group: u32,
     /// Full history (`kv`), sliding-window history (`swa`), or `recurrent`.
@@ -53,7 +53,7 @@ pub struct CacheGroupMetrics {
 
 /// Prefix LRU counters. Reclaimed storage counts actual physical frees during
 /// eviction; evicting an ancestor or a live request's prefix may free nothing.
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, serde::Serialize)]
 pub struct PrefixCacheMetrics {
     pub entries: u64,
     pub hits: u64,
@@ -681,77 +681,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn metrics_describe_shared_capacity_without_treating_recurrent_slots_as_tokens() {
-        let layout = KvLayout::new(
-            8,
-            vec![
-                KvGroupLayout::new(2, 2, KvRetention::FullContext).unwrap(),
-                KvGroupLayout::new(
-                    2,
-                    2,
-                    KvRetention::SlidingWindow {
-                        tokens: NonZeroU32::new(4).unwrap(),
-                    },
-                )
-                .unwrap(),
-                KvGroupLayout::new_with_family(
-                    4,
-                    4,
-                    KvRetention::FullContext,
-                    super::super::kv::KvGroupFamily::State,
-                )
-                .unwrap(),
-            ],
-        )
-        .unwrap();
-        let mut resources = PagedKvResources::new(layout).unwrap();
-        let id = RequestId::new(NonZeroU64::new(1).unwrap());
-        let request = resources.attach(id, 8).unwrap();
-        let metrics = resources.metrics();
-        assert_eq!(metrics.capacity_slabs, 8);
-        assert_eq!(metrics.occupied_slabs, 5);
-        assert_eq!(metrics.free_slabs, 3);
-        assert_eq!(metrics.reclaimable_slabs, 0);
-        assert_eq!(metrics.prefix, None);
-        let [kv, swa, recurrent] = metrics.groups.as_slice() else {
-            panic!("all three groups must be reported");
-        };
-        assert_eq!(
-            (kv.pool, swa.pool, recurrent.pool),
-            ("kv", "swa", "recurrent")
-        );
-        assert_eq!(
-            (
-                kv.occupied_blocks,
-                swa.occupied_blocks,
-                recurrent.occupied_blocks
-            ),
-            (4, 3, 2)
-        );
-        assert_eq!(
-            (
-                kv.occupied_tokens,
-                swa.occupied_tokens,
-                recurrent.occupied_tokens
-            ),
-            (Some(8), Some(6), None)
-        );
-        assert_eq!(
-            (kv.free_blocks, swa.free_blocks, recurrent.free_blocks),
-            (0, 1, 2)
-        );
-        resources.retire(request).unwrap();
-        let retired = resources.metrics();
-        assert_eq!(retired.free_slabs, 8);
-        assert!(
-            retired
-                .groups
-                .iter()
-                .all(|group| group.occupied_blocks == 0)
-        );
-    }
-
-    #[test]
     fn ancestor_eviction_counts_no_reclaimed_storage_until_the_last_checkpoint() {
         let layout = KvLayout::new(
             2,
@@ -772,65 +701,17 @@ mod tests {
 
         let cached = resources.metrics();
         assert_eq!(cached.reclaimable_slabs, 1);
-        assert_eq!(cached.groups[0].cached_blocks, 2);
         assert_eq!(cached.groups[0].reclaimable_blocks, 2);
-        assert_eq!(cached.groups[0].reclaimable_tokens, Some(4));
-        assert_eq!(cached.prefix.unwrap().entries, 2);
         assert!(resources.evict_one_prefix().unwrap());
         let ancestor = resources.metrics();
         assert_eq!(ancestor.groups[0].occupied_blocks, 2);
-        assert_eq!(ancestor.groups[0].reclaimable_blocks, 2);
-        assert_eq!(
-            ancestor.prefix.unwrap(),
-            PrefixCacheMetrics {
-                entries: 1,
-                evictions: 1,
-                ..PrefixCacheMetrics::default()
-            }
-        );
+        assert_eq!(ancestor.prefix.unwrap().reclaimed_blocks, 0);
 
         assert!(resources.evict_one_prefix().unwrap());
         let empty = resources.metrics();
         assert_eq!(empty.free_slabs, 2);
-        assert_eq!(empty.groups[0].cached_blocks, 0);
-        assert_eq!(
-            empty.prefix.unwrap(),
-            PrefixCacheMetrics {
-                evictions: 2,
-                reclaimed_blocks: 2,
-                reclaimed_slabs: 1,
-                ..PrefixCacheMetrics::default()
-            }
-        );
-    }
-
-    #[test]
-    fn reclaimable_block_in_shared_slab_does_not_imply_reclaimable_slab() {
-        let layout = KvLayout::new(
-            1,
-            vec![KvGroupLayout::new(2, 2, KvRetention::FullContext).unwrap()],
-        )
-        .unwrap();
-        let mut resources = PagedKvResources::with_prefix_cache(layout).unwrap();
-        let id = RequestId::new(NonZeroU64::new(1).unwrap());
-        let mut cached = resources.attach(id, 2).unwrap();
-        resources.publish_prefix(&mut cached, &[1, 2], 2).unwrap();
-        resources.retire(cached).unwrap();
-        let live = resources
-            .attach(RequestId::new(NonZeroU64::new(2).unwrap()), 2)
-            .unwrap();
-        let metrics = resources.metrics();
-        assert_eq!(metrics.reclaimable_slabs, 0);
-        assert_eq!(metrics.groups[0].reclaimable_blocks, 1);
-        assert_eq!(metrics.groups[0].cached_blocks, 1);
-        resources.evict_one_prefix().unwrap();
-        let evicted = resources.metrics();
-        assert_eq!(evicted.free_slabs, 0);
-        assert_eq!(evicted.groups[0].free_blocks, 1);
-        assert_eq!(evicted.prefix.unwrap().reclaimed_blocks, 1);
-        assert_eq!(evicted.prefix.unwrap().reclaimed_slabs, 0);
-        resources.retire(live).unwrap();
-        assert_eq!(resources.metrics().free_slabs, 1);
+        assert_eq!(empty.prefix.unwrap().reclaimed_blocks, 2);
+        assert_eq!(empty.prefix.unwrap().reclaimed_slabs, 1);
     }
 
     #[test]

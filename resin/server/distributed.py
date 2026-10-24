@@ -159,17 +159,17 @@ class DistributedHttpCoordinator:
             packet = self.session.process(events)
             assert ingress is not None
             if ingress.collect_metrics:
-                snapshot = self.engine.local.metrics_snapshot()
+                snapshot = self.engine.local._metrics_prometheus_protobuf(
+                    model_name=self.model,
+                    rank=self.engine.worker.groups.rank,
+                    attn_dp_rank=self.rank,
+                    include_runner=False,
+                )
                 assert snapshot is not None
                 physical = self.engine.worker.collect_metrics()
                 packet = packet.with_metrics(
                     [
-                        snapshot.prometheus_protobuf(
-                            model_name=self.model,
-                            rank=self.engine.worker.groups.rank,
-                            attn_dp_rank=self.rank,
-                            include_runner=False,
-                        ),
+                        snapshot,
                         *(
                             _runner_metrics_prometheus_protobuf(
                                 observation,

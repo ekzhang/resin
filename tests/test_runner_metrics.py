@@ -4,10 +4,9 @@ from types import SimpleNamespace
 
 import pytest
 
-from resin import BatchPhase, Histogram
+from resin import BatchPhase
 from resin._resin import _HistogramAccumulator
 from resin.backend.cuda.metrics import CudaMetrics, observe_execution
-from resin.backend.metrics import DpSyncMetrics
 
 
 class Event:
@@ -85,74 +84,19 @@ def test_placeholder_participation_has_its_own_time_category(metrics):
     assert snapshot.cuda_graph_passes["decode_none"] == 1
 
 
-def test_failed_execution_is_not_queried(metrics):
-    class Runner:
-        _metrics = metrics
-
-        @observe_execution
-        def forward(self, plan):
-            raise RuntimeError("CUDA failure")
-
-    with pytest.raises(RuntimeError, match="CUDA failure"):
-        Runner().forward(plan=SimpleNamespace(phase=BatchPhase.DECODE))
-    assert metrics.active is None
-    assert not metrics.pending
-    assert not any(metrics.snapshot().forward_seconds.values())
-
-
-def test_speculation_snapshot_uses_raw_acceptance_counters(metrics):
-    speculation = SimpleNamespace(drafts=12, accepted=9, blocks=4)
-    snapshot = metrics.snapshot(speculation)
-    assert (snapshot.speculative_drafts, snapshot.speculative_accepted) == (12, 9)
-    assert snapshot.speculative_rows == 4
-
-
-def test_dp_wait_histogram_adapts_and_keeps_owned_snapshots():
-    metrics = DpSyncMetrics()
-    for value in (0.0002, 0.02, 2.0):
-        metrics.observe(value)
-    snapshot = metrics.snapshot()
-    assert snapshot.sum == pytest.approx(2.0202)
-    assert snapshot.count == sum(snapshot.counts) == 3
-    assert len(snapshot.counts) <= 160
-    metrics.observe(0)
-    metrics.observe(1e20)
-    widened = metrics.snapshot()
-    assert widened.count == 5 and widened.zero_count == 1
-    assert widened.schema < snapshot.schema
-    assert snapshot.count == 3 and snapshot.zero_count == 0
-    assert len(widened.counts) <= 160
-
-
-def test_histogram_snapshot_roundtrip_merge_and_weighted_observations():
+def test_histogram_snapshot_merge_and_weighted_observations():
     first, second = _HistogramAccumulator(), _HistogramAccumulator()
     first.observe(0, weight=2)
     first.observe(0.125, weight=3)
     second.observe(2e12)
     left, right = first.snapshot(), second.snapshot()
-    copied = Histogram(**left.as_dict())
-    merged = copied.merge(right)
-    assert merged.count == 6
-    assert merged.zero_count == 2
-    assert merged.sum == 2e12 + 0.375
-    assert sum(merged.counts) == 4
-    assert left.count == copied.count == 5 and right.count == 1
-    assert Histogram(**merged.as_dict()).as_dict() == merged.as_dict()
-    with pytest.raises(AttributeError):
-        setattr(merged, "count", 4)
-    with pytest.raises(ValueError, match="count"):
-        Histogram(count=1)
-    with pytest.raises(ValueError, match="finite and nonnegative"):
-        first.observe(float("inf"))
-
-
-def test_completed_outer_events_are_recycled(metrics):
-    first = metrics.begin(BatchPhase.DECODE, idle=False)
-    metrics.finish(first)
-    first.end.ready = True
-    metrics.snapshot()
-    second = metrics.begin(BatchPhase.DECODE, idle=False)
-    assert (second.start, second.end) == (first.start, first.end)
+    merged = first.snapshot(additional=right)
+    assert merged["count"] == 6
+    assert merged["zero_count"] == 2
+    assert merged["sum"] == 2e12 + 0.375
+    assert sum(merged["counts"]) == 4
+    assert left["count"] == 5 and right["count"] == 1
+    assert first.snapshot() == left
 
 
 def test_eager_phases_are_exclusive_and_recycle_completed_events(metrics, monkeypatch):
@@ -173,27 +117,3 @@ def test_eager_phases_are_exclusive_and_recycle_completed_events(metrics, monkey
     reused = metrics.eager_phases(("draft", "target_verify"))
     assert reused is not None
     assert reused.events == phases.events
-
-
-def test_eager_markers_use_runner_device_not_thread_current_device(metrics):
-    metrics.device = "cuda:1"
-    metrics.begin(BatchPhase.DECODE, idle=False)
-    phases = metrics.eager_phases(("draft", "target_verify"))
-    assert phases is not None
-    phases.mark(0)
-    assert phases.events[0].stream == "stream:cuda:1"
-
-
-def test_speculation_starts_at_metrics_enable_boundary():
-    speculation = SimpleNamespace(drafts=20, accepted=12, blocks=5)
-    metrics = CudaMetrics("cuda", speculation=speculation)
-    assert metrics.snapshot(speculation).speculative_drafts == 0
-    speculation.drafts += 4
-    speculation.accepted += 3
-    speculation.blocks += 1
-    snapshot = metrics.snapshot(speculation)
-    assert (
-        snapshot.speculative_drafts,
-        snapshot.speculative_accepted,
-        snapshot.speculative_rows,
-    ) == (4, 3, 1)

@@ -3,15 +3,13 @@
 import json
 from datetime import timedelta
 from pathlib import Path
-from typing import cast
 
-import pytest
 import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
 
-from resin import Histogram, Parallelism, RunnerConfig
-from resin.backend.distributed import DistributedExecutionError, DistributedWorker
+from resin import Parallelism, RunnerConfig
+from resin.backend.distributed import DistributedWorker
 from resin.backend.metrics import RunnerMetrics
 from resin.backend.topology import ParallelGroups
 
@@ -28,9 +26,8 @@ class _Runner:
     runner_config = RunnerConfig()
     worker: DistributedWorker
 
-    def __init__(self, rank, invalid=False):
+    def __init__(self, rank):
         self.rank = rank
-        self.invalid = invalid
         self.enabled = False
         self.pending = _Pending()
 
@@ -42,25 +39,23 @@ class _Runner:
         assert self.enabled
         assert self.pending.harvests == 0
         return RunnerMetrics(
-            forward_seconds=(
-                cast(dict[str, float], {"decode": object()})
-                if self.invalid
-                else {"decode": self.rank + 0.125}
-            ),
+            forward_seconds={"decode": self.rank + 0.125},
             speculative_drafts=(1 << 54) + self.rank,
-            dp_sync=Histogram(
-                counts=[(1 << 54) + self.rank],
-                count=(1 << 54) + self.rank,
-                offset=1,
-                sum=float((1 << 54) + self.rank),
-            ),
+            dp_sync={
+                "schema": 4,
+                "zero_count": 0,
+                "counts": [(1 << 54) + self.rank],
+                "count": (1 << 54) + self.rank,
+                "offset": 1,
+                "sum": float((1 << 54) + self.rank),
+            },
         )
 
     def forward(self, plan):
         raise AssertionError("snapshot must not execute the model")
 
 
-def _rank(rank, rendezvous, output, invalid):
+def _rank(rank, rendezvous, output):
     torch.set_num_threads(1)
     dist.init_process_group(
         "gloo",
@@ -72,7 +67,7 @@ def _rank(rank, rendezvous, output, invalid):
     groups = ParallelGroups.create(
         Parallelism(world_size=2, attn_tp=2), device_backend="gloo"
     )
-    runner = _Runner(rank, invalid=invalid and rank == 1)
+    runner = _Runner(rank)
     worker = DistributedWorker(runner, groups)
     runner.worker = worker
 
@@ -84,14 +79,6 @@ def _rank(rank, rendezvous, output, invalid):
     try:
         if groups.is_driver:
             worker.configure_metrics()
-            if invalid:
-                with pytest.raises(
-                    DistributedExecutionError, match="not JSON serializable"
-                ):
-                    worker.collect_metrics()
-                assert runner.pending.harvests == 0
-                worker._send({"operation": "close", "error": None})
-                return
             snapshots = worker.collect_metrics()
             assert runner.pending.harvests == 0
             Path(output).write_text(
@@ -101,9 +88,7 @@ def _rank(rank, rendezvous, output, invalid):
                             rank,
                             snapshot.forward_seconds["decode"],
                             snapshot.speculative_drafts,
-                            None
-                            if snapshot.dp_sync is None
-                            else snapshot.dp_sync.as_dict(),
+                            snapshot.dp_sync,
                         ]
                         for rank, snapshot in snapshots
                     ]
@@ -118,24 +103,20 @@ def _rank(rank, rendezvous, output, invalid):
         dist.destroy_process_group()
 
 
-@pytest.mark.parametrize("invalid", [False, True])
-def test_physical_rank_snapshots_preserve_counters_and_pending_work(tmp_path, invalid):
+def test_physical_rank_snapshots_preserve_counters_and_pending_work(tmp_path):
     output = tmp_path / "metrics.json"
     mp.spawn(
         _rank,
-        args=(f"file://{tmp_path / 'rendezvous'}", str(output), invalid),
+        args=(f"file://{tmp_path / 'rendezvous'}", str(output)),
         nprocs=2,
         join=True,
     )
-    if invalid:
-        return
     values = json.loads(output.read_text())
     assert [row[:3] for row in values] == [
         [0, 0.125, 1 << 54],
         [1, 1.125, (1 << 54) + 1],
     ]
     for rank, _, _, histogram in values:
-        assert Histogram(**histogram).as_dict() == histogram
         assert histogram["count"] == (1 << 54) + rank
         assert histogram["counts"] == [(1 << 54) + rank]
         assert histogram["offset"] == 1 and histogram["schema"] == 4

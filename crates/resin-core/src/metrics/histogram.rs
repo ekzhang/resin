@@ -30,7 +30,7 @@ const FRACTION_BOUNDS: [f64; 16] = [
 /// Resolution decreases as needed to keep at most 160 buckets, preserving all
 /// observations. Cloning produces an independent snapshot, unlike a collector
 /// handle. The representation maps directly to Prometheus native histograms.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct Histogram {
     pub schema: i8,
     pub zero_count: u64,
@@ -54,6 +54,41 @@ impl Default for Histogram {
 }
 
 impl Histogram {
+    /// Validate externally supplied snapshots before merging or exporting them.
+    pub fn validate(&self) -> Result<(), &'static str> {
+        if !(-4..=INITIAL_SCHEMA).contains(&self.schema) || !self.sum.is_finite() || self.sum < 0.0
+        {
+            return Err("histogram requires schema -4..4 and a finite nonnegative sum");
+        }
+        if self.counts.len() > MAX_BUCKETS {
+            return Err("histogram exceeds 160 buckets");
+        }
+        if self
+            .counts
+            .iter()
+            .try_fold(self.zero_count, |total, value| total.checked_add(*value))
+            != Some(self.count)
+        {
+            return Err("histogram count must equal zero_count plus bucket counts");
+        }
+        let scale = 2.0_f64.powi(i32::from(self.schema));
+        let minimum = (-1074.0 * scale).ceil() as i32;
+        let maximum = (1024.0 * scale).ceil() as i32;
+        let valid_indices = if self.counts.is_empty() {
+            self.offset == 0
+        } else {
+            self.offset >= minimum
+                && self
+                    .offset
+                    .checked_add(self.counts.len() as i32 - 1)
+                    .is_some_and(|last| last <= maximum)
+        };
+        if !valid_indices {
+            return Err("histogram bucket indices are outside the finite positive range");
+        }
+        Ok(())
+    }
+
     pub fn observe(&mut self, value: f64) {
         self.observe_weighted(value, 1);
     }
@@ -188,46 +223,6 @@ mod tests {
     use std::collections::BTreeMap;
 
     #[test]
-    fn weighted_observations_and_clones_preserve_counts() {
-        let mut histogram = Histogram::default();
-        histogram.observe_weighted(2.0, 3);
-        histogram.observe_weighted(0.0, 2);
-        let snapshot = histogram.clone();
-        histogram.observe_weighted(9.0, 0);
-        assert_eq!(histogram, snapshot);
-        histogram.observe(9.0);
-        assert_eq!(snapshot.count, 5);
-        assert_eq!(snapshot.sum, 6.0);
-        assert_eq!(snapshot.zero_count, 2);
-        assert_eq!(snapshot.offset, 16);
-        assert_eq!(snapshot.counts, [3]);
-        assert_eq!(histogram.count, 6);
-        assert_eq!(histogram.sum, 15.0);
-        assert_eq!(histogram.counts.iter().sum::<u64>(), 4);
-    }
-
-    #[test]
-    fn bounded_storage_conserves_observations_across_entire_f64_range() {
-        let mut histogram = Histogram::default();
-        histogram.observe(f64::from_bits(1));
-        histogram.observe(f64::MAX);
-        for exponent in -1074..=1023 {
-            let value = if exponent < -1022 {
-                f64::from_bits(1_u64 << (exponent + 1074))
-            } else {
-                f64::from_bits(((exponent + 1023) as u64) << 52)
-            };
-            histogram.observe(value);
-            assert!(histogram.counts.len() <= MAX_BUCKETS);
-        }
-        assert_eq!(histogram.schema, -4);
-        assert_eq!(histogram.offset, -67);
-        assert_eq!(histogram.counts.len(), 132);
-        assert_eq!(histogram.count, 2100);
-        assert_eq!(histogram.counts.iter().sum::<u64>(), histogram.count);
-    }
-
-    #[test]
     fn merging_different_resolutions_matches_observing_all_values() {
         let groups = [
             vec![(0.0, 3), (2.0_f64.powi(-80), 2), (0.25, 7)],
@@ -245,6 +240,7 @@ mod tests {
         }
         assert!(merged.schema < INITIAL_SCHEMA);
         assert_eq!(merged, combined);
+        assert_eq!(merged.validate(), Ok(()));
         assert_eq!(merged.count, 30);
         assert_eq!(merged.zero_count + merged.counts.iter().sum::<u64>(), 30);
     }
@@ -262,6 +258,15 @@ mod tests {
                 ]);
             }
         }
+        let mut bounded = Histogram::default();
+        for &value in &values {
+            bounded.observe(value);
+            assert!(bounded.counts.len() <= MAX_BUCKETS);
+        }
+        assert_eq!(
+            bounded.zero_count + bounded.counts.iter().sum::<u64>(),
+            values.len() as u64
+        );
         for schema in -4..=INITIAL_SCHEMA {
             let native = NativeHistogram::new_native(
                 NativeHistogramConfig::with_schema(schema).zero_threshold(-1.0),

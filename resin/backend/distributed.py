@@ -15,7 +15,6 @@ from typing import Protocol
 import torch
 
 from resin import BatchPhase, BatchPlan, Engine, ForwardOutput, Runner, RunnerConfig
-from resin._resin import Histogram
 from resin.backend.command_transport import CommandTransport
 from resin.backend.control_plane import ControlOperation, ControlPlane
 from resin.backend.metrics import DpSyncMetrics, RunnerMetrics
@@ -224,11 +223,7 @@ class DistributedWorker:
         metrics = self._metrics
         if metrics is None:
             return result
-        wait = metrics.snapshot()
-        return replace(
-            result,
-            dp_sync=wait if result.dp_sync is None else result.dp_sync.merge(wait),
-        )
+        return replace(result, dp_sync=metrics.snapshot(additional=result.dp_sync))
 
     def collect_metrics(self) -> tuple[tuple[int, RunnerMetrics], ...]:
         """Publish every physical rank at a coordinated serving boundary.
@@ -250,8 +245,6 @@ class DistributedWorker:
                 field.name: getattr(observation, field.name)
                 for field in fields(observation)
             }
-            if observation.dp_sync is not None:
-                snapshot["dp_sync"] = observation.dp_sync.as_dict()
             payload = json.dumps(
                 (snapshot, None), separators=(",", ":"), allow_nan=False
             ).encode()
@@ -287,8 +280,6 @@ class DistributedWorker:
         snapshots = []
         for rank, (value, _) in zip(group.ranks, gathered, strict=True):
             assert isinstance(value, dict)
-            if value["dp_sync"] is not None:
-                value["dp_sync"] = Histogram(**value["dp_sync"])
             snapshots.append((rank, RunnerMetrics(**value)))
         return tuple(snapshots)
 
