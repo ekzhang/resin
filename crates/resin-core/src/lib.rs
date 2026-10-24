@@ -16,6 +16,7 @@ mod batch;
 pub mod engine;
 mod ids;
 pub mod logprobs;
+pub mod metrics;
 pub mod output;
 pub mod parallelism;
 mod planning;

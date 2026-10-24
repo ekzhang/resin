@@ -470,6 +470,9 @@ struct PageSlot {
     generation: u64,
     mode: Option<PageMode>,
     request_refs: u32,
+    /// Immutable segment ownership is separate from live request ownership.
+    /// Several checkpoints can share one segment reference.
+    cache_refs: u32,
     reader_leases: u32,
     writer_lease: bool,
     write_epoch: u64,
@@ -479,6 +482,7 @@ impl PageSlot {
     fn is_live(self) -> bool {
         matches!(self.mode, Some(PageMode::Reserved { .. }))
             || self.request_refs != 0
+            || self.cache_refs != 0
             || self.reader_leases != 0
             || self.writer_lease
     }
@@ -495,10 +499,25 @@ impl PageSlot {
         debug_assert!(!self.is_live());
         self.mode = None;
         self.request_refs = 0;
+        self.cache_refs = 0;
         self.reader_leases = 0;
         self.writer_lease = false;
         self.write_epoch = 0;
     }
+}
+
+/// Physical inventory for one group. Reclaimable means that retiring every
+/// cache reference would free the block now, with no request or device lease
+/// still holding it. Free blocks are holes in already bound slabs.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct GroupOccupancy {
+    pub occupied_slabs: u32,
+    pub reclaimable_slabs: u32,
+    pub occupied_blocks: u64,
+    pub cached_blocks: u64,
+    pub reclaimable_blocks: u64,
+    pub pinned_blocks: u64,
+    pub free_blocks: u64,
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -805,6 +824,34 @@ impl CachePool {
         self.occupied_blocks
     }
 
+    /// Inspect physical ownership only when publishing a metrics snapshot.
+    /// This scans allocated metadata, never request token histories or the
+    /// potentially shared prefix checkpoint chains.
+    pub(crate) fn group_occupancy(&self) -> Vec<GroupOccupancy> {
+        let mut groups = vec![GroupOccupancy::default(); self.group_packings.len()];
+        for parent in &self.parents {
+            let Some(group) = parent.binding else {
+                continue;
+            };
+            let metrics = &mut groups[group.index() as usize];
+            metrics.occupied_slabs += 1;
+            metrics.occupied_blocks += u64::from(parent.occupied_slots);
+            metrics.free_blocks += parent.slots.len() as u64 - u64::from(parent.occupied_slots);
+            let mut reclaimable = 0;
+            for slot in &parent.slots {
+                metrics.cached_blocks += u64::from(slot.cache_refs != 0);
+                let pinned = slot.reader_leases != 0 || slot.writer_lease;
+                metrics.pinned_blocks += u64::from(pinned);
+                if slot.cache_refs != 0 && slot.request_refs == 0 && !pinned {
+                    reclaimable += 1;
+                }
+            }
+            metrics.reclaimable_blocks += u64::from(reclaimable);
+            metrics.reclaimable_slabs += u32::from(reclaimable == parent.occupied_slots);
+        }
+        groups
+    }
+
     /// Resolve a live page capability into its device-facing physical address.
     /// Parent zero remains reserved for each runner's null page.
     pub fn physical_address(&self, handle: PageHandle) -> Result<(u32, u32), CachePoolError> {
@@ -1035,7 +1082,7 @@ impl CachePool {
                 .filter(|tail| tail.len() <= demand.blocks);
             let shared = previous.as_ref().map_or(0, |tail| tail.len());
             for page in &source.pages[shared..demand.blocks] {
-                if self.validate_live_handle(page.handle)?.request_refs == u32::MAX {
+                if self.validate_live_handle(page.handle)?.cache_refs == u32::MAX {
                     return Err(CachePoolError::DemandOverflow);
                 }
             }
@@ -1086,7 +1133,7 @@ impl CachePool {
                     Some(PageMode::Shared) => debug_assert!(!page.writable),
                     _ => unreachable!("validated request pages remain mutable or shared"),
                 }
-                slot.request_refs += 1;
+                slot.cache_refs += 1;
             }
             source.snapshot = cached.tail.as_ref().map(Arc::downgrade).unwrap_or_default();
         }
@@ -1158,9 +1205,7 @@ impl CachePool {
                 }
                 for page in &segment.pages {
                     let slot = self.validate_live_handle(page.handle)?;
-                    if slot.mode != Some(PageMode::Shared)
-                        || page.writable
-                        || slot.request_refs == 0
+                    if slot.mode != Some(PageMode::Shared) || page.writable || slot.cache_refs == 0
                     {
                         return Err(CachePoolError::StaleHandle);
                     }
@@ -1174,7 +1219,7 @@ impl CachePool {
                 match Arc::try_unwrap(segment) {
                     Ok(mut segment) => {
                         for page in segment.pages.iter().rev() {
-                            self.slot_mut(page.handle).request_refs -= 1;
+                            self.slot_mut(page.handle).cache_refs -= 1;
                             self.retire_slot_if_unused(page.handle);
                         }
                         current = segment.previous.take();
@@ -1869,10 +1914,8 @@ mod tests {
         assert_eq!(segments.len(), 512);
         assert_eq!(stored_pages, 512);
         for page in &request.groups[0].pages {
-            assert_eq!(
-                pool.validate_live_handle(page.handle).unwrap().request_refs,
-                2
-            );
+            let slot = pool.validate_live_handle(page.handle).unwrap();
+            assert_eq!((slot.request_refs, slot.cache_refs), (1, 1));
         }
         let expected = request_handles(&request);
         let validation_capacity = pool.validation_handles.lock().unwrap().capacity();
@@ -1968,10 +2011,8 @@ mod tests {
         assert!(request.groups[0].snapshot.upgrade().is_none());
         let replacement = pool.share_request_prefix(&mut request, &demands).unwrap();
         for page in &request.groups[0].pages {
-            assert_eq!(
-                pool.validate_live_handle(page.handle).unwrap().request_refs,
-                2
-            );
+            let slot = pool.validate_live_handle(page.handle).unwrap();
+            assert_eq!((slot.request_refs, slot.cache_refs), (1, 1));
         }
         pool.retire_request(request).unwrap();
         pool.retire_cached_prefix(replacement).unwrap();
@@ -1991,10 +2032,8 @@ mod tests {
             second.groups[0].tail.as_ref().unwrap()
         ));
         for page in &request.groups[0].pages {
-            assert_eq!(
-                pool.validate_live_handle(page.handle).unwrap().request_refs,
-                2
-            );
+            let slot = pool.validate_live_handle(page.handle).unwrap();
+            assert_eq!((slot.request_refs, slot.cache_refs), (1, 1));
         }
         pool.retire_cached_prefix(first).unwrap();
         pool.retire_request(request).unwrap();

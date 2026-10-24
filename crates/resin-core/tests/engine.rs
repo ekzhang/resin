@@ -98,6 +98,7 @@ fn admission_credits_restored_physical_prefix_pages_only() {
             true,
         )
         .unwrap();
+        engine.enable_metrics().unwrap();
         let mut model = Model::default();
         let prefix: Vec<u32> = (0..8).collect();
         let seed = engine.submit(input(prefix.clone(), 1)).unwrap();
@@ -143,6 +144,13 @@ fn admission_credits_restored_physical_prefix_pages_only() {
             for request in requests {
                 request.take_result().unwrap();
             }
+            let metrics = engine.metrics_snapshot().unwrap();
+            assert_eq!(metrics.prompt_tokens, 48);
+            assert_eq!(metrics.cached_tokens, 32);
+            assert_eq!(metrics.prefill_cache_tokens, 32);
+            assert_eq!(metrics.prefill_compute_tokens, 16);
+            assert_eq!(metrics.uncached_prompt_tokens_histogram.sum, 16.0);
+            assert_eq!(metrics.completed_requests, 5);
         }
         engine.close(&mut model).unwrap();
     }
@@ -268,6 +276,7 @@ fn terminal_limits_do_not_hide_unleased_runner_output() {
 #[test]
 fn frontend_event_failure_quarantines_before_native_commit() {
     let mut engine = engine(0, 8);
+    engine.enable_metrics().unwrap();
     let mut model = Model::default();
     let request = engine.submit(input(vec![1, 2], 1)).unwrap();
     let error = engine
@@ -280,6 +289,13 @@ fn frontend_event_failure_quarantines_before_native_commit() {
     assert!(!request.done());
     assert!(model.released.is_empty());
     assert_eq!(engine.cache_occupied_block_count(), Some(1));
+    let metrics = engine.metrics_snapshot().unwrap();
+    assert_eq!(metrics.accepted_requests, 1);
+    assert_eq!(metrics.running_requests, 1);
+    assert_eq!(metrics.completed_requests, 0);
+    assert_eq!(metrics.decode_tokens, 0);
+    assert_eq!(metrics.prefill_compute_tokens, 0);
+    assert_eq!(metrics.time_to_first_token_seconds.count, 0);
 }
 
 #[test]
@@ -658,6 +674,7 @@ fn stop_overlap_engine() -> EngineCore<&'static str> {
 fn stopped_continuation_publishes_result_but_keeps_pages_until_successor_finishes() {
     for stop in [3, 4, 5] {
         let mut engine = stop_overlap_engine();
+        engine.enable_metrics().unwrap();
         let mut model = Model::default();
         let mut submission = input(vec![1], 40);
         submission.stop_token_ids = vec![stop];
@@ -667,6 +684,7 @@ fn stopped_continuation_publishes_result_but_keeps_pages_until_successor_finishe
         assert!(engine.retain_continuation(&plan));
         engine.continuation_plan().unwrap().unwrap(); // Successor accepted on device.
         let leased = engine.cache_free_parent_count();
+        let idle_before = engine.metrics_snapshot().unwrap().scheduler_idle_seconds;
 
         let events = engine
             .complete_continuing_step_with(&mut model, TokenRows::new(&[3, 4, 5], &[0, 3]), Ok)
@@ -689,6 +707,16 @@ fn stopped_continuation_publishes_result_but_keeps_pages_until_successor_finishe
             (2..=stop).collect::<Vec<_>>()
         );
         assert_eq!(engine.active_request_count(), 0);
+        let metrics = engine.metrics_snapshot().unwrap();
+        assert_eq!(metrics.running_requests, 0);
+        assert_eq!(metrics.scheduler_idle_seconds, idle_before);
+        assert_eq!(metrics.completed_requests, 1);
+        assert_eq!(metrics.generation_tokens, u64::from(stop - 1));
+        assert_eq!(metrics.decode_tokens, u64::from(stop - 1));
+        assert_eq!(
+            metrics.inter_token_latency_seconds.count,
+            u64::from(stop - 2)
+        );
         assert_eq!(engine.ready_request_count(), 0);
         assert!(engine.has_work() && engine.has_in_flight_step());
         assert!(engine.continuation_plan().unwrap().is_none());
@@ -713,7 +741,160 @@ fn stopped_continuation_publishes_result_but_keeps_pages_until_successor_finishe
         assert!(request.take_result().is_err()); // Never refill a consumed result.
         engine.close(&mut model).unwrap();
         assert_eq!(model.released, [request.id()]);
+        let metrics = engine.metrics_snapshot().unwrap();
+        assert_eq!(metrics.completed_requests, 1);
+        assert_eq!(metrics.aborted_requests, 0);
+        assert_eq!(metrics.decode_tokens, u64::from(stop - 1));
+        assert_eq!(metrics.generation_tokens, u64::from(stop - 1));
     }
+}
+
+#[test]
+fn metrics_distinguish_waiting_running_rejection_cancellation_and_completion() {
+    let mut engine = engine(0, 2);
+    assert!(engine.metrics_snapshot().is_none());
+    engine.enable_metrics().unwrap();
+    assert!(engine.submit(input(Vec::new(), 1)).is_err());
+    assert!(
+        engine
+            .submit_with::<()>(input(vec![1], 1), |_| {
+                Err(Error::memory("handle allocation failed"))
+            })
+            .is_err()
+    );
+    assert_eq!(engine.metrics_snapshot().unwrap().accepted_requests, 0);
+    let request = engine.submit(input(vec![1, 2, 3, 4], 2)).unwrap();
+    let cancelled = engine.submit(input(vec![5, 6], 2)).unwrap();
+    let mut model = Model::default();
+    assert_eq!(engine.metrics_snapshot().unwrap().waiting_requests, 2);
+    engine.cancel(&mut model, &cancelled).unwrap();
+    model.outputs.push_back(Err(Error::rejected("retry")));
+    assert!(engine.step(&mut model).is_err());
+    let metrics = engine.metrics_snapshot().unwrap();
+    assert_eq!(metrics.waiting_requests, 1);
+    assert_eq!(metrics.running_requests, 0);
+    assert_eq!(metrics.prefill_compute_tokens, 0);
+    assert_eq!(metrics.queue_time_seconds.count, 0);
+
+    engine.prepare_step(&mut model, None).unwrap().unwrap();
+    let metrics = engine.metrics_snapshot().unwrap();
+    assert_eq!(metrics.waiting_requests, 0);
+    assert_eq!(metrics.running_requests, 1);
+    engine
+        .complete_step_with(&mut model, TokenRows::new(&[99], &[0, 1]), Ok)
+        .unwrap();
+    let metrics = engine.metrics_snapshot().unwrap();
+    assert_eq!(metrics.running_requests, 1);
+    assert_eq!(metrics.prefill_compute_tokens, 2);
+    assert_eq!(metrics.decode_tokens, 0);
+    assert_eq!(metrics.time_to_first_token_seconds.count, 0);
+    while engine.has_work() {
+        engine.step(&mut model).unwrap();
+    }
+    assert!(request.done());
+    let metrics = engine.metrics_snapshot().unwrap();
+    assert_eq!(metrics.accepted_requests, 2);
+    assert_eq!(metrics.aborted_requests, 1);
+    assert_eq!(metrics.completed_requests, 1);
+    assert_eq!(metrics.waiting_requests + metrics.running_requests, 0);
+    assert_eq!(metrics.prompt_tokens, 4);
+    assert_eq!(metrics.prefill_compute_tokens, 4);
+    assert_eq!(metrics.generation_tokens, 2);
+    assert_eq!(metrics.decode_tokens, 2);
+    assert_eq!(metrics.queue_time_seconds.count, 1);
+    assert_eq!(metrics.time_to_first_token_seconds.count, 1);
+    assert_eq!(metrics.request_time_per_output_token_seconds.count, 1);
+    assert_eq!(metrics.prompt_tokens_histogram.sum, 4.0);
+    assert_eq!(metrics.generation_tokens_histogram.sum, 2.0);
+    engine.submit(input(vec![9], 2)).unwrap();
+    engine.close(&mut model).unwrap();
+    assert_eq!(engine.metrics_snapshot().unwrap().aborted_requests, 2);
+}
+
+#[test]
+fn metrics_must_start_before_the_first_request_and_cannot_reset_totals() {
+    let mut first = engine(0, 8);
+    first.submit(input(vec![1], 1)).unwrap();
+    assert!(first.enable_metrics().is_err());
+    let mut second = engine(0, 8);
+    second.enable_metrics().unwrap();
+    second.submit(input(vec![1], 1)).unwrap();
+    second.enable_metrics().unwrap();
+    assert_eq!(second.metrics_snapshot().unwrap().accepted_requests, 1);
+}
+
+#[test]
+fn idle_time_excludes_queued_work_and_freezes_after_close() {
+    let mut engine = engine(0, 8);
+    engine.enable_metrics().unwrap();
+    let initially_idle = engine.metrics_snapshot().unwrap();
+    assert_eq!(
+        initially_idle.scheduler_idle_seconds,
+        initially_idle.elapsed_seconds
+    );
+    let request = engine.submit(input(vec![1], 2)).unwrap();
+    let waiting_idle = engine.metrics_snapshot().unwrap().scheduler_idle_seconds;
+    assert_eq!(
+        engine.metrics_snapshot().unwrap().scheduler_idle_seconds,
+        waiting_idle
+    );
+    let mut model = Model::default();
+    engine.step(&mut model).unwrap();
+    assert_eq!(
+        engine.metrics_snapshot().unwrap().scheduler_idle_seconds,
+        waiting_idle
+    );
+    engine.cancel(&mut model, &request).unwrap();
+    let after_cancel = engine.metrics_snapshot().unwrap().scheduler_idle_seconds;
+    assert!(after_cancel >= waiting_idle);
+    engine.close(&mut model).unwrap();
+    let closed = engine.metrics_snapshot().unwrap();
+    assert!(closed.scheduler_idle_seconds >= after_cancel);
+    let later = engine.metrics_snapshot().unwrap();
+    assert_eq!(closed.scheduler_idle_seconds, later.scheduler_idle_seconds);
+    assert_eq!(closed.elapsed_seconds, later.elapsed_seconds);
+}
+
+#[test]
+fn retraction_counts_compute_replay_without_duplicating_logical_tokens() {
+    let mut engine = EngineCore::new(
+        RunnerConfig {
+            cache_layout: Some(
+                KvLayout::new(
+                    3,
+                    vec![KvGroupLayout::new(1, 1, KvRetention::FullContext).unwrap()],
+                )
+                .unwrap(),
+            ),
+            continuation_prefill: true,
+            ..Default::default()
+        },
+        2,
+        3,
+        SchedulerConfig {
+            schedule_conservativeness: 0.0,
+            ..Default::default()
+        },
+        false,
+    )
+    .unwrap();
+    engine.enable_metrics().unwrap();
+    engine.submit(input(vec![1], 3)).unwrap();
+    engine.submit(input(vec![10], 3)).unwrap();
+    let mut model = Model::default();
+    while engine.has_work() {
+        engine.step(&mut model).unwrap();
+    }
+    let metrics = engine.metrics_snapshot().unwrap();
+    assert_eq!(metrics.retracted_requests, 1);
+    assert_eq!(metrics.accepted_requests, 2);
+    assert_eq!(metrics.completed_requests, 2);
+    assert_eq!(metrics.prompt_tokens, 2);
+    assert_eq!(metrics.prefill_compute_tokens, 3);
+    assert_eq!(metrics.generation_tokens, 6);
+    assert_eq!(metrics.decode_tokens, 6);
+    assert_eq!(metrics.queue_time_seconds.count, 2);
+    assert_eq!(metrics.time_to_first_token_seconds.count, 2);
 }
 
 #[test]

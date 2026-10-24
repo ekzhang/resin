@@ -120,7 +120,7 @@ fn lru() {
         cache.publish_prefix(&mut request, &[token], 1).unwrap();
         cache.retire(request).unwrap();
     }
-    assert_eq!(cache.prefix_cache_metrics().unwrap().0, count as usize);
+    assert_eq!(cache.prefix_metrics().unwrap().entries, u64::from(count));
     let started = Instant::now();
     cache.clear_prefix_cache().unwrap();
     report("lru_16384_entries_clear", started);

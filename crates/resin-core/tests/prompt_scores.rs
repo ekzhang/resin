@@ -100,6 +100,7 @@ fn prompt_top_and_position_targets_work_alone_or_together_across_chunks() {
             (2, Some(vec![vec![], vec![9, 9], vec![], vec![4]])),
         ] {
             let mut engine = engine(chunk);
+            engine.enable_metrics().unwrap();
             let mut input = Submission::new(vec![1, 2, 3, 4], ());
             input.max_output_tokens = Some(0);
             input.prompt_top_logprobs = top;
@@ -110,6 +111,16 @@ fn prompt_top_and_position_targets_work_alone_or_together_across_chunks() {
                 assert!(engine.step(&mut model).unwrap().is_empty());
             }
             assert!(request.done());
+            let metrics = engine.metrics_snapshot().unwrap();
+            assert_eq!(metrics.completed_requests, 1);
+            assert_eq!(metrics.prompt_tokens, 4);
+            assert_eq!(metrics.prefill_compute_tokens, 4);
+            assert_eq!(metrics.generation_tokens, 0);
+            assert_eq!(metrics.generation_tokens_histogram.count, 1);
+            assert_eq!(metrics.generation_tokens_histogram.sum, 0.0);
+            assert_eq!(metrics.time_to_first_token_seconds.count, 0);
+            assert_eq!(metrics.inter_token_latency_seconds.count, 0);
+            assert_eq!(metrics.request_time_per_output_token_seconds.count, 0);
             assert!(request.take_result().unwrap().is_empty());
             let scores = request.prompt_logprobs().unwrap();
             assert!(scores[0].is_none());

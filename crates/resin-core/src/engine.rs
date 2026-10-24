@@ -4,11 +4,12 @@
 //! plan and releases model-local state. Opaque payloads carry frontend metadata.
 
 pub use crate::logprobs::{LogprobView, TokenLogprobs};
+use crate::metrics::{EngineMetrics, EngineMetricsSnapshot, RequestMetrics};
 pub use crate::output::{OwnedTokenRows, TokenRows};
 use crate::resources::RequestResourceRef;
 use crate::resources::kv::{KvGroupPlan, KvLayout};
 use crate::resources::paged::{CachePoolError, RequestPages, WriterAccessLease};
-use crate::resources::paged_kv::{PagedKvBatchView, PagedKvError, PagedKvResources};
+use crate::resources::paged_kv::{CacheMetrics, PagedKvBatchView, PagedKvError, PagedKvResources};
 use crate::{
     Phase, PlanningConfig, PlanningError, RequestId, RequestProgress, Schedulable, Scheduler,
     Selection, SequenceStep, TokenRange, schedule_ready_prefix,
@@ -19,6 +20,7 @@ use std::num::{NonZeroU32, NonZeroU64, NonZeroUsize};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Instant;
 
 pub type Result<T> = std::result::Result<T, Error>;
 
@@ -329,6 +331,7 @@ pub trait Runner<P> {
 }
 #[derive(Debug)]
 struct Request<P> {
+    metrics: Option<RequestMetrics>,
     prompt_logprobs: bool,
     prompt_top_logprobs: u32,
     prompt_target_logprobs: Option<Vec<Vec<u32>>>,
@@ -488,9 +491,11 @@ struct PreparedProgress {
 struct Batch<P> {
     rows: Vec<BatchRow<P>>,
     resources: Option<WriterAccessLease>,
+    prepared_at: Option<Instant>,
 }
 
 pub struct EngineCore<P> {
+    metrics: Option<EngineMetrics>,
     in_flight: Option<Batch<P>>,
     continuation: Option<ExecutionPlan<P>>,
     quarantined: Option<Batch<P>>,
@@ -558,6 +563,7 @@ impl<P: Clone> EngineCore<P> {
         let new_token_ratio_decay =
             (new_token_ratio - minimum_new_token_ratio) / NEW_TOKEN_RATIO_DECAY_STEPS;
         Ok(Self {
+            metrics: None,
             in_flight: None,
             continuation: None,
             quarantined: None,
@@ -579,6 +585,48 @@ impl<P: Clone> EngineCore<P> {
 
     pub fn id(&self) -> u64 {
         self.engine_id
+    }
+
+    /// Enable native accounting before submission, preserving cumulative totals.
+    pub fn enable_metrics(&mut self) -> Result<()> {
+        if self.metrics.is_some() {
+            return Ok(());
+        }
+        self.raise_if_open()?;
+        if self.next_request_id != 1 {
+            return Err(Error::invalid(
+                "metrics must be enabled before submitting requests",
+            ));
+        }
+        self.metrics = Some(EngineMetrics::new());
+        Ok(())
+    }
+
+    pub fn metrics_enabled(&self) -> bool {
+        self.metrics.is_some()
+    }
+
+    /// Copy observations without device synchronization or runner callbacks.
+    pub fn metrics_snapshot(&self) -> Option<EngineMetricsSnapshot> {
+        let mut snapshot = self.metrics.as_ref()?.snapshot();
+        snapshot.waiting_requests = self
+            .scheduler
+            .iter()
+            .filter(|request| !request.running)
+            .count();
+        snapshot.running_requests = self
+            .scheduler
+            .iter()
+            .filter(|request| request.running)
+            .count()
+            + self
+                .in_flight
+                .iter()
+                .chain(&self.quarantined)
+                .flat_map(|batch| &batch.rows)
+                .filter(|row| !row.terminal)
+                .count();
+        Some(snapshot)
     }
     pub fn next_request_id(&self) -> u64 {
         self.next_request_id
@@ -636,7 +684,18 @@ impl<P: Clone> EngineCore<P> {
     pub fn prefix_cache_stats(&self) -> Option<(usize, u64, u64, u64)> {
         self.kv_resources
             .as_ref()
-            .and_then(PagedKvResources::prefix_cache_metrics)
+            .and_then(PagedKvResources::prefix_metrics)
+            .map(|stats| {
+                (
+                    stats.entries as usize,
+                    stats.hits,
+                    stats.misses,
+                    stats.evictions,
+                )
+            })
+    }
+    pub fn cache_metrics(&self) -> Option<CacheMetrics> {
+        self.kv_resources.as_ref().map(PagedKvResources::metrics)
     }
     pub fn clear_prefix_cache(&mut self) -> Result<()> {
         self.raise_if_open()?;
@@ -679,6 +738,7 @@ impl<P: Clone> EngineCore<P> {
         make_handle: impl FnOnce(RequestHandle) -> Result<H>,
     ) -> Result<H> {
         self.raise_if_open()?;
+        let submitted_at = self.metrics.as_ref().map(|_| Instant::now());
         let Submission {
             prompt_logprobs,
             prompt_top_logprobs,
@@ -814,7 +874,15 @@ impl<P: Clone> EngineCore<P> {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .cached_tokens = resident_tokens;
         self.next_request_id = next_request_id;
+        let metrics = self.metrics.as_mut().map(|metrics| {
+            metrics.submit(
+                token_ids.len() as u32,
+                resident_tokens,
+                submitted_at.expect("metrics-enabled submission has a timestamp"),
+            )
+        });
         self.scheduler.enqueue(Request {
+            metrics,
             prompt_logprobs,
             prompt_top_logprobs,
             prompt_target_logprobs,
@@ -1210,6 +1278,7 @@ impl<P: Clone> EngineCore<P> {
             }
         };
         let batch = Batch {
+            prepared_at: self.metrics.as_ref().map(|_| Instant::now()),
             rows: scheduled
                 .into_iter()
                 .zip(scheduled_rows)
@@ -1428,6 +1497,35 @@ impl<P: Clone> EngineCore<P> {
 
         // Logical progress becomes visible only after every fallible physical
         // cleanup step has completed.
+        let committed_at = self.metrics.as_ref().map(|_| Instant::now());
+        if let Some(metrics) = &mut self.metrics {
+            let now = committed_at.expect("metrics-enabled commit has a timestamp");
+            let prepared_at = batch
+                .prepared_at
+                .expect("metrics-enabled batch has a timestamp");
+            for ((row, progress), &finished) in
+                batch.rows.iter_mut().zip(&prepared_progress).zip(&retired)
+            {
+                if row.terminal {
+                    continue;
+                }
+                metrics.commit(
+                    row.request
+                        .metrics
+                        .as_mut()
+                        .expect("metrics-enabled request"),
+                    prepared_at,
+                    now,
+                    if row.scheduled.phase == Phase::Prefill {
+                        row.scheduled.token_count().get()
+                    } else {
+                        0
+                    },
+                    progress.sampled_tokens.len(),
+                    finished,
+                );
+            }
+        }
         Self::apply_scheduled_progress(&mut batch.rows, prepared_progress);
         for (row, updates) in batch.rows.iter().zip(prompt_updates) {
             if updates.is_empty() {
@@ -1486,6 +1584,13 @@ impl<P: Clone> EngineCore<P> {
         if decoded_batch {
             self.decay_new_token_ratio();
         }
+        let idle = !self.has_work();
+        if let Some(metrics) = &mut self.metrics {
+            metrics.set_idle(
+                idle,
+                committed_at.expect("metrics-enabled commit has a timestamp"),
+            );
+        }
         Ok(events)
     }
 
@@ -1518,6 +1623,11 @@ impl<P: Clone> EngineCore<P> {
             }
             let generated = std::mem::take(&mut request.generated);
             complete_request_lease(&request.lease, generated, true);
+            let idle = !self.has_work();
+            if let Some(metrics) = &mut self.metrics {
+                metrics.abort();
+                metrics.set_idle(idle, Instant::now());
+            }
             return Ok(true);
         }
 
@@ -1725,6 +1835,9 @@ impl<P: Clone> EngineCore<P> {
             return Err(error);
         }
         request.resident_tokens = 0;
+        if let Some(metrics) = &mut self.metrics {
+            metrics.retract();
+        }
         self.scheduler.requeue_retracted(request);
         self.update_new_token_ratio_after_retraction();
         Ok(true)
@@ -1779,6 +1892,9 @@ impl<P: Clone> EngineCore<P> {
             resources.clear_prefix_cache().map_err(Error::from)?;
         }
         self.closed = true;
+        if let Some(metrics) = &mut self.metrics {
+            metrics.close();
+        }
         Ok(())
     }
 
@@ -1819,6 +1935,9 @@ impl<P: Clone> EngineCore<P> {
             }
             let generated = std::mem::take(&mut request.generated);
             complete_request_lease(&request.lease, generated, true);
+            if let Some(metrics) = &mut self.metrics {
+                metrics.abort();
+            }
         }
         Ok(())
     }
@@ -2107,6 +2226,7 @@ mod tests {
         pages: Option<RequestPages>,
     ) -> Request<()> {
         Request {
+            metrics: None,
             prompt_logprobs: false,
             prompt_top_logprobs: 0,
             prompt_target_logprobs: None,
