@@ -78,7 +78,7 @@ class RankRunner:
         return RunnerMetrics(
             # Synthetic rank-specific observations prove that physical ranks
             # publish independently of logical request ownership.
-            forward_seconds={"decode": float(self.groups.rank + 1)},
+            forward_execution_seconds={"decode": float(self.groups.rank + 1)},
             cuda_graph_passes={"decode_none": len(self.calls)},
         )
 

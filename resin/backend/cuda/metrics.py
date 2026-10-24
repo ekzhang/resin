@@ -149,7 +149,7 @@ class CudaMetrics:
         self.available: list[tuple[torch.cuda.Event, torch.cuda.Event]] = []
         self.seconds = dict.fromkeys(FORWARD_CATEGORIES, 0.0)
         self.graphs: Counter[str] = Counter(dict.fromkeys(CUDA_GRAPH_MODES, 0))
-        self.dp_sync = DpSyncMetrics()
+        self.dp_attention_sync_wait_seconds = DpSyncMetrics()
         self._eager_phases: dict[tuple[str, ...], GraphPhaseTiming] = {}
         self._speculation_baseline = (
             (0, 0, 0)
@@ -218,17 +218,17 @@ class CudaMetrics:
     def snapshot(self, speculation=None) -> RunnerMetrics:
         self.collect()
         drafts, accepted, rows = self._speculation_baseline
-        return self.dp_sync.attach(
+        return self.dp_attention_sync_wait_seconds.attach(
             RunnerMetrics(
-                forward_seconds=self.seconds,
+                forward_execution_seconds=self.seconds,
                 cuda_graph_passes=self.graphs,
-                speculative_drafts=0
+                spec_draft_tokens=0
                 if speculation is None
                 else speculation.drafts - drafts,
-                speculative_accepted=0
+                spec_accepted_tokens=0
                 if speculation is None
                 else speculation.accepted - accepted,
-                speculative_rows=0
+                spec_verify_rows=0
                 if speculation is None
                 else speculation.blocks - rows,
             )

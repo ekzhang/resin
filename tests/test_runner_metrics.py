@@ -43,12 +43,12 @@ def test_pending_execution_events_are_owned_and_published_once(metrics):
     metrics.finish(second)
     assert first.start is not second.start
     assert first.end is not second.end
-    assert not any(metrics.snapshot().forward_seconds.values())
+    assert not any(metrics.snapshot().forward_execution_seconds.values())
     first.end.ready = True
-    assert metrics.snapshot().forward_seconds["decode"] == 0.005
-    assert metrics.snapshot().forward_seconds["decode"] == 0.005
+    assert metrics.snapshot().forward_execution_seconds["decode"] == 0.005
+    assert metrics.snapshot().forward_execution_seconds["decode"] == 0.005
     second.end.ready = True
-    assert metrics.snapshot().forward_seconds["decode"] == 0.010
+    assert metrics.snapshot().forward_execution_seconds["decode"] == 0.010
 
 
 def test_prefill_regions_and_nested_forward_count_as_one_pass(metrics):
@@ -80,7 +80,7 @@ def test_placeholder_participation_has_its_own_time_category(metrics):
     Runner().forward_distributed(None, SimpleNamespace(phase=BatchPhase.DECODE))
     metrics.pending[0].end.ready = True
     snapshot = metrics.snapshot()
-    assert snapshot.forward_seconds["idle"] == 0.005
+    assert snapshot.forward_execution_seconds["idle"] == 0.005
     assert snapshot.cuda_graph_passes["decode_none"] == 1
 
 
@@ -90,8 +90,8 @@ def test_histogram_snapshot_merge_and_weighted_observations():
     first.observe(0.125, weight=3)
     second.observe(2e12)
     left, right = first.snapshot(), second.snapshot()
-    runner = RunnerMetrics(dp_sync=left)
-    merged = second.attach(runner).as_dict()["dp_sync"]
+    runner = RunnerMetrics(dp_attention_sync_wait_seconds=left)
+    merged = second.attach(runner).as_dict()["dp_attention_sync_wait_seconds"]
     assert merged["count"] == 6
     assert merged["zero_count"] == 2
     assert merged["sum"] == 2e12 + 0.375
@@ -112,9 +112,9 @@ def test_eager_phases_are_exclusive_and_recycle_completed_events(metrics, monkey
     execution.end.ready = True
     monkeypatch.setattr(execution.start, "elapsed_time", lambda _: 20.0)
     snapshot = metrics.snapshot()
-    assert snapshot.forward_seconds["draft"] == 0.005
-    assert snapshot.forward_seconds["target_verify"] == 0.005
-    assert snapshot.forward_seconds["decode"] == 0.010
+    assert snapshot.forward_execution_seconds["draft"] == 0.005
+    assert snapshot.forward_execution_seconds["target_verify"] == 0.005
+    assert snapshot.forward_execution_seconds["decode"] == 0.010
     metrics.begin(BatchPhase.DECODE, idle=False)
     reused = metrics.eager_phases(("draft", "target_verify"))
     assert reused is not None

@@ -75,7 +75,7 @@ def test_captured_phase_events_belong_to_each_queued_replay(monkeypatch):
             left is not right
             for left, right in zip(first.phases[0].events, second.phases[0].events)
         )
-        assert not any(runner.metrics_snapshot().forward_seconds.values())
+        assert not any(runner.metrics_snapshot().forward_execution_seconds.values())
         torch.cuda.synchronize()
 
         def no_synchronize(_):
@@ -84,9 +84,9 @@ def test_captured_phase_events_belong_to_each_queued_replay(monkeypatch):
         monkeypatch.setattr(torch.cuda.Event, "synchronize", no_synchronize)
         snapshot = runner.metrics_snapshot()
         assert snapshot.cuda_graph_passes["decode_cuda_graph"] == 2
-        assert snapshot.forward_seconds["draft"] > 0
-        assert snapshot.forward_seconds["target_verify"] > 0
-        assert snapshot.forward_seconds["decode"] >= 0
+        assert snapshot.forward_execution_seconds["draft"] > 0
+        assert snapshot.forward_execution_seconds["target_verify"] > 0
+        assert snapshot.forward_execution_seconds["decode"] >= 0
         assert runner.metrics_snapshot() == snapshot
         assert not runner._metrics.pending
         # Completed event generations are reusable without changing old totals.

@@ -37,6 +37,13 @@ The inspector returns plain dictionaries and lists, with `requests`, optional
 independent of later execution. Cache inventory scans physical allocation
 metadata, so poll periodically rather than on every generated token.
 
+Snapshot fields follow exported metric stems where possible, omitting the
+counter suffix `_total`. Request-state fields remain explicit:
+`completed_requests` maps to `resin:num_requests_total`, while
+`decode_tokens` feeds `resin:realtime_tokens_total{mode="decode"}` and
+includes prefill output and committed work from cancelled requests.
+`generation_throughput` is the derived tokens-per-second value.
+
 ## Exponential histograms and scraping
 
 Latency and token distributions use native base-2 exponential histograms rather
@@ -132,6 +139,21 @@ The optional `resin.protocols.MetricsRunner` contract has two methods:
 ```python
 def configure_metrics(self, *, enabled: bool = True) -> None: ...
 def metrics_snapshot(self) -> RunnerMetrics: ...
+```
+
+The snapshot uses the same names across native and Python execution:
+
+```python
+from resin import RunnerMetrics
+
+snapshot = RunnerMetrics(
+    forward_execution_seconds={"decode": 1.25},
+    cuda_graph_passes={"decode_cuda_graph": 40},
+    spec_draft_tokens=120,
+    spec_accepted_tokens=90,
+    spec_verify_rows=40,
+    dp_attention_sync_wait_seconds=None,  # Optional exponential histogram.
+)
 ```
 
 `resin.RunnerMetrics` is a frozen native snapshot with keyword-only fields for

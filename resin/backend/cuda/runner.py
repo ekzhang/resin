@@ -261,7 +261,9 @@ class CudaRunner(Runner):
             finally:
                 if timed:
                     assert metrics is not None
-                    metrics.dp_sync.observe(perf_counter() - started)
+                    metrics.dp_attention_sync_wait_seconds.observe(
+                        perf_counter() - started
+                    )
         if any(error is not None for error in errors):
             raise ValueError("; ".join(error for error in errors if error is not None))
         if any(row[2] != len(required_shape) for row in records):

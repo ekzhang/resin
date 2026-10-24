@@ -9,12 +9,12 @@ pub use histogram::Histogram;
 /// Collecting these values never requires a metric exporter in the runner.
 #[derive(Clone, Debug, Default, PartialEq, serde::Serialize)]
 pub struct RunnerMetricsSnapshot {
-    pub forward_seconds: BTreeMap<String, f64>,
+    pub forward_execution_seconds: BTreeMap<String, f64>,
     pub cuda_graph_passes: BTreeMap<String, u64>,
-    pub speculative_drafts: u64,
-    pub speculative_accepted: u64,
-    pub speculative_rows: u64,
-    pub dp_sync: Option<Histogram>,
+    pub spec_draft_tokens: u64,
+    pub spec_accepted_tokens: u64,
+    pub spec_verify_rows: u64,
+    pub dp_attention_sync_wait_seconds: Option<Histogram>,
 }
 
 /// Logical request metrics, counted once by the engine owning each request.

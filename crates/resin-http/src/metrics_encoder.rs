@@ -350,7 +350,7 @@ impl MetricsEncoder {
         }
     }
     pub fn runner(&mut self, r: &RunnerMetricsSnapshot) -> Result<(), MetricsEncodeError> {
-        for (category, &value) in &r.forward_seconds {
+        for (category, &value) in &r.forward_execution_seconds {
             self.counter(
                 "forward_execution_seconds_total",
                 "Nonoverlapping GPU execution intervals; host-side collection never synchronizes.",
@@ -366,9 +366,9 @@ impl MetricsEncoder {
                 &[("mode", mode)],
             );
         }
-        let drafts = r.speculative_drafts;
-        let accepted = r.speculative_accepted;
-        let rows = r.speculative_rows;
+        let drafts = r.spec_draft_tokens;
+        let accepted = r.spec_accepted_tokens;
+        let rows = r.spec_verify_rows;
         for (name, help, value) in [
             (
                 "spec_draft_tokens_total",
@@ -400,7 +400,7 @@ impl MetricsEncoder {
             self.gauge("spec_accept_length","Cumulative committed speculative length including one target token per row, before stop clipping.",(accepted+rows) as f64/rows as f64,&[]);
         }
         let empty = Histogram::default();
-        let wait = r.dp_sync.as_ref().unwrap_or(&empty);
+        let wait = r.dp_attention_sync_wait_seconds.as_ref().unwrap_or(&empty);
         self.histogram("dp_attention_sync_wait_seconds","Blocking host coordination time, including collective latency; can overlap GPU execution.",wait,&[])?;
         Ok(())
     }

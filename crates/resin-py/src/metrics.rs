@@ -103,29 +103,31 @@ pub(crate) struct RunnerMetrics(RunnerMetricsSnapshot);
 #[pymethods]
 impl RunnerMetrics {
     #[new]
-    #[pyo3(signature = (*, forward_seconds = None, cuda_graph_passes = None,
-        speculative_drafts = 0, speculative_accepted = 0, speculative_rows = 0, dp_sync = None))]
+    #[pyo3(signature = (*, forward_execution_seconds = None, cuda_graph_passes = None,
+        spec_draft_tokens = 0, spec_accepted_tokens = 0, spec_verify_rows = 0, dp_attention_sync_wait_seconds = None))]
     fn new(
-        forward_seconds: Option<BTreeMap<String, f64>>,
+        forward_execution_seconds: Option<BTreeMap<String, f64>>,
         cuda_graph_passes: Option<BTreeMap<String, u64>>,
-        speculative_drafts: u64,
-        speculative_accepted: u64,
-        speculative_rows: u64,
-        dp_sync: Option<&Bound<'_, PyAny>>,
+        spec_draft_tokens: u64,
+        spec_accepted_tokens: u64,
+        spec_verify_rows: u64,
+        dp_attention_sync_wait_seconds: Option<&Bound<'_, PyAny>>,
     ) -> PyResult<Self> {
         Ok(Self(RunnerMetricsSnapshot {
-            forward_seconds: forward_seconds.unwrap_or_default(),
+            forward_execution_seconds: forward_execution_seconds.unwrap_or_default(),
             cuda_graph_passes: cuda_graph_passes.unwrap_or_default(),
-            speculative_drafts,
-            speculative_accepted,
-            speculative_rows,
-            dp_sync: dp_sync.map(histogram).transpose()?,
+            spec_draft_tokens,
+            spec_accepted_tokens,
+            spec_verify_rows,
+            dp_attention_sync_wait_seconds: dp_attention_sync_wait_seconds
+                .map(histogram)
+                .transpose()?,
         }))
     }
 
     #[getter]
-    fn forward_seconds(&self) -> &BTreeMap<String, f64> {
-        &self.0.forward_seconds
+    fn forward_execution_seconds(&self) -> &BTreeMap<String, f64> {
+        &self.0.forward_execution_seconds
     }
 
     #[getter]
@@ -134,23 +136,23 @@ impl RunnerMetrics {
     }
 
     #[getter]
-    fn speculative_drafts(&self) -> u64 {
-        self.0.speculative_drafts
+    fn spec_draft_tokens(&self) -> u64 {
+        self.0.spec_draft_tokens
     }
 
     #[getter]
-    fn speculative_accepted(&self) -> u64 {
-        self.0.speculative_accepted
+    fn spec_accepted_tokens(&self) -> u64 {
+        self.0.spec_accepted_tokens
     }
 
     #[getter]
-    fn speculative_rows(&self) -> u64 {
-        self.0.speculative_rows
+    fn spec_verify_rows(&self) -> u64 {
+        self.0.spec_verify_rows
     }
 
     #[getter]
-    fn dp_sync<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
-        Ok(pythonize(py, &self.0.dp_sync)?)
+    fn dp_attention_sync_wait_seconds<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        Ok(pythonize(py, &self.0.dp_attention_sync_wait_seconds)?)
     }
 
     /// Plain fields for inspection and explicit distributed transport.
@@ -207,7 +209,7 @@ impl HistogramAccumulator {
         let mut result = snapshot.clone();
         result
             .0
-            .dp_sync
+            .dp_attention_sync_wait_seconds
             .get_or_insert_with(Histogram::default)
             .merge(&self.0);
         result

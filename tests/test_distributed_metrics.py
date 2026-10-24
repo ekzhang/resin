@@ -39,9 +39,9 @@ class _Runner:
         assert self.enabled
         assert self.pending.harvests == 0
         return RunnerMetrics(
-            forward_seconds={"decode": self.rank + 0.125},
-            speculative_drafts=(1 << 54) + self.rank,
-            dp_sync={
+            forward_execution_seconds={"decode": self.rank + 0.125},
+            spec_draft_tokens=(1 << 54) + self.rank,
+            dp_attention_sync_wait_seconds={
                 "schema": 4,
                 "zero_count": 0,
                 "counts": [(1 << 54) + self.rank],
@@ -86,9 +86,9 @@ def _rank(rank, rendezvous, output):
                     [
                         [
                             rank,
-                            snapshot.forward_seconds["decode"],
-                            snapshot.speculative_drafts,
-                            snapshot.dp_sync,
+                            snapshot.forward_execution_seconds["decode"],
+                            snapshot.spec_draft_tokens,
+                            snapshot.dp_attention_sync_wait_seconds,
                         ]
                         for rank, snapshot in snapshots
                     ]
