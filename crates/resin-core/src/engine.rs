@@ -607,8 +607,8 @@ impl<P: Clone> EngineCore<P> {
     }
 
     /// Copy observations without device synchronization or runner callbacks.
-    pub fn metrics_snapshot(&mut self) -> Option<EngineMetricsSnapshot> {
-        let mut snapshot = self.metrics.as_mut()?.snapshot();
+    pub fn metrics_snapshot(&self) -> Option<EngineMetricsSnapshot> {
+        let mut snapshot = self.metrics.as_ref()?.snapshot();
         snapshot.waiting_requests = self
             .scheduler
             .iter()

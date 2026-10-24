@@ -45,7 +45,6 @@ impl MetricsEncoder {
         r: &EngineMetricsSnapshot,
         cache: Option<&CacheMetrics>,
     ) -> Result<(), MetricsEncodeError> {
-        self.gauge("gen_throughput", "Committed output tokens per second in the last collection window (at least one second).", r.generation_throughput, &[]);
         for (name, help, value) in [
             (
                 "num_accepted_requests_total",

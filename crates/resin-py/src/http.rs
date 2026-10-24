@@ -293,7 +293,7 @@ fn engine_actor(
                 let encoded = Python::attach(|py| {
                     engine
                         .bind(py)
-                        .borrow_mut()
+                        .borrow()
                         .collect_metrics(py, true)?
                         .expect("enabled metrics")
                         .encode_protobuf(model, 0, 0)

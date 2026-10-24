@@ -1696,14 +1696,14 @@ impl Engine {
 
     /// Collect a read-only native snapshot of engine and runner observations.
     /// Call periodically: cache inventory requires a scan of allocated blocks.
-    fn metrics_snapshot(&mut self, py: Python<'_>) -> PyResult<Option<metrics::EngineMetrics>> {
+    fn metrics_snapshot(&self, py: Python<'_>) -> PyResult<Option<metrics::EngineMetrics>> {
         self.collect_metrics(py, true)
     }
 
     /// Native serving export; avoids constructing Python inspector dictionaries.
     #[pyo3(signature = (*, model_name, rank = 0, attn_dp_rank = 0, include_runner = true))]
     fn _metrics_prometheus_protobuf<'py>(
-        &mut self,
+        &self,
         py: Python<'py>,
         model_name: &str,
         rank: u32,

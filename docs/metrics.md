@@ -44,8 +44,8 @@ counter suffix `_total`. Request-state fields remain explicit:
 `completed_requests` maps to `resin:num_requests_total`, while
 `decode_tokens` feeds `resin:realtime_tokens_total{mode="decode"}` and
 includes prefill output and committed work from cancelled requests.
-`requests["generation_throughput"]` is the derived tokens-per-second value,
-tracked by the core alongside request counters.
+For throughput between snapshots, divide the change in `decode_tokens` by the
+change in `elapsed_seconds`.
 
 ## Exponential histograms and scraping
 
@@ -113,7 +113,6 @@ histograms must not be combined as observations of the same clock.
 | Running / waiting requests                | `resin:num_running_reqs`, `resin:num_queue_reqs`                                                               |
 | Completed prompt / cached / output tokens | `resin:prompt_tokens_total`, `resin:cached_tokens_total`, `resin:generation_tokens_total`                      |
 | Live token work                           | `resin:realtime_tokens_total{mode="prefill_compute\|prefill_cache\|decode"}`                                   |
-| Recent generation throughput              | `resin:gen_throughput`                                                                                         |
 | Completed request length distributions    | `resin:prompt_tokens_histogram`, `resin:uncached_prompt_tokens_histogram`, `resin:generation_tokens_histogram` |
 | HTTP TTFT / successful latency            | `resin:http_time_to_first_token_seconds`, `resin:http_request_latency_seconds`                                 |
 | HTTP queue latency / depth                | `resin:http_queue_time_seconds`, `resin:http_num_queue_reqs`                                                   |
@@ -122,10 +121,8 @@ Completed-request token totals exclude cancellations. Live counters retain
 committed work for requests later cancelled. `prefill_compute` includes replay
 after retraction; `prefill_cache` counts reused prompt tokens at successful
 submission; `decode` counts committed output tokens, including the first token
-produced by prefill. `resin:gen_throughput` reports committed output tokens per
-second between sampling windows, refreshed at most once per second. It is not
-a lifetime average. Use the live output counter's rate for a dashboard window
-of your choosing.
+produced by prefill. Calculate generation throughput with the live output
+counter's rate over the dashboard window of your choosing.
 
 Metrics carry `model_name` and `engine_type="resin"`. Engine and runner series
 also carry `rank` and `attn_dp_rank`. Logical request observations are emitted
@@ -246,7 +243,8 @@ histogram_quantile(0.99,
 
 Use the same query with `generation_tokens_histogram` for output-length
 percentiles or `request_time_per_output_token_seconds` for request TPOT.
-Live generation throughput, including unfinished requests:
+Live generation throughput in tokens per second, including unfinished requests
+and committed work from cancellations (adjust the window as needed):
 
 ```promql
 sum by (model_name) (rate(resin:realtime_tokens_total{mode="decode"}[1m]))

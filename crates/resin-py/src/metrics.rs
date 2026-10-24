@@ -40,7 +40,7 @@ impl EngineMetrics {
 
 impl Engine {
     pub(crate) fn collect_metrics(
-        &mut self,
+        &self,
         py: Python<'_>,
         include_runner: bool,
     ) -> PyResult<Option<EngineMetrics>> {
