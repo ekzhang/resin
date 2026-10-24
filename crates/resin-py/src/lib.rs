@@ -1714,8 +1714,8 @@ impl Engine {
         }
         Ok(Some(metrics::EngineMetrics {
             generation_throughput: self.metrics_sample.2,
-            requests: requests.into(),
-            cache: self.core.cache_metrics().map(Into::into),
+            requests,
+            cache: self.core.cache_metrics(),
             runner: self
                 .runner_metrics
                 .as_ref()
@@ -2037,9 +2037,9 @@ mod _resin {
     #[pymodule_export]
     use crate::cache_metrics::{CacheGroupMetrics, CacheMetrics, PrefixCacheMetrics};
     #[pymodule_export]
-    use crate::metrics::{_runner_metrics_prometheus, EngineMetrics};
+    use crate::metrics::{_runner_metrics_prometheus_protobuf, EngineMetrics};
     #[pymodule_export]
-    use crate::metrics_types::{Histogram, RequestMetrics};
+    use crate::metrics_types::{Histogram, HistogramAccumulator, RequestMetrics};
 
     #[pymodule_export]
     use crate::http::NativeHttpServer;

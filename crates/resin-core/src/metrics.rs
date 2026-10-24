@@ -1,47 +1,20 @@
 //! Exporter-independent observations at committed engine lifecycle boundaries.
 
-use std::time::Instant;
+use std::{collections::BTreeMap, time::Instant};
 
-const LATENCY_BUCKETS: &[f64] = &[
-    0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0, 60.0, 120.0, 300.0,
-    600.0,
-];
-const TOKEN_BUCKETS: &[f64] = &[
-    1.0, 4.0, 16.0, 64.0, 256.0, 1024.0, 4096.0, 16384.0, 65536.0, 262144.0, 1048576.0,
-];
+mod histogram;
+pub use histogram::Histogram;
 
-/// Cumulative finite buckets. The implicit positive-infinity bucket is `count`.
-#[derive(Clone, Debug, PartialEq)]
-pub struct Histogram {
-    pub bounds: &'static [f64],
-    pub counts: Vec<u64>,
-    pub count: u64,
-    pub sum: f64,
-}
-
-impl Histogram {
-    fn new(bounds: &'static [f64]) -> Self {
-        Self {
-            bounds,
-            counts: vec![0; bounds.len()],
-            count: 0,
-            sum: 0.0,
-        }
-    }
-
-    fn observe(&mut self, value: f64) {
-        self.observe_weighted(value, 1);
-    }
-
-    fn observe_weighted(&mut self, value: f64, weight: u64) {
-        for (bound, count) in self.bounds.iter().zip(&mut self.counts) {
-            if value <= *bound {
-                *count += weight;
-            }
-        }
-        self.count += weight;
-        self.sum += value * weight as f64;
-    }
+/// Cumulative physical-rank observations supplied by an optional runner hook.
+/// Collecting these values never requires a metric exporter in the runner.
+#[derive(Clone, Debug, Default)]
+pub struct RunnerMetricsSnapshot {
+    pub forward_seconds: BTreeMap<String, f64>,
+    pub cuda_graph_passes: BTreeMap<String, u64>,
+    pub speculative_drafts: u64,
+    pub speculative_accepted: u64,
+    pub speculative_rows: u64,
+    pub dp_sync: Option<Histogram>,
 }
 
 /// Logical request metrics, counted once by the engine owning each request.
@@ -96,14 +69,14 @@ impl Default for EngineMetricsSnapshot {
             running_requests: 0,
             elapsed_seconds: 0.0,
             scheduler_idle_seconds: 0.0,
-            prompt_tokens_histogram: Histogram::new(TOKEN_BUCKETS),
-            uncached_prompt_tokens_histogram: Histogram::new(TOKEN_BUCKETS),
-            generation_tokens_histogram: Histogram::new(TOKEN_BUCKETS),
-            queue_time_seconds: Histogram::new(LATENCY_BUCKETS),
-            time_to_first_token_seconds: Histogram::new(LATENCY_BUCKETS),
-            inter_token_latency_seconds: Histogram::new(LATENCY_BUCKETS),
-            request_time_per_output_token_seconds: Histogram::new(LATENCY_BUCKETS),
-            e2e_request_latency_seconds: Histogram::new(LATENCY_BUCKETS),
+            prompt_tokens_histogram: Histogram::default(),
+            uncached_prompt_tokens_histogram: Histogram::default(),
+            generation_tokens_histogram: Histogram::default(),
+            queue_time_seconds: Histogram::default(),
+            time_to_first_token_seconds: Histogram::default(),
+            inter_token_latency_seconds: Histogram::default(),
+            request_time_per_output_token_seconds: Histogram::default(),
+            e2e_request_latency_seconds: Histogram::default(),
         }
     }
 }
@@ -291,15 +264,5 @@ mod tests {
         assert_eq!(values.decode_tokens, 4);
         assert_eq!(values.generation_tokens, 4);
         assert_eq!(values.uncached_prompt_tokens_histogram.sum, 4.0);
-    }
-
-    #[test]
-    fn histogram_buckets_are_inclusive_and_cumulative() {
-        let mut histogram = Histogram::new(&[1.0, 2.0, 4.0]);
-        histogram.observe_weighted(2.0, 3);
-        histogram.observe(9.0);
-        assert_eq!(histogram.counts, [0, 3, 3]);
-        assert_eq!(histogram.count, 4);
-        assert_eq!(histogram.sum, 15.0);
     }
 }

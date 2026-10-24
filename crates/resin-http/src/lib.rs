@@ -1,5 +1,6 @@
 mod anthropic;
 mod metrics;
+mod metrics_encoder;
 mod openai;
 mod protocol;
 mod ui;
@@ -16,12 +17,15 @@ use std::{
 use axum::{
     Router,
     extract::DefaultBodyLimit,
-    http::StatusCode,
+    http::{HeaderMap, StatusCode},
     routing::{get, post},
 };
 use tokio::sync::{mpsc, oneshot};
 
-pub use metrics::{MetricsEndpoint, MetricsPublishError};
+pub use metrics::{
+    MetricsEndpoint, MetricsPublishError, decode_metrics, encode_metrics, metrics_text,
+};
+pub use metrics_encoder::{MetricsEncodeError, MetricsEncoder};
 pub use protocol::{
     ConversationRequest, FinishReason, GeneratedTokenLogprob, GenerationEvent, GenerationJob,
     TokenLogprob,
@@ -101,9 +105,9 @@ pub fn router(
     if let Some(metrics) = metrics {
         router = router.route(
             "/metrics",
-            get(move || {
+            get(move |headers: HeaderMap| {
                 let metrics = metrics.clone();
-                async move { metrics.response() }
+                async move { metrics.response(&headers) }
             }),
         );
     }

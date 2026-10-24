@@ -290,17 +290,17 @@ fn engine_actor(
         if let Some(endpoint) = &metrics {
             endpoint.set_queue_size(jobs.len());
             if Instant::now() >= next_metrics {
-                let text = Python::attach(|py| {
+                let encoded = Python::attach(|py| {
                     engine
                         .bind(py)
                         .borrow_mut()
                         .metrics_snapshot(py)?
                         .expect("enabled metrics")
-                        .prometheus(py, model, 0, 0, true)
+                        .encode_protobuf(py, model, 0, 0, true)
                 })
                 .map_err(|error| format_python_error("metrics collection failed", error))?;
                 endpoint
-                    .publish(vec![text])
+                    .publish(vec![encoded])
                     .map_err(|error| error.to_string())?;
                 next_metrics = Instant::now() + Duration::from_secs(1);
             }

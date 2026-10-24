@@ -8,7 +8,7 @@ from resin._resin import (
     _HttpEvents,
     _HttpIngress,
     _HttpSession,
-    _runner_metrics_prometheus,
+    _runner_metrics_prometheus_protobuf,
 )
 from resin.backend.distributed import DistributedExecutionError
 from resin.server.transport import HttpTransport
@@ -164,14 +164,14 @@ class DistributedHttpCoordinator:
                 physical = self.engine.worker.collect_metrics()
                 packet = packet.with_metrics(
                     [
-                        snapshot.prometheus(
+                        snapshot.prometheus_protobuf(
                             model_name=self.model,
                             rank=self.engine.worker.groups.rank,
                             attn_dp_rank=self.rank,
                             include_runner=False,
                         ),
                         *(
-                            _runner_metrics_prometheus(
+                            _runner_metrics_prometheus_protobuf(
                                 observation,
                                 model_name=self.model,
                                 rank=rank,

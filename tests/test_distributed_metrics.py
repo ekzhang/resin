@@ -10,7 +10,7 @@ import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
 
-from resin import Parallelism, RunnerConfig
+from resin import Histogram, Parallelism, RunnerConfig
 from resin.backend.distributed import DistributedExecutionError, DistributedWorker
 from resin.backend.metrics import RunnerMetrics
 from resin.backend.topology import ParallelGroups
@@ -48,6 +48,12 @@ class _Runner:
                 else {"decode": self.rank + 0.125}
             ),
             speculative_drafts=(1 << 54) + self.rank,
+            dp_sync=Histogram(
+                counts=[(1 << 54) + self.rank],
+                count=(1 << 54) + self.rank,
+                offset=1,
+                sum=float((1 << 54) + self.rank),
+            ),
         )
 
     def forward(self, plan):
@@ -95,6 +101,9 @@ def _rank(rank, rendezvous, output, invalid):
                             rank,
                             snapshot.forward_seconds["decode"],
                             snapshot.speculative_drafts,
+                            None
+                            if snapshot.dp_sync is None
+                            else snapshot.dp_sync.as_dict(),
                         ]
                         for rank, snapshot in snapshots
                     ]
@@ -120,7 +129,13 @@ def test_physical_rank_snapshots_preserve_counters_and_pending_work(tmp_path, in
     )
     if invalid:
         return
-    assert json.loads(output.read_text()) == [
+    values = json.loads(output.read_text())
+    assert [row[:3] for row in values] == [
         [0, 0.125, 1 << 54],
         [1, 1.125, (1 << 54) + 1],
     ]
+    for rank, _, _, histogram in values:
+        assert Histogram(**histogram).as_dict() == histogram
+        assert histogram["count"] == (1 << 54) + rank
+        assert histogram["counts"] == [(1 << 54) + rank]
+        assert histogram["offset"] == 1 and histogram["schema"] == 4

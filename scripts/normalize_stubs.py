@@ -28,7 +28,7 @@ OUTPUT_COLUMNS = {
 
 PARAMETERS = {
     ("", "_media_to_buffers"): {"media": "MediaInput"},
-    ("", "_runner_metrics_prometheus"): {"snapshot": "RunnerMetrics"},
+    ("", "_runner_metrics_prometheus_protobuf"): {"snapshot": "RunnerMetrics"},
     ("", "_media_from_buffers"): {"buffers": "Sequence[npt.NDArray[Any]]"},
     ("Message", "__new__"): {"content": "Sequence[ContentBlock]"},
     ("RenderOptions", "__new__"): {"reasoning_effort": "str | int | float | None"},

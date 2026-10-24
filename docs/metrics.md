@@ -6,9 +6,7 @@ Metrics are enabled by default. The engine switches are explicit keyword argumen
 from resin import Engine
 from resin.server import HttpServer
 
-with Engine(
-    runner, enable_metrics=True, enable_overlap=True, context_length=32768
-) as engine:
+with Engine(runner, enable_metrics=True, context_length=32768) as engine:
     HttpServer(engine, recipe=recipe, model="my-model").serve(port=8000)
 ```
 
@@ -39,9 +37,41 @@ if snapshot is not None:
 of later execution. Cache inventory scans physical allocation metadata, so poll
 periodically rather than on every generated token.
 
+## Exponential histograms and scraping
+
+Latency and token distributions use native base-2 exponential histograms rather
+than configured bucket boundaries. They start at schema 4 (a bucket growth factor
+of about 1.044) and lower their resolution when the bucket budget is exceeded.
+Engine and DP-wait snapshots hold at most 160 positive buckets; HTTP observations
+use the same initial schema and bucket limit through `prometheus-client`.
+Bucket merging preserves counts and the separately accumulated sum. Snapshots
+expose `schema`, `offset`, noncumulative `counts`, `zero_count`, `count`, and `sum`.
+
+Enable native histograms and protobuf scraping in Prometheus:
+
+```yaml
+scrape_configs:
+  - job_name: resin
+    scrape_native_histograms: true
+    scrape_protocols: [PrometheusProto]
+    static_configs:
+      - targets: ["127.0.0.1:8000"]
+```
+
+`/metrics` negotiates its representation from the `Accept` header. Protobuf
+scrapes receive complete native distributions. The default text view retains
+counters, gauges, histogram counts and sums, and the `+Inf` bucket for inspection;
+it has no finite buckets and cannot provide useful percentiles. For programmatic
+export, `snapshot.prometheus_protobuf(model_name="my-model")` returns the same
+length-delimited Prometheus protobuf format. `snapshot.prometheus(...)` returns
+the text view.
+
 ## Ownership and timing
 
 Rust records request and scheduler observations after transactional commit.
+`resin-core` owns observations and snapshots. `resin-http` owns the Prometheus
+metric schema, descriptions, and encoding. `resin-py` exposes native snapshots
+and adapts Python runner observations, without defining exporter policy.
 Rejected work, failed commits, speculative padding, stop-clipped output, and
 discarded overlap successors do not become generated-token observations.
 Zero-output prompt scoring completes normally but contributes no TTFT or TPOT.
@@ -61,22 +91,22 @@ buffering. It does not measure client network latency. Successful HTTP latency
 includes response preparation through terminal completion. HTTP and engine
 histograms must not be combined as observations of the same clock.
 
-| Measurement | Metric |
-| --- | --- |
-| TTFT | `resin:time_to_first_token_seconds` |
-| Token-weighted TPOT | `resin:inter_token_latency_seconds` |
-| Request-weighted TPOT | `resin:request_time_per_output_token_seconds` |
-| Successful request latency | `resin:e2e_request_latency_seconds` |
-| Initial scheduler queue latency | `resin:queue_time_seconds` |
-| Accepted / completed / cancelled requests | `resin:num_accepted_requests_total`, `resin:num_requests_total`, `resin:num_aborted_requests_total` |
-| Memory retractions | `resin:num_retracted_requests_total` |
-| Running / waiting requests | `resin:num_running_reqs`, `resin:num_queue_reqs` |
-| Completed prompt / cached / output tokens | `resin:prompt_tokens_total`, `resin:cached_tokens_total`, `resin:generation_tokens_total` |
-| Live token work | `resin:realtime_tokens_total{mode="prefill_compute\|prefill_cache\|decode"}` |
-| Recent generation throughput | `resin:gen_throughput` |
-| Completed request length distributions | `resin:prompt_tokens_histogram`, `resin:uncached_prompt_tokens_histogram`, `resin:generation_tokens_histogram` |
-| HTTP TTFT / successful latency | `resin:http_time_to_first_token_seconds`, `resin:http_request_latency_seconds` |
-| HTTP queue latency / depth | `resin:http_queue_time_seconds`, `resin:http_num_queue_reqs` |
+| Measurement                               | Metric                                                                                                         |
+| ----------------------------------------- | -------------------------------------------------------------------------------------------------------------- |
+| TTFT                                      | `resin:time_to_first_token_seconds`                                                                            |
+| Token-weighted TPOT                       | `resin:inter_token_latency_seconds`                                                                            |
+| Request-weighted TPOT                     | `resin:request_time_per_output_token_seconds`                                                                  |
+| Successful request latency                | `resin:e2e_request_latency_seconds`                                                                            |
+| Initial scheduler queue latency           | `resin:queue_time_seconds`                                                                                     |
+| Accepted / completed / cancelled requests | `resin:num_accepted_requests_total`, `resin:num_requests_total`, `resin:num_aborted_requests_total`            |
+| Memory retractions                        | `resin:num_retracted_requests_total`                                                                           |
+| Running / waiting requests                | `resin:num_running_reqs`, `resin:num_queue_reqs`                                                               |
+| Completed prompt / cached / output tokens | `resin:prompt_tokens_total`, `resin:cached_tokens_total`, `resin:generation_tokens_total`                      |
+| Live token work                           | `resin:realtime_tokens_total{mode="prefill_compute\|prefill_cache\|decode"}`                                   |
+| Recent generation throughput              | `resin:gen_throughput`                                                                                         |
+| Completed request length distributions    | `resin:prompt_tokens_histogram`, `resin:uncached_prompt_tokens_histogram`, `resin:generation_tokens_histogram` |
+| HTTP TTFT / successful latency            | `resin:http_time_to_first_token_seconds`, `resin:http_request_latency_seconds`                                 |
+| HTTP queue latency / depth                | `resin:http_queue_time_seconds`, `resin:http_num_queue_reqs`                                                   |
 
 Completed-request token totals exclude cancellations. Live counters retain
 committed work for requests later cancelled. `prefill_compute` includes replay
@@ -115,11 +145,11 @@ and collects intervals only after their completion event is ready. Captured
 phase boundaries use independent replay generations so an overlapped successor
 cannot overwrite a pending measurement.
 
-| Measurement | Metric |
-| --- | --- |
-| Device time by phase | `resin:forward_execution_seconds_total{category="prefill\|target_verify\|draft\|decode\|idle"}` |
-| No-work engine time | `resin:scheduler_idle_seconds_total` |
-| Blocking host DP coordination | `resin:dp_attention_sync_wait_seconds` |
+| Measurement                      | Metric                                                                                                   |
+| -------------------------------- | -------------------------------------------------------------------------------------------------------- |
+| Device time by phase             | `resin:forward_execution_seconds_total{category="prefill\|target_verify\|draft\|decode\|idle"}`          |
+| No-work engine time              | `resin:scheduler_idle_seconds_total`                                                                     |
+| Blocking host DP coordination    | `resin:dp_attention_sync_wait_seconds`                                                                   |
 | Graph decisions per forward pass | `resin:cuda_graph_passes_total{mode="decode_cuda_graph\|decode_none\|prefill_cuda_graph\|prefill_none"}` |
 
 Phase durations are exclusive within an observed execution. Detailed draft and
@@ -177,18 +207,18 @@ frees; eviction counts include explicit clearing.
 
 ## Dashboard queries
 
-Histogram buckets aggregate across replicas. For example, p99 native TTFT:
+Native histograms aggregate across replicas. For example, p99 native TTFT:
 
 ```promql
 histogram_quantile(0.99,
-  sum by (model_name, le) (
-    rate(resin:time_to_first_token_seconds_bucket[5m])
+  sum by (model_name) (
+    rate(resin:time_to_first_token_seconds[5m])
   )
 )
 ```
 
-Use the same query with `generation_tokens_histogram_bucket` for output-length
-percentiles or `request_time_per_output_token_seconds_bucket` for request TPOT.
+Use the same query with `generation_tokens_histogram` for output-length
+percentiles or `request_time_per_output_token_seconds` for request TPOT.
 Live generation throughput, including unfinished requests:
 
 ```promql
@@ -236,10 +266,10 @@ ratios from counter sums rather than averaging acceptance gauges.
 
 ## OTLP via a Collector
 
-Resin exports Prometheus text. An OpenTelemetry Collector can scrape that
-endpoint and forward OTLP without instrumenting model execution again. A minimal
-Collector configuration, with target addresses resolved from the Collector's
-network environment:
+An OpenTelemetry Collector can scrape the protobuf endpoint and convert native
+histograms to OTLP exponential histograms without instrumenting model execution
+again. A minimal Collector configuration, with target addresses resolved from
+the Collector's network environment:
 
 ```yaml
 receivers:
@@ -248,6 +278,8 @@ receivers:
       scrape_configs:
         - job_name: resin
           scrape_interval: 5s
+          scrape_native_histograms: true
+          scrape_protocols: [PrometheusProto]
           static_configs:
             - targets: ["127.0.0.1:8000"]
 processors:

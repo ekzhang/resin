@@ -2,24 +2,149 @@
 
 use std::{
     collections::BTreeMap,
-    fmt,
+    fmt::{self, Write},
     sync::{Arc, RwLock},
 };
 
 use axum::{
     body::Bytes,
-    http::header::CONTENT_TYPE,
+    http::{
+        HeaderMap, StatusCode,
+        header::{ACCEPT, CONTENT_TYPE, VARY},
+    },
     response::{IntoResponse, Response},
 };
-use prometheus::{Histogram, HistogramOpts, IntGauge, Opts, Registry, TextEncoder};
+use prometheus_client::{
+    collector::Collector,
+    encoding::{
+        DescriptorEncoder, EncodeLabelValue, LabelValueEncoder, NoLabelSet,
+        prometheus_protobuf::{
+            self,
+            prometheus_data_model::{MetricFamily, MetricType as ProtoMetricType},
+        },
+        text,
+    },
+    metrics::{
+        MetricType,
+        gauge::Gauge,
+        histogram::{Histogram, NativeHistogramConfig},
+    },
+    registry::Registry,
+};
+use prost::Message;
+
+const TEXT_CONTENT_TYPE: &str = "text/plain; version=0.0.4; charset=utf-8";
+const PROTO_CONTENT_TYPE: &str =
+    "application/vnd.google.protobuf; proto=io.prometheus.client.MetricFamily; encoding=delimited";
+
+/// Encode length-delimited Prometheus MetricFamily messages for publication.
+pub fn encode_metrics(families: &[MetricFamily]) -> Vec<u8> {
+    let mut bytes = Vec::new();
+    for family in families {
+        family
+            .encode_length_delimited(&mut bytes)
+            .expect("Vec has sufficient capacity");
+    }
+    bytes
+}
+
+/// Decode an entire publication, rejecting malformed or truncated framing.
+pub fn decode_metrics(mut bytes: &[u8]) -> Result<Vec<MetricFamily>, prost::DecodeError> {
+    let mut families = Vec::new();
+    while !bytes.is_empty() {
+        families.push(MetricFamily::decode_length_delimited(&mut bytes)?);
+    }
+    Ok(families)
+}
+
+/// Human-readable classic exposition. Native distributions require protobuf;
+/// text retains histogram counts, sums, and the unbounded bucket.
+pub fn metrics_text(families: &[MetricFamily]) -> Result<String, fmt::Error> {
+    let mut registry = Registry::default();
+    registry.register_collector(Box::new(TextSnapshot(families.to_vec())));
+    let mut output = String::new();
+    text::encode_registry(&mut output, &registry)?;
+    Ok(output)
+}
+
+/// Adapt published protobuf values to the crate's text encoder, which owns
+/// label syntax and numeric formatting. Counter names are already suffixed.
+#[derive(Debug)]
+struct TextSnapshot(Vec<MetricFamily>);
+
+impl Collector for TextSnapshot {
+    fn encode(&self, mut encoder: DescriptorEncoder) -> Result<(), fmt::Error> {
+        for family in &self.0 {
+            let kind = match ProtoMetricType::try_from(family.r#type).map_err(|_| fmt::Error)? {
+                ProtoMetricType::Counter => MetricType::Counter,
+                ProtoMetricType::Gauge => MetricType::Gauge,
+                ProtoMetricType::Histogram => MetricType::Histogram,
+                _ => return Err(fmt::Error),
+            };
+            let mut metric_encoder =
+                encoder.encode_descriptor(&family.name, &family.help, None, kind)?;
+            for metric in &family.metric {
+                let labels: Vec<_> = metric
+                    .label
+                    .iter()
+                    .map(|label| (label.name.as_str(), TextLabel(&label.value)))
+                    .collect();
+                let mut sample = metric_encoder.encode_family(&labels)?;
+                match kind {
+                    MetricType::Counter => {
+                        sample.encode_gauge(&metric.counter.as_ref().ok_or(fmt::Error)?.value)?
+                    }
+                    MetricType::Gauge => {
+                        sample.encode_gauge(&metric.gauge.as_ref().ok_or(fmt::Error)?.value)?
+                    }
+                    MetricType::Histogram => {
+                        let histogram = metric.histogram.as_ref().ok_or(fmt::Error)?;
+                        sample.encode_histogram::<NoLabelSet>(
+                            histogram.sample_sum,
+                            histogram.sample_count,
+                            &[(f64::MAX, histogram.sample_count)],
+                            None,
+                        )?;
+                    }
+                    _ => unreachable!(),
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+// prometheus-client writes string label values verbatim. This adapter is used
+// only by the text collector; protobuf retains the original, unescaped values.
+struct TextLabel<'a>(&'a str);
+
+impl EncodeLabelValue for TextLabel<'_> {
+    fn encode(&self, encoder: &mut LabelValueEncoder) -> Result<(), fmt::Error> {
+        for character in self.0.chars() {
+            match character {
+                '\\' => encoder.write_str("\\\\")?,
+                '"' => encoder.write_str("\\\"")?,
+                '\n' => encoder.write_str("\\n")?,
+                character => encoder.write_char(character)?,
+            }
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+struct Published {
+    text: Bytes,
+    protobuf: Bytes,
+}
 
 /// Prometheus exposition shared by the inference publisher and HTTP runtime.
 ///
-/// Publishing formats complete per-rank snapshots before swapping the buffer.
-/// Scrapes clone that buffer without invoking inference, Python, or collectives.
+/// Publishing encodes complete per-rank snapshots before swapping both formats.
+/// Scrapes clone cached bytes without invoking inference, Python, or collectives.
 #[derive(Clone, Debug, Default)]
 pub struct MetricsEndpoint {
-    published: Arc<RwLock<Bytes>>,
+    published: Arc<RwLock<Published>>,
     http: Option<Arc<HttpMetrics>>,
 }
 
@@ -64,92 +189,167 @@ impl MetricsEndpoint {
     }
 
     /// Replace the complete snapshot, preserving rank labels and grouping all
-    /// samples of a metric family behind one consistent HELP/TYPE descriptor.
-    /// Conflicting descriptors reject the publication, preserving the prior one.
-    pub fn publish(&self, mut snapshots: Vec<String>) -> Result<(), MetricsPublishError> {
-        if let Some(http) = &self.http {
-            snapshots.push(
-                TextEncoder::new()
-                    .encode_to_string(&http.registry.gather())
-                    .expect("registered HTTP metrics have valid descriptors"),
-            );
-        }
-        let mut families = BTreeMap::<&str, Family<'_>>::new();
-        for snapshot in &snapshots {
-            for line in snapshot.lines() {
-                let (kind, description) = if let Some(description) = line.strip_prefix("# HELP ") {
-                    ("HELP", description)
-                } else if let Some(description) = line.strip_prefix("# TYPE ") {
-                    ("TYPE", description)
-                } else {
-                    continue;
-                };
-                let name = description.split_ascii_whitespace().next().unwrap_or("");
-                let family = families.entry(name).or_default();
-                let slot = if kind == "HELP" {
-                    &mut family.help
-                } else {
-                    &mut family.kind
-                };
-                if slot.is_some_and(|previous| previous != line) {
-                    return Err(MetricsPublishError {
-                        metric: name.to_owned(),
-                        descriptor: kind,
-                    });
+    /// samples under consistent descriptors. Invalid publications leave both
+    /// cached representations unchanged.
+    pub fn publish(&self, snapshots: Vec<Vec<u8>>) -> Result<(), MetricsPublishError> {
+        let mut families = BTreeMap::<String, MetricFamily>::new();
+        let mut merge = |family: MetricFamily| -> Result<(), MetricsPublishError> {
+            if let Some(previous) = families.get_mut(&family.name) {
+                for (conflict, descriptor) in [
+                    (previous.help != family.help, "HELP"),
+                    (previous.r#type != family.r#type, "TYPE"),
+                    (previous.unit != family.unit, "UNIT"),
+                ] {
+                    if conflict {
+                        return Err(MetricsPublishError::Conflict {
+                            metric: family.name,
+                            descriptor,
+                        });
+                    }
                 }
-                *slot = Some(line);
+                previous.metric.extend(family.metric);
+            } else {
+                families.insert(family.name.clone(), family);
+            }
+            Ok(())
+        };
+        for snapshot in snapshots {
+            for family in decode_metrics(&snapshot).map_err(MetricsPublishError::Decode)? {
+                merge(family)?;
             }
         }
-        for snapshot in &snapshots {
-            for line in snapshot
-                .lines()
-                .filter(|line| !line.is_empty() && !line.starts_with('#'))
+        if let Some(http) = &self.http {
+            for family in
+                prometheus_protobuf::encode(&http.registry).map_err(MetricsPublishError::Encode)?
             {
-                let name = line.split(['{', ' ', '\t']).next().unwrap_or("");
-                let family = if families.contains_key(name) {
-                    name
-                } else {
-                    ["_bucket", "_sum", "_count", "_created"]
-                        .iter()
-                        .find_map(|suffix| {
-                            name.strip_suffix(suffix)
-                                .filter(|base| families.contains_key(base))
-                        })
-                        .unwrap_or(name)
-                };
-                families.entry(family).or_default().samples.push(line);
+                merge(family)?;
             }
         }
-        let mut output = String::with_capacity(snapshots.iter().map(String::len).sum());
-        for family in families.into_values() {
-            for line in family
-                .help
-                .into_iter()
-                .chain(family.kind)
-                .chain(family.samples)
-            {
-                output.push_str(line);
-                output.push('\n');
-            }
-        }
+        let families: Vec<_> = families.into_values().collect();
+        let published = Published {
+            text: Bytes::from(metrics_text(&families).map_err(MetricsPublishError::Encode)?),
+            protobuf: Bytes::from(encode_metrics(&families)),
+        };
         *self
             .published
             .write()
-            .unwrap_or_else(|error| error.into_inner()) = Bytes::from(output);
+            .unwrap_or_else(|error| error.into_inner()) = published;
         Ok(())
     }
 
-    pub(crate) fn response(&self) -> Response {
+    pub(crate) fn response(&self, headers: &HeaderMap) -> Response {
+        let Some(format) = Exposition::negotiate(headers) else {
+            return (
+                StatusCode::NOT_ACCEPTABLE,
+                [(VARY, "Accept")],
+                "supported metrics formats: Prometheus protobuf and text/plain; version=0.0.4",
+            )
+                .into_response();
+        };
         let snapshot = self
             .published
             .read()
-            .unwrap_or_else(|error| error.into_inner())
-            .clone();
-        (
-            [(CONTENT_TYPE, "text/plain; version=0.0.4; charset=utf-8")],
-            snapshot,
-        )
-            .into_response()
+            .unwrap_or_else(|error| error.into_inner());
+        let (content_type, bytes) = match format {
+            Exposition::Text => (TEXT_CONTENT_TYPE, snapshot.text.clone()),
+            Exposition::Protobuf => (PROTO_CONTENT_TYPE, snapshot.protobuf.clone()),
+        };
+        ([(CONTENT_TYPE, content_type), (VARY, "Accept")], bytes).into_response()
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Exposition {
+    Text,
+    Protobuf,
+}
+
+impl Exposition {
+    fn negotiate(headers: &HeaderMap) -> Option<Self> {
+        if !headers.contains_key(ACCEPT) {
+            return Some(Self::Text);
+        }
+        // The most specific matching media range determines each format's q;
+        // in particular an explicit q=0 takes precedence over a wildcard.
+        let preference = |format: Self| {
+            let mut best = None::<((usize, usize), f64)>;
+            for header in headers.get_all(ACCEPT) {
+                let Ok(header) = header.to_str() else {
+                    continue;
+                };
+                for range in header.split(',') {
+                    let mut parts = range.split(';').map(str::trim);
+                    let media = parts.next().unwrap_or("");
+                    let (target, wildcard) = match format {
+                        Self::Text => ("text/plain", "text/*"),
+                        Self::Protobuf => ("application/vnd.google.protobuf", "application/*"),
+                    };
+                    let media_specificity = if media.eq_ignore_ascii_case(target) {
+                        2
+                    } else if media.eq_ignore_ascii_case(wildcard) {
+                        1
+                    } else if media == "*/*" {
+                        0
+                    } else {
+                        continue;
+                    };
+                    let mut specificity = (media_specificity, 0);
+                    let mut quality = 1.0;
+                    let mut valid = true;
+                    let mut extensions = false;
+                    for parameter in parts {
+                        let Some((name, value)) = parameter.split_once('=') else {
+                            valid = false;
+                            break;
+                        };
+                        let value = value.trim().trim_matches('"');
+                        if name.trim().eq_ignore_ascii_case("q") {
+                            quality = value
+                                .parse::<f64>()
+                                .ok()
+                                .filter(|q| (0.0..=1.0).contains(q))
+                                .unwrap_or(0.0);
+                            extensions = true;
+                        } else if !extensions {
+                            let matches = match (format, name.trim().to_ascii_lowercase().as_str())
+                            {
+                                (_, "charset") => value.eq_ignore_ascii_case("utf-8"),
+                                (Self::Text, "version") => value == "0.0.4",
+                                (Self::Protobuf, "proto") => {
+                                    value == "io.prometheus.client.MetricFamily"
+                                }
+                                (Self::Protobuf, "encoding") => value == "delimited",
+                                // Both formats use legacy-valid metric names.
+                                (_, "escaping") => value == "underscores" || value == "allow-utf-8",
+                                _ => false,
+                            };
+                            valid &= matches;
+                            specificity.1 += 1;
+                        }
+                    }
+                    if valid
+                        && best.is_none_or(|(prior, q)| {
+                            specificity > prior || (specificity == prior && quality > q)
+                        })
+                    {
+                        best = Some((specificity, quality));
+                    }
+                }
+            }
+            best.filter(|(_, quality)| *quality > 0.0)
+        };
+        match (preference(Self::Text), preference(Self::Protobuf)) {
+            (None, None) => None,
+            (Some(_), None) => Some(Self::Text),
+            (None, Some(_)) => Some(Self::Protobuf),
+            (Some((text_specificity, text_q)), Some((proto_specificity, proto_q))) => Some(
+                if proto_q > text_q || (proto_q == text_q && proto_specificity > text_specificity) {
+                    Self::Protobuf
+                } else {
+                    Self::Text
+                },
+            ),
+        }
     }
 }
 
@@ -159,31 +359,22 @@ struct HttpMetrics {
     first_token: Histogram,
     latency: Histogram,
     queue_time: Histogram,
-    queue_size: IntGauge,
+    queue_size: Gauge,
 }
 
 impl HttpMetrics {
     fn new(model_name: String) -> Self {
-        let registry = Registry::new_custom(
-            None,
-            Some(
-                [
-                    ("model_name".into(), model_name),
-                    ("engine_type".into(), "resin".into()),
-                ]
-                .into(),
-            ),
-        )
-        .expect("HTTP metric labels are valid");
-        let histogram = |name, help| {
-            let histogram = Histogram::with_opts(HistogramOpts::new(name, help).buckets(vec![
-                0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 20.0, 40.0,
-                80.0, 160.0, 320.0, 640.0,
-            ]))
-            .expect("HTTP histogram descriptor is valid");
-            registry
-                .register(Box::new(histogram.clone()))
-                .expect("HTTP histogram names are distinct");
+        let mut registry = Registry::with_labels(
+            [
+                ("model_name".into(), model_name.into()),
+                ("engine_type".into(), "resin".into()),
+            ]
+            .into_iter(),
+        );
+        let mut histogram = |name, help| {
+            let histogram =
+                Histogram::new_native(NativeHistogramConfig::with_schema(4).max_buckets(160));
+            registry.register(name, help, histogram.clone());
             histogram
         };
         let first_token = histogram(
@@ -198,14 +389,12 @@ impl HttpMetrics {
             "resin:http_queue_time_seconds",
             "HTTP admission queue time before recipe rendering starts.",
         );
-        let queue_size = IntGauge::with_opts(Opts::new(
+        let queue_size = Gauge::default();
+        registry.register(
             "resin:http_num_queue_reqs",
             "Requests waiting in the frontend admission queue.",
-        ))
-        .expect("HTTP queue descriptor is valid");
-        registry
-            .register(Box::new(queue_size.clone()))
-            .expect("HTTP queue metric name is distinct");
+            queue_size.clone(),
+        );
         Self {
             registry,
             first_token,
@@ -216,27 +405,27 @@ impl HttpMetrics {
     }
 }
 
-#[derive(Default)]
-struct Family<'a> {
-    help: Option<&'a str>,
-    kind: Option<&'a str>,
-    samples: Vec<&'a str>,
-}
-
-/// Two publishers disagreed on the descriptor for one metric family.
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct MetricsPublishError {
-    metric: String,
-    descriptor: &'static str,
+/// Invalid metric publications preserve the last successfully published state.
+#[derive(Debug)]
+pub enum MetricsPublishError {
+    Conflict {
+        metric: String,
+        descriptor: &'static str,
+    },
+    Decode(prost::DecodeError),
+    Encode(fmt::Error),
 }
 
 impl fmt::Display for MetricsPublishError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(
-            formatter,
-            "conflicting {} descriptors for metric {}",
-            self.descriptor, self.metric
-        )
+        match self {
+            Self::Conflict { metric, descriptor } => write!(
+                formatter,
+                "conflicting {descriptor} descriptors for metric {metric}"
+            ),
+            Self::Decode(error) => write!(formatter, "invalid metrics publication: {error}"),
+            Self::Encode(error) => write!(formatter, "cannot encode metrics publication: {error}"),
+        }
     }
 }
 
@@ -245,114 +434,238 @@ impl std::error::Error for MetricsPublishError {}
 #[cfg(test)]
 mod tests {
     use super::*;
+    use prometheus_client::encoding::prometheus_protobuf::prometheus_data_model::{
+        Counter, LabelPair, Metric,
+    };
 
     fn text(endpoint: &MetricsEndpoint) -> String {
-        String::from_utf8(endpoint.published.read().unwrap().to_vec()).unwrap()
+        String::from_utf8(endpoint.published.read().unwrap().text.to_vec()).unwrap()
     }
 
-    #[test]
-    fn merges_rank_samples_and_histograms_under_single_descriptors() {
-        let endpoint = MetricsEndpoint::default();
-        endpoint.publish((0..2).map(|rank| format!(
-            "# HELP resin:requests_total Completed requests.\n# TYPE resin:requests_total counter\nresin:requests_total{{rank=\"{rank}\"}} 2\n# HELP resin:latency_seconds Latency.\n# TYPE resin:latency_seconds histogram\nresin:latency_seconds_bucket{{rank=\"{rank}\",le=\"+Inf\"}} 2\nresin:latency_seconds_sum{{rank=\"{rank}\"}} 4\nresin:latency_seconds_count{{rank=\"{rank}\"}} 2\n"
-        )).collect()).unwrap();
-        let merged = text(&endpoint);
-        assert_eq!(merged.matches("# HELP resin:requests_total").count(), 1);
-        assert_eq!(merged.matches("# TYPE resin:latency_seconds").count(), 1);
-        assert_eq!(merged.matches("resin:latency_seconds_bucket{").count(), 2);
-        assert!(
-            merged
-                .find("resin:latency_seconds_count{rank=\"1\"}")
-                .unwrap()
-                < merged.find("# HELP resin:requests_total").unwrap()
-        );
-        for rank in 0..2 {
-            assert!(merged.contains(&format!("resin:requests_total{{rank=\"{rank}\"}} 2\n")));
+    fn requests(rank: u32, count: f64) -> MetricFamily {
+        MetricFamily {
+            name: "resin:requests_total".into(),
+            help: "Completed requests.".into(),
+            r#type: ProtoMetricType::Counter as i32,
+            metric: vec![Metric {
+                label: vec![LabelPair {
+                    name: "rank".into(),
+                    value: rank.to_string(),
+                }],
+                counter: Some(Counter {
+                    value: count,
+                    ..Default::default()
+                }),
+                ..Default::default()
+            }],
+            ..Default::default()
         }
     }
 
+    fn headers(accept: &str) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        headers.insert(ACCEPT, accept.parse().unwrap());
+        headers
+    }
+
     #[test]
-    fn conflicting_metadata_preserves_previous_publication() {
+    fn merges_rank_samples_under_single_descriptors() {
         let endpoint = MetricsEndpoint::default();
         endpoint
-            .publish(vec![
-                "# TYPE resin:requests_total counter\nresin:requests_total 2\n".into(),
-            ])
+            .publish(
+                (0..2)
+                    .map(|rank| encode_metrics(&[requests(rank, 2.0)]))
+                    .collect(),
+            )
             .unwrap();
-        let previous = text(&endpoint);
-        let error = endpoint
-            .publish(vec![
-                "# TYPE resin:requests_total counter\n".into(),
-                "# TYPE resin:requests_total gauge\n".into(),
-            ])
-            .unwrap_err();
-        assert_eq!(
-            error.to_string(),
-            "conflicting TYPE descriptors for metric resin:requests_total"
-        );
-        assert_eq!(text(&endpoint), previous);
+        let merged = text(&endpoint);
+        assert_eq!(merged.matches("# HELP resin:requests_total").count(), 1);
+        for rank in 0..2 {
+            assert!(merged.contains(&format!("resin:requests_total{{rank=\"{rank}\"}} 2.0\n")));
+        }
+        let families = decode_metrics(&endpoint.published.read().unwrap().protobuf).unwrap();
+        assert_eq!(families.len(), 1);
+        assert_eq!(families[0].metric.len(), 2);
+    }
+
+    #[test]
+    fn text_escapes_labels_without_changing_protobuf_values() {
+        let endpoint = MetricsEndpoint::default();
+        let mut family = requests(0, 2.0);
+        let model_name = "model\"\\line\nnext λ";
+        family.metric[0].label.push(LabelPair {
+            name: "model_name".into(),
+            value: model_name.into(),
+        });
+        endpoint
+            .publish(vec![encode_metrics(&[family.clone()])])
+            .unwrap();
+        assert!(text(&endpoint).contains(r#"model_name="model\"\\line\nnext λ""#));
+        let decoded = decode_metrics(&endpoint.published.read().unwrap().protobuf).unwrap();
+        assert_eq!(decoded, [family]);
+    }
+
+    #[test]
+    fn failed_publications_preserve_both_previous_formats() {
+        let endpoint = MetricsEndpoint::default();
+        endpoint
+            .publish(vec![encode_metrics(&[requests(0, 2.0)])])
+            .unwrap();
+        let previous = endpoint.published.read().unwrap().clone();
+        for descriptor in ["HELP", "TYPE", "UNIT"] {
+            let mut conflict = requests(1, 2.0);
+            match descriptor {
+                "HELP" => conflict.help = "Changed help".into(),
+                "TYPE" => conflict.r#type = ProtoMetricType::Gauge as i32,
+                "UNIT" => conflict.unit = "seconds".into(),
+                _ => unreachable!(),
+            }
+            let error = endpoint
+                .publish(vec![encode_metrics(&[requests(0, 2.0), conflict])])
+                .unwrap_err();
+            assert_eq!(
+                error.to_string(),
+                format!("conflicting {descriptor} descriptors for metric resin:requests_total")
+            );
+        }
+        assert!(endpoint.publish(vec![vec![0xff]]).is_err());
+        let current = endpoint.published.read().unwrap().clone();
+        assert_eq!(current.text, previous.text);
+        assert_eq!(current.protobuf, previous.protobuf);
         endpoint.publish(vec![]).unwrap();
         assert_eq!(text(&endpoint), "");
+    }
+
+    #[tokio::test]
+    async fn native_histogram_preserves_distribution_and_text_count_sum() {
+        let endpoint = MetricsEndpoint::new("test-model");
+        endpoint.set_queue_size(3);
+        endpoint.observe_queue_time(0.25);
+        endpoint.observe_first_token(0.75);
+        endpoint.observe_completed(1.5);
+        endpoint.observe_completed(0.5);
+        assert!(text(&endpoint).is_empty());
+        endpoint.publish(vec![]).unwrap();
+        let published = endpoint.published.read().unwrap().clone();
+        let response = endpoint.response(&headers(PROTO_CONTENT_TYPE));
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(body, published.protobuf);
+        let families = decode_metrics(&body).unwrap();
+        let latency = families
+            .iter()
+            .find(|family| family.name == "resin:http_request_latency_seconds")
+            .unwrap();
+        let metric = &latency.metric[0];
+        assert!(
+            metric
+                .label
+                .iter()
+                .any(|label| label.name == "model_name" && label.value == "test-model")
+        );
+        let histogram = metric.histogram.as_ref().unwrap();
+        assert_eq!(histogram.schema, 4);
+        assert_eq!(histogram.sample_count, 2);
+        assert_eq!(histogram.sample_sum, 2.0);
+        assert!(!histogram.positive_span.is_empty());
+        assert_eq!(
+            histogram
+                .positive_delta
+                .iter()
+                .scan(0i64, |count, delta| {
+                    *count += delta;
+                    Some(*count)
+                })
+                .sum::<i64>(),
+            2
+        );
+        assert!(histogram.bucket.is_empty());
+        let first = text(&endpoint);
+        assert!(first.lines().any(|line| {
+            line.starts_with("resin:http_request_latency_seconds_count{") && line.ends_with(" 2")
+        }));
+        assert!(first.lines().any(
+            |line| line.starts_with("resin:http_request_latency_seconds_sum{")
+                && line.ends_with(" 2.0")
+        ));
+        assert!(
+            first
+                .lines()
+                .filter(|line| line.contains("_bucket{"))
+                .all(|line| line.contains("le=\"+Inf\""))
+        );
+        endpoint.set_queue_size(0);
+        assert_eq!(text(&endpoint), first);
+        endpoint.publish(vec![]).unwrap();
+        assert_ne!(text(&endpoint), first);
+    }
+
+    #[test]
+    fn negotiates_formats_quality_and_explicit_exclusions() {
+        let endpoint = MetricsEndpoint::default();
+        for (accept, content_type) in [
+            ("*/*", TEXT_CONTENT_TYPE),
+            ("text/plain;version=0.0.4", TEXT_CONTENT_TYPE),
+            (PROTO_CONTENT_TYPE, PROTO_CONTENT_TYPE),
+            (
+                "text/plain;q=0.3,application/vnd.google.protobuf;q=0.9",
+                PROTO_CONTENT_TYPE,
+            ),
+            (
+                "text/plain;q=1,application/vnd.google.protobuf;q=0.5",
+                TEXT_CONTENT_TYPE,
+            ),
+            ("text/plain;q=0,*/*;q=0.5", PROTO_CONTENT_TYPE),
+            (
+                "application/vnd.google.protobuf;q=0,*/*;q=0.5",
+                TEXT_CONTENT_TYPE,
+            ),
+        ] {
+            let response = endpoint.response(&headers(accept));
+            assert_eq!(response.status(), StatusCode::OK, "{accept}");
+            assert_eq!(response.headers()[CONTENT_TYPE], content_type, "{accept}");
+            assert_eq!(response.headers()[VARY], "Accept");
+        }
+        for accept in [
+            "application/json",
+            "text/plain;q=0,application/vnd.google.protobuf;q=0",
+            "application/vnd.google.protobuf;proto=unsupported;encoding=delimited",
+            "text/plain;version=9",
+            "text/plain;q=NaN",
+        ] {
+            assert_eq!(
+                endpoint.response(&headers(accept)).status(),
+                StatusCode::NOT_ACCEPTABLE,
+                "{accept}"
+            );
+        }
+        assert_eq!(
+            endpoint.response(&HeaderMap::new()).headers()[CONTENT_TYPE],
+            TEXT_CONTENT_TYPE
+        );
     }
 
     #[test]
     fn concurrent_readers_only_observe_complete_snapshots() {
         let endpoint = MetricsEndpoint::default();
         endpoint
-            .publish(vec!["resin:gauge 0\n".repeat(100)])
+            .publish(vec![encode_metrics(&[requests(0, 0.0)])])
             .unwrap();
         std::thread::scope(|scope| {
             let publisher = endpoint.clone();
             scope.spawn(move || {
                 for value in 1..100 {
                     publisher
-                        .publish(vec![format!("resin:gauge {value}\n").repeat(100)])
+                        .publish(vec![encode_metrics(&[requests(0, value as f64)])])
                         .unwrap();
                 }
             });
             for _ in 0..100 {
-                let snapshot = text(&endpoint);
-                let mut lines = snapshot.lines();
-                let first = lines.next().unwrap();
-                assert_eq!(lines.clone().count(), 99);
-                assert!(lines.all(|line| line == first));
+                let snapshot = endpoint.published.read().unwrap().clone();
+                let families = decode_metrics(&snapshot.protobuf).unwrap();
+                assert_eq!(snapshot.text, metrics_text(&families).unwrap());
             }
         });
-    }
-
-    #[test]
-    fn frontend_observations_publish_with_stable_labels_and_separate_clocks() {
-        let endpoint = MetricsEndpoint::new("test-model");
-        endpoint.set_queue_size(3);
-        endpoint.observe_queue_time(0.25);
-        endpoint.observe_first_token(0.75);
-        endpoint.observe_completed(1.5);
-        // Zero-output successful requests have no first-token observation.
-        endpoint.observe_completed(0.5);
-        assert!(text(&endpoint).is_empty());
-        endpoint.publish(vec![]).unwrap();
-        let first = text(&endpoint);
-        let sample = |snapshot: &str, name: &str| {
-            let line = snapshot
-                .lines()
-                .find(|line| line.starts_with(&format!("resin:{name}{{")))
-                .unwrap();
-            assert!(line.contains("engine_type=\"resin\""));
-            assert!(line.contains("model_name=\"test-model\""));
-            line.rsplit_once(' ').unwrap().1.parse::<f64>().unwrap()
-        };
-        assert_eq!(sample(&first, "http_num_queue_reqs"), 3.0);
-        assert_eq!(sample(&first, "http_request_latency_seconds_count"), 2.0);
-        assert_eq!(sample(&first, "http_request_latency_seconds_sum"), 2.0);
-        assert_eq!(
-            sample(&first, "http_time_to_first_token_seconds_count"),
-            1.0
-        );
-        assert_eq!(sample(&first, "http_time_to_first_token_seconds_sum"), 0.75);
-        assert_eq!(sample(&first, "http_queue_time_seconds_sum"), 0.25);
-        endpoint.set_queue_size(0);
-        assert_eq!(text(&endpoint), first);
-        endpoint.publish(vec![]).unwrap();
-        assert_eq!(sample(&text(&endpoint), "http_num_queue_reqs"), 0.0);
     }
 }

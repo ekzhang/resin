@@ -228,9 +228,7 @@ class CudaMetrics:
             if speculation is None
             else speculation.accepted - accepted,
             speculative_rows=0 if speculation is None else speculation.blocks - rows,
-            dp_sync_seconds=self.dp_sync.seconds,
-            dp_sync_count=self.dp_sync.count,
-            dp_sync_buckets=tuple(self.dp_sync.buckets),
+            dp_sync=self.dp_sync.snapshot(),
         )
 
 

@@ -253,9 +253,10 @@ def test_prometheus_labels_histograms_and_live_counters_are_well_formed():
             if metric == "resin:prompt_tokens_histogram_bucket"
             and dict(labels)["le"] != "+Inf"
         )
-        assert finite
-        assert [value for _, value in finite] == sorted(value for _, value in finite)
-        assert all(value == (bound >= 2) for bound, value in finite)
+        # Text is a diagnostic view; full distributions travel in native protobuf.
+        assert finite == []
+        encoded = snapshot.prometheus_protobuf(model_name=name, rank=3, attn_dp_rank=1)
+        assert isinstance(encoded, bytes) and encoded
 
 
 def test_throughput_uses_live_output_and_retains_the_last_collection_window():

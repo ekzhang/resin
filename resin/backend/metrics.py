@@ -5,7 +5,8 @@ from __future__ import annotations
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 
-DP_SYNC_BUCKETS = (0.0001, 0.0005, 0.001, 0.005, 0.01, 0.05, 0.1, 0.5, 1.0)
+from resin._resin import Histogram, _HistogramAccumulator
+
 FORWARD_CATEGORIES = ("prefill", "target_verify", "draft", "decode", "idle")
 CUDA_GRAPH_MODES = (
     "decode_cuda_graph",
@@ -22,8 +23,8 @@ class RunnerMetrics:
     Forward categories are exclusive: prefill, decode, target_verify, draft,
     and idle (participating without local requests). Graph counts describe
     executions, not individual regions in a breakable graph; a pass counts as
-    captured when any of its configured regions replayed. DP buckets are
-    cumulative counts at ``DP_SYNC_BUCKETS``; the count includes +Inf.
+    captured when any of its configured regions replayed. DP wait uses a bounded
+    exponential histogram, independent of the exporter.
     """
 
     forward_seconds: Mapping[str, float] = field(default_factory=dict)
@@ -31,25 +32,17 @@ class RunnerMetrics:
     speculative_drafts: int = 0
     speculative_accepted: int = 0
     speculative_rows: int = 0
-    dp_sync_seconds: float = 0.0
-    dp_sync_count: int = 0
-    dp_sync_buckets: tuple[int, ...] = (0,) * len(DP_SYNC_BUCKETS)
-
-    @property
-    def dp_sync_bounds(self) -> tuple[float, ...]:
-        return DP_SYNC_BUCKETS
+    dp_sync: Histogram | None = None
 
 
 class DpSyncMetrics:
     """Bounded host-side accumulator for coordinator collective wait time."""
 
     def __init__(self) -> None:
-        self.seconds = 0.0
-        self.count = 0
-        self.buckets = [0] * len(DP_SYNC_BUCKETS)
+        self._histogram = _HistogramAccumulator()
 
     def observe(self, seconds: float) -> None:
-        self.seconds += seconds
-        self.count += 1
-        for index, bound in enumerate(DP_SYNC_BUCKETS):
-            self.buckets[index] += seconds <= bound
+        self._histogram.observe(seconds)
+
+    def snapshot(self) -> Histogram:
+        return self._histogram.snapshot()

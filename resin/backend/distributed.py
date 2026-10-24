@@ -7,7 +7,7 @@ its existing step boundary; model runtimes own partitioning and device collectiv
 from __future__ import annotations
 
 import json
-from dataclasses import asdict, dataclass, replace
+from dataclasses import dataclass, fields, replace
 from time import perf_counter
 from types import SimpleNamespace
 from typing import Protocol
@@ -15,6 +15,7 @@ from typing import Protocol
 import torch
 
 from resin import BatchPhase, BatchPlan, Engine, ForwardOutput, Runner, RunnerConfig
+from resin._resin import Histogram
 from resin.backend.command_transport import CommandTransport
 from resin.backend.control_plane import ControlOperation, ControlPlane
 from resin.backend.metrics import DpSyncMetrics, RunnerMetrics
@@ -223,14 +224,10 @@ class DistributedWorker:
         metrics = self._metrics
         if metrics is None:
             return result
+        wait = metrics.snapshot()
         return replace(
             result,
-            dp_sync_seconds=result.dp_sync_seconds + metrics.seconds,
-            dp_sync_count=result.dp_sync_count + metrics.count,
-            dp_sync_buckets=tuple(
-                left + right
-                for left, right in zip(result.dp_sync_buckets, metrics.buckets)
-            ),
+            dp_sync=wait if result.dp_sync is None else result.dp_sync.merge(wait),
         )
 
     def collect_metrics(self) -> tuple[tuple[int, RunnerMetrics], ...]:
@@ -248,7 +245,13 @@ class DistributedWorker:
     def _collect_metrics(self) -> tuple[tuple[int, RunnerMetrics], ...]:
         snapshot, error = None, None
         try:
-            snapshot = asdict(self.metrics_snapshot())
+            observation = self.metrics_snapshot()
+            snapshot = {
+                field.name: getattr(observation, field.name)
+                for field in fields(observation)
+            }
+            if observation.dp_sync is not None:
+                snapshot["dp_sync"] = observation.dp_sync.as_dict()
             payload = json.dumps(
                 (snapshot, None), separators=(",", ":"), allow_nan=False
             ).encode()
@@ -284,7 +287,8 @@ class DistributedWorker:
         snapshots = []
         for rank, (value, _) in zip(group.ranks, gathered, strict=True):
             assert isinstance(value, dict)
-            value["dp_sync_buckets"] = tuple(value["dp_sync_buckets"])
+            if value["dp_sync"] is not None:
+                value["dp_sync"] = Histogram(**value["dp_sync"])
             snapshots.append((rank, RunnerMetrics(**value)))
         return tuple(snapshots)
 

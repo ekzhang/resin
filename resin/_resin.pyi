@@ -671,7 +671,19 @@ class EngineMetrics:
         include_runner: bool = True,
     ) -> str:
         """
-        Encode one engine's cumulative observations in Prometheus text format.
+        Human-readable metrics. Histogram distributions require the protobuf export.
+        """
+    def prometheus_protobuf(
+        self,
+        /,
+        *,
+        model_name: str,
+        rank: int = 0,
+        attn_dp_rank: int = 0,
+        include_runner: bool = True,
+    ) -> bytes:
+        """
+        Length-delimited Prometheus protobuf, including native exponential histograms.
         """
     @property
     def requests(self, /) -> RequestMetrics: ...
@@ -808,16 +820,40 @@ class GptOssRecipe(_NativeRecipe):
 @final
 class Histogram:
     """
-    Cumulative finite buckets, observation count, and sum. `count` is the +Inf bucket.
+    Immutable exponential histogram. Bucket counts are noncumulative;
+    `offset` is the Prometheus bucket index of the first positive bucket.
     """
-    @property
-    def bounds(self, /) -> list[float]: ...
+    def __new__(
+        cls,
+        /,
+        *,
+        schema: int = 4,
+        zero_count: int = 0,
+        offset: int = 0,
+        counts: Sequence[int] | None = None,
+        count: int = 0,
+        sum: float = 0.0,
+    ) -> Histogram: ...
+    def as_dict(self, /) -> dict:
+        """
+        Plain numeric fields for explicit JSON transport; no Python pickling.
+        """
     @property
     def count(self, /) -> int: ...
     @property
     def counts(self, /) -> list[int]: ...
+    def merge(self, /, other: Histogram) -> Histogram:
+        """
+        Combine cumulative distributions without mutating either snapshot.
+        """
+    @property
+    def offset(self, /) -> int: ...
+    @property
+    def schema(self, /) -> int: ...
     @property
     def sum(self, /) -> float: ...
+    @property
+    def zero_count(self, /) -> int: ...
 
 @final
 class Image:
@@ -1522,6 +1558,15 @@ class Video:
     def source(self, /) -> Any: ...
 
 @final
+class _HistogramAccumulator:
+    """
+    Mutable native accumulator shared by host execution observations.
+    """
+    def __new__(cls, /) -> _HistogramAccumulator: ...
+    def observe(self, /, value: float, *, weight: int = 1) -> None: ...
+    def snapshot(self, /) -> Histogram: ...
+
+@final
 class _HttpEvents:
     def __new__(cls, /) -> _HttpEvents: ...
     @staticmethod
@@ -1529,7 +1574,7 @@ class _HttpEvents:
     @staticmethod
     def from_bytes(data: bytes) -> _HttpEvents: ...
     def to_bytes(self, /) -> bytes: ...
-    def with_metrics(self, /, snapshots: Sequence[str]) -> _HttpEvents: ...
+    def with_metrics(self, /, snapshots: Sequence[Sequence[int]]) -> _HttpEvents: ...
 
 @final
 class _HttpIngress:
@@ -1639,9 +1684,9 @@ def _media_from_buffers(
 def _media_to_buffers(
     media: MediaInput,
 ) -> tuple[bytes, tuple[npt.NDArray[Any], ...]]: ...
-def _runner_metrics_prometheus(
+def _runner_metrics_prometheus_protobuf(
     snapshot: RunnerMetrics, *, model_name: str, rank: int, attn_dp_rank: int
-) -> str:
+) -> bytes:
     """
     Encode physical-rank observations separately from logical request ownership.
     """

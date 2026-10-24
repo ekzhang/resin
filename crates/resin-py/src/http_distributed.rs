@@ -76,7 +76,7 @@ impl HttpIngress {
 #[serde(default, deny_unknown_fields)]
 pub(crate) struct HttpEvents {
     pub(crate) events: Vec<(String, GenerationEvent)>,
-    pub(crate) metrics: Vec<String>,
+    pub(crate) metrics: Vec<Vec<u8>>,
 }
 
 #[pymethods]
@@ -103,7 +103,7 @@ impl HttpEvents {
         Ok(PyBytes::new(py, &bytes))
     }
 
-    fn with_metrics(&self, snapshots: Vec<String>) -> Self {
+    fn with_metrics(&self, snapshots: Vec<Vec<u8>>) -> Self {
         Self {
             events: self.events.clone(),
             metrics: snapshots,
