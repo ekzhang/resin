@@ -56,18 +56,25 @@ def samples(text: str) -> dict[tuple[str, tuple[tuple[str, str], ...]], float]:
     return result
 
 
-def test_metrics_are_optional_and_ordinary_runners_need_no_new_methods():
+def test_metrics_default_on_with_an_explicit_opt_out_and_no_new_runner_methods():
     class UnobservedRunner(Runner):
+        enabled = True
+
+        def configure_metrics(self, *, enabled: bool):
+            self.enabled = enabled
+
         def metrics_snapshot(self):
             raise AssertionError("disabled metrics must not poll the runner")
 
-    with Engine(UnobservedRunner()) as engine:
+    runner = UnobservedRunner()
+    with Engine(runner, enable_metrics=False) as engine:
+        assert not runner.enabled
         assert engine.metrics_snapshot() is None
         engine.submit([1], sampling_params=SamplingParams(max_output_tokens=1))
         engine.step()
         assert engine.metrics_snapshot() is None
 
-    with Engine(Runner(), metrics=True) as engine:
+    with Engine(Runner()) as engine:
         snapshot = engine.metrics_snapshot()
         assert snapshot is not None
         assert snapshot.runner is None
@@ -76,7 +83,7 @@ def test_metrics_are_optional_and_ordinary_runners_need_no_new_methods():
 
 
 def test_snapshots_are_independent_and_native_fields_are_read_only():
-    with Engine(Runner(), metrics=True) as engine:
+    with Engine(Runner(), enable_metrics=True) as engine:
         request = engine.submit(
             [1, 2], sampling_params=SamplingParams(max_output_tokens=2)
         )
@@ -115,7 +122,7 @@ def test_stop_clipping_and_cancellation_keep_live_and_completed_totals_distinct(
                 [[2] if plan.phase == BatchPhase.PREFILL else [3, 4, 5]]
             )
 
-    with Engine(SpeculativeRunner(), metrics=True) as engine:
+    with Engine(SpeculativeRunner(), enable_metrics=True) as engine:
         stopped = engine.submit(
             [1],
             sampling_params=SamplingParams(max_output_tokens=10, stop_token_ids=[4]),
@@ -146,7 +153,7 @@ def test_stop_clipping_and_cancellation_keep_live_and_completed_totals_distinct(
 
 
 def test_prompt_scoring_without_output_has_no_ttft_or_tpot_observations():
-    with Engine(Runner(), metrics=True) as engine:
+    with Engine(Runner(), enable_metrics=True) as engine:
         request = engine.submit(
             [1],
             sampling_params=SamplingParams(max_output_tokens=0, prompt_logprobs=True),
@@ -192,7 +199,7 @@ def test_runner_observation_hook_precedes_resource_binding_and_is_read_once():
             )
 
     runner = ObservableRunner()
-    with Engine(runner, metrics=True) as engine:
+    with Engine(runner, enable_metrics=True) as engine:
         assert runner.enabled and runner.bound
         snapshot = engine.metrics_snapshot()
         assert snapshot is not None
@@ -212,7 +219,7 @@ def test_runner_observation_hook_precedes_resource_binding_and_is_read_once():
 
 
 def test_prometheus_labels_histograms_and_live_counters_are_well_formed():
-    with Engine(Runner(), metrics=True) as engine:
+    with Engine(Runner(), enable_metrics=True) as engine:
         engine.submit([1, 2], sampling_params=SamplingParams(max_output_tokens=2))
         while engine.has_work():
             engine.step()
@@ -252,7 +259,7 @@ def test_prometheus_labels_histograms_and_live_counters_are_well_formed():
 
 
 def test_throughput_uses_live_output_and_retains_the_last_collection_window():
-    with Engine(Runner(), metrics=True) as engine:
+    with Engine(Runner(), enable_metrics=True) as engine:
         engine.submit([1], sampling_params=SamplingParams(max_output_tokens=8))
         engine.step()
         time.sleep(1.01)

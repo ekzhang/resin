@@ -112,7 +112,7 @@ def _serve_rank(rank: int, port: int) -> None:
         max_running_requests=MAX_SEQUENCES,
         context_length=CONTEXT_LENGTH,
         prefix_cache=True,
-        overlap=True,
+        enable_overlap=True,
         scheduler_config=SchedulerConfig(
             max_batch_tokens=MAX_SEQUENCES * PREFILL_CHUNK_SIZE,
             prefill_chunk_size=PREFILL_CHUNK_SIZE,

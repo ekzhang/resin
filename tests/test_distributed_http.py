@@ -140,7 +140,7 @@ def _serve_rank(rank, world_size, directory, port, case):
             engine = DistributedEngine(
                 worker,
                 context_length=2048,
-                metrics=case in ("normal", "metrics_failure"),
+                enable_metrics=case in ("normal", "metrics_failure"),
             )
             codec = RankCodec(rank, "normal")
             if case == "initialize" and groups.drivers.local_rank == 1:

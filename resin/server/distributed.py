@@ -49,7 +49,10 @@ class DistributedHttpCoordinator:
         error = None
         try:
             self.session = _HttpSession(
-                engine.local, recipe, stream_interval=stream_interval
+                engine.local,
+                recipe,
+                stream_interval=stream_interval,
+                emit_first_token=engine.local.metrics_enabled,
             )
         except BaseException as exc:
             error = str(exc)

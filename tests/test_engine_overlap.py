@@ -132,7 +132,7 @@ def test_overlap_switch_preserves_single_step_for_synchronous_runners(overlap):
         def forward(self, plan):
             return forward_output([int(token) + 1 for token in plan.token_ids])
 
-    engine = Engine(Synchronous(), overlap=overlap)
+    engine = Engine(Synchronous(), enable_overlap=overlap)
     request = engine.submit([1], sampling_params=SamplingParams(max_output_tokens=8))
     assert [event.token_id for event in engine.step()] == [2]
     assert not engine.overlap_pending
@@ -354,7 +354,7 @@ def test_gpu_feedback_matches_reference_across_page_and_budget_drains():
     outputs = []
     for overlap in (False, True):
         runner = AsyncRunner()
-        engine = Engine(runner, overlap=overlap, context_length=1024)
+        engine = Engine(runner, enable_overlap=overlap, context_length=1024)
         request = engine.submit(
             [1] * 123, sampling_params=SamplingParams(max_output_tokens=270)
         )

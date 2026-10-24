@@ -100,7 +100,7 @@ def _worker(rank, rendezvous):
         runner = ParallelRunner(groups)
         worker = DistributedWorker(runner, groups)
         if groups.is_driver:
-            engine = DistributedEngine(worker, overlap=overlap)
+            engine = DistributedEngine(worker, enable_overlap=overlap)
             start = 1 + groups.attn_dp.local_rank * 20
             request = engine.submit(
                 [start], sampling_params=SamplingParams(max_output_tokens=34)

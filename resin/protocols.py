@@ -96,7 +96,7 @@ class RunnerCompletion(Protocol):
 class EnqueuingRunner(Runner, Protocol):
     """Optional device submission boundary; overlap belongs to the Engine.
 
-    A synchronous result is a supported fallback. Engine(overlap=False) uses
+    A synchronous result is a supported fallback. Engine(enable_overlap=False) uses
     forward directly. Models themselves retain their ordinary tensor forward.
     """
 

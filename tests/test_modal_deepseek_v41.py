@@ -83,7 +83,7 @@ def test_rank_startup_warms_then_joins_distributed_http(monkeypatch, rank, fail)
         def __init__(self, worker, **options):
             signature(Engine).bind(worker, **options)
             assert isinstance(worker, Worker)
-            assert options["overlap"] and options["prefix_cache"]
+            assert options["enable_overlap"] and options["prefix_cache"]
             assert options["context_length"] == 1_048_576
             assert options["max_running_requests"] == 32
             scheduler = options["scheduler_config"]

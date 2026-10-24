@@ -1514,7 +1514,7 @@ impl Engine {
 #[pymethods]
 impl Engine {
     #[new]
-    #[pyo3(signature = (runner, *, max_running_requests = 32, context_length = 32768, scheduler_config = None, prefix_cache = false, overlap = true, metrics = false))]
+    #[pyo3(signature = (runner, *, max_running_requests = 32, context_length = 32768, scheduler_config = None, prefix_cache = false, enable_overlap = true, enable_metrics = true))]
     #[allow(
         clippy::too_many_arguments,
         reason = "Python constructor exposes keyword configuration"
@@ -1526,8 +1526,8 @@ impl Engine {
         context_length: u32,
         scheduler_config: Option<Py<SchedulerConfig>>,
         prefix_cache: bool,
-        overlap: bool,
-        metrics: bool,
+        enable_overlap: bool,
+        enable_metrics: bool,
     ) -> PyResult<Self> {
         let runner_enqueue = optional_runner_callable(py, runner.bind(py), "enqueue")?;
         let (runner_forward, runner_release) = resolve_runner_contract(py, runner.bind(py))?;
@@ -1558,15 +1558,16 @@ impl Engine {
             prefix_cache,
         )
         .map_err(core_error)?;
-        let runner_metrics = if metrics {
+        if enable_metrics {
             core.enable_metrics().map_err(core_error)?;
-            if let Some(configure) =
-                optional_runner_callable(py, runner.bind(py), "configure_metrics")?
-            {
-                let kwargs = PyDict::new(py);
-                kwargs.set_item("enabled", true)?;
-                configure.bind(py).call((), Some(&kwargs))?;
-            }
+        }
+        if let Some(configure) = optional_runner_callable(py, runner.bind(py), "configure_metrics")?
+        {
+            let kwargs = PyDict::new(py);
+            kwargs.set_item("enabled", enable_metrics)?;
+            configure.bind(py).call((), Some(&kwargs))?;
+        }
+        let runner_metrics = if enable_metrics {
             optional_runner_callable(py, runner.bind(py), "metrics_snapshot")?
         } else {
             None
@@ -1578,7 +1579,7 @@ impl Engine {
             runner_release,
             runner_config,
             runner_enqueue,
-            overlap,
+            overlap: enable_overlap,
             pending: None,
             deferred_events: Vec::new(),
             failed_executions: Vec::new(),

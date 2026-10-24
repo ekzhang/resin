@@ -568,8 +568,8 @@ class Engine:
         context_length: int = 32768,
         scheduler_config: SchedulerConfig | None = None,
         prefix_cache: bool = False,
-        overlap: bool = True,
-        metrics: bool = False,
+        enable_overlap: bool = True,
+        enable_metrics: bool = True,
     ) -> Engine: ...
     def __repr__(self, /) -> str: ...
     @property
@@ -1582,7 +1582,13 @@ class _HttpSession:
     The same native lifecycle used by the ordinary actor, attached to one DP driver.
     """
     def __new__(
-        cls, /, engine: Engine, recipe: Recipe, *, stream_interval: int = 1
+        cls,
+        /,
+        engine: Engine,
+        recipe: Recipe,
+        *,
+        stream_interval: int = 1,
+        emit_first_token: bool = False,
     ) -> _HttpSession: ...
     @property
     def active_count(self, /) -> int: ...

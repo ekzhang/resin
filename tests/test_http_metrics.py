@@ -18,7 +18,7 @@ from resin import Engine
 
 @pytest.fixture
 def metrics_server(monkeypatch):
-    monkeypatch.setattr(lifecycle, "Engine", partial(Engine, metrics=True))
+    monkeypatch.setattr(lifecycle, "Engine", partial(Engine, enable_metrics=True))
     return lifecycle.running_server
 
 
@@ -47,7 +47,8 @@ def wait_for_sample(base, name, expected):
         time.sleep(0.05)
 
 
-def test_metrics_route_is_absent_when_engine_collection_is_disabled():
+def test_metrics_route_is_absent_when_engine_collection_is_disabled(monkeypatch):
+    monkeypatch.setattr(lifecycle, "Engine", partial(Engine, enable_metrics=False))
     with lifecycle.running_server(lifecycle.Runner()) as (_, _, _, errors, base, _):
         with pytest.raises(urllib.error.HTTPError) as caught:
             scrape(base)

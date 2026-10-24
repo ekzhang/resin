@@ -78,11 +78,11 @@ submit a continuation before harvesting the previous batch.
 
 ### Engine overlap
 
-`Engine(overlap=True)` is the default. An optional runner `enqueue()` returns an
-owned completion with `result()` and device `feedback`; the synchronous runner
-contract remains sufficient. The shared DeepSeek CUDA runner implements this
-boundary. Model forward methods receive ordinary device inputs and cache views;
-they do not track pending batches or schedule continuations.
+`Engine(enable_overlap=True)` is the default. An optional runner `enqueue()`
+returns an owned completion with `result()` and device `feedback`; the
+synchronous runner contract remains sufficient. The shared DeepSeek CUDA runner
+implements this boundary. Model forward methods receive ordinary device inputs
+and cache views; they do not track pending batches or schedule continuations.
 
 The Engine keeps one batch in flight. Exact accepted tokens, positions and
 sampling offsets feed the next graph on the GPU; CPU progress and events commit
@@ -96,7 +96,7 @@ in every cache group. Stop tokens, including EOS, can finish a request while its
 successor step is in flight: its result is published immediately, but its row
 and cache lease remain alive until that step completes. Successor outputs for
 finished rows are discarded. Other steps use the synchronous path.
-`overlap=False` or `step(allow_overlap=False)` selects the reference path.
+`enable_overlap=False` or `step(allow_overlap=False)` selects the reference path.
 Distributed replicas vote together before enqueue or drain.
 
 ## Cache geometry
@@ -172,8 +172,8 @@ borrowed NumPy columns.
 
 ## Observability
 
-`Engine(metrics=True)` enables native request timing, committed token counters,
-scheduler state, and cache inventory. Optional runner hooks supply device pass
+`Engine(enable_metrics=True)` enables native request timing, committed token
+counters, scheduler state, and cache inventory. Optional runner hooks supply device pass
 durations, graph decisions, speculative counters, and distributed wait time.
 They leave `forward`, `enqueue`, and `ForwardOutput` unchanged. Collection never
 synchronizes the accelerator; the HTTP server publishes periodic snapshots at

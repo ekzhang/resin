@@ -219,7 +219,7 @@ pub(crate) struct Session {
     active: HashMap<u64, ActiveRequest>,
     stream_interval: u32,
     pub(crate) metrics: Option<resin_http::MetricsEndpoint>,
-    metrics_enabled: bool,
+    emit_first_token: bool,
 }
 impl Session {
     pub fn new(
@@ -239,7 +239,6 @@ impl Session {
                 "the inference engine is closed or poisoned",
             ));
         }
-        let metrics_enabled = state.metrics_enabled();
         drop(state);
         let vocabulary = Vocabulary::from_recipe(py, &recipe)?;
         Ok(Self {
@@ -249,7 +248,7 @@ impl Session {
             active: HashMap::new(),
             stream_interval,
             metrics: None,
-            metrics_enabled,
+            emit_first_token: false,
         })
     }
     pub fn active_count(&self) -> usize {
@@ -271,7 +270,7 @@ impl Session {
             &mut self.active,
             self.stream_interval,
             self.metrics.as_ref(),
-            self.metrics_enabled,
+            self.emit_first_token,
             tokens,
         )
     }
@@ -307,7 +306,7 @@ fn process(
     active: &mut HashMap<u64, ActiveRequest>,
     stream_interval: u32,
     metrics: Option<&resin_http::MetricsEndpoint>,
-    metrics_enabled: bool,
+    emit_first_token: bool,
     token_events: Vec<TokenEvent>,
 ) -> Result<(), String> {
     let mut grouped = HashMap::<u64, Vec<crate::TokenEvent>>::new();
@@ -332,7 +331,7 @@ fn process(
             request.first_token_at = Some(Instant::now());
             if let Some(metrics) = metrics {
                 metrics.observe_first_token(request.started.elapsed().as_secs_f64());
-            } else if metrics_enabled {
+            } else if emit_first_token {
                 let _ = request.events.try_send(GenerationEvent::FirstToken);
             }
         }
@@ -663,18 +662,18 @@ pub(crate) struct NativeHttpSession {
 #[pymethods]
 impl NativeHttpSession {
     #[new]
-    #[pyo3(signature = (engine, recipe, *, stream_interval = 1))]
+    #[pyo3(signature = (engine, recipe, *, stream_interval = 1, emit_first_token = false))]
     fn new(
         py: Python<'_>,
         engine: Py<Engine>,
         recipe: Py<PyAny>,
         stream_interval: u32,
+        emit_first_token: bool,
     ) -> PyResult<Self> {
+        let mut session = Session::new(py, engine, recipe, stream_interval)?;
+        session.emit_first_token = emit_first_token;
         Ok(Self {
-            inner: Mutex::new((
-                Session::new(py, engine, recipe, stream_interval)?,
-                HashMap::new(),
-            )),
+            inner: Mutex::new((session, HashMap::new())),
         })
     }
     #[pyo3(signature = (ingress, *, rank = 0))]

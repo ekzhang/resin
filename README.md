@@ -186,10 +186,10 @@ Managed history and recurrent state are cache groups declared through a frozen
 `RunnerConfig`. The Engine binds their one physical arena during construction.
 Pass `prefix_cache=True` to reuse aligned prefixes across requests.
 
-`Engine(overlap=True)` enables device submission/completion overlap when the
-runner provides it. The initial DeepSeek CUDA path covers stable decode cohorts;
-generated-token logprobs and ownership changes take a synchronous
-fallback. Use `overlap=False` for reference execution. See
+`Engine(enable_overlap=True)` enables device submission/completion overlap when
+the runner provides it. The initial DeepSeek CUDA path covers stable decode
+cohorts; generated-token logprobs and ownership changes take a synchronous
+fallback. Use `enable_overlap=False` for reference execution. See
 [Engine overlap](docs/architecture.md#engine-overlap).
 
 ## Local HTTP server
@@ -437,8 +437,9 @@ Use the current report instead of a checked-in line-count snapshot.
 
 For resident prefill/decode sweeps, fixed speculative acceptance, balanced
 expert routing, and throughput/latency charts, see [benchmarking](docs/benchmarks.md).
-Enable `Engine(metrics=True)` for native request/cache metrics and optional runner
-observations. The HTTP server publishes `/metrics`; see [metrics](docs/metrics.md)
+`Engine` collects native request/cache metrics and optional runner observations
+by default (`enable_metrics=True`). Use `enable_metrics=False` to opt out.
+The HTTP server publishes `/metrics`; see [metrics](docs/metrics.md)
 for Prometheus queries and forwarding through an OTLP Collector.
 
 ## Repository map

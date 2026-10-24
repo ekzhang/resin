@@ -1,17 +1,20 @@
 # Metrics
 
-Enable collection when constructing the engine:
+Metrics are enabled by default. The engine switches are explicit keyword arguments:
 
 ```python
 from resin import Engine
 from resin.server import HttpServer
 
-with Engine(runner, metrics=True, context_length=32768) as engine:
+with Engine(
+    runner, enable_metrics=True, enable_overlap=True, context_length=32768
+) as engine:
     HttpServer(engine, recipe=recipe, model="my-model").serve(port=8000)
 ```
 
 The server automatically exposes `/metrics` when engine metrics are enabled.
-Collection is disabled by default. `DistributedEngine(worker, metrics=True)`
+Pass `enable_metrics=False` to disable collection and the endpoint.
+`DistributedEngine(worker, enable_metrics=True)`
 enables the same instrumentation across its replica ranks; the frontend serves
 one endpoint for the complete engine.
 
