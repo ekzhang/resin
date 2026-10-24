@@ -218,17 +218,20 @@ class CudaMetrics:
     def snapshot(self, speculation=None) -> RunnerMetrics:
         self.collect()
         drafts, accepted, rows = self._speculation_baseline
-        return RunnerMetrics(
-            forward_seconds=dict(self.seconds),
-            cuda_graph_passes=dict(self.graphs),
-            speculative_drafts=0
-            if speculation is None
-            else speculation.drafts - drafts,
-            speculative_accepted=0
-            if speculation is None
-            else speculation.accepted - accepted,
-            speculative_rows=0 if speculation is None else speculation.blocks - rows,
-            dp_sync=self.dp_sync.snapshot(),
+        return self.dp_sync.attach(
+            RunnerMetrics(
+                forward_seconds=self.seconds,
+                cuda_graph_passes=self.graphs,
+                speculative_drafts=0
+                if speculation is None
+                else speculation.drafts - drafts,
+                speculative_accepted=0
+                if speculation is None
+                else speculation.accepted - accepted,
+                speculative_rows=0
+                if speculation is None
+                else speculation.blocks - rows,
+            )
         )
 
 

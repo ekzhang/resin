@@ -134,10 +134,12 @@ def configure_metrics(self, *, enabled: bool = True) -> None: ...
 def metrics_snapshot(self) -> RunnerMetrics: ...
 ```
 
-`RunnerMetrics` lives in `resin.backend.metrics`. The Engine enables collection
-before `bind_resources`, allowing shared graph machinery to capture timing
-boundaries. A snapshot returns cumulative data without device synchronization
-or distributed collectives. Ordinary runners need neither method. `forward`,
+`resin.RunnerMetrics` is a frozen native snapshot with keyword-only fields for
+phase durations, graph counts, speculation, and DP wait. It is also re-exported
+from `resin.backend.metrics`. The Engine enables collection before
+`bind_resources`, allowing shared graph machinery to capture timing boundaries.
+A snapshot returns cumulative data without device synchronization or distributed
+collectives. Ordinary runners need neither method. `forward`,
 `enqueue`, and `ForwardOutput` are unchanged.
 
 Shared CUDA instrumentation records owned event generations for each execution

@@ -3,7 +3,6 @@ from typing import Any, Final, final
 from collections.abc import Mapping
 from typing import Literal
 from resin.recipe import Recipe
-from resin.backend.metrics import RunnerMetrics
 from resin.recipe import ContentBlock
 import numpy as np
 import numpy.typing as npt
@@ -1129,6 +1128,45 @@ class RunnerConfig:
     def prefill_chunk_size(self, /) -> int | None: ...
 
 @final
+class RunnerMetrics:
+    """
+    A nonblocking snapshot of cumulative observations for one physical rank.
+
+    Forward categories are exclusive: prefill, decode, target_verify, draft,
+    and idle. Graph counts describe executions, not regions; DP wait uses a
+    bounded exponential histogram. The core snapshot is stored directly.
+    """
+    def __eq__(self, value: object, /) -> bool: ...
+    def __ne__(self, value: object, /) -> bool: ...
+    def __new__(
+        cls,
+        /,
+        *,
+        forward_seconds: dict[str, float] | None = None,
+        cuda_graph_passes: dict[str, int] | None = None,
+        speculative_drafts: int = 0,
+        speculative_accepted: int = 0,
+        speculative_rows: int = 0,
+        dp_sync: dict[str, Any] | None = None,
+    ) -> RunnerMetrics: ...
+    def as_dict(self, /) -> dict[str, Any]:
+        """
+        Plain fields for inspection and explicit distributed transport.
+        """
+    @property
+    def cuda_graph_passes(self, /) -> dict[str, int]: ...
+    @property
+    def dp_sync(self, /) -> dict[str, Any] | None: ...
+    @property
+    def forward_seconds(self, /) -> dict[str, float]: ...
+    @property
+    def speculative_accepted(self, /) -> int: ...
+    @property
+    def speculative_drafts(self, /) -> int: ...
+    @property
+    def speculative_rows(self, /) -> int: ...
+
+@final
 class SamplingParams:
     """
     Per-request generation policy, including sampling, length, and stop tokens.
@@ -1355,10 +1393,12 @@ class _HistogramAccumulator:
     Native accumulator; snapshots are plain Python dictionaries.
     """
     def __new__(cls, /) -> _HistogramAccumulator: ...
+    def attach(self, /, snapshot: RunnerMetrics) -> RunnerMetrics:
+        """
+        Return a snapshot with this coordinator's wait observations included.
+        """
     def observe(self, /, value: float, *, weight: int = 1) -> None: ...
-    def snapshot(
-        self, /, *, additional: dict[str, Any] | None = None
-    ) -> dict[str, Any]: ...
+    def snapshot(self, /) -> dict[str, Any]: ...
 
 @final
 class _HttpEvents:

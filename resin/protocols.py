@@ -19,8 +19,8 @@ if TYPE_CHECKING:
         ParserEvent,
         ResourceBinding,
         RunnerConfig,
+        RunnerMetrics,
     )
-    from resin.backend.metrics import RunnerMetrics
 
 
 class MediaTokenSpan(NamedTuple):

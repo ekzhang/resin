@@ -1,5 +1,7 @@
 //! Thin Python inspection and runner hooks over native core observations.
 
+use std::collections::BTreeMap;
+
 use crate::Engine;
 use pyo3::{exceptions::PyValueError, prelude::*, types::PyBytes};
 use pythonize::{depythonize, pythonize};
@@ -38,7 +40,14 @@ impl Engine {
         let runner = if include_runner {
             self.runner_metrics
                 .as_ref()
-                .map(|hook| runner_snapshot(&hook.bind(py).call0()?))
+                .map(|hook| -> PyResult<_> {
+                    Ok(hook
+                        .bind(py)
+                        .call0()?
+                        .extract::<PyRef<'_, RunnerMetrics>>()?
+                        .0
+                        .clone())
+                })
                 .transpose()?
         } else {
             None
@@ -82,37 +91,90 @@ fn histogram(value: &Bound<'_, PyAny>) -> PyResult<Histogram> {
     Ok(histogram)
 }
 
-fn runner_snapshot(snapshot: &Bound<'_, PyAny>) -> PyResult<RunnerMetricsSnapshot> {
-    let wait = snapshot.getattr("dp_sync")?;
-    Ok(RunnerMetricsSnapshot {
-        forward_seconds: snapshot.getattr("forward_seconds")?.extract()?,
-        cuda_graph_passes: snapshot.getattr("cuda_graph_passes")?.extract()?,
-        speculative_drafts: snapshot.getattr("speculative_drafts")?.extract()?,
-        speculative_accepted: snapshot.getattr("speculative_accepted")?.extract()?,
-        speculative_rows: snapshot.getattr("speculative_rows")?.extract()?,
-        dp_sync: if wait.is_none() {
-            None
-        } else {
-            Some(histogram(&wait)?)
-        },
-    })
+/// A nonblocking snapshot of cumulative observations for one physical rank.
+///
+/// Forward categories are exclusive: prefill, decode, target_verify, draft,
+/// and idle. Graph counts describe executions, not regions; DP wait uses a
+/// bounded exponential histogram. The core snapshot is stored directly.
+#[pyclass(frozen, eq, module = "resin._resin", skip_from_py_object)]
+#[derive(Clone, PartialEq)]
+pub(crate) struct RunnerMetrics(RunnerMetricsSnapshot);
+
+#[pymethods]
+impl RunnerMetrics {
+    #[new]
+    #[pyo3(signature = (*, forward_seconds = None, cuda_graph_passes = None,
+        speculative_drafts = 0, speculative_accepted = 0, speculative_rows = 0, dp_sync = None))]
+    fn new(
+        forward_seconds: Option<BTreeMap<String, f64>>,
+        cuda_graph_passes: Option<BTreeMap<String, u64>>,
+        speculative_drafts: u64,
+        speculative_accepted: u64,
+        speculative_rows: u64,
+        dp_sync: Option<&Bound<'_, PyAny>>,
+    ) -> PyResult<Self> {
+        Ok(Self(RunnerMetricsSnapshot {
+            forward_seconds: forward_seconds.unwrap_or_default(),
+            cuda_graph_passes: cuda_graph_passes.unwrap_or_default(),
+            speculative_drafts,
+            speculative_accepted,
+            speculative_rows,
+            dp_sync: dp_sync.map(histogram).transpose()?,
+        }))
+    }
+
+    #[getter]
+    fn forward_seconds(&self) -> &BTreeMap<String, f64> {
+        &self.0.forward_seconds
+    }
+
+    #[getter]
+    fn cuda_graph_passes(&self) -> &BTreeMap<String, u64> {
+        &self.0.cuda_graph_passes
+    }
+
+    #[getter]
+    fn speculative_drafts(&self) -> u64 {
+        self.0.speculative_drafts
+    }
+
+    #[getter]
+    fn speculative_accepted(&self) -> u64 {
+        self.0.speculative_accepted
+    }
+
+    #[getter]
+    fn speculative_rows(&self) -> u64 {
+        self.0.speculative_rows
+    }
+
+    #[getter]
+    fn dp_sync<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        Ok(pythonize(py, &self.0.dp_sync)?)
+    }
+
+    /// Plain fields for inspection and explicit distributed transport.
+    fn as_dict<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        Ok(pythonize(py, &self.0)?)
+    }
 }
 
 /// Encode physical-rank observations separately from logical request ownership.
 #[pyfunction]
 #[pyo3(signature = (snapshot, *, model_name, rank, attn_dp_rank))]
 pub(crate) fn _runner_metrics_prometheus_protobuf<'py>(
-    snapshot: &Bound<'py, PyAny>,
+    py: Python<'py>,
+    snapshot: &RunnerMetrics,
     model_name: &str,
     rank: u32,
     attn_dp_rank: u32,
 ) -> PyResult<Bound<'py, PyBytes>> {
     let mut encoder = MetricsEncoder::new(model_name, rank, attn_dp_rank);
     encoder
-        .runner(&runner_snapshot(snapshot)?)
+        .runner(&snapshot.0)
         .map_err(|error| PyValueError::new_err(error.to_string()))?;
     Ok(PyBytes::new(
-        snapshot.py(),
+        py,
         &resin_http::encode_metrics(&encoder.finish()),
     ))
 }
@@ -140,16 +202,18 @@ impl HistogramAccumulator {
         Ok(())
     }
 
-    #[pyo3(signature = (*, additional = None))]
-    fn snapshot<'py>(
-        &self,
-        py: Python<'py>,
-        additional: Option<&Bound<'py, PyAny>>,
-    ) -> PyResult<Bound<'py, PyAny>> {
-        let mut snapshot = self.0.clone();
-        if let Some(additional) = additional {
-            snapshot.merge(&histogram(additional)?);
-        }
-        Ok(pythonize(py, &snapshot)?)
+    /// Return a snapshot with this coordinator's wait observations included.
+    fn attach(&self, snapshot: &RunnerMetrics) -> RunnerMetrics {
+        let mut result = snapshot.clone();
+        result
+            .0
+            .dp_sync
+            .get_or_insert_with(Histogram::default)
+            .merge(&self.0);
+        result
+    }
+
+    fn snapshot<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        Ok(pythonize(py, &self.0)?)
     }
 }

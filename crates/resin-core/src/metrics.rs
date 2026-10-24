@@ -7,7 +7,7 @@ pub use histogram::Histogram;
 
 /// Cumulative physical-rank observations supplied by an optional runner hook.
 /// Collecting these values never requires a metric exporter in the runner.
-#[derive(Clone, Debug, Default, serde::Serialize)]
+#[derive(Clone, Debug, Default, PartialEq, serde::Serialize)]
 pub struct RunnerMetricsSnapshot {
     pub forward_seconds: BTreeMap<String, f64>,
     pub cuda_graph_passes: BTreeMap<String, u64>,

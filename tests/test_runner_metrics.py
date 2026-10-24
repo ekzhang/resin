@@ -4,7 +4,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from resin import BatchPhase
+from resin import BatchPhase, RunnerMetrics
 from resin._resin import _HistogramAccumulator
 from resin.backend.cuda.metrics import CudaMetrics, observe_execution
 
@@ -90,13 +90,15 @@ def test_histogram_snapshot_merge_and_weighted_observations():
     first.observe(0.125, weight=3)
     second.observe(2e12)
     left, right = first.snapshot(), second.snapshot()
-    merged = first.snapshot(additional=right)
+    runner = RunnerMetrics(dp_sync=left)
+    merged = second.attach(runner).as_dict()["dp_sync"]
     assert merged["count"] == 6
     assert merged["zero_count"] == 2
     assert merged["sum"] == 2e12 + 0.375
     assert sum(merged["counts"]) == 4
     assert left["count"] == 5 and right["count"] == 1
     assert first.snapshot() == left
+    assert runner == RunnerMetrics(**runner.as_dict())
 
 
 def test_eager_phases_are_exclusive_and_recycle_completed_events(metrics, monkeypatch):

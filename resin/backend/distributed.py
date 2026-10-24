@@ -7,7 +7,7 @@ its existing step boundary; model runtimes own partitioning and device collectiv
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass, fields, replace
+from dataclasses import dataclass
 from time import perf_counter
 from types import SimpleNamespace
 from typing import Protocol
@@ -223,7 +223,7 @@ class DistributedWorker:
         metrics = self._metrics
         if metrics is None:
             return result
-        return replace(result, dp_sync=metrics.snapshot(additional=result.dp_sync))
+        return metrics.attach(result)
 
     def collect_metrics(self) -> tuple[tuple[int, RunnerMetrics], ...]:
         """Publish every physical rank at a coordinated serving boundary.
@@ -240,11 +240,7 @@ class DistributedWorker:
     def _collect_metrics(self) -> tuple[tuple[int, RunnerMetrics], ...]:
         snapshot, error = None, None
         try:
-            observation = self.metrics_snapshot()
-            snapshot = {
-                field.name: getattr(observation, field.name)
-                for field in fields(observation)
-            }
+            snapshot = self.metrics_snapshot().as_dict()
             payload = json.dumps(
                 (snapshot, None), separators=(",", ":"), allow_nan=False
             ).encode()

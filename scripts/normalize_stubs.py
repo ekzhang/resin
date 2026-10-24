@@ -28,7 +28,6 @@ OUTPUT_COLUMNS = {
 
 PARAMETERS = {
     ("", "_media_to_buffers"): {"media": "MediaInput"},
-    ("", "_runner_metrics_prometheus_protobuf"): {"snapshot": "RunnerMetrics"},
     ("", "_media_from_buffers"): {"buffers": "Sequence[npt.NDArray[Any]]"},
     ("Message", "__new__"): {"content": "Sequence[ContentBlock]"},
     ("RenderOptions", "__new__"): {"reasoning_effort": "str | int | float | None"},
@@ -71,7 +70,7 @@ PARAMETERS = {
     ("Engine", "__new__"): {"runner": "Runner"},
     ("Engine", "cancel"): {"request": "RequestLease"},
     ("Engine", "submit"): {"media": "MediaInput | None"},
-    ("_HistogramAccumulator", "snapshot"): {"additional": "dict[str, Any] | None"},
+    ("RunnerMetrics", "__new__"): {"dp_sync": "dict[str, Any] | None"},
     ("ForwardOutput", "__new__"): OUTPUT_COLUMNS,
     ("_HttpServer", "__new__"): {"recipe": "Recipe"},
     ("_HttpSession", "__new__"): {"recipe": "Recipe"},
@@ -86,6 +85,8 @@ PARAMETERS = {
 RETURNS = {
     ("Engine", "metrics_snapshot"): "dict[str, Any] | None",
     ("_HistogramAccumulator", "snapshot"): "dict[str, Any]",
+    ("RunnerMetrics", "as_dict"): "dict[str, Any]",
+    ("RunnerMetrics", "dp_sync"): "dict[str, Any] | None",
     ("SamplingParams", "stop_token_ids"): "tuple[int, ...]",
     ("", "_media_to_buffers"): "tuple[bytes, tuple[npt.NDArray[Any], ...]]",
     ("", "_media_from_buffers"): "MediaInput",
@@ -313,7 +314,6 @@ def import_edits(
         ("collections.abc", "Mapping"),
         ("typing", "Literal"),
         ("resin.recipe", "Recipe"),
-        ("resin.backend.metrics", "RunnerMetrics"),
         ("resin.recipe", "ContentBlock"),
     ):
         if (module, name) not in existing_imports:

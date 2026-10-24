@@ -2033,7 +2033,9 @@ mod _resin {
     };
 
     #[pymodule_export]
-    use crate::metrics::{_runner_metrics_prometheus_protobuf, HistogramAccumulator};
+    use crate::metrics::{
+        _runner_metrics_prometheus_protobuf, HistogramAccumulator, RunnerMetrics,
+    };
 
     #[pymodule_export]
     use crate::http::NativeHttpServer;
