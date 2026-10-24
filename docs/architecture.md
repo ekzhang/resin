@@ -172,10 +172,15 @@ borrowed NumPy columns.
 
 ## Observability
 
-The Engine exposes prefix-cache and overlap counters, and CUDA runners expose
-capture, replay and fallback counters. [Benchmark harnesses](benchmarks.md)
-record timings and Perfetto traces. A server metrics export surface and OTLP
-integration are planned.
+`Engine(metrics=True)` enables native request timing, committed token counters,
+scheduler state, and cache inventory. Optional runner hooks supply device pass
+durations, graph decisions, speculative counters, and distributed wait time.
+They leave `forward`, `enqueue`, and `ForwardOutput` unchanged. Collection never
+synchronizes the accelerator; the HTTP server publishes periodic snapshots at
+`/metrics`, and scrapes read the last published buffer without entering inference.
+See [metrics](metrics.md) for ownership, timing definitions, Prometheus queries,
+and OTLP forwarding. [Benchmark harnesses](benchmarks.md) also record timings and
+Perfetto traces.
 
 ## Current limits
 

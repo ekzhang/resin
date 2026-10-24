@@ -42,6 +42,7 @@ The focused contracts are:
 - [runner/kernel boundary](docs/kernel-boundary.md)
 - [authoring a CUDA model runner](docs/model-forward-pass.md)
 - [CUDA graph policies and startup](docs/cuda-graphs.md)
+- [engine metrics and Prometheus export](docs/metrics.md)
 - [CUDA model package boundaries](models/cuda/ARCHITECTURE.md)
 - [GPT-OSS execution and parallelism](docs/gpt-oss-parallelism.md)
 - [persistent kernel artifacts](docs/kernel-cache.md)
@@ -436,8 +437,9 @@ Use the current report instead of a checked-in line-count snapshot.
 
 For resident prefill/decode sweeps, fixed speculative acceptance, balanced
 expert routing, and throughput/latency charts, see [benchmarking](docs/benchmarks.md).
-Engine prefix-cache and overlap counters, CUDA graph counters, and benchmark
-traces are available. Server metrics export and OTLP integration are planned.
+Enable `Engine(metrics=True)` for native request/cache metrics and optional runner
+observations. The HTTP server publishes `/metrics`; see [metrics](docs/metrics.md)
+for Prometheus queries and forwarding through an OTLP Collector.
 
 ## Repository map
 
