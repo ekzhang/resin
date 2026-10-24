@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
+import pytest
 from output_helpers import forward_output
 
 from resin import (
     BatchPhase,
     BatchPlan,
     Engine,
+    EngineMetrics,
     ForwardOutput,
     SamplingParams,
 )
@@ -43,10 +45,13 @@ def test_metrics_default_on_with_an_explicit_opt_out_and_no_new_runner_methods()
 
     with Engine(Runner()) as engine:
         snapshot = engine.metrics_snapshot()
-        assert snapshot is not None
-        assert snapshot["runner"] is None
-        assert snapshot["cache"] is None
-        assert snapshot["requests"]["accepted_requests"] == 0
+        assert isinstance(snapshot, EngineMetrics)
+        assert snapshot.runner is None
+        assert snapshot.cache is None
+        snapshot.requests["accepted_requests"] = 100
+        assert snapshot.requests["accepted_requests"] == 0
+        with pytest.raises(AttributeError):
+            setattr(snapshot, "runner", None)
 
 
 def test_stop_clipping_and_cancellation_keep_live_and_completed_totals_distinct():
@@ -71,7 +76,7 @@ def test_stop_clipping_and_cancellation_keep_live_and_completed_totals_distinct(
         engine.cancel(cancelled)
         snapshot = engine.metrics_snapshot()
         assert snapshot is not None
-        values = snapshot["requests"]
+        values = snapshot.requests
         assert values["accepted_requests"] == 2
         assert values["completed_requests"] == 1
         assert values["aborted_requests"] == 1

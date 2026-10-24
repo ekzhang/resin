@@ -28,21 +28,24 @@ Applications without HTTP can collect the same data directly:
 ```python
 snapshot = engine.metrics_snapshot()
 if snapshot is not None:
-    print(snapshot["requests"]["running_requests"])
-    print(snapshot["cache"])
+    print(snapshot.requests["running_requests"])
+    print(snapshot.cache)
 ```
 
-The inspector returns plain dictionaries and lists, with `requests`, optional
-`cache`, optional `runner`, and `generation_throughput` fields. Each snapshot is
-independent of later execution. Cache inventory scans physical allocation
-metadata, so poll periodically rather than on every generated token.
+The inspector returns a frozen `resin.EngineMetrics` snapshot. Its `requests`
+and optional `cache` properties expose dictionaries and lists; `runner` is an
+optional native `RunnerMetrics`.
+Snapshots and returned inspection views are independent of later execution.
+Cache inventory scans physical allocation metadata, so poll periodically rather
+than on every generated token.
 
 Snapshot fields follow exported metric stems where possible, omitting the
 counter suffix `_total`. Request-state fields remain explicit:
 `completed_requests` maps to `resin:num_requests_total`, while
 `decode_tokens` feeds `resin:realtime_tokens_total{mode="decode"}` and
 includes prefill output and committed work from cancelled requests.
-`generation_throughput` is the derived tokens-per-second value.
+`requests["generation_throughput"]` is the derived tokens-per-second value,
+tracked by the core alongside request counters.
 
 ## Exponential histograms and scraping
 

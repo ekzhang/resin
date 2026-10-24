@@ -43,10 +43,9 @@ impl MetricsEncoder {
     pub fn engine(
         &mut self,
         r: &EngineMetricsSnapshot,
-        generation_throughput: f64,
         cache: Option<&CacheMetrics>,
     ) -> Result<(), MetricsEncodeError> {
-        self.gauge("gen_throughput", "Committed output tokens per second in the last collection window (at least one second).", generation_throughput, &[]);
+        self.gauge("gen_throughput", "Committed output tokens per second in the last collection window (at least one second).", r.generation_throughput, &[]);
         for (name, help, value) in [
             (
                 "num_accepted_requests_total",

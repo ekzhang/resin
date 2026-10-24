@@ -85,7 +85,8 @@ PARAMETERS = {
 }
 
 RETURNS = {
-    ("Engine", "metrics_snapshot"): "dict[str, Any] | None",
+    ("EngineMetrics", "requests"): "dict[str, Any]",
+    ("EngineMetrics", "cache"): "dict[str, Any] | None",
     ("_HistogramAccumulator", "snapshot"): "dict[str, Any]",
     ("RunnerMetrics", "as_dict"): "dict[str, Any]",
     ("RunnerMetrics", "dp_attention_sync_wait_seconds"): "dict[str, Any] | None",

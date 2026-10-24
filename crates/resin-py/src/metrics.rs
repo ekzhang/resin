@@ -11,13 +11,31 @@ use resin_core::{
 };
 use resin_http::MetricsEncoder;
 
-/// Assemble core snapshots without duplicating their field definitions.
-#[derive(serde::Serialize)]
+/// An immutable engine snapshot with request, cache, and runner observations.
+/// Request and cache properties return independent dictionary views.
+#[pyclass(frozen, module = "resin._resin", skip_from_py_object)]
 pub(crate) struct EngineMetrics {
     requests: EngineMetricsSnapshot,
-    generation_throughput: f64,
     cache: Option<paged_kv::CacheMetrics>,
     runner: Option<RunnerMetricsSnapshot>,
+}
+
+#[pymethods]
+impl EngineMetrics {
+    #[getter]
+    fn requests<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        Ok(pythonize(py, &self.requests)?)
+    }
+
+    #[getter]
+    fn cache<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        Ok(pythonize(py, &self.cache)?)
+    }
+
+    #[getter]
+    fn runner(&self) -> Option<RunnerMetrics> {
+        self.runner.clone().map(RunnerMetrics)
+    }
 }
 
 impl Engine {
@@ -29,14 +47,6 @@ impl Engine {
         let Some(requests) = self.core.metrics_snapshot() else {
             return Ok(None);
         };
-        let elapsed = self.metrics_sample.0.elapsed().as_secs_f64();
-        if elapsed >= 1.0 {
-            self.metrics_sample = (
-                std::time::Instant::now(),
-                requests.decode_tokens,
-                (requests.decode_tokens - self.metrics_sample.1) as f64 / elapsed,
-            );
-        }
         let runner = if include_runner {
             self.runner_metrics
                 .as_ref()
@@ -53,7 +63,6 @@ impl Engine {
             None
         };
         Ok(Some(EngineMetrics {
-            generation_throughput: self.metrics_sample.2,
             requests,
             cache: self.core.cache_metrics(),
             runner,
@@ -70,11 +79,7 @@ impl EngineMetrics {
     ) -> PyResult<Vec<u8>> {
         let mut encoder = MetricsEncoder::new(model_name, rank, attn_dp_rank);
         encoder
-            .engine(
-                &self.requests,
-                self.generation_throughput,
-                self.cache.as_ref(),
-            )
+            .engine(&self.requests, self.cache.as_ref())
             .map_err(|error| PyValueError::new_err(error.to_string()))?;
         if let Some(runner) = &self.runner {
             encoder

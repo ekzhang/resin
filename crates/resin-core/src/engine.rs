@@ -4,7 +4,7 @@
 //! plan and releases model-local state. Opaque payloads carry frontend metadata.
 
 pub use crate::logprobs::{LogprobView, TokenLogprobs};
-use crate::metrics::{EngineMetrics, EngineMetricsSnapshot, RequestMetrics};
+use crate::metrics::{EngineMetricsSnapshot, EngineMetricsState, RequestMetricsState};
 pub use crate::output::{OwnedTokenRows, TokenRows};
 use crate::resources::RequestResourceRef;
 use crate::resources::kv::{KvGroupPlan, KvLayout};
@@ -331,7 +331,7 @@ pub trait Runner<P> {
 }
 #[derive(Debug)]
 struct Request<P> {
-    metrics: Option<RequestMetrics>,
+    metrics: Option<RequestMetricsState>,
     prompt_logprobs: bool,
     prompt_top_logprobs: u32,
     prompt_target_logprobs: Option<Vec<Vec<u32>>>,
@@ -495,7 +495,7 @@ struct Batch<P> {
 }
 
 pub struct EngineCore<P> {
-    metrics: Option<EngineMetrics>,
+    metrics: Option<EngineMetricsState>,
     in_flight: Option<Batch<P>>,
     continuation: Option<ExecutionPlan<P>>,
     quarantined: Option<Batch<P>>,
@@ -598,7 +598,7 @@ impl<P: Clone> EngineCore<P> {
                 "metrics must be enabled before submitting requests",
             ));
         }
-        self.metrics = Some(EngineMetrics::new());
+        self.metrics = Some(EngineMetricsState::new());
         Ok(())
     }
 
@@ -607,8 +607,8 @@ impl<P: Clone> EngineCore<P> {
     }
 
     /// Copy observations without device synchronization or runner callbacks.
-    pub fn metrics_snapshot(&self) -> Option<EngineMetricsSnapshot> {
-        let mut snapshot = self.metrics.as_ref()?.snapshot();
+    pub fn metrics_snapshot(&mut self) -> Option<EngineMetricsSnapshot> {
+        let mut snapshot = self.metrics.as_mut()?.snapshot();
         snapshot.waiting_requests = self
             .scheduler
             .iter()

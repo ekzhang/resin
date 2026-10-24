@@ -34,6 +34,8 @@ pub struct EngineMetricsSnapshot {
     pub prefill_compute_tokens: u64,
     pub prefill_cache_tokens: u64,
     pub decode_tokens: u64,
+    /// Committed output tokens/s over the latest snapshot interval >=1 second.
+    pub generation_throughput: f64,
     pub waiting_requests: usize,
     pub running_requests: usize,
     pub elapsed_seconds: f64,
@@ -65,6 +67,7 @@ impl Default for EngineMetricsSnapshot {
             prefill_compute_tokens: 0,
             prefill_cache_tokens: 0,
             decode_tokens: 0,
+            generation_throughput: 0.0,
             waiting_requests: 0,
             running_requests: 0,
             elapsed_seconds: 0.0,
@@ -81,8 +84,9 @@ impl Default for EngineMetricsSnapshot {
     }
 }
 
+/// Request-local timestamps and counts retained until retirement.
 #[derive(Debug)]
-pub(crate) struct RequestMetrics {
+pub(crate) struct RequestMetricsState {
     submitted_at: Instant,
     queued_at: Option<Instant>,
     first_token_at: Option<Instant>,
@@ -92,27 +96,41 @@ pub(crate) struct RequestMetrics {
     output_tokens: u64,
 }
 
-pub(crate) struct EngineMetrics {
+/// Mutable engine accounting that produces owned metrics snapshots.
+pub(crate) struct EngineMetricsState {
     started_at: Instant,
     stopped_at: Option<Instant>,
     idle_since: Option<Instant>,
+    throughput_sample: (Instant, u64),
     values: EngineMetricsSnapshot,
 }
 
-impl EngineMetrics {
+impl EngineMetricsState {
     pub(crate) fn new() -> Self {
         let now = Instant::now();
         Self {
             started_at: now,
             stopped_at: None,
             idle_since: Some(now),
+            throughput_sample: (now, 0),
             values: EngineMetricsSnapshot::default(),
         }
     }
 
-    pub(crate) fn snapshot(&self) -> EngineMetricsSnapshot {
+    pub(crate) fn snapshot(&mut self) -> EngineMetricsSnapshot {
+        self.snapshot_at(Instant::now())
+    }
+
+    fn snapshot_at(&mut self, now: Instant) -> EngineMetricsSnapshot {
+        let now = self.stopped_at.unwrap_or(now);
+        let (sampled_at, sampled_tokens) = self.throughput_sample;
+        let elapsed = now.duration_since(sampled_at).as_secs_f64();
+        if elapsed >= 1.0 {
+            self.values.generation_throughput =
+                (self.values.decode_tokens - sampled_tokens) as f64 / elapsed;
+            self.throughput_sample = (now, self.values.decode_tokens);
+        }
         let mut snapshot = self.values.clone();
-        let now = self.stopped_at.unwrap_or_else(Instant::now);
         snapshot.elapsed_seconds = now.duration_since(self.started_at).as_secs_f64();
         if let Some(idle_since) = self.idle_since {
             snapshot.scheduler_idle_seconds += now.duration_since(idle_since).as_secs_f64();
@@ -139,11 +157,11 @@ impl EngineMetrics {
         prompt_tokens: u32,
         cached_tokens: u32,
         now: Instant,
-    ) -> RequestMetrics {
+    ) -> RequestMetricsState {
         self.set_idle(false, now);
         self.values.accepted_requests += 1;
         self.values.prefill_cache_tokens += u64::from(cached_tokens);
-        RequestMetrics {
+        RequestMetricsState {
             submitted_at: now,
             queued_at: Some(now),
             first_token_at: None,
@@ -156,7 +174,7 @@ impl EngineMetrics {
 
     pub(crate) fn commit(
         &mut self,
-        request: &mut RequestMetrics,
+        request: &mut RequestMetricsState,
         prepared_at: Instant,
         now: Instant,
         prefill_tokens: u32,
@@ -230,9 +248,9 @@ mod tests {
 
     #[test]
     fn token_weighted_intervals_and_request_tpot_have_distinct_denominators() {
-        let mut metrics = EngineMetrics::new();
-        let mut request = metrics.submit(12, 8, Instant::now());
-        let start = request.submitted_at;
+        let mut metrics = EngineMetricsState::new();
+        let start = metrics.started_at;
+        let mut request = metrics.submit(12, 8, start);
         for (prepared, completed, prefill, output, finished) in
             [(20, 100, 4, 1, false), (100, 160, 0, 3, true)]
         {
@@ -245,7 +263,7 @@ mod tests {
                 finished,
             );
         }
-        let values = metrics.snapshot();
+        let values = metrics.snapshot_at(start + Duration::from_millis(160));
         assert_eq!(values.inter_token_latency_seconds.count, 3);
         assert_eq!(values.inter_token_latency_seconds.sum, 0.06);
         assert_eq!(values.request_time_per_output_token_seconds.count, 1);
@@ -253,5 +271,13 @@ mod tests {
         assert_eq!(values.time_to_first_token_seconds.sum, 0.1);
         assert_eq!(values.queue_time_seconds.sum, 0.02);
         assert_eq!(values.e2e_request_latency_seconds.sum, 0.16);
+        for (millis, rate) in [(500, 0.0), (1000, 4.0), (1500, 4.0), (2000, 0.0)] {
+            let snapshot = metrics.snapshot_at(start + Duration::from_millis(millis));
+            assert_eq!(snapshot.generation_throughput, rate);
+        }
+        metrics.stopped_at = Some(start + Duration::from_secs(2));
+        let stopped = metrics.snapshot_at(start + Duration::from_secs(8));
+        assert_eq!(stopped.elapsed_seconds, 2.0);
+        assert_eq!(metrics.throughput_sample.0, start + Duration::from_secs(2));
     }
 }

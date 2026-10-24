@@ -1229,7 +1229,6 @@ struct Engine {
     overlap_enqueues: u64,
     overlap_continuations: u64,
     runner_metrics: Option<Py<PyAny>>,
-    metrics_sample: (std::time::Instant, u64, f64),
 }
 
 struct PendingExecution {
@@ -1584,7 +1583,6 @@ impl Engine {
             overlap_enqueues: 0,
             overlap_continuations: 0,
             runner_metrics,
-            metrics_sample: (std::time::Instant::now(), 0, 0.0),
         })
     }
     #[pyo3(signature = (
@@ -1696,10 +1694,10 @@ impl Engine {
         Ok(events)
     }
 
-    /// Inspect native observations as independent Python dictionaries and lists.
+    /// Collect a read-only native snapshot of engine and runner observations.
     /// Call periodically: cache inventory requires a scan of allocated blocks.
-    fn metrics_snapshot<'py>(&mut self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
-        Ok(pythonize::pythonize(py, &self.collect_metrics(py, true)?)?)
+    fn metrics_snapshot(&mut self, py: Python<'_>) -> PyResult<Option<metrics::EngineMetrics>> {
+        self.collect_metrics(py, true)
     }
 
     /// Native serving export; avoids constructing Python inspector dictionaries.
@@ -2034,7 +2032,7 @@ mod _resin {
 
     #[pymodule_export]
     use crate::metrics::{
-        _runner_metrics_prometheus_protobuf, HistogramAccumulator, RunnerMetrics,
+        _runner_metrics_prometheus_protobuf, EngineMetrics, HistogramAccumulator, RunnerMetrics,
     };
 
     #[pymodule_export]

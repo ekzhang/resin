@@ -540,9 +540,9 @@ class Engine:
     def max_running_requests(self, /) -> int: ...
     @property
     def metrics_enabled(self, /) -> bool: ...
-    def metrics_snapshot(self, /) -> dict[str, Any] | None:
+    def metrics_snapshot(self, /) -> EngineMetrics | None:
         """
-        Inspect native observations as independent Python dictionaries and lists.
+        Collect a read-only native snapshot of engine and runner observations.
         Call periodically: cache inventory requires a scan of allocated blocks.
         """
     @property
@@ -590,6 +590,19 @@ class Engine:
         media: MediaInput | None = None,
         prompt_target_logprobs: Sequence[Sequence[int]] | None = None,
     ) -> RequestLease: ...
+
+@final
+class EngineMetrics:
+    """
+    An immutable engine snapshot with request, cache, and runner observations.
+    Request and cache properties return independent dictionary views.
+    """
+    @property
+    def cache(self, /) -> dict[str, Any] | None: ...
+    @property
+    def requests(self, /) -> dict[str, Any]: ...
+    @property
+    def runner(self, /) -> RunnerMetrics | None: ...
 
 @final
 class ForwardOutput:
