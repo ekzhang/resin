@@ -19,7 +19,10 @@ classifiers = [
 dependencies = ["blake3>=1.0,<2", "numpy>=1.26,<3", "torch>=2.13.0"]
 
 [project.optional-dependencies]
-cuda = ["flashinfer-python>=0.6.15.post1; sys_platform == 'linux'"]
+cuda = [
+  "flashinfer-python>=0.6.15.post1; sys_platform == 'linux'",
+  "cuda-bindings>=13.3,<14; sys_platform == 'linux'",
+]
 
 [dependency-groups]
 deployment = [

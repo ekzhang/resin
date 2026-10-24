@@ -18,6 +18,7 @@ from resin.backend.cuda.graphs import (
     GraphShape,
     resolve_decode_graph_shapes,
 )
+from resin.backend.cuda.metrics import observe_execution
 from resin.backend.cuda.parallel import (
     TensorParallelContext,
     replicated_cache_capacity,
@@ -450,6 +451,12 @@ class Qwen3_5CudaRunner(CudaRunner):
             (batch_size, output_width), dtype=torch.long, device=self.device
         )
 
+        phase_timing = (
+            self._new_phase_timing("decode", "draft", "target_verify", "decode")
+            if self.speculative_tokens
+            else None
+        )
+
         def ordinary_launch() -> None:
             attention.reset()
             recurrent, convolution, _ = self._initial_state(cache, positions)
@@ -473,6 +480,8 @@ class Qwen3_5CudaRunner(CudaRunner):
             )
 
         def speculative_launch() -> None:
+            if phase_timing is not None:
+                phase_timing.mark(0)
             attention.reset()
             recurrent, convolution, _ = self._initial_state(cache, positions)
             anchor_hidden, recurrent, convolution = self._target_forward(
@@ -491,6 +500,8 @@ class Qwen3_5CudaRunner(CudaRunner):
                 self._sampler, self._model.logits(anchor_hidden[:, -1]), sampling, 0
             )
 
+            if phase_timing is not None:
+                phase_timing.mark(1)
             draft_columns = []
             draft_input = first
             draft_hidden = anchor_hidden[:, -1:]
@@ -513,6 +524,8 @@ class Qwen3_5CudaRunner(CudaRunner):
                 )
                 draft_columns.append(draft_input)
             drafts = torch.stack(draft_columns, dim=1)
+            if phase_timing is not None:
+                phase_timing.mark(2)
             verify_ids = torch.cat((first[:, None], drafts), dim=1)
 
             active = torch.ones(batch_size, dtype=torch.bool, device=self.device)
@@ -561,6 +574,8 @@ class Qwen3_5CudaRunner(CudaRunner):
                 target_columns.append(target)
                 if step < self.speculative_tokens:
                     active = active & (drafts[:, step] == target)
+            if phase_timing is not None:
+                phase_timing.mark(3)
             targets = torch.stack(target_columns, dim=1)
             matches = drafts == targets[:, : self.speculative_tokens]
             accepted = torch.cumprod(matches.to(torch.int64), dim=1).sum(1)
@@ -595,6 +610,9 @@ class Qwen3_5CudaRunner(CudaRunner):
             output_ids[:, 1 : self.speculative_tokens + 1].copy_(drafts)
             output_ids[:, self.speculative_tokens + 1 :].copy_(targets)
 
+            if phase_timing is not None:
+                phase_timing.mark(4)
+
         launch = speculative_launch if self.speculative_tokens else ordinary_launch
         inputs = {
             "token_ids": token_ids,
@@ -613,6 +631,7 @@ class Qwen3_5CudaRunner(CudaRunner):
             inputs=inputs,
             output=output_ids,
             launch=launch,
+            phase_timing=phase_timing,
             prepare=prepare,
         )
 
@@ -947,6 +966,11 @@ class Qwen3_5CudaRunner(CudaRunner):
         anchors: torch.Tensor,
         positions: torch.Tensor,
     ) -> ForwardOutput:
+        phase_timing = self._eager_phase_timing(
+            "decode", "draft", "target_verify", "decode"
+        )
+        if phase_timing is not None:
+            phase_timing.mark(0)
         contexts = torch.as_tensor(
             plan.context_lengths, dtype=torch.long, device=self.device
         )
@@ -963,6 +987,8 @@ class Qwen3_5CudaRunner(CudaRunner):
         first_logits = self._model.logits(anchor_hidden[:, -1])
         first = self._sample(first_logits, plan, 0)
 
+        if phase_timing is not None:
+            phase_timing.mark(1)
         drafts = []
         draft_input = first
         draft_hidden = anchor_hidden[:, -1:]
@@ -981,6 +1007,8 @@ class Qwen3_5CudaRunner(CudaRunner):
             drafts.append(draft_input)
         draft_ids = torch.stack(drafts, dim=1)
 
+        if phase_timing is not None:
+            phase_timing.mark(2)
         verify_ids = torch.cat((first[:, None], draft_ids), dim=1)
         verify_positions = positions[:, None] + torch.arange(
             1, self.speculative_tokens + 2, device=self.device
@@ -996,6 +1024,8 @@ class Qwen3_5CudaRunner(CudaRunner):
             ),
         )
         verify_logits = self._model.logits(verify_hidden)
+        if phase_timing is not None:
+            phase_timing.mark(3)
         targets = torch.stack(
             [
                 self._sample(verify_logits[:, step].contiguous(), plan, step + 1)
@@ -1044,11 +1074,14 @@ class Qwen3_5CudaRunner(CudaRunner):
                 committed_hidden[:, processed - 1],
             )
             rows.append([int(first[row]), *acceptance.token_rows[row]])
+        if phase_timing is not None:
+            phase_timing.mark(4)
         if plan.needs_logprobs:
             logits = torch.cat((first_logits[:, None], verify_logits), dim=1)
             return format_output(logits, rows, plan)
         return token_output(rows)
 
+    @observe_execution
     def forward(self, plan: BatchPlan) -> ForwardOutput:
         self._check_cuda_graphs(plan.phase)
         rows = self._validate_plan(plan)

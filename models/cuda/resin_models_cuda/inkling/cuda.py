@@ -18,6 +18,7 @@ from resin.backend.cuda.graphs import (
     GraphShape,
     resolve_decode_graph_shapes,
 )
+from resin.backend.cuda.metrics import observe_execution
 from resin.backend.cuda.runner import (
     CudaRunner,
     capture_sampling_inputs,
@@ -258,8 +259,12 @@ class InklingCudaRunner(CudaRunner):
             (batch_size, output_width), dtype=torch.long, device=self.device
         )
 
+        phase_timing = self._new_phase_timing("draft", "target_verify", "decode")
+
         def launch() -> None:
             with use_default_dtype(torch.bfloat16), torch.device(self.device):
+                if phase_timing is not None:
+                    phase_timing.mark(0)
                 initial_state = self._initial_state(cache, positions)
                 state_inputs = self._graph_state_inputs[:batch_size]
                 drafts, _ = self._draft.propose(
@@ -271,6 +276,8 @@ class InklingCudaRunner(CudaRunner):
                         self._sampler, logits, sampling, step
                     ),
                 )
+                if phase_timing is not None:
+                    phase_timing.mark(1)
                 verify_ids = torch.cat((token_ids[:, None], drafts), dim=1)
                 offsets = torch.arange(self.speculative_tokens + 1, device=self.device)
                 verify_positions = positions[:, None] + offsets
@@ -284,6 +291,8 @@ class InklingCudaRunner(CudaRunner):
                     full_logits=True,
                     state_inputs_out=state_inputs,
                 )
+                if phase_timing is not None:
+                    phase_timing.mark(2)
                 targets = torch.stack(
                     [
                         graph_sample(
@@ -307,6 +316,9 @@ class InklingCudaRunner(CudaRunner):
                 output_ids[:, : self.speculative_tokens].copy_(drafts)
                 output_ids[:, self.speculative_tokens :].copy_(targets)
 
+                if phase_timing is not None:
+                    phase_timing.mark(3)
+
         inputs = {"token_ids": token_ids, "positions": positions}
         inputs.update(self._cache.graph_device_inputs(cache))
         inputs.update(self._sampler.graph_inputs(sampling))
@@ -314,6 +326,7 @@ class InklingCudaRunner(CudaRunner):
             inputs=inputs,
             output=output_ids,
             launch=launch,
+            phase_timing=phase_timing,
             prepare=self._cache.reset_null,
         )
 
@@ -497,6 +510,9 @@ class InklingCudaRunner(CudaRunner):
         anchors: torch.Tensor,
         positions: torch.Tensor,
     ) -> ForwardOutput:
+        phase_timing = self._eager_phase_timing("draft", "target_verify", "decode")
+        if phase_timing is not None:
+            phase_timing.mark(0)
         drafts, _ = self._draft.propose(
             anchors,
             positions,
@@ -504,6 +520,8 @@ class InklingCudaRunner(CudaRunner):
             int(positions.max().item()) + self.speculative_tokens,
             lambda logits, step: self._sample(logits, plan, step),
         )
+        if phase_timing is not None:
+            phase_timing.mark(1)
         verify_ids = torch.cat((anchors[:, None], drafts), dim=1)
         verify_positions = positions[:, None] + torch.arange(
             self.speculative_tokens + 1, device=self.device
@@ -532,6 +550,8 @@ class InklingCudaRunner(CudaRunner):
             full_logits=True,
             state_inputs_out=state_inputs,
         )
+        if phase_timing is not None:
+            phase_timing.mark(2)
         targets = torch.stack(
             [
                 self._sample(logits[:, step].contiguous(), plan, step)
@@ -553,8 +573,11 @@ class InklingCudaRunner(CudaRunner):
         )
         self._store_state(cache, positions + processed - 1, final_state)
         self._draft.inject_target(taps, verify_positions, cache)
+        if phase_timing is not None:
+            phase_timing.mark(3)
         return format_output(logits, acceptance.token_rows, plan)
 
+    @observe_execution
     def forward(self, plan: BatchPlan) -> ForwardOutput:
         self._check_cuda_graphs(plan.phase)
         rows = self._validate_plan(plan)

@@ -11,6 +11,7 @@ from typing import Any, NoReturn, NotRequired, TypedDict
 import torch
 
 from resin.backend.cuda.failures import GraphInputError, PostAcceptCudaError
+from resin.backend.cuda.metrics import CudaMetrics, GraphPhaseTiming
 from resin.backend.cuda.staging import StagingError, TensorStagerPool
 
 GraphShape = tuple[int, ...]
@@ -159,6 +160,7 @@ class CudaGraphStep:
     launch: Callable[[], None]
     prepare: Callable[[], None] | None = None
     validate_eager_output: bool = True
+    phase_timing: GraphPhaseTiming | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -196,6 +198,7 @@ class CudaGraphProgram:
     regions: tuple[CudaGraphRegion, ...]
     prepare: Callable[[], None] | None = None
     validate_eager_output: bool = True
+    phase_timing: GraphPhaseTiming | None = None
 
     def __post_init__(self) -> None:
         regions = tuple(self.regions)
@@ -221,6 +224,7 @@ def _as_program(step: CudaGraphStep | CudaGraphProgram) -> CudaGraphProgram:
             regions=(CudaGraphRegion("step", step.launch),),
             prepare=step.prepare,
             validate_eager_output=step.validate_eager_output,
+            phase_timing=step.phase_timing,
         )
     raise TypeError("CUDA graph builder must return a step or program")
 
@@ -484,6 +488,8 @@ class CudaGraphCache:
         self,
         shape: GraphShape,
         inputs: Mapping[str, object],
+        *,
+        metrics: CudaMetrics | None = None,
     ) -> Any:
         """Stage and replay one current batch using a pre-captured graph."""
 
@@ -506,6 +512,15 @@ class CudaGraphCache:
 
         try:
             with torch.cuda.device(self.device), torch.inference_mode():
+                timing = entry.program.phase_timing
+                if (
+                    metrics is not None
+                    and metrics.active is not None
+                    and timing is not None
+                ):
+                    metrics.active.phases.append(timing.replay(entry.graphs))
+                elif timing is not None:
+                    timing.unobserved(entry.graphs)
                 self._replay(entry.program, entry.graphs)
         except BaseException as error:
             self._fail("graph replay", error)
@@ -563,6 +578,8 @@ class CudaGraphCache:
                     f"actual: {_output_summary(program.output)})"
                 )
         entry.graphs = graphs
+        if program.phase_timing is not None:
+            program.phase_timing.prepare(graphs)
         entry.captured = True
         entry.captures = 1
         entry.capture_ms = (perf_counter() - started) * 1000
@@ -587,7 +604,11 @@ class CudaGraphCache:
                 entry.graphs = tuple(graphs)
                 region.launch()
                 continue
-            graph = torch.cuda.CUDAGraph()
+            graph = (
+                torch.cuda.CUDAGraph(keep_graph=True)
+                if program.phase_timing is not None
+                else torch.cuda.CUDAGraph()
+            )
             graphs.append(graph)
             # Keep ownership even when capture or parity validation fails, so
             # close() can release NCCL graph references before communicator teardown.
@@ -597,6 +618,8 @@ class CudaGraphCache:
                 torch.inference_mode(),
             ):
                 region.launch()
+            if program.phase_timing is not None:
+                graph.instantiate()
         return tuple(graphs)
 
     @staticmethod

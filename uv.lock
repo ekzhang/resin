@@ -3069,6 +3069,7 @@ dependencies = [
 
 [package.optional-dependencies]
 cuda = [
+    { name = "cuda-bindings", marker = "sys_platform == 'linux'" },
     { name = "flashinfer-python", marker = "sys_platform == 'linux'" },
 ]
 
@@ -3101,6 +3102,7 @@ dev = [
 [package.metadata]
 requires-dist = [
     { name = "blake3", specifier = ">=1.0,<2" },
+    { name = "cuda-bindings", marker = "sys_platform == 'linux' and extra == 'cuda'", specifier = ">=13.3,<14" },
     { name = "flashinfer-python", marker = "sys_platform == 'linux' and extra == 'cuda'", specifier = ">=0.6.15.post1" },
     { name = "numpy", specifier = ">=1.26,<3" },
     { name = "torch", specifier = ">=2.13.0" },

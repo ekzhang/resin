@@ -6,13 +6,18 @@ its existing step boundary; model runtimes own partitioning and device collectiv
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+import json
+from dataclasses import asdict, dataclass, replace
+from time import perf_counter
 from types import SimpleNamespace
 from typing import Protocol
+
+import torch
 
 from resin import BatchPhase, BatchPlan, Engine, ForwardOutput, Runner, RunnerConfig
 from resin.backend.command_transport import CommandTransport
 from resin.backend.control_plane import ControlOperation, ControlPlane
+from resin.backend.metrics import DpSyncMetrics, RunnerMetrics
 from resin.backend.plan_transport import PlanTransport
 from resin.backend.topology import ParallelGroups, RankGroup
 
@@ -125,6 +130,7 @@ class DistributedWorker:
         self._step_id, self._phase = 0, None
         self._forward, self._validate, self._enqueue = None, None, None
         self._completion = None
+        self._metrics: DpSyncMetrics | None = None
         self._control = ControlPlane(groups.distributed)
         self._plans = PlanTransport()
         self._wire = CommandTransport(
@@ -185,11 +191,102 @@ class DistributedWorker:
         return results
 
     def _vote(self, group, operation, values=(), *, error=None):
+        metrics = self._metrics
+        timed = (
+            metrics is not None
+            and self.groups.topology.attn_dp > 1
+            and (group is self.groups.domain or group is self.groups.drivers)
+        )
+        started = perf_counter() if timed else 0.0
         try:
             return self._control.gather(group, operation, values, error=error)
         except BaseException as exc:
             self.failure = _message(exc)
             raise DistributedExecutionError(self.failure) from exc
+        finally:
+            if timed:
+                assert metrics is not None
+                metrics.observe(perf_counter() - started)
+
+    def configure_metrics(self, *, enabled: bool = True) -> None:
+        """Configure all replica ranks once; metrics reads never communicate."""
+
+        command = {"operation": "metrics", "metrics": enabled}
+        self._send(command)
+        self._local_command(command)
+
+    def metrics_snapshot(self) -> RunnerMetrics:
+        """Return this rank's physical execution and coordinator observations."""
+
+        snapshot = getattr(self.runner, "metrics_snapshot", None)
+        result = RunnerMetrics() if snapshot is None else snapshot()
+        metrics = self._metrics
+        if metrics is None:
+            return result
+        return replace(
+            result,
+            dp_sync_seconds=result.dp_sync_seconds + metrics.seconds,
+            dp_sync_count=result.dp_sync_count + metrics.count,
+            dp_sync_buckets=tuple(
+                left + right
+                for left, right in zip(result.dp_sync_buckets, metrics.buckets)
+            ),
+        )
+
+    def collect_metrics(self) -> tuple[tuple[int, RunnerMetrics], ...]:
+        """Publish every physical rank at a coordinated serving boundary.
+
+        This is an explicit CPU collective, separate from the nonblocking local
+        snapshot hook. The serving loop calls it periodically; scrapes read the
+        published result without entering inference or process groups.
+        """
+
+        command = {"operation": "metrics_snapshot"}
+        self._send(command)
+        return self._collect_metrics()
+
+    def _collect_metrics(self) -> tuple[tuple[int, RunnerMetrics], ...]:
+        snapshot, error = None, None
+        try:
+            snapshot = asdict(self.metrics_snapshot())
+            payload = json.dumps(
+                (snapshot, None), separators=(",", ":"), allow_nan=False
+            ).encode()
+        except BaseException as exc:
+            snapshot = None
+            error = _message(exc)
+            payload = json.dumps((None, error)).encode()
+        group = self.groups.replica
+        value = (snapshot, error)
+        if group.size == 1:
+            gathered = [value]
+        else:
+            # Snapshot transport is intentionally separate from step packets:
+            # bounded, infrequent UTF-8 records without Python object pickling.
+            with torch.inference_mode(False):
+                size = torch.tensor([len(payload)], dtype=torch.int64)
+                sizes = [torch.empty_like(size) for _ in group.ranks]
+                self.groups.distributed.all_gather(sizes, size, group=group.handle)
+                capacity = max(int(item.item()) for item in sizes)
+                source = torch.zeros(capacity, dtype=torch.uint8)
+                source[: len(payload)] = torch.frombuffer(
+                    bytearray(payload), dtype=torch.uint8
+                )
+                records = [torch.empty_like(source) for _ in group.ranks]
+                self.groups.distributed.all_gather(records, source, group=group.handle)
+            gathered = [
+                json.loads(record[: int(size.item())].numpy().tobytes())
+                for record, size in zip(records, sizes, strict=True)
+            ]
+        failure = _first_error(self.groups.replica, [item[1] for item in gathered])
+        if failure:
+            raise DistributedExecutionError(failure)
+        snapshots = []
+        for rank, (value, _) in zip(group.ranks, gathered, strict=True):
+            assert isinstance(value, dict)
+            value["dp_sync_buckets"] = tuple(value["dp_sync_buckets"])
+            snapshots.append((rank, RunnerMetrics(**value)))
+        return tuple(snapshots)
 
     def _consensus(self, group: RankGroup, error: str | None):
         _, errors = self._vote(group, ControlOperation.VALIDATE, error=error)
@@ -269,12 +366,23 @@ class DistributedWorker:
 
     def _local_command(self, command):
         operation = command["operation"]
+        if operation == "metrics_snapshot":
+            # Do not harvest the pending inference completion: observation must
+            # not drain the GPU pipeline even when driver snapshots communicate.
+            self._collect_metrics()
+            return
         error = None
         try:
             if self._completion is not None:
                 self._completion.result()
                 self._completion = None
-            if operation == "bind":
+            if operation == "metrics":
+                enabled = command["metrics"]
+                self._metrics = DpSyncMetrics() if enabled else None
+                configure = getattr(self.runner, "configure_metrics", None)
+                if configure is not None:
+                    configure(enabled=enabled)
+            elif operation == "bind":
                 getattr(self.runner, "bind_resources")(
                     SimpleNamespace(
                         cache_pool_id=command["cache_pool_id"],

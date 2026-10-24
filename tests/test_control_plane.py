@@ -98,6 +98,7 @@ def _control_worker(rank, rendezvous, output):
     # Exercise actual driver codecs and their opaque HTTP fallback on the same
     # group. Every successful step vote uses only fixed tensor collectives.
     worker = object.__new__(DistributedWorker)
+    worker._metrics = None
     worker.groups = SimpleNamespace(drivers=group, distributed=transport)
     worker._control, worker.failure = control, None
     assert worker._drivers("work", (rank == 0, None)) == [

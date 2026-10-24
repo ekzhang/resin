@@ -5,6 +5,7 @@ from __future__ import annotations
 from collections.abc import Callable, Mapping
 from contextlib import contextmanager, nullcontext
 from dataclasses import replace
+from time import perf_counter
 
 import torch
 
@@ -24,6 +25,7 @@ from resin.backend.cuda.graphs import (
     CudaGraphStats,
     GraphShape,
 )
+from resin.backend.cuda.metrics import CudaMetrics, GraphPhaseTiming
 from resin.backend.cuda.sampling import (
     SAMPLING_OFFSET_STRIDE,
     FlashInferSampler,
@@ -34,6 +36,7 @@ from resin.backend.cuda.tensor_graphs import (
     PrefillTensorGraphs,
     TensorSpec,
 )
+from resin.backend.metrics import RunnerMetrics
 from resin.backend.resources import CachePoolBinding
 from resin.backend.topology import ParallelismCapabilities
 from resin.protocols import Runner
@@ -109,6 +112,40 @@ class CudaRunner(Runner):
         self._distributed_prefill_bucket = None
         self._distributed_prefill_region_buckets = {}
         self._distributed_prefill_scope = False
+        self._metrics: CudaMetrics | None = None
+
+    def configure_metrics(self, *, enabled: bool = True) -> None:
+        """Enable optional execution observations without changing forward results."""
+
+        if enabled and getattr(self, "_metrics", None) is None:
+            self._metrics = CudaMetrics(
+                self.device, speculation=getattr(self, "_speculation", None)
+            )
+        elif not enabled:
+            self._metrics = None
+
+    def metrics_snapshot(self) -> RunnerMetrics:
+        """Read completed observations without waiting for outstanding GPU work."""
+
+        metrics = getattr(self, "_metrics", None)
+        return (
+            RunnerMetrics()
+            if metrics is None
+            else metrics.snapshot(getattr(self, "_speculation", None))
+        )
+
+    def _new_phase_timing(self, *categories: str) -> GraphPhaseTiming | None:
+        """Capture optional semantic markers when metrics precede graph capture."""
+
+        return (
+            GraphPhaseTiming(categories, device=self.device)
+            if getattr(self, "_metrics", None) is not None
+            else None
+        )
+
+    def _eager_phase_timing(self, *categories: str):
+        metrics = getattr(self, "_metrics", None)
+        return None if metrics is None else metrics.eager_phases(categories)
 
     def _configure_parallel_graphs(self, model, groups) -> None:
         """Coordinate capture catalogs and collectives across the execution mesh."""
@@ -214,9 +251,17 @@ class CudaRunner(Runner):
             operation = f"cuda_graph_select:{mode}"
             if agreement is not None:
                 operation += f":{agreement!r}"
-            records, errors = control.gather(
-                groups.domain, operation, record, error=validation_error
-            )
+            metrics = getattr(self, "_metrics", None)
+            timed = metrics is not None and groups.topology.attn_dp > 1
+            started = perf_counter() if timed else 0.0
+            try:
+                records, errors = control.gather(
+                    groups.domain, operation, record, error=validation_error
+                )
+            finally:
+                if timed:
+                    assert metrics is not None
+                    metrics.dp_sync.observe(perf_counter() - started)
         if any(error is not None for error in errors):
             raise ValueError("; ".join(error for error in errors if error is not None))
         if any(row[2] != len(required_shape) for row in records):
@@ -585,7 +630,16 @@ class CudaRunner(Runner):
     ):
         """Stage model-owned inputs and replay one selected physical shape."""
 
-        return self._require_cuda_graph_executor().mode(mode).run(shape, inputs)
+        metrics = getattr(self, "_metrics", None)
+        cache = self._require_cuda_graph_executor().mode(mode)
+        output = (
+            cache.run(shape, inputs, metrics=metrics)
+            if metrics is not None
+            else cache.run(shape, inputs)
+        )
+        if metrics is not None:
+            metrics.graph(mode)
+        return output
 
     def _cuda_graph_fallback(self, mode: str, reason: str) -> None:
         """Record a model-level reason that a configured mode ran eagerly."""

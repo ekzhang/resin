@@ -41,6 +41,7 @@ from resin.backend.cuda.graphs import (
     GraphShape,
     resolve_decode_graph_shapes,
 )
+from resin.backend.cuda.metrics import observe_execution
 from resin.backend.cuda.paged_kv import (
     DevicePagedAttentionBatch,
     PagedKvArena,
@@ -958,6 +959,7 @@ class GptOssCudaRunner(CudaRunner):
         self._last_graph_logits = self._graph_logits[shape][:rows]
         return format_output(self._last_graph_logits, output, plan)
 
+    @observe_execution
     def forward(self, plan: BatchPlan) -> ForwardOutput:
         if getattr(self, "parallel_groups", None) is not None:
             raise RuntimeError("explicit rank groups require forward_distributed")
@@ -1095,6 +1097,7 @@ class GptOssCudaRunner(CudaRunner):
             self._require_cuda_graph_executor().mode("decode").check_ready()
         return prepared
 
+    @observe_execution
     def forward_distributed(
         self,
         plan: BatchPlan | None,

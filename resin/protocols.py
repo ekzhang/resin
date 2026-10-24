@@ -20,6 +20,7 @@ if TYPE_CHECKING:
         ResourceBinding,
         RunnerConfig,
     )
+    from resin.backend.metrics import RunnerMetrics
 
 
 class MediaTokenSpan(NamedTuple):
@@ -117,11 +118,26 @@ class ManagedRunner(Runner, Protocol):
     def bind_resources(self, resources: ResourceBinding) -> None: ...
 
 
+class MetricsRunner(Protocol):
+    """Optional physical execution observations, independent of forward output.
+
+    The Engine enables collection before resource binding, so captured runtimes
+    can include timing boundaries. Snapshots contain cumulative observations and
+    must not synchronize the device or enter distributed collectives. Each read
+    returns independent data; the serving layer publishes it periodically.
+    """
+
+    def configure_metrics(self, *, enabled: bool = True) -> None: ...
+
+    def metrics_snapshot(self) -> RunnerMetrics: ...
+
+
 __all__ = [
     "FinalizingResponseParser",
     "ManagedRunner",
     "MediaInput",
     "MediaTokenSpan",
+    "MetricsRunner",
     "ResponseParser",
     "Runner",
     "RunnerCompletion",

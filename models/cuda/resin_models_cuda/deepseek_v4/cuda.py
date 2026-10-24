@@ -28,6 +28,7 @@ from resin.backend.cuda.graphs import (
     GraphShape,
     resolve_decode_graph_shapes,
 )
+from resin.backend.cuda.metrics import observe_execution
 from resin.backend.cuda.parallel import (
     FlashInferAllReduce,
     TensorParallelContext,
@@ -647,6 +648,7 @@ class DeepSeekV4CudaRunner(CudaRunner):
             else None
         )
         sampling = self._sampler.empty(batch_size, self.device)
+        phase_timing = self._new_phase_timing("draft", "target_verify", "decode")
         phase_events: tuple[torch.cuda.Event, ...] | None = None
         if self.profile_graph_phases:
             phase_events = tuple(
@@ -661,6 +663,8 @@ class DeepSeekV4CudaRunner(CudaRunner):
 
         def launch() -> None:
             with use_default_dtype(torch.bfloat16), torch.device(self.device):
+                if phase_timing is not None:
+                    phase_timing.mark(0)
                 if phase_events is not None:
                     phase_events[0].record()
                 # Expert dispatch counts flattened token rows. Draft and
@@ -673,6 +677,8 @@ class DeepSeekV4CudaRunner(CudaRunner):
                     drafts = self._broadcast_tokens(
                         self._model.draft(token_ids, positions, cache=cache)
                     )
+                if phase_timing is not None:
+                    phase_timing.mark(1)
                 if phase_events is not None:
                     phase_events[1].record()
                 verify_ids = torch.cat((token_ids, drafts), dim=1)
@@ -686,6 +692,8 @@ class DeepSeekV4CudaRunner(CudaRunner):
                         verify_ids, positions, graph_seq_len, cache=cache
                     )
                 logits_buffer.copy_(verify_logits)
+                if phase_timing is not None:
+                    phase_timing.mark(2)
                 if phase_events is not None:
                     phase_events[2].record()
                 if verify_hidden is None:
@@ -700,6 +708,8 @@ class DeepSeekV4CudaRunner(CudaRunner):
                     output_ids[:, block_size + index].copy_(
                         sample(verify_logits[:, index].contiguous(), index)
                     )
+                if phase_timing is not None:
+                    phase_timing.mark(3)
                 if phase_events is not None:
                     phase_events[3].record()
 
@@ -713,6 +723,7 @@ class DeepSeekV4CudaRunner(CudaRunner):
             output=output_ids,
             launch=launch,
             prepare=self._reset_model_state,
+            phase_timing=phase_timing,
         )
 
     @overload
@@ -966,9 +977,14 @@ class DeepSeekV4CudaRunner(CudaRunner):
         batch_size = plan.num_sequences
         anchors = token_ids.view(batch_size, 1)
         graph_seq_len = int(np.max(plan.positions)) + self.speculative_tokens + 1
+        phase_timing = self._eager_phase_timing("draft", "target_verify", "decode")
+        if phase_timing is not None:
+            phase_timing.mark(0)
         drafts = self._broadcast_tokens(
             self._model.draft(anchors, positions, cache=cache)
         )
+        if phase_timing is not None:
+            phase_timing.mark(1)
         verify_ids = torch.cat((anchors, drafts), dim=1)
         verify_logits, verify_hidden = self._model.forward_verify(
             verify_ids,
@@ -978,6 +994,8 @@ class DeepSeekV4CudaRunner(CudaRunner):
         )
         if verify_hidden is None:
             raise RuntimeError("target did not produce DSpark verification states")
+        if phase_timing is not None:
+            phase_timing.mark(2)
         self._model.commit_dspark_main_block(verify_hidden, positions, cache=cache)
 
         target_columns = [
@@ -990,8 +1008,11 @@ class DeepSeekV4CudaRunner(CudaRunner):
             positions,
             cache,
         )
+        if phase_timing is not None:
+            phase_timing.mark(3)
         return format_output(verify_logits, accepted, plan)
 
+    @observe_execution
     def enqueue(self, plan: BatchPlan, *, feedback=None):
         """Submit graph decode and keep exact continuation inputs on the GPU.
 
@@ -1019,6 +1040,7 @@ class DeepSeekV4CudaRunner(CudaRunner):
             )
         return self.forward(plan) if result is None else result
 
+    @observe_execution
     def enqueue_distributed(self, plan, context, *, prepared=None, feedback=None):
         """Generic asynchronous graph submission across composed rank meshes."""
         if context.phase != BatchPhase.DECODE or (
@@ -1072,6 +1094,7 @@ class DeepSeekV4CudaRunner(CudaRunner):
             )
         return self.forward_distributed(plan, context, prepared=prepared)
 
+    @observe_execution
     def forward(self, plan: BatchPlan) -> ForwardOutput:
         """Run one dynamically batched prefill or decode sampling step."""
 
@@ -1142,6 +1165,7 @@ class DeepSeekV4CudaRunner(CudaRunner):
             self._require_cuda_graph_executor().mode("decode").check_ready()
         return PreparedBatch(rows, cache_plan)
 
+    @observe_execution
     def forward_distributed(
         self,
         plan: BatchPlan | None,

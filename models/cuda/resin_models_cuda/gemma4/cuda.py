@@ -27,6 +27,7 @@ from resin.backend.cuda.graphs import (
     GraphShape,
     resolve_decode_graph_shapes,
 )
+from resin.backend.cuda.metrics import observe_execution
 from resin.backend.cuda.parallel import (
     TensorParallelContext,
     replicated_cache_capacity,
@@ -1044,7 +1045,11 @@ class Gemma4CudaRunner(CudaRunner):
         shared_local = (self._cache.local_keys[-1], self._cache.local_values[-1])
         shared_global = (self._cache.global_keys[-1], self._cache.global_values[-1])
 
+        phase_timing = self._new_phase_timing("draft", "target_verify", "decode")
+
         def launch() -> None:
+            if phase_timing is not None:
+                phase_timing.mark(0)
             last_ids = token_ids
             last_hidden = target_hidden
             draft_columns = []
@@ -1062,6 +1067,8 @@ class Gemma4CudaRunner(CudaRunner):
                 last_ids = draft_logits.argmax(dim=-1)
                 draft_columns.append(last_ids)
             drafts = torch.stack(draft_columns, dim=1)
+            if phase_timing is not None:
+                phase_timing.mark(1)
             verify_ids = torch.cat((token_ids[:, None], drafts), dim=1).reshape(-1)
             verify_positions = (
                 positions[:, None]
@@ -1082,6 +1089,8 @@ class Gemma4CudaRunner(CudaRunner):
             verify_logits = self._model.logits(hidden).view(
                 batch_size, width, self.config.vocab_size
             )
+            if phase_timing is not None:
+                phase_timing.mark(2)
             output_ids[:, : self.speculative_tokens].copy_(drafts)
             for index in range(width):
                 step_sampling = SamplingTensors(
@@ -1097,6 +1106,9 @@ class Gemma4CudaRunner(CudaRunner):
                         verify_logits[:, index].contiguous(), step_sampling
                     )
                 )
+
+            if phase_timing is not None:
+                phase_timing.mark(3)
 
         inputs = {
             "token_ids": token_ids,
@@ -1129,6 +1141,7 @@ class Gemma4CudaRunner(CudaRunner):
             inputs=inputs,
             output=output_ids,
             launch=launch,
+            phase_timing=phase_timing,
             validate_eager_output=False,
         )
 
@@ -1505,6 +1518,9 @@ class Gemma4CudaRunner(CudaRunner):
         target_hidden = torch.stack(
             [self._target_hidden[sequence_id] for sequence_id in sequence_ids]
         )
+        phase_timing = self._eager_phase_timing("draft", "target_verify", "decode")
+        if phase_timing is not None:
+            phase_timing.mark(0)
         last_ids = anchors
         last_hidden = target_hidden
         draft_columns = []
@@ -1525,6 +1541,8 @@ class Gemma4CudaRunner(CudaRunner):
             draft_columns.append(last_ids)
         drafts = torch.stack(draft_columns, dim=1)
 
+        if phase_timing is not None:
+            phase_timing.mark(1)
         verify = expand_gemma4_decode_batch(batch, drafts.cpu().numpy())
         verify_hidden = self._eager_transformer(native, verify)
         width = self.speculative_tokens + 1
@@ -1534,6 +1552,8 @@ class Gemma4CudaRunner(CudaRunner):
         verify_logits = self._model.logits(verify_hidden).view(
             native.num_sequences, width, self.config.vocab_size
         )
+        if phase_timing is not None:
+            phase_timing.mark(2)
         target_columns = [
             self._sample_target(verify_logits[:, index].contiguous(), native, index)
             for index in range(width)
@@ -1544,9 +1564,12 @@ class Gemma4CudaRunner(CudaRunner):
             torch.stack(target_columns, dim=1).tolist(),
             verify_hidden_rows,
         )
+        if phase_timing is not None:
+            phase_timing.mark(3)
         return format_output(verify_logits, accepted, native)
 
     @torch.inference_mode()
+    @observe_execution
     def forward(self, plan: BatchPlan) -> ForwardOutput:
         self._check_cuda_graphs(plan.phase)
         batch = build_gemma4_batch_plan(

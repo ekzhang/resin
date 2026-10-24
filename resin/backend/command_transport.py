@@ -19,9 +19,17 @@ class CommandTransport:
     while an earlier asynchronous forward is still using its own plan.
     """
 
-    _operations = ("bind", "release", "forward", "finish", "close")
-    _version = 2
-    _header_size = 12
+    _operations = (
+        "bind",
+        "release",
+        "forward",
+        "finish",
+        "close",
+        "metrics",
+        "metrics_snapshot",
+    )
+    _version = 3
+    _header_size = 13
 
     def __init__(self, distributed, group, *, source=0):
         self.distributed, self.group, self.source = distributed, group, source
@@ -56,6 +64,7 @@ class CommandTransport:
                 len(error),
                 0 if packet is None else packet.data.size,
                 0 if packet is None else len(packet.registrations),
+                int(command.get("metrics", False)),
             ],
             dtype=np.uint64,
         )
@@ -90,6 +99,7 @@ class CommandTransport:
             error_size,
             plan_size,
             registrations,
+            metrics,
         ) = map(int, header)
         if version != self._version or operation >= len(self._operations):
             raise ValueError("unsupported replica command format")
@@ -106,6 +116,7 @@ class CommandTransport:
             "phase": "decode" if phase else "prefill",
             "enqueue": bool(enqueue),
             "feedback": bool(feedback),
+            "metrics": bool(metrics),
             "cache_pool_id": cache_pool_id,
             "sizes": tuple(
                 map(tuple, details[: size_count * 2].reshape(-1, 2).tolist())
