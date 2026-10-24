@@ -15,9 +15,10 @@ from typing import Protocol
 import torch
 
 from resin import BatchPhase, BatchPlan, Engine, ForwardOutput, Runner, RunnerConfig
+from resin._resin import _HistogramAccumulator
 from resin.backend.command_transport import CommandTransport
 from resin.backend.control_plane import ControlOperation, ControlPlane
-from resin.backend.metrics import DpSyncMetrics, RunnerMetrics
+from resin.backend.metrics import RunnerMetrics
 from resin.backend.plan_transport import PlanTransport
 from resin.backend.topology import ParallelGroups, RankGroup
 
@@ -130,7 +131,7 @@ class DistributedWorker:
         self._step_id, self._phase = 0, None
         self._forward, self._validate, self._enqueue = None, None, None
         self._completion = None
-        self._metrics: DpSyncMetrics | None = None
+        self._metrics: _HistogramAccumulator | None = None
         self._control = ControlPlane(groups.distributed)
         self._plans = PlanTransport()
         self._wire = CommandTransport(
@@ -369,7 +370,7 @@ class DistributedWorker:
                 self._completion = None
             if operation == "metrics":
                 enabled = command["metrics"]
-                self._metrics = DpSyncMetrics() if enabled else None
+                self._metrics = _HistogramAccumulator() if enabled else None
                 configure = getattr(self.runner, "configure_metrics", None)
                 if configure is not None:
                     configure(enabled=enabled)

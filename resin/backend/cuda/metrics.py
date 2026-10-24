@@ -11,10 +11,10 @@ from typing import ParamSpec, TypeVar
 import torch
 
 from resin import BatchPhase
+from resin._resin import _HistogramAccumulator
 from resin.backend.metrics import (
     CUDA_GRAPH_MODES,
     FORWARD_CATEGORIES,
-    DpSyncMetrics,
     RunnerMetrics,
 )
 
@@ -149,7 +149,7 @@ class CudaMetrics:
         self.available: list[tuple[torch.cuda.Event, torch.cuda.Event]] = []
         self.seconds = dict.fromkeys(FORWARD_CATEGORIES, 0.0)
         self.graphs: Counter[str] = Counter(dict.fromkeys(CUDA_GRAPH_MODES, 0))
-        self.dp_attention_sync_wait_seconds = DpSyncMetrics()
+        self.dp_attention_sync_wait_seconds = _HistogramAccumulator()
         self._eager_phases: dict[tuple[str, ...], GraphPhaseTiming] = {}
         self._speculation_baseline = (
             (0, 0, 0)
