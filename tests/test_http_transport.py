@@ -31,6 +31,7 @@ def test_native_http_packets_encode_only_at_the_wire_boundary():
         "canceled": ["request-1"],
         "shutdown": True,
         "error": "failure",
+        "collect_metrics": False,
     }
     assert _HttpIngress().to_bytes() == b""
     assert not _HttpIngress.from_bytes(b"").shutdown
@@ -38,14 +39,13 @@ def test_native_http_packets_encode_only_at_the_wire_boundary():
         setattr(ingress, "shutdown", False)
 
     payload = [["request-1", {"type": "text_delta", "data": {"delta": "hello 🌎"}}]]
-    events = _HttpEvents.from_bytes(json.dumps(payload).encode())
+    events = _HttpEvents.from_bytes(json.dumps({"events": payload}).encode())
     assert isinstance(events.to_bytes(), bytes)
-    assert json.loads(events.to_bytes()) == payload
+    assert json.loads(events.to_bytes()) == {"events": payload, "metrics": []}
     assert _HttpEvents().to_bytes() == _HttpEvents.from_bytes(b"").to_bytes() == b""
-    assert (
-        json.loads(_HttpEvents.combine([events, _HttpEvents(), events]).to_bytes())
-        == payload * 2
-    )
+    assert json.loads(
+        _HttpEvents.combine([events, _HttpEvents(), events]).to_bytes()
+    ) == {"events": payload * 2, "metrics": []}
 
 
 @pytest.mark.parametrize(
@@ -56,7 +56,9 @@ def test_native_ingress_rejects_malformed_wire_packets(payload):
         _HttpIngress.from_bytes(payload)
 
 
-@pytest.mark.parametrize("payload", [b"invalid", b"{}", b'[["x",{"type":"unknown"}]]'])
+@pytest.mark.parametrize(
+    "payload", [b"invalid", b'{"events":42}', b'{"events":[["x",{"type":"unknown"}]]}']
+)
 def test_native_events_reject_malformed_wire_packets(payload):
     with pytest.raises(ValueError):
         _HttpEvents.from_bytes(payload)

@@ -218,6 +218,8 @@ pub(crate) struct Session {
     vocabulary: Vocabulary,
     active: HashMap<u64, ActiveRequest>,
     stream_interval: u32,
+    pub(crate) metrics: Option<resin_http::MetricsEndpoint>,
+    metrics_enabled: bool,
 }
 impl Session {
     pub fn new(
@@ -237,6 +239,7 @@ impl Session {
                 "the inference engine is closed or poisoned",
             ));
         }
+        let metrics_enabled = state.metrics_enabled();
         drop(state);
         let vocabulary = Vocabulary::from_recipe(py, &recipe)?;
         Ok(Self {
@@ -245,12 +248,17 @@ impl Session {
             vocabulary,
             active: HashMap::new(),
             stream_interval,
+            metrics: None,
+            metrics_enabled,
         })
     }
     pub fn active_count(&self) -> usize {
         self.active.len()
     }
     pub fn admit(&mut self, job: GenerationJob) {
+        if let Some(metrics) = &self.metrics {
+            metrics.observe_queue_time(job.enqueued_at.elapsed().as_secs_f64());
+        }
         admit(&self.engine, &self.recipe, job, &mut self.active);
     }
     pub fn cancel_disconnected(&mut self) -> Result<(), String> {
@@ -262,6 +270,8 @@ impl Session {
             &self.vocabulary,
             &mut self.active,
             self.stream_interval,
+            self.metrics.as_ref(),
+            self.metrics_enabled,
             tokens,
         )
     }
@@ -296,6 +306,8 @@ fn process(
     vocabulary: &Vocabulary,
     active: &mut HashMap<u64, ActiveRequest>,
     stream_interval: u32,
+    metrics: Option<&resin_http::MetricsEndpoint>,
+    metrics_enabled: bool,
     token_events: Vec<TokenEvent>,
 ) -> Result<(), String> {
     let mut grouped = HashMap::<u64, Vec<crate::TokenEvent>>::new();
@@ -316,8 +328,13 @@ fn process(
         let Some(request) = active.get_mut(&request_id) else {
             continue;
         };
-        if !tokens.is_empty() {
-            request.first_token_at.get_or_insert_with(Instant::now);
+        if !tokens.is_empty() && request.first_token_at.is_none() {
+            request.first_token_at = Some(Instant::now());
+            if let Some(metrics) = metrics {
+                metrics.observe_first_token(request.started.elapsed().as_secs_f64());
+            } else if metrics_enabled {
+                let _ = request.events.try_send(GenerationEvent::FirstToken);
+            }
         }
         let mut finished = tokens.is_empty().then_some(CompletionReason::Length);
         let mut scores = std::mem::take(&mut request.stream.scores);
@@ -439,6 +456,9 @@ fn process(
                 CompletionReason::Stop => FinishReason::Stop,
                 CompletionReason::Length => FinishReason::Length,
             };
+            if let Some(metrics) = metrics {
+                metrics.observe_completed(request.started.elapsed().as_secs_f64());
+            }
             let _ = request.events.try_send(GenerationEvent::Finished {
                 reason,
                 input_tokens: request.input_tokens,
@@ -594,7 +614,7 @@ fn admit(
                     prompt_logprobs: job.request.prompt_logprobs,
                     prompt_ids,
                     events: job.events,
-                    started: Instant::now(),
+                    started: job.enqueued_at,
                     first_token_at: None,
                     input_tokens,
                     cached_tokens,
@@ -674,6 +694,7 @@ impl NativeHttpSession {
             session.admit(GenerationJob {
                 request: request.clone(),
                 events,
+                enqueued_at: Instant::now(),
             });
         }
         session.cancel(&ingress.canceled)?;
@@ -721,7 +742,10 @@ impl NativeHttpSession {
             }
             !finished
         });
-        Ok(HttpEvents { events: output })
+        Ok(HttpEvents {
+            events: output,
+            ..HttpEvents::default()
+        })
     }
     fn close(&self) -> PyResult<()> {
         let mut inner = self.inner.lock().unwrap_or_else(|error| error.into_inner());

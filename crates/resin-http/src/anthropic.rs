@@ -353,7 +353,7 @@ fn messages_stream(
                     let wire_index = tool_indices.get(index).copied().unwrap_or(index);
                     yield named_event("content_block_delta", json!({"type": "content_block_delta", "index": wire_index, "delta": {"type": "input_json_delta", "partial_json": delta}}));
                 }
-                GenerationEvent::Logprobs(_) | GenerationEvent::PromptLogprobs(_) => {}
+                GenerationEvent::FirstToken | GenerationEvent::Logprobs(_) | GenerationEvent::PromptLogprobs(_) => {}
                 GenerationEvent::StopSequence(sequence) => { stop_sequence = Some(sequence); }
                 GenerationEvent::Finished { reason, output_tokens, .. } => {
                     terminated = true;

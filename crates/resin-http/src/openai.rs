@@ -292,7 +292,7 @@ fn chat_stream(
                     chunk["resin"] = json!({"generation_logprobs": tokens});
                     chunk
                 }
-                GenerationEvent::StopSequence(_) => continue,
+                GenerationEvent::FirstToken | GenerationEvent::StopSequence(_) => continue,
                 GenerationEvent::PromptLogprobs(tokens) => {
                     let mut chunk = chat_chunk(&request, created, json!({}), None);
                     chunk["resin"] = json!({"prompt_logprobs": tokens});
@@ -591,7 +591,7 @@ fn responses_stream(
                 GenerationEvent::Logprobs(tokens) => {
                     yield Ok(Event::default().data(event_json("resin.generation_logprobs.delta", sequence, json!({"logprobs": tokens})).to_string())); sequence += 1;
                 }
-                GenerationEvent::StopSequence(_) => continue,
+                GenerationEvent::FirstToken | GenerationEvent::StopSequence(_) => continue,
                 GenerationEvent::PromptLogprobs(tokens) => {
                     yield Ok(Event::default().data(event_json("resin.prompt_logprobs", sequence, json!({"logprobs": tokens})).to_string())); sequence += 1;
                 }

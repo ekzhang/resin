@@ -1,4 +1,5 @@
 mod anthropic;
+mod metrics;
 mod openai;
 mod protocol;
 mod ui;
@@ -9,7 +10,7 @@ use std::{
         Arc,
         atomic::{AtomicU64, Ordering},
     },
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use axum::{
@@ -20,6 +21,7 @@ use axum::{
 };
 use tokio::sync::{mpsc, oneshot};
 
+pub use metrics::{MetricsEndpoint, MetricsPublishError};
 pub use protocol::{
     ConversationRequest, FinishReason, GeneratedTokenLogprob, GenerationEvent, GenerationJob,
     TokenLogprob,
@@ -65,7 +67,11 @@ impl AppState {
         request: ConversationRequest,
     ) -> Result<mpsc::Receiver<GenerationEvent>, (StatusCode, &'static str)> {
         let (events, receiver) = mpsc::channel(EVENT_QUEUE_CAPACITY);
-        match self.jobs.try_send(GenerationJob { request, events }) {
+        match self.jobs.try_send(GenerationJob {
+            request,
+            events,
+            enqueued_at: Instant::now(),
+        }) {
             Ok(()) => Ok(receiver),
             Err(mpsc::error::TrySendError::Full(_)) => Err((
                 StatusCode::TOO_MANY_REQUESTS,
@@ -83,6 +89,7 @@ pub fn router(
     model: impl Into<Arc<str>>,
     jobs: mpsc::Sender<GenerationJob>,
     routes: RouteConfig,
+    metrics: Option<MetricsEndpoint>,
 ) -> Router {
     let state = AppState {
         jobs,
@@ -91,6 +98,15 @@ pub fn router(
         routed_dp_size: routes.routed_dp_size,
     };
     let mut router = Router::new().route("/health", get(openai::health));
+    if let Some(metrics) = metrics {
+        router = router.route(
+            "/metrics",
+            get(move || {
+                let metrics = metrics.clone();
+                async move { metrics.response() }
+            }),
+        );
+    }
     if routes.enable_demo {
         router = router.route("/", get(openai::index));
     }
@@ -113,8 +129,9 @@ pub async fn serve(
     model: impl Into<Arc<str>>,
     jobs: mpsc::Sender<GenerationJob>,
     routes: RouteConfig,
+    metrics: Option<MetricsEndpoint>,
 ) -> std::io::Result<()> {
-    serve_with_shutdown(listener, model, jobs, routes, async {
+    serve_with_shutdown(listener, model, jobs, routes, metrics, async {
         let _ = tokio::signal::ctrl_c().await;
     })
     .await
@@ -128,10 +145,11 @@ pub async fn serve_with_shutdown(
     model: impl Into<Arc<str>>,
     jobs: mpsc::Sender<GenerationJob>,
     routes: RouteConfig,
+    metrics: Option<MetricsEndpoint>,
     shutdown: impl Future<Output = ()>,
 ) -> std::io::Result<()> {
     let (stop, stopped) = oneshot::channel::<()>();
-    let server = axum::serve(listener, router(model, jobs, routes))
+    let server = axum::serve(listener, router(model, jobs, routes, metrics))
         .with_graceful_shutdown(async {
             let _ = stopped.await;
         })

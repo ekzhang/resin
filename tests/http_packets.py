@@ -10,4 +10,4 @@ def ingress(requests):
 
 
 def decoded_events(packet: _HttpEvents):
-    return json.loads(packet.to_bytes() or b"[]")
+    return json.loads(packet.to_bytes() or b'{"events":[]}')["events"]

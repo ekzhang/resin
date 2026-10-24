@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 import socket
 import threading
 import time
@@ -20,6 +21,7 @@ import torch.multiprocessing as mp
 import resin
 from resin import Parallelism, RunnerConfig
 from resin.backend.distributed import DistributedEngine, DistributedWorker
+from resin.backend.metrics import RunnerMetrics
 from resin.backend.sampling import format_output, prompt_scores
 from resin.backend.topology import ParallelGroups, ParallelismCapabilities
 from resin.server import HttpServer
@@ -57,12 +59,28 @@ class RankRunner:
         attn_dp=True, attn_tp=True, ep=True, expert_tp=True
     )
 
-    def __init__(self, groups, directory):
+    def __init__(self, groups, directory, case):
         self.groups = groups
         self.directory = directory
+        self.case = case
+        self.metrics_enabled = False
         self.calls = []
         self.released = []
         self.cancel_requests = set()
+
+    def configure_metrics(self, *, enabled=True):
+        self.metrics_enabled = enabled
+
+    def metrics_snapshot(self):
+        assert self.metrics_enabled
+        if self.case == "metrics_failure" and self.groups.rank == 2:
+            raise RuntimeError("injected metrics snapshot failure")
+        return RunnerMetrics(
+            # Synthetic rank-specific observations prove that physical ranks
+            # publish independently of logical request ownership.
+            forward_seconds={"decode": float(self.groups.rank + 1)},
+            cuda_graph_passes={"decode_none": len(self.calls)},
+        )
 
     def release(self, ids):
         self.released.extend(map(int, ids))
@@ -110,7 +128,7 @@ def _serve_rank(rank, world_size, directory, port, case):
         device_backend="gloo",
         timeout=timedelta(seconds=25),
     )
-    runner = RankRunner(groups, directory)
+    runner = RankRunner(groups, directory, case)
     worker = DistributedWorker(runner, groups)
     engine = None
     error = None
@@ -119,7 +137,11 @@ def _serve_rank(rank, world_size, directory, port, case):
             worker.serve()
         else:
             assert groups.drivers is not None
-            engine = DistributedEngine(worker, context_length=2048)
+            engine = DistributedEngine(
+                worker,
+                context_length=2048,
+                metrics=case in ("normal", "metrics_failure"),
+            )
             codec = RankCodec(rank, "normal")
             if case == "initialize" and groups.drivers.local_rank == 1:
                 # Native session initialization snapshots an optional tokenizer.
@@ -285,11 +307,47 @@ def _wait_ready(base, directory):
     raise AssertionError("distributed HTTP listener did not start")
 
 
+def _metric_rows(text, name):
+    return [
+        (dict(re.findall(r'(\w+)="([^"]*)"', line)), float(line.rsplit(" ", 1)[1]))
+        for line in text.splitlines()
+        if line.startswith(name + "{")
+    ]
+
+
+def _assert_distributed_metrics(base):
+    deadline = time.monotonic() + 10
+    while time.monotonic() < deadline:
+        with urllib.request.urlopen(f"{base}/metrics", timeout=1) as response:
+            text = response.read().decode()
+        requests = _metric_rows(text, "resin:num_requests_total")
+        if sum(value for _, value in requests) == 8:
+            break
+        time.sleep(0.05)
+    else:
+        raise AssertionError("distributed request metrics did not publish")
+    assert {int(labels["rank"]): value for labels, value in requests} == {0: 2, 2: 6}
+    assert {
+        int(labels["attn_dp_rank"]): value
+        for labels, value in _metric_rows(text, "resin:generation_tokens_total")
+    } == {0: 4, 1: 13}
+    assert {
+        int(labels["rank"]): value
+        for labels, value in _metric_rows(text, "resin:forward_execution_seconds_total")
+    } == {0: 1, 1: 2, 2: 3, 3: 4}
+    assert len(_metric_rows(text, "resin:cuda_graph_passes_total")) == 4
+    assert text.count("# HELP resin:forward_execution_seconds_total ") == 1
+    assert text.count("# TYPE resin:num_requests_total ") == 1
+    assert _metric_rows(text, "resin:http_time_to_first_token_seconds_count")[0][1] == 7
+    assert _metric_rows(text, "resin:http_request_latency_seconds_count")[0][1] == 8
+
+
 @pytest.mark.skipif(not dist.is_gloo_available(), reason="Gloo is required")
 @pytest.mark.parametrize(
     "case,world_size",
     [
         ("normal", 4),
+        ("metrics_failure", 4),
         ("fatal", 2),
         ("ingress_decode", 2),
         ("ingress_copy", 2),
@@ -387,6 +445,7 @@ def test_distributed_http_routes_real_replica_engines(tmp_path, case, world_size
                 _post(base, 1, content="bad-render")
             with _post(base, 0) as response:
                 assert json.load(response)["choices"][0]["message"]["content"] == "00"
+            _assert_distributed_metrics(base)
             # Drop a streaming client while rank one remains active.
             with _post(
                 base, 1, content="cancelme", stream=True, max_tokens=1000
@@ -398,6 +457,11 @@ def test_distributed_http_routes_real_replica_engines(tmp_path, case, world_size
                     "remote cancellation did not release its lease"
                 )
                 time.sleep(0.01)
+        elif case == "metrics_failure":
+            deadline = time.monotonic() + 30
+            while len(list(tmp_path.glob("rank-*.json"))) < world_size:
+                assert time.monotonic() < deadline, "metrics failure stranded a rank"
+                time.sleep(0.05)
     finally:
         Path(tmp_path, "stop").touch()
         deadline = time.monotonic() + 30
@@ -422,6 +486,17 @@ def test_distributed_http_routes_real_replica_engines(tmp_path, case, world_size
         assert all(record["calls"] for record in records)
         assert any(any(record["calls"]) for record in records)
         assert all(len(record["calls"]) < 1000 for record in records)
+    elif case == "metrics_failure":
+        assert all(
+            "injected metrics snapshot failure" in records[rank]["error"]
+            for rank in (0, 2)
+        )
+        assert all(records[rank]["error"] is None for rank in (1, 3))
+        assert all(
+            record["engine_closed"]
+            for record in records
+            if record["engine_closed"] is not None
+        )
     elif case == "bind":
         assert "bind" in records[0]["error"]
         assert records[1]["error"] is None

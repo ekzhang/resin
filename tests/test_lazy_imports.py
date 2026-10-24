@@ -37,6 +37,7 @@ class TestImport:
         cuda = optional_dependencies["cuda"]
         assert cuda == [
             "flashinfer-python>=0.6.15.post1; sys_platform == 'linux'",
+            "cuda-bindings>=13.3,<14; sys_platform == 'linux'",
         ]
         assert "gpu" not in optional_dependencies
 

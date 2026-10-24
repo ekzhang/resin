@@ -5,14 +5,14 @@ use std::{
         atomic::{AtomicBool, Ordering},
     },
     thread,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 use pyo3::{
     exceptions::{PyRuntimeError, PyValueError},
     prelude::*,
 };
-use resin_http::{GenerationJob, RouteConfig};
+use resin_http::{GenerationJob, MetricsEndpoint, RouteConfig};
 use tokio::sync::{mpsc, oneshot, watch};
 
 use crate::Engine;
@@ -208,6 +208,10 @@ fn run_server(
         .block_on(tokio::net::TcpListener::bind(address))
         .map_err(|error| format!("failed to bind {address}: {error}"))?;
     let (jobs, receiver) = mpsc::channel(request_queue_capacity as usize);
+    let metrics = Python::attach(|py| engine.bind(py).borrow().metrics_enabled())
+        .then(|| MetricsEndpoint::new(&model));
+    let actor_metrics = metrics.clone();
+    let actor_model = model.clone();
     let actor_shutdown = shutdown.subscribe();
     let (actor_finished, actor_done) = oneshot::channel();
     let actor = thread::Builder::new()
@@ -219,9 +223,18 @@ fn run_server(
                     receiver,
                     actor_shutdown,
                     routes.routed_dp_size,
+                    actor_metrics,
                 )
             } else {
-                engine_actor(engine, recipe, receiver, actor_shutdown, stream_interval)
+                engine_actor(
+                    engine,
+                    recipe,
+                    receiver,
+                    actor_shutdown,
+                    stream_interval,
+                    actor_metrics,
+                    &actor_model,
+                )
             };
             if let Err(error) = &result {
                 eprintln!("[resin-http] inference actor failed: {error}");
@@ -237,6 +250,7 @@ fn run_server(
         model,
         jobs,
         routes,
+        metrics,
         async move {
             if !*stopping.borrow() {
                 tokio::select! {
@@ -263,12 +277,34 @@ fn engine_actor(
     mut jobs: mpsc::Receiver<GenerationJob>,
     shutdown: watch::Receiver<bool>,
     stream_interval: u32,
+    metrics: Option<MetricsEndpoint>,
+    model: &str,
 ) -> Result<(), String> {
     let mut session =
         Python::attach(|py| Session::new(py, engine.clone_ref(py), recipe, stream_interval))
             .map_err(|error| format_python_error("HTTP session preparation failed", error))?;
+    session.metrics = metrics.clone();
+    let mut next_metrics = Instant::now();
     let mut disconnected = false;
     loop {
+        if let Some(endpoint) = &metrics {
+            endpoint.set_queue_size(jobs.len());
+            if Instant::now() >= next_metrics {
+                let text = Python::attach(|py| {
+                    engine
+                        .bind(py)
+                        .borrow_mut()
+                        .metrics_snapshot(py)?
+                        .expect("enabled metrics")
+                        .prometheus(py, model, 0, 0, true)
+                })
+                .map_err(|error| format_python_error("metrics collection failed", error))?;
+                endpoint
+                    .publish(vec![text])
+                    .map_err(|error| error.to_string())?;
+                next_metrics = Instant::now() + Duration::from_secs(1);
+            }
+        }
         for _ in 0..ADMISSIONS_PER_STEP {
             if disconnected || *shutdown.borrow() || session.active_count() >= MAX_ACTIVE_REQUESTS {
                 break;

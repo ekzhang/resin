@@ -98,6 +98,7 @@ class HttpServer:
                     enable_demo,
                     stream_interval,
                     request_queue_capacity,
+                    engine.local.metrics_enabled,
                 )
             )
             states = engine.worker._drivers(
@@ -128,7 +129,7 @@ class HttpServer:
             from resin.server.distributed import DistributedHttpCoordinator
 
             self._coordinator = DistributedHttpCoordinator(
-                engine, recipe, stream_interval=stream_interval
+                engine, recipe, model=model, stream_interval=stream_interval
             )
         self._native = None
         error = None

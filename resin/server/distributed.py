@@ -4,7 +4,12 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
-from resin._resin import _HttpEvents, _HttpIngress, _HttpSession
+from resin._resin import (
+    _HttpEvents,
+    _HttpIngress,
+    _HttpSession,
+    _runner_metrics_prometheus,
+)
 from resin.backend.distributed import DistributedExecutionError
 from resin.server.transport import HttpTransport
 
@@ -28,8 +33,10 @@ class DistributedHttpCoordinator:
         recipe: Recipe,
         *,
         stream_interval: int = 1,
+        model: str = "resin",
     ):
         self.engine = engine
+        self.model = model
         self.group = engine.worker._driver_group
         self._wire = HttpTransport(engine.worker)
         self.rank = self.group.local_rank
@@ -147,6 +154,30 @@ class DistributedHttpCoordinator:
         try:
             assert self.session is not None
             packet = self.session.process(events)
+            assert ingress is not None
+            if ingress.collect_metrics:
+                snapshot = self.engine.local.metrics_snapshot()
+                assert snapshot is not None
+                physical = self.engine.worker.collect_metrics()
+                packet = packet.with_metrics(
+                    [
+                        snapshot.prometheus(
+                            model_name=self.model,
+                            rank=self.engine.worker.groups.rank,
+                            attn_dp_rank=self.rank,
+                            include_runner=False,
+                        ),
+                        *(
+                            _runner_metrics_prometheus(
+                                observation,
+                                model_name=self.model,
+                                rank=rank,
+                                attn_dp_rank=self.rank,
+                            )
+                            for rank, observation in physical
+                        ),
+                    ]
+                )
             if not self.is_root:
                 payload = packet.to_bytes()
         except BaseException as exc:

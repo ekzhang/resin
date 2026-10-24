@@ -3,6 +3,7 @@ from typing import Any, Final, final
 from collections.abc import Mapping
 from typing import Literal
 from resin.recipe import Recipe
+from resin.backend.metrics import RunnerMetrics
 from resin.recipe import ContentBlock
 import numpy as np
 import numpy.typing as npt
@@ -249,6 +250,57 @@ class CacheGroupLayout:
         """
 
 @final
+class CacheGroupMetrics:
+    """
+    Physical usage for one runner-declared group in the unified cache pool.
+    Groups share slab capacity; they are not separate capacity partitions.
+    """
+    @property
+    def block_tokens(self, /) -> int: ...
+    @property
+    def blocks_per_slab(self, /) -> int: ...
+    @property
+    def cached_blocks(self, /) -> int:
+        """
+        Blocks held by cached prefixes, including those shared with requests.
+        """
+    @property
+    def free_blocks(self, /) -> int:
+        """
+        Unoccupied slots in slabs already bound to this group.
+        """
+    @property
+    def group(self, /) -> int: ...
+    @property
+    def occupied_blocks(self, /) -> int: ...
+    @property
+    def occupied_slabs(self, /) -> int: ...
+    @property
+    def occupied_tokens(self, /) -> int | None:
+        """
+        Block-rounded token capacity, or ``None`` for recurrent checkpoints.
+        """
+    @property
+    def pinned_blocks(self, /) -> int:
+        """
+        Blocks with outstanding device read or write leases.
+        """
+    @property
+    def pool(self, /) -> str:
+        """
+        ``kv``, ``swa``, or ``recurrent``.
+        """
+    @property
+    def reclaimable_blocks(self, /) -> int:
+        """
+        Blocks freed by evicting every cached prefix with requests unchanged.
+        """
+    @property
+    def reclaimable_slabs(self, /) -> int: ...
+    @property
+    def reclaimable_tokens(self, /) -> int | None: ...
+
+@final
 class CacheGroupPlan:
     """
     Plan for one type of cache in a BatchPlan.
@@ -400,6 +452,25 @@ class CacheLayout:
         """
 
 @final
+class CacheMetrics:
+    """
+    Shared physical cache capacity. Reclaimable slabs exclude live requests
+    and outstanding device access, including retired overlapped executions.
+    """
+    @property
+    def capacity_slabs(self, /) -> int: ...
+    @property
+    def free_slabs(self, /) -> int: ...
+    @property
+    def groups(self, /) -> list[CacheGroupMetrics]: ...
+    @property
+    def occupied_slabs(self, /) -> int: ...
+    @property
+    def prefix(self, /) -> PrefixCacheMetrics | None: ...
+    @property
+    def reclaimable_slabs(self, /) -> int: ...
+
+@final
 class CacheRetention:
     """
     Cache-block lifetime policy.
@@ -498,6 +569,7 @@ class Engine:
         scheduler_config: SchedulerConfig | None = None,
         prefix_cache: bool = False,
         overlap: bool = True,
+        metrics: bool = False,
     ) -> Engine: ...
     def __repr__(self, /) -> str: ...
     @property
@@ -525,6 +597,13 @@ class Engine:
     def has_work(self, /) -> bool: ...
     @property
     def max_running_requests(self, /) -> int: ...
+    @property
+    def metrics_enabled(self, /) -> bool: ...
+    def metrics_snapshot(self, /) -> EngineMetrics | None:
+        """
+        Collect native counters and optional nonblocking runner observations.
+        Call periodically: cache inventory requires a scan of allocated blocks.
+        """
     @property
     def new_token_ratio(self, /) -> float: ...
     def next_phase(self, /) -> BatchPhase | None:
@@ -570,6 +649,34 @@ class Engine:
         media: MediaInput | None = None,
         prompt_target_logprobs: Sequence[Sequence[int]] | None = None,
     ) -> RequestLease: ...
+
+@final
+class EngineMetrics:
+    """
+    An immutable logical-engine snapshot and optional physical-runner observations.
+    Reading this snapshot never synchronizes the accelerator. Cache inventory is
+    scanned, so collect periodically rather than once per token.
+    """
+    @property
+    def cache(self, /) -> CacheMetrics | None: ...
+    @property
+    def generation_throughput(self, /) -> float: ...
+    def prometheus(
+        self,
+        /,
+        *,
+        model_name: str,
+        rank: int = 0,
+        attn_dp_rank: int = 0,
+        include_runner: bool = True,
+    ) -> str:
+        """
+        Encode one engine's cumulative observations in Prometheus text format.
+        """
+    @property
+    def requests(self, /) -> RequestMetrics: ...
+    @property
+    def runner(self, /) -> RunnerMetrics | None: ...
 
 @final
 class ForwardOutput:
@@ -697,6 +804,20 @@ class GptOssRecipe(_NativeRecipe):
         options: RenderOptions | None = None,
         media_config: Any | None = None,
     ) -> GptOssRecipe: ...
+
+@final
+class Histogram:
+    """
+    Cumulative finite buckets, observation count, and sum. `count` is the +Inf bucket.
+    """
+    @property
+    def bounds(self, /) -> list[float]: ...
+    @property
+    def count(self, /) -> int: ...
+    @property
+    def counts(self, /) -> list[int]: ...
+    @property
+    def sum(self, /) -> float: ...
 
 @final
 class Image:
@@ -853,6 +974,25 @@ class ParserEvent:
     def token_spans(self, /) -> tuple[TokenSpan, ...]: ...
     @property
     def type(self, /) -> str: ...
+
+@final
+class PrefixCacheMetrics:
+    """
+    Prefix LRU statistics. Reclaimed counters measure physical frees during
+    eviction; removing a shared ancestor or a live request's prefix can free zero.
+    """
+    @property
+    def entries(self, /) -> int: ...
+    @property
+    def evictions(self, /) -> int: ...
+    @property
+    def hits(self, /) -> int: ...
+    @property
+    def misses(self, /) -> int: ...
+    @property
+    def reclaimed_blocks(self, /) -> int: ...
+    @property
+    def reclaimed_slabs(self, /) -> int: ...
 
 @final
 class Qwen35Media:
@@ -1047,6 +1187,59 @@ class RequestLease:
         """
         Consume the completed token buffer exactly once.
         """
+
+@final
+class RequestMetrics:
+    """
+    Cumulative request observations and current scheduler state for one engine.
+
+    Completed-request totals exclude cancellations. Live token counters include
+    all committed work; prefill compute includes replay after retraction.
+    """
+    @property
+    def aborted_requests(self, /) -> int: ...
+    @property
+    def accepted_requests(self, /) -> int: ...
+    @property
+    def cached_tokens(self, /) -> int: ...
+    @property
+    def completed_requests(self, /) -> int: ...
+    @property
+    def decode_tokens(self, /) -> int: ...
+    @property
+    def e2e_request_latency_seconds(self, /) -> Histogram: ...
+    @property
+    def elapsed_seconds(self, /) -> float: ...
+    @property
+    def generation_tokens(self, /) -> int: ...
+    @property
+    def generation_tokens_histogram(self, /) -> Histogram: ...
+    @property
+    def inter_token_latency_seconds(self, /) -> Histogram: ...
+    @property
+    def prefill_cache_tokens(self, /) -> int: ...
+    @property
+    def prefill_compute_tokens(self, /) -> int: ...
+    @property
+    def prompt_tokens(self, /) -> int: ...
+    @property
+    def prompt_tokens_histogram(self, /) -> Histogram: ...
+    @property
+    def queue_time_seconds(self, /) -> Histogram: ...
+    @property
+    def request_time_per_output_token_seconds(self, /) -> Histogram: ...
+    @property
+    def retracted_requests(self, /) -> int: ...
+    @property
+    def running_requests(self, /) -> int: ...
+    @property
+    def scheduler_idle_seconds(self, /) -> float: ...
+    @property
+    def time_to_first_token_seconds(self, /) -> Histogram: ...
+    @property
+    def uncached_prompt_tokens_histogram(self, /) -> Histogram: ...
+    @property
+    def waiting_requests(self, /) -> int: ...
 
 @final
 class ResourceBinding:
@@ -1336,6 +1529,7 @@ class _HttpEvents:
     @staticmethod
     def from_bytes(data: bytes) -> _HttpEvents: ...
     def to_bytes(self, /) -> bytes: ...
+    def with_metrics(self, /, snapshots: Sequence[str]) -> _HttpEvents: ...
 
 @final
 class _HttpIngress:
@@ -1344,6 +1538,8 @@ class _HttpIngress:
     between ranks encodes it; JSON never becomes a Python object graph.
     """
     def __new__(cls, /, *, shutdown: bool = False) -> _HttpIngress: ...
+    @property
+    def collect_metrics(self, /) -> bool: ...
     @property
     def error(self, /) -> str | None: ...
     @staticmethod
@@ -1437,4 +1633,11 @@ def _media_from_buffers(
 def _media_to_buffers(
     media: MediaInput,
 ) -> tuple[bytes, tuple[npt.NDArray[Any], ...]]: ...
+def _runner_metrics_prometheus(
+    snapshot: RunnerMetrics, *, model_name: str, rank: int, attn_dp_rank: int
+) -> str:
+    """
+    Encode physical-rank observations separately from logical request ownership.
+    """
+
 def image_token_types(height: int, width: int) -> tuple[int, ...]: ...

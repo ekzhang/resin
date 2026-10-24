@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::{collections::BTreeMap, time::Instant};
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -61,6 +61,9 @@ impl FinishReason {
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(tag = "type", content = "data", rename_all = "snake_case")]
 pub enum GenerationEvent {
+    /// Internal observation of the first raw output token, before stream
+    /// coalescing and parser buffering. HTTP protocol adapters omit this event.
+    FirstToken,
     Started {
         input_tokens: usize,
     },
@@ -121,6 +124,8 @@ pub struct GeneratedTokenLogprob {
 pub struct GenerationJob {
     pub request: ConversationRequest,
     pub events: mpsc::Sender<GenerationEvent>,
+    /// Frontend queue admission, before recipe rendering and engine submission.
+    pub enqueued_at: Instant,
 }
 
 #[derive(Debug, Default)]
@@ -206,7 +211,7 @@ impl ResponseAccumulator {
                 self.generation_elapsed_ms = *generation_elapsed_ms;
                 self.time_to_first_token_ms = *time_to_first_token_ms;
             }
-            GenerationEvent::Error { .. } => {}
+            GenerationEvent::FirstToken | GenerationEvent::Error { .. } => {}
         }
     }
 }

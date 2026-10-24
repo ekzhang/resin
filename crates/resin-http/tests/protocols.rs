@@ -18,6 +18,7 @@ fn test_router() -> axum::Router {
             let _ = job
                 .events
                 .try_send(GenerationEvent::Started { input_tokens: 3 });
+            let _ = job.events.try_send(GenerationEvent::FirstToken);
             let _ = job
                 .events
                 .try_send(GenerationEvent::ReasoningDelta("brief thought".to_owned()));
@@ -36,7 +37,7 @@ fn test_router() -> axum::Router {
             });
         }
     });
-    router("test-model", jobs, RouteConfig::default())
+    router("test-model", jobs, RouteConfig::default(), None)
 }
 
 fn tool_router() -> axum::Router {
@@ -46,6 +47,7 @@ fn tool_router() -> axum::Router {
             let _ = job
                 .events
                 .try_send(GenerationEvent::Started { input_tokens: 7 });
+            let _ = job.events.try_send(GenerationEvent::FirstToken);
             let _ = job
                 .events
                 .try_send(GenerationEvent::ReasoningDelta("check weather".to_owned()));
@@ -71,7 +73,7 @@ fn tool_router() -> axum::Router {
             });
         }
     });
-    router("test-model", jobs, RouteConfig::default())
+    router("test-model", jobs, RouteConfig::default(), None)
 }
 
 async fn json_response(app: axum::Router, request: Request<Body>) -> (StatusCode, Value) {
@@ -137,7 +139,7 @@ fn scored_router() -> axum::Router {
             }
         }
     });
-    router("test-model", jobs, RouteConfig::default())
+    router("test-model", jobs, RouteConfig::default(), None)
 }
 
 fn scored_request(path: &str, stream: bool) -> Request<Body> {
@@ -366,6 +368,7 @@ fn recording_router(ranks: usize) -> axum::Router {
             routed_dp_size: ranks,
             ..RouteConfig::default()
         },
+        None,
     )
 }
 
@@ -578,6 +581,7 @@ async fn route_flags_remove_disabled_apis_and_demo() {
             enable_demo: false,
             ..RouteConfig::default()
         },
+        None,
     );
     for path in ["/", "/v1/models", "/v1/chat/completions", "/v1/messages"] {
         let response = app
@@ -715,7 +719,7 @@ fn generation_request(path: &str, stream: bool) -> Request<Body> {
 async fn full_admission_queue_rejects_each_api_without_waiting() {
     for path in ["/v1/chat/completions", "/v1/responses", "/v1/messages"] {
         let (jobs, receiver) = mpsc::channel(1);
-        let app = router("test-model", jobs, RouteConfig::default());
+        let app = router("test-model", jobs, RouteConfig::default(), None);
         let first = app
             .clone()
             .oneshot(generation_request(path, true))
@@ -742,7 +746,7 @@ async fn full_admission_queue_rejects_each_api_without_waiting() {
 #[tokio::test]
 async fn stopped_actor_fails_health_and_generation_admission() {
     let (jobs, receiver) = mpsc::channel(1);
-    let app = router("test-model", jobs, RouteConfig::default());
+    let app = router("test-model", jobs, RouteConfig::default(), None);
     drop(receiver);
     let (status, _) = json_response(
         app.clone(),
@@ -757,7 +761,7 @@ async fn stopped_actor_fails_health_and_generation_admission() {
 #[tokio::test]
 async fn slow_stream_has_a_bounded_queue_and_does_not_block_another_response() {
     let (jobs, mut receiver) = mpsc::channel(2);
-    let app = router("test-model", jobs, RouteConfig::default());
+    let app = router("test-model", jobs, RouteConfig::default(), None);
     let slow = app
         .clone()
         .oneshot(generation_request("/v1/chat/completions", true))
@@ -824,7 +828,7 @@ async fn failed_requests_never_return_partial_success() {
         for streaming in [false, true] {
             for explicit_error in [false, true] {
                 let (jobs, mut receiver) = mpsc::channel(1);
-                let app = router("test-model", jobs, RouteConfig::default());
+                let app = router("test-model", jobs, RouteConfig::default(), None);
                 let pending = tokio::spawn(app.oneshot(generation_request(path, streaming)));
                 let job = receiver.recv().await.unwrap();
                 job.events
@@ -889,6 +893,7 @@ async fn programmatic_shutdown_closes_the_listener() {
         "test-model",
         jobs,
         RouteConfig::default(),
+        None,
         async {
             let _ = stopped.await;
         },

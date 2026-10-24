@@ -15,6 +15,7 @@ use pyo3::types::{PyDict, PyTuple};
 
 mod arrays;
 mod cache;
+mod cache_metrics;
 mod http;
 mod http_distributed;
 mod http_logprobs;
@@ -23,6 +24,8 @@ mod http_session;
 mod http_stop;
 mod media_payload;
 mod media_preprocess;
+mod metrics;
+mod metrics_types;
 mod output;
 mod parallelism;
 mod planning;
@@ -1227,6 +1230,8 @@ struct Engine {
     failed_executions: Vec<Py<PyAny>>,
     overlap_enqueues: u64,
     overlap_continuations: u64,
+    runner_metrics: Option<Py<PyAny>>,
+    metrics_sample: (std::time::Instant, u64, f64),
 }
 
 struct PendingExecution {
@@ -1509,7 +1514,7 @@ impl Engine {
 #[pymethods]
 impl Engine {
     #[new]
-    #[pyo3(signature = (runner, *, max_running_requests = 32, context_length = 32768, scheduler_config = None, prefix_cache = false, overlap = true))]
+    #[pyo3(signature = (runner, *, max_running_requests = 32, context_length = 32768, scheduler_config = None, prefix_cache = false, overlap = true, metrics = false))]
     #[allow(
         clippy::too_many_arguments,
         reason = "Python constructor exposes keyword configuration"
@@ -1522,6 +1527,7 @@ impl Engine {
         scheduler_config: Option<Py<SchedulerConfig>>,
         prefix_cache: bool,
         overlap: bool,
+        metrics: bool,
     ) -> PyResult<Self> {
         let runner_enqueue = optional_runner_callable(py, runner.bind(py), "enqueue")?;
         let (runner_forward, runner_release) = resolve_runner_contract(py, runner.bind(py))?;
@@ -1531,7 +1537,7 @@ impl Engine {
             .as_ref()
             .map(|config| *config.borrow(py))
             .unwrap_or_default();
-        let core = core::EngineCore::new(
+        let mut core = core::EngineCore::new(
             core::RunnerConfig {
                 max_batch_tokens: config.max_batch_tokens,
                 prefill_chunk_size: config.prefill_chunk_size,
@@ -1552,6 +1558,19 @@ impl Engine {
             prefix_cache,
         )
         .map_err(core_error)?;
+        let runner_metrics = if metrics {
+            core.enable_metrics().map_err(core_error)?;
+            if let Some(configure) =
+                optional_runner_callable(py, runner.bind(py), "configure_metrics")?
+            {
+                let kwargs = PyDict::new(py);
+                kwargs.set_item("enabled", true)?;
+                configure.bind(py).call((), Some(&kwargs))?;
+            }
+            optional_runner_callable(py, runner.bind(py), "metrics_snapshot")?
+        } else {
+            None
+        };
         let runner_config = bind_runner_resources(py, resolved, core.cache_pool_id())?;
         Ok(Self {
             core,
@@ -1565,6 +1584,8 @@ impl Engine {
             failed_executions: Vec::new(),
             overlap_enqueues: 0,
             overlap_continuations: 0,
+            runner_metrics,
+            metrics_sample: (std::time::Instant::now(), 0, 0.0),
         })
     }
     #[pyo3(signature = (
@@ -1674,6 +1695,37 @@ impl Engine {
         let mut events = std::mem::take(&mut self.deferred_events);
         events.append(&mut current);
         Ok(events)
+    }
+
+    /// Collect native counters and optional nonblocking runner observations.
+    /// Call periodically: cache inventory requires a scan of allocated blocks.
+    fn metrics_snapshot(&mut self, py: Python<'_>) -> PyResult<Option<metrics::EngineMetrics>> {
+        let Some(requests) = self.core.metrics_snapshot() else {
+            return Ok(None);
+        };
+        let elapsed = self.metrics_sample.0.elapsed().as_secs_f64();
+        if elapsed >= 1.0 {
+            self.metrics_sample = (
+                std::time::Instant::now(),
+                requests.decode_tokens,
+                (requests.decode_tokens - self.metrics_sample.1) as f64 / elapsed,
+            );
+        }
+        Ok(Some(metrics::EngineMetrics {
+            generation_throughput: self.metrics_sample.2,
+            requests: requests.into(),
+            cache: self.core.cache_metrics().map(Into::into),
+            runner: self
+                .runner_metrics
+                .as_ref()
+                .map(|hook| hook.bind(py).call0().map(Bound::unbind))
+                .transpose()?,
+        }))
+    }
+
+    #[getter]
+    fn metrics_enabled(&self) -> bool {
+        self.core.metrics_enabled()
     }
 
     #[getter]
@@ -1980,6 +2032,13 @@ mod _resin {
         CacheRetention, Engine, ForwardOutput, Parallelism, RequestLease, ResourceBinding,
         RunnerConfig, SamplingParams, SchedulerConfig, TokenEvent, TokenLogprobs,
     };
+
+    #[pymodule_export]
+    use crate::cache_metrics::{CacheGroupMetrics, CacheMetrics, PrefixCacheMetrics};
+    #[pymodule_export]
+    use crate::metrics::{_runner_metrics_prometheus, EngineMetrics};
+    #[pymodule_export]
+    use crate::metrics_types::{Histogram, RequestMetrics};
 
     #[pymodule_export]
     use crate::http::NativeHttpServer;

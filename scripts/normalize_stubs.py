@@ -28,6 +28,7 @@ OUTPUT_COLUMNS = {
 
 PARAMETERS = {
     ("", "_media_to_buffers"): {"media": "MediaInput"},
+    ("", "_runner_metrics_prometheus"): {"snapshot": "RunnerMetrics"},
     ("", "_media_from_buffers"): {"buffers": "Sequence[npt.NDArray[Any]]"},
     ("Message", "__new__"): {"content": "Sequence[ContentBlock]"},
     ("RenderOptions", "__new__"): {"reasoning_effort": "str | int | float | None"},
@@ -82,6 +83,7 @@ PARAMETERS = {
 }
 
 RETURNS = {
+    ("EngineMetrics", "runner"): "RunnerMetrics | None",
     ("SamplingParams", "stop_token_ids"): "tuple[int, ...]",
     ("", "_media_to_buffers"): "tuple[bytes, tuple[npt.NDArray[Any], ...]]",
     ("", "_media_from_buffers"): "MediaInput",
@@ -309,6 +311,7 @@ def import_edits(
         ("collections.abc", "Mapping"),
         ("typing", "Literal"),
         ("resin.recipe", "Recipe"),
+        ("resin.backend.metrics", "RunnerMetrics"),
         ("resin.recipe", "ContentBlock"),
     ):
         if (module, name) not in existing_imports:
