@@ -74,6 +74,14 @@ packages. Then use the following skills:
 
 Importing `resin` does not import PyTorch or initialize CUDA.
 
+Model runners are not tied to CUDA. `resin_models_mlx` runs
+[Qwen3.5-MoE models such as Ornith](models/mlx/resin_models_mlx/qwen3_5_moe/README.md)
+on Apple Silicon with MLX, on the same Rust Engine:
+
+```bash
+uv run scripts/serve.py --model ornith-1.0-35b --checkpoint ~/models/Ornith-1.0-35B
+```
+
 ## Installation
 
 Install the core library directly from GitHub with Python 3.11+ and Rust installed:

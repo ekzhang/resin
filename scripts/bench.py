@@ -347,15 +347,16 @@ def _rank(
             for axis in ("world_size", "attn_dp", "attn_tp", "cp", "ep")
         },
         "graphs": (
-            None
+            {"prefill": "disabled", "decode": "disabled"}
             if apple
             else {
                 "prefill": options["prefill_graph"],
                 "decode": options["decode_graph"],
             }
         ),
-        "quant": "checkpoint",
-        "expert_backend": options["expert_backend"],
+        # The MLX runner quantizes BF16 checkpoints at load with gather_qmm experts.
+        "quant": "mlx-int8-g64" if apple else "checkpoint",
+        "expert_backend": "mlx-gather-qmm" if apple else options["expert_backend"],
         "load_seconds": loaded_seconds,
         "capture_seconds": capture_seconds,
         "profile_graph_phases": options.get("profile_graph_phases", False),
@@ -1100,6 +1101,11 @@ def main(argv=None) -> None:
         options.update(
             trace_dir=None if local_trace_dir is None else str(local_trace_dir),
             assistant_checkpoint=args.assistant_checkpoint,
+        )
+        # A local directory is only known to be the pinned revision when it is
+        # the registry's own checkpoint path.
+        options["metadata"]["checkpoint_revision"] = (
+            spec.revision if Path(checkpoint) == spec.path else "local"
         )
         records = run_benchmark(
             spec.name, checkpoint, cases, parallelism=topology, **options

@@ -172,7 +172,10 @@ def test_local_prefill_trace_uses_fresh_run_directory_and_appends_results(
         assert model == "gpt-oss-20b" and path == checkpoint
         assert parallelism.world_size == 1
         assert {case["phase"] for case in cases} == {"prefill"}
-        assert options["metadata"] == {"git_commit": "fixture"}
+        assert options["metadata"] == {
+            "git_commit": "fixture",
+            "checkpoint_revision": "local",
+        }
         seen.update(options)
         return [{"phase": "prefill", "input_tokens": 8192}]
 

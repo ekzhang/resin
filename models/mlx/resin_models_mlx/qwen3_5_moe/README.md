@@ -69,6 +69,45 @@ chunk and uses MLX's fused causal attention.
 - the paged kernel against gathered attention, including NaN-poisoned padding;
 - sampler filtering against `TorchSampler`, and row-stable seeded draws.
 
+## Results on an M4 Max (128 GB)
+
+October 26, 2026, mlx 0.32.4 and mlx-lm 0.32.2, Ornith-1.0-35B at the pinned
+revision. Loading the BF16 checkpoint and quantizing it takes 7–12 s and leaves
+about 50 GiB resident. Measurements come from `scripts/bench.py` with 5 warmup
+and 20 measured steps. Laptop thermals and other applications move individual
+points by roughly ±15%.
+
+| Decode, 8K context | 1 | 2 | 4 | 8 | 16 |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Output tokens/s | 54.6 | 87.4 | 123.3 | 147.4 | 148.2 |
+| Tokens/s per request | 54.6 | 43.7 | 30.8 | 18.4 | 9.3 |
+
+| Prefill, one request | 4K | 8K | 16K | 32K |
+| --- | ---: | ---: | ---: | ---: |
+| Input tokens/s | 1,402 | 1,141 | 921 | 808 |
+
+Against mlx-lm's own model and cache on identical 8-bit weights (8K context,
+distinct requests per row), decode steps are 12–18% slower at batch 1–4
+(18.3 vs 16.3 ms, 32.5 vs 27.5 ms) and about 15% faster at batch 16 (108 vs
+127 ms). Prefill is about 3× faster; full-model greedy parity below shows
+it does the same computation. At batch 8 and above, decode is bounded by
+reading the experts routed to by different requests: 16 rows touch about 100 of
+256 experts per layer.
+
+- **Parity.** On three chat prompts, 64-token greedy continuations match mlx-lm
+  exactly for two. The third diverges at token 42 on a one-ulp BF16 tie
+  (top logits 28.625 and 28.5). Per-layer hidden states agree to one ulp after
+  the first layer and drift smoothly to 2% of their scale by the last.
+- **Serving.** `scripts/check_server.py` passes chat, logprobs, concurrency,
+  stress, robustness and recovery. A repeated 5,243-token prompt reuses 4,096
+  cached tokens, and first-request TTFT shows no compilation spike up to 16K.
+  On 100 seeded MMLU questions (`cais/mmlu` `c30699e`, 50 subjects × 2), the
+  model answers 89 correctly with an 8,192-token reasoning budget; 4 answers
+  are truncated by that budget.
+- **Compilation.** After warmup, unseen context lengths (77 to 9,001 tokens) and
+  sampling settings add no Metal compiler time, measured from
+  `MTLCompilerService` CPU time. A control of 20 new kernels adds 0.57 s.
+
 ## Limitations
 
 - The published Ornith checkpoints declare one MTP layer but ship no MTP
