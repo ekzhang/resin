@@ -17,6 +17,7 @@ same partial events across chunk schedules, matching each format's contract.
 | GPT-OSS | Harmony | Harmony; TML secondary |
 | Inkling | pinned HF Jinja | generated schema values; TML v0 secondary |
 | Qwen3.5/3.8 | pinned HF Jinja | generated schema values; TML secondary |
+| Ornith | pinned HF Jinja | generated schema values; TML secondary |
 | Gemma4 | pinned HF Jinja | HF argument macro plus semantic round trip |
 | LFM2.5 | pinned HF Jinja | Python literal AST |
 

@@ -233,7 +233,8 @@ fn render_fixture(request: &serde_json::Value) -> Result<resin_recipe::Prompt, E
     }
     match variant.as_deref() {
         Some("qwen3_5") => Qwen35Recipe::default().render(&request),
+        Some("qwen3_8") | None => Qwen38Recipe::default().render(&request),
         Some("ornith") => OrnithRecipe::default().render(&request),
-        _ => Qwen38Recipe::default().render(&request),
+        Some(other) => panic!("unknown recipe_variant {other:?}"),
     }
 }

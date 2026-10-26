@@ -34,6 +34,9 @@ MARKERS = (
 
 
 class QwenAdapter:
+    # Native recipe and pinned prompt template exercised by this adapter.
+    variant = "qwen3_8"
+
     def __init__(self):
         vocab = {char: index for index, char in enumerate(sorted(ByteLevel.alphabet()))}
         self.ordinary = HFTokenizer(BPE(vocab, []))
@@ -42,7 +45,7 @@ class QwenAdapter:
         backend = HFTokenizer.from_str(self.ordinary.to_str())
         backend.add_special_tokens(list(MARKERS))
         self.ids = {marker: backend.token_to_id(marker) for marker in MARKERS}
-        self.recipe = get_native_recipe("qwen3_8", backend)
+        self.recipe = get_native_recipe(self.variant, backend)
         self.reference = renderers.Qwen35()
         _, self.reference_parser = self.reference.render_for_completion(
             chat.OpenAIMessage.from_oss_messages([{"role": "user", "content": "hi"}])
@@ -56,7 +59,7 @@ class QwenAdapter:
             variant: _compile_jinja_template(
                 (directory / f"{variant}.jinja").read_text()
             )
-            for variant in ("qwen3_5", "qwen3_8")
+            for variant in ("qwen3_5", "qwen3_8", "ornith")
         }
 
     @staticmethod
@@ -212,8 +215,14 @@ class QwenAdapter:
 
     def prompt_oracle(self, request):
         options = request.get("extra", {})
-        variant = options.get("recipe_variant", "qwen3_8")
+        variant = options.get("recipe_variant", self.variant)
         context = {key: value for key, value in request.items() if key != "extra"}
         context.update(options)
         context.setdefault("add_generation_prompt", True)
         return self.templates[variant].render(**context)
+
+
+class OrnithAdapter(QwenAdapter):
+    """Ornith's Qwen3.5 template: preserved reasoning and JSON tool arguments."""
+
+    variant = "ornith"
