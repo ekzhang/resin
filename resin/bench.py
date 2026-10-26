@@ -103,6 +103,8 @@ def perfetto_trace(
     metadata: dict | None = None,
     *,
     decode_passes: int = 2,
+    synchronize: Callable[[], None] | None = None,
+    cuda: bool = True,
 ):
     """Capture two untimed prefill cohorts or ``decode_passes`` completions.
 
@@ -114,6 +116,8 @@ def perfetto_trace(
     Use three decode completions for an overlapping Engine: one may harvest
     already-completed work submitted before the profiler started. This captures
     at least two fresh forwards while preserving the normal overlap path.
+    Pass ``cuda=False`` and the device's ``synchronize`` for non-CUDA runners;
+    their traces then contain host spans only.
     """
     if type(decode_passes) is not int or decode_passes < 1:
         raise ValueError("decode_passes must be a positive integer")
@@ -121,6 +125,11 @@ def perfetto_trace(
 
     directory = Path(directory)
     directory.mkdir(parents=True, exist_ok=True)
+    if synchronize is None:
+        synchronize = torch.cuda.synchronize
+    activities = [torch.profiler.ProfilerActivity.CPU]
+    if cuda:
+        activities.append(torch.profiler.ProfilerActivity.CUDA)
 
     def trace(case, run_pass):
         name = f"{case.phase}-ctx{case.context_length}-b{case.batch_size}-rank{rank:03}"
@@ -134,13 +143,8 @@ def perfetto_trace(
             "trace_unit": unit,
             "host_scope_policy": "untimed-perfetto-callbacks-only",
         }
-        torch.cuda.synchronize()
-        with torch.profiler.profile(
-            activities=[
-                torch.profiler.ProfilerActivity.CPU,
-                torch.profiler.ProfilerActivity.CUDA,
-            ],
-        ) as profiler:
+        synchronize()
+        with torch.profiler.profile(activities=activities) as profiler:
             profiler.add_metadata("resin_rank", str(rank))
             profiler.add_metadata(
                 "resin_timing", f"{passes} untimed {unit} after measurement"
@@ -153,7 +157,7 @@ def perfetto_trace(
                             run_pass()
                     finally:
                         _TRACE_HOST_SCOPES.reset(token)
-                torch.cuda.synchronize()
+                synchronize()
         with tempfile.TemporaryDirectory(prefix="resin-bench-trace-") as staging:
             raw = Path(staging) / f"{name}.json"
             profiler.export_chrome_trace(str(raw))
@@ -170,7 +174,7 @@ def perfetto_trace(
             f"[bench-trace] rank={rank} case={name} CUDA kernel events={kernels}",
             flush=True,
         )
-        if not kernels:
+        if cuda and not kernels:
             raise RuntimeError(f"{case.phase} trace contains no CUDA kernel activity")
 
     # run_sweep reserves the advertised count, including custom trace lengths.

@@ -64,6 +64,7 @@ class ModelSpec:
     memory: int = 256 * 1024
     enable_anthropic: bool = True
     image_warmup: bool = False
+    recipe: str | None = None
 
     @property
     def repo_id(self) -> str:
@@ -277,6 +278,32 @@ MODEL_SPECS.update(
             gpu_memory_utilization=0.70,
             memory=128 * 1024,
             image_warmup=True,
+        ),
+        "ornith-1.0-35b": ModelSpec(
+            name="ornith-1.0-35b",
+            family="qwen3_5_moe",
+            checkpoint=Checkpoint(
+                repo_id="ornith-ai/Ornith-1.0-35B",
+                revision="5df2ed3f675c7beaa490328cc70bb573b65fb660",
+                directory="",
+                required_files=(
+                    "config.json",
+                    "chat_template.jinja",
+                    "tokenizer.json",
+                    "tokenizer_config.json",
+                    "preprocessor_config.json",
+                ),
+            ),
+            # Apple Silicon (MLX) runner: BF16 weights quantized to 8-bit at load.
+            model_mount="/models/resin-ornith",
+            model_volume="resin-ornith-models-v1",
+            gpu="M4-Max",
+            label="ornith-1.0-35b-mlx",
+            context_length=32_768,
+            max_batch_size=32,
+            # Unified memory is shared with the OS and other applications.
+            gpu_memory_utilization=0.70,
+            recipe="ornith",
         ),
         "inkling": ModelSpec(
             name="inkling",
@@ -519,6 +546,21 @@ def create_runner(
         if gpu_memory_utilization is None
         else gpu_memory_utilization
     )
+    if spec.family == "qwen3_5_moe":
+        from resin_models_mlx.qwen3_5_moe import Qwen3_5MoeMlxRunner
+        from resin_models_mlx.qwen3_5_moe.cache import PREFILL_CHUNK_SIZE
+
+        if draft_tokens:
+            raise ValueError(
+                "Ornith checkpoints ship no MTP weights; use draft_tokens=0"
+            )
+        if groups is not None:
+            raise ValueError("the MLX runner executes on one Apple Silicon device")
+        if prefill_chunk_size != PREFILL_CHUNK_SIZE:
+            raise ValueError(
+                f"the MLX Qwen3.5-MoE runner uses {PREFILL_CHUNK_SIZE}-token chunks"
+            )
+        return Qwen3_5MoeMlxRunner(checkpoint, memory_utilization=memory)
     common: dict[str, Any] = dict(
         device=device, cuda_graph_prefill=prefill_graph, cuda_graph_decode=decode_graph
     )
@@ -688,6 +730,5 @@ def create_recipe(
         if spec.family == "gemma4" and runner is not None
         else {}
     )
-    return get_native_recipe(
-        "qwen3_8" if spec.family == "qwen3_5" else spec.family, processor, **options
-    )
+    name = spec.recipe or ("qwen3_8" if spec.family == "qwen3_5" else spec.family)
+    return get_native_recipe(name, processor, **options)

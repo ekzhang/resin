@@ -84,6 +84,11 @@ def _runner(model, checkpoint, *, device, groups, cases, options, context_capaci
     )
 
 
+def _apple_silicon(spec) -> bool:
+    """Whether this preset runs one MLX process instead of CUDA ranks."""
+    return spec.family == "qwen3_5_moe"
+
+
 def _result_callback(report_path):
     """Keep a valid snapshot of completed cases and print untimed progress."""
     records = []
@@ -246,7 +251,17 @@ def _rank(
         # the user's ordinary FlashInfer cache unless that mount is configured.
         if os.environ.get("CUDA_CACHE_PATH", "").startswith(KERNEL_CACHE_MOUNT + "/"):
             install_flashinfer_hash_cache()
-    torch.cuda.set_device(rank)
+    spec = get_model(model)
+    apple = _apple_silicon(spec)
+    if apple:
+        import mlx.core as mx
+
+        synchronize = mx.synchronize
+        hardware = mx.device_info()["device_name"]
+    else:
+        torch.cuda.set_device(rank)
+        synchronize = torch.cuda.synchronize
+        hardware = torch.cuda.get_device_name(rank)
     groups = None
     if topology.world_size > 1:
         dist.init_process_group(
@@ -305,7 +320,7 @@ def _rank(
         accepted_drafts=options["accepted_drafts"],
         balanced_experts=options["balanced_experts"],
     )
-    torch.cuda.synchronize()
+    synchronize()
     loaded_seconds = time.perf_counter() - started
     if rank == 0:
         print(
@@ -313,8 +328,9 @@ def _rank(
             flush=True,
         )
     started = time.perf_counter()
-    raw.capture_cuda_graphs()
-    torch.cuda.synchronize()
+    if not apple:
+        raw.capture_cuda_graphs()
+    synchronize()
     capture_seconds = time.perf_counter() - started
     if rank == 0:
         print(f"[bench] graphs ready in {capture_seconds:.1f}s", flush=True)
@@ -325,15 +341,19 @@ def _rank(
         "implementation": "resin",
         "implementation_version": resin.__version__,
         "checkpoint": str(checkpoint),
-        "hardware": torch.cuda.get_device_name(rank),
+        "hardware": hardware,
         "parallelism": {
             axis: getattr(topology, axis)
             for axis in ("world_size", "attn_dp", "attn_tp", "cp", "ep")
         },
-        "graphs": {
-            "prefill": options["prefill_graph"],
-            "decode": options["decode_graph"],
-        },
+        "graphs": (
+            None
+            if apple
+            else {
+                "prefill": options["prefill_graph"],
+                "decode": options["decode_graph"],
+            }
+        ),
         "quant": "checkpoint",
         "expert_backend": options["expert_backend"],
         "load_seconds": loaded_seconds,
@@ -398,7 +418,7 @@ def _rank(
             prefill_measure_cohorts=options.get("prefill_measure_cohorts", 3),
             gpu_count=topology.world_size,
             attn_dp=topology.attn_dp,
-            synchronize=torch.cuda.synchronize,
+            synchronize=synchronize,
             reduce_step=None if groups is None else distributed_reducer(groups),
             metadata=metadata,
             on_result=_result_callback(report_path) if rank == 0 else None,
@@ -406,7 +426,12 @@ def _rank(
                 None
                 if options.get("trace_dir") is None
                 else perfetto_trace(
-                    options["trace_dir"], rank, metadata, decode_passes=2 + int(overlap)
+                    options["trace_dir"],
+                    rank,
+                    metadata,
+                    decode_passes=2 + int(overlap),
+                    synchronize=synchronize,
+                    cuda=not apple,
                 )
             ),
         )
@@ -628,7 +653,10 @@ def run_benchmark(
         },
     )
     _validate_configuration(model, cases, topology, options)
-    if torch.cuda.device_count() < topology.world_size:
+    apple = _apple_silicon(spec)
+    if apple and topology.world_size != 1:
+        raise ValueError(f"{model} runs on one Apple Silicon device")
+    if not apple and torch.cuda.device_count() < topology.world_size:
         raise ValueError(f"the sweep requires {topology.world_size} visible GPUs")
     with tempfile.TemporaryDirectory(prefix="resin-bench-") as directory:
         output = (
@@ -648,8 +676,12 @@ def run_benchmark(
         processes = resin.process.spawn(
             _rank,
             args=(port, output, model, checkpoint, cases, topology, options),
-            devices=[f"cuda:{rank}" for rank in range(topology.world_size)],
-            numa=numa,
+            devices=(
+                ["mps"]
+                if apple
+                else [f"cuda:{rank}" for rank in range(topology.world_size)]
+            ),
+            numa="off" if apple else numa,
         )
         records = json.loads(output.read_text())
         placement = {

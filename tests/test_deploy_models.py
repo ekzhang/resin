@@ -3,6 +3,7 @@
 import importlib
 from dataclasses import replace
 from types import SimpleNamespace
+from typing import Any
 
 import pytest
 
@@ -14,6 +15,36 @@ from deploy.models import (
     require_checkpoint,
     validate_gpu,
 )
+
+
+def test_mlx_factory_constructs_single_device_runner(monkeypatch):
+    spec = get_model("ornith-1.0-35b")
+    module = importlib.import_module("resin_models_mlx.qwen3_5_moe")
+    calls = []
+    monkeypatch.setattr(
+        module,
+        "Qwen3_5MoeMlxRunner",
+        lambda *args, **kwargs: calls.append((args, kwargs)),
+    )
+
+    def create(**overrides):
+        options: dict[str, Any] = dict(
+            device="mps",
+            context_length=8192,
+            max_batch_size=8,
+            prefill_chunk_size=4096,
+            draft_tokens=0,
+        )
+        return create_runner(spec, **(options | overrides))
+
+    create()
+    assert calls == [((spec.path,), {"memory_utilization": 0.7})]
+    with pytest.raises(ValueError, match="no MTP"):
+        create(draft_tokens=2)
+    with pytest.raises(ValueError, match="one Apple Silicon device"):
+        create(groups=object())
+    with pytest.raises(ValueError, match="4096-token chunks"):
+        create(prefill_chunk_size=8192)
 
 
 def make_checkpoint(path, required_files):
