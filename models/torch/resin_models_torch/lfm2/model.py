@@ -65,7 +65,9 @@ class RMSNorm(nn.Module):
     def forward(self, hidden: Tensor) -> Tensor:
         dtype = hidden.dtype
         normalized = hidden.float()
-        normalized *= torch.rsqrt(normalized.square().mean(-1, keepdim=True) + self.eps)
+        normalized = normalized * torch.rsqrt(
+            normalized.square().mean(-1, keepdim=True) + self.eps
+        )
         return self.weight * normalized.to(dtype)
 
 

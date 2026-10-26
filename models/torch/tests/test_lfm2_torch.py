@@ -50,6 +50,32 @@ for name in ('transformers', 'tokenizers', 'huggingface_hub', 'safetensors'):
             Lfm2Config.from_dict({"model_type": "llama"})
 
 
+class TestLfm2RMSNorm:
+    @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16, torch.float16])
+    @pytest.mark.parametrize("strided", [False, True])
+    def test_preserves_input_and_matches_reference(self, dtype, strided) -> None:
+        from resin_models_torch.lfm2.model import RMSNorm
+
+        storage = torch.arange(1, 17, dtype=dtype).reshape(2, 8)
+        hidden = storage[:, ::2] if strided else storage
+        original = storage.clone()
+        norm = RMSNorm(hidden.shape[-1], 1e-5).to(dtype=dtype)
+        with torch.no_grad():
+            norm.weight.copy_(torch.linspace(0.5, 1.5, hidden.shape[-1]))
+
+        reference = hidden.float().clone()
+        variance = reference.square().mean(-1, keepdim=True)
+        expected = (reference / torch.sqrt(variance + norm.eps)).to(dtype)
+        expected = norm.weight.detach() * expected
+
+        with torch.inference_mode():
+            actual = norm(hidden)
+
+        torch.testing.assert_close(storage, original, rtol=0, atol=0)
+        assert actual.dtype == dtype
+        torch.testing.assert_close(actual, expected)
+
+
 class TestLfm2Torch:
     def setup_method(self) -> None:
         from resin_models_torch.lfm2.model import Lfm2ForCausalLM
@@ -57,6 +83,62 @@ class TestLfm2Torch:
         torch.manual_seed(7)
         self.args = _tiny_args()
         self.model = Lfm2ForCausalLM(self.args).eval()
+
+    def test_fp32_logits_match_transformers_reference(self) -> None:
+        from transformers.models.lfm2.configuration_lfm2 import (
+            Lfm2Config as ReferenceConfig,
+        )
+        from transformers.models.lfm2.modeling_lfm2 import (
+            Lfm2ForCausalLM as ReferenceModel,
+        )
+
+        from resin_models_torch.lfm2.model import RMSNorm
+
+        config = ReferenceConfig(
+            vocab_size=self.args.vocab_size,
+            hidden_size=self.args.hidden_size,
+            intermediate_size=self.args.intermediate_size,
+            num_hidden_layers=self.args.num_hidden_layers,
+            num_attention_heads=self.args.num_attention_heads,
+            num_key_value_heads=self.args.num_key_value_heads,
+            norm_eps=self.args.norm_eps,
+            conv_bias=self.args.conv_bias,
+            conv_L_cache=self.args.conv_cache_length,
+            block_multiple_of=self.args.multiple_of,
+            block_auto_adjust_ff_dim=self.args.auto_adjust_ff_dim,
+            block_ffn_dim_multiplier=self.args.ffn_dim_multiplier,
+            rope_parameters={
+                "rope_type": "default",
+                "rope_theta": self.args.rope_theta,
+            },
+            layer_types=list(self.args.layer_types),
+            pad_token_id=self.args.pad_token_id,
+            tie_word_embeddings=True,
+        )
+        config._attn_implementation = "eager"
+        reference = ReferenceModel(config).eval()
+        with torch.no_grad():
+            for module in self.model.modules():
+                if isinstance(module, RMSNorm):
+                    module.weight.copy_(torch.linspace(0.5, 1.5, module.weight.numel()))
+
+        # Resin projects logits with the embedding weight directly; HF exposes
+        # the same tied tensor under an additional lm_head.weight state key.
+        reference.load_state_dict(
+            {
+                **self.model.state_dict(),
+                "lm_head.weight": self.model.model.embed_tokens.weight,
+            }
+        )
+        assert reference.lm_head.weight is reference.model.embed_tokens.weight
+        tokens = torch.tensor([[1, 2, 3, 4]])
+
+        with torch.inference_mode():
+            expected = reference(tokens, use_cache=False).logits
+            actual = self.model(tokens)
+
+        assert actual.dtype == expected.dtype == torch.float32
+        torch.testing.assert_close(actual, expected, rtol=1e-5, atol=1e-5)
 
     def test_cached_chunks_match_full_forward(self) -> None:
         tokens = torch.tensor([[1, 2, 3, 4]])
