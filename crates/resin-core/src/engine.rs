@@ -22,6 +22,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
+mod storage;
+pub use storage::{StorageCandidate, StorageExportJob, StorageImportJob, StorageImportStart};
+
 pub type Result<T> = std::result::Result<T, Error>;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -385,6 +388,9 @@ struct Request<P> {
     payload: P,
     cacheable: bool,
     cache: Option<RequestPages>,
+    storage_checked: bool,
+    storage_waiting: bool,
+    storage_base_tokens: u32,
 }
 
 impl<P> Request<P> {
@@ -494,6 +500,10 @@ impl<P> Schedulable for Request<P> {
         self.running
     }
 
+    fn is_ready(&self) -> bool {
+        !self.storage_waiting
+    }
+
     fn set_running(&mut self, running: bool) {
         self.running = running;
     }
@@ -544,6 +554,7 @@ pub struct EngineCore<P> {
     next_request_id: u64,
     next_batch_id: u64,
     kv_resources: Option<PagedKvResources>,
+    storage: Option<storage::StorageState>,
     poisoned_error: Option<String>,
     closed: bool,
 }
@@ -613,6 +624,7 @@ impl<P: Clone> EngineCore<P> {
             next_request_id: 1,
             next_batch_id: 1,
             kv_resources,
+            storage: None,
             poisoned_error: None,
             closed: false,
         })
@@ -676,7 +688,7 @@ impl<P: Clone> EngineCore<P> {
         self.context_length.get()
     }
     pub fn has_work(&self) -> bool {
-        self.in_flight.is_some() || !self.scheduler.is_empty()
+        self.in_flight.is_some() || !self.scheduler.is_empty() || self.storage_has_work()
     }
     pub fn active_request_count(&self) -> usize {
         self.scheduler.len()
@@ -937,6 +949,9 @@ impl<P: Clone> EngineCore<P> {
             payload,
             cacheable,
             cache: pages,
+            storage_checked: false,
+            storage_waiting: false,
+            storage_base_tokens: 0,
         });
         Ok(lease)
     }
@@ -1402,6 +1417,11 @@ impl<P: Clone> EngineCore<P> {
         };
         if let Some(error) = growth_error {
             self.scheduler.restore_rejected(scheduled);
+            if matches!(error, CachePoolError::InsufficientCapacity { .. })
+                && self.storage_has_work()
+            {
+                return Ok(None);
+            }
             if matches!(error, CachePoolError::InsufficientCapacity { .. })
                 && self.retract_one(runner)?
             {
@@ -1964,7 +1984,9 @@ impl<P: Clone> EngineCore<P> {
                         .publish_prefix(pages, &tokens[..length as usize], length)
                         .map_err(Error::from)?;
                 }
+                self.queue_storage_export(&tokens[..length as usize], length)?;
             }
+
         }
         Ok(())
     }
@@ -2148,6 +2170,11 @@ impl<P: Clone> EngineCore<P> {
     }
 
     fn close_healthy(&mut self, runner: &mut impl Runner<P>) -> Result<()> {
+        if self.storage_has_work() {
+            return Err(Error::internal(
+                "Engine must drain pending cache-storage transfers before close",
+            ));
+        }
         self.retire_ready(runner)?;
         if let Some(resources) = self.kv_resources.as_mut() {
             resources.clear_prefix_cache().map_err(Error::from)?;
@@ -2511,6 +2538,9 @@ mod tests {
             payload: (),
             cacheable: true,
             cache: pages,
+            storage_checked: false,
+            storage_waiting: false,
+            storage_base_tokens: 0,
         }
     }
 

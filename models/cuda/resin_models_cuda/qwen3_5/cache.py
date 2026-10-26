@@ -294,6 +294,19 @@ class CacheArena(GraphPageTableArena):
 
     graph_label = "Qwen3.5"
 
+    @property
+    def cache_storage_block_bytes(self):
+        geometry = self.geometry
+        groups = (
+            geometry.full_layers * geometry.unit_bytes,
+            geometry.state_bytes,
+        )
+        return groups + ((geometry.unit_bytes,) if geometry.include_mtp else ())
+
+    @property
+    def cache_storage_geometry(self):
+        return str(self.kv_dtype), repr(self.geometry)
+
     def __init__(
         self,
         device: Any,

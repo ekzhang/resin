@@ -9,8 +9,8 @@ use super::kv::{
     StatePlan,
 };
 use super::paged::{
-    CachePool, CachePoolError, GroupDemand, GroupId, PageAccessClaim, PageHandle, RequestPages,
-    RetireRequestFailure, SequenceId, WriterAccessLease,
+    CachePool, CachePoolError, CachedReadLease, GroupDemand, GroupId, PageAccessClaim, PageHandle,
+    RequestPages, RetireRequestFailure, SequenceId, WriterAccessLease,
 };
 use super::prefix::PrefixCache;
 use super::{BatchAccess, RequestResourceRef};
@@ -64,6 +64,56 @@ pub struct PrefixCacheMetrics {
     pub evictions: u64,
     pub reclaimed_blocks: u64,
     pub reclaimed_slabs: u64,
+}
+
+/// Portable checkpoint placement. Each group's addresses are chronological;
+/// slot numbers address child blocks, never entire fungible slabs.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PrefixTransferGroup {
+    pub group_index: u32,
+    pub first_block: u32,
+    pub slab_ids: Vec<u32>,
+    pub slotnums: Vec<u32>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PrefixTransfer {
+    pub resident_tokens: u32,
+    pub groups: Vec<PrefixTransferGroup>,
+}
+
+#[derive(Debug)]
+#[must_use = "prefix exports must be released after completion or retained as quarantine"]
+pub struct PrefixExport {
+    view: PrefixTransfer,
+    lease: CachedReadLease,
+}
+
+impl PrefixExport {
+    pub const fn view(&self) -> &PrefixTransfer {
+        &self.view
+    }
+}
+
+#[derive(Debug)]
+#[must_use = "prefix imports must be committed, aborted after completion, or quarantined"]
+pub struct PrefixImport {
+    view: PrefixTransfer,
+    pages: RequestPages,
+    lease: Option<WriterAccessLease>,
+}
+
+impl PrefixImport {
+    pub const fn view(&self) -> &PrefixTransfer {
+        &self.view
+    }
+}
+
+/// A failed import transition returns its exact physical owner unchanged.
+#[derive(Debug)]
+pub struct PrefixImportFailure {
+    pub error: CachePoolError,
+    pub import: PrefixImport,
 }
 
 #[derive(Debug)]
@@ -457,6 +507,216 @@ impl PagedKvResources {
             self.pool.retire_cached_prefix(replaced)?;
         }
         Ok(true)
+    }
+
+    /// Pin an exact published boundary without changing lookup counters or LRU
+    /// order. The returned owner survives trie eviction and live-request release.
+    pub fn export_prefix(
+        &mut self,
+        tokens: &[u32],
+        resident_tokens: u32,
+    ) -> Result<Option<PrefixExport>, CachePoolError> {
+        self.validate_prefix_length(resident_tokens)?;
+        let Some(tokens) = tokens.get(..resident_tokens as usize) else {
+            return Err(CachePoolError::StaleHandle);
+        };
+        let Some(snapshot) = self
+            .prefix_cache
+            .as_ref()
+            .and_then(|cache| cache.get_exact(tokens))
+        else {
+            return Ok(None);
+        };
+        let lease = self.pool.pin_cached_prefix(snapshot)?;
+        let tables = lease
+            .groups()
+            .iter()
+            .map(|group| group.pages())
+            .collect::<Vec<_>>();
+        match self.prefix_transfer_view(resident_tokens, &tables) {
+            Ok(view) => Ok(Some(PrefixExport { view, lease })),
+            Err(error) => {
+                self.pool.release_cached_read(lease);
+                Err(error)
+            }
+        }
+    }
+
+    pub fn validate_prefix_export(&self, export: &PrefixExport) -> Result<(), CachePoolError> {
+        self.pool.validate_cached_read(&export.lease)
+    }
+
+    /// Release only after the storage provider proves all source reads complete.
+    pub fn release_prefix_export(&mut self, export: PrefixExport) {
+        self.pool.release_cached_read(export.lease);
+    }
+
+    /// Reserve a whole checkpoint without applying model-execution write-span
+    /// limits. Imported Window and State rings preserve their allocator order;
+    /// the transfer descriptor maps their chronological source bytes into it.
+    pub fn begin_prefix_import(
+        &mut self,
+        request_id: RequestId,
+        resident_tokens: u32,
+    ) -> Result<PrefixImport, CachePoolError> {
+        self.validate_prefix_length(resident_tokens)?;
+        if self.batch_active {
+            return Err(CachePoolError::AccessConflict);
+        }
+        let pages = loop {
+            match self.attach(request_id, resident_tokens) {
+                Ok(pages) => break pages,
+                Err(error @ CachePoolError::InsufficientCapacity { .. }) => {
+                    if !self.evict_one_prefix()? {
+                        return Err(error);
+                    }
+                }
+                Err(error) => return Err(error),
+            }
+        };
+        let prepared = (|| {
+            let mut tables = Vec::new();
+            let mut claims = Vec::new();
+            for group in pages.groups() {
+                let mut table = Vec::new();
+                for page in group.pages() {
+                    table.push(self.pool.physical_address(page.handle())?);
+                    claims.push(pages.access_claim(page));
+                }
+                tables.push(table);
+            }
+            let tables = tables.iter().map(Vec::as_slice).collect::<Vec<_>>();
+            let view = self.prefix_transfer_view(resident_tokens, &tables)?;
+            let prepared = self.pool.prepare_writer_access(claims)?;
+            let lease = self.pool.acquire_writer_access(prepared)?;
+            Ok((view, lease))
+        })();
+        match prepared {
+            Ok((view, lease)) => Ok(PrefixImport {
+                view,
+                pages,
+                lease: Some(lease),
+            }),
+            Err(error) => {
+                self.pool
+                    .retire_request(pages)
+                    .expect("fresh import pages remain valid");
+                Err(error)
+            }
+        }
+    }
+
+    /// Publish only after all destination writes completed successfully. An
+    /// error returns the import owner so callers can abort or quarantine it.
+    #[expect(
+        clippy::result_large_err,
+        reason = "return the exact move-only owner without allocating on transfer cleanup failure"
+    )]
+    pub fn commit_prefix_import(
+        &mut self,
+        mut import: PrefixImport,
+        tokens: &[u32],
+    ) -> Result<RequestPages, PrefixImportFailure> {
+        let length = import.view.resident_tokens;
+        if let Err(error) = self
+            .pool
+            .validate_request(&import.pages)
+            .and_then(|()| self.validate_prefix_length(length))
+            .and({
+                if tokens.len() < length as usize {
+                    Err(CachePoolError::StaleHandle)
+                } else {
+                    Ok(())
+                }
+            })
+        {
+            return Err(PrefixImportFailure { error, import });
+        }
+        if let Some(lease) = import.lease.take() {
+            self.pool.release_writer_access(lease);
+        }
+        match self.publish_prefix(&mut import.pages, tokens, length) {
+            Ok(true) => Ok(import.pages),
+            Ok(false) => Err(PrefixImportFailure {
+                error: CachePoolError::StaleHandle,
+                import,
+            }),
+            Err(error) => Err(PrefixImportFailure { error, import }),
+        }
+    }
+
+    /// Abort only before transfer acceptance or after all destination writes
+    /// are known complete, including a completed provider failure.
+    #[expect(
+        clippy::result_large_err,
+        reason = "return the exact move-only owner without allocating on transfer cleanup failure"
+    )]
+    pub fn abort_prefix_import(
+        &mut self,
+        mut import: PrefixImport,
+    ) -> Result<(), PrefixImportFailure> {
+        if let Err(error) = self.pool.validate_request(&import.pages) {
+            return Err(PrefixImportFailure { error, import });
+        }
+        if let Some(lease) = import.lease.take() {
+            self.pool.release_writer_access(lease);
+        }
+        match self.pool.retire_request(import.pages) {
+            Ok(()) => Ok(()),
+            Err(failure) => Err(PrefixImportFailure {
+                error: failure.error,
+                import: PrefixImport {
+                    pages: failure.request,
+                    ..import
+                },
+            }),
+        }
+    }
+
+    fn validate_prefix_length(&self, resident_tokens: u32) -> Result<(), CachePoolError> {
+        let alignment = self.prefix_alignment().ok_or(CachePoolError::StaleHandle)?;
+        if resident_tokens == 0 || !resident_tokens.is_multiple_of(alignment) {
+            return Err(CachePoolError::InvalidPrefixLength {
+                requested: resident_tokens,
+                alignment,
+            });
+        }
+        Ok(())
+    }
+
+    fn prefix_transfer_view(
+        &self,
+        resident_tokens: u32,
+        tables: &[&[(u32, u32)]],
+    ) -> Result<PrefixTransfer, CachePoolError> {
+        if tables.len() != self.layout.groups().len() {
+            return Err(CachePoolError::StaleHandle);
+        }
+        let mut groups = Vec::new();
+        for (index, (group, table)) in self.layout.groups().iter().zip(tables).enumerate() {
+            let (first_block, count) = group.active_blocks(resident_tokens);
+            if table.len() != count as usize {
+                return Err(CachePoolError::StaleHandle);
+            }
+            let mut slab_ids = Vec::new();
+            let mut slotnums = Vec::new();
+            for logical in first_block..first_block + count {
+                let &(slab, slot) =
+                    page_for(*group, table, logical).ok_or(CachePoolError::StaleHandle)?;
+                slab_ids.push(slab);
+                slotnums.push(slot);
+            }
+            groups.push(PrefixTransferGroup {
+                group_index: index as u32,
+                first_block,
+                slab_ids,
+                slotnums,
+            });
+        }
+        Ok(PrefixTransfer {
+            resident_tokens,
+            groups,
+        })
     }
 
     pub fn evict_one_prefix(&mut self) -> Result<bool, CachePoolError> {

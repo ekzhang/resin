@@ -122,6 +122,19 @@ class ManagedRunner(Runner, Protocol):
     def bind_resources(self, resources: ResourceBinding) -> None: ...
 
 
+class CacheStorageRunner(ManagedRunner, Protocol):
+    """Optional byte ABI for immutable external prefix storage.
+
+    Buffers borrow exact native-selected child blocks in group-major order.
+    The Engine retains physical access until the storage operation retires.
+    """
+
+    @property
+    def cache_storage_signature(self) -> bytes: ...
+
+    def cache_storage_buffers(self, transfer): ...
+
+
 class MetricsRunner(Protocol):
     """Optional physical execution observations, independent of forward output.
 
@@ -137,6 +150,7 @@ class MetricsRunner(Protocol):
 
 
 __all__ = [
+    "CacheStorageRunner",
     "FinalizingResponseParser",
     "ManagedRunner",
     "MediaInput",

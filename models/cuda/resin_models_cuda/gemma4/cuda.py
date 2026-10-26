@@ -133,9 +133,12 @@ def plan_gemma4_kv_capacity(
 
 
 class _Gemma4KvArena:
-    def __init__(self, device, config, parent_capacity: int, *, dtype) -> None:
+    def __init__(
+        self, device, config, parent_capacity: int, *, dtype, layout=None
+    ) -> None:
         self.dtype = dtype
         self.parent_capacity = parent_capacity
+        self.layout = layout
         physical_parent_capacity = parent_capacity + 1
         local_shape = (
             physical_parent_capacity,
@@ -160,6 +163,31 @@ class _Gemma4KvArena:
         )
         global_view = self.storage.view(global_shape).permute(1, 2, 0, 3, 4, 5)
         self.global_keys, self.global_values = global_view[0], global_view[1]
+        parent_bytes = self.storage[0].numel() * self.storage.element_size()
+        self._storage_block_bytes = (parent_bytes // packing, parent_bytes)
+        self._storage_geometry = (str(dtype), local_shape[1:], global_shape[1:])
+
+    @property
+    def cache_storage_signature(self):
+        from resin.backend.cache_storage import cache_signature
+
+        if self.layout is None:
+            raise ValueError("cache storage requires the Engine's frozen cache layout")
+        return cache_signature(
+            "resin.gemma4-kv.v1",
+            self.layout,
+            self._storage_block_bytes,
+            self._storage_geometry,
+        )
+
+    def cache_storage_buffers(self, transfer):
+        from resin.backend.cache_storage import slab_buffers
+
+        if self.layout is None:
+            raise ValueError("cache storage requires the Engine's frozen cache layout")
+        return slab_buffers(
+            transfer, self.storage, self.layout, self._storage_block_bytes
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -389,6 +417,7 @@ class Gemma4CudaRunner(CudaRunner):
             self.attention_config,
             self.cache_parent_capacity,
             dtype=cache_dtype,
+            layout=self.cache_layout,
         )
         self._graph_attention_workspaces = tuple(
             torch.zeros(_GRAPH_WORKSPACE_BYTES, dtype=torch.uint8, device=self.device)

@@ -30,11 +30,13 @@ snapshot = engine.metrics_snapshot()
 if snapshot is not None:
     print(snapshot.requests["running_requests"])
     print(snapshot.cache)
+    print(snapshot.storage)
 ```
 
 The inspector returns a frozen `resin.EngineMetrics` snapshot. Its `requests`
 and optional `cache` properties expose dictionaries and lists; `runner` is an
-optional native `RunnerMetrics`.
+optional native `RunnerMetrics`. The optional `storage` property exposes an
+independent dictionary of cache-storage observations.
 Snapshots and returned inspection views are independent of later execution.
 Cache inventory scans physical allocation metadata, so poll periodically rather
 than on every generated token.
@@ -123,6 +125,13 @@ after retraction; `prefill_cache` counts reused prompt tokens at successful
 submission; `decode` counts committed output tokens, including the first token
 produced by prefill. Calculate generation throughput with the live output
 counter's rate over the dashboard window of your choosing.
+
+`cached_tokens` remains the aggregate completed-request total. The inspector's
+`storage_cached_tokens` identifies the portion first materialized from external
+prefix storage; `resin:cached_tokens_total{cache_source="storage"}` exports that
+portion, and `cache_source="device"` exports the remainder. A later request that
+reuses those same pages from the local device trie counts its reuse as device
+cache. Storage source series appear after the first attributed completion.
 
 Metrics carry `model_name` and `engine_type="resin"`. Engine and runner series
 also carry `rank` and `attn_dp_rank`. Logical request observations are emitted
@@ -230,6 +239,47 @@ are `resin:prefix_cache_entries`, `resin:prefix_cache_hits_total`,
 `resin:prefix_cache_reclaimed_blocks_total`, and
 `resin:prefix_cache_reclaimed_slabs_total`. Reclaimed counters report physical
 frees; eviction counts include explicit clearing.
+
+## Prefix storage
+
+Engines with configured prefix storage expose its cumulative observations in
+`snapshot.storage` and export `resin:cache_storage_*` series. Engines without
+storage return `None` and omit those series. `enable_metrics=False` disables
+these observations along with the other engine metrics. Storage observations
+belong to the engine's storage manager; they do not require a metrics method on
+the storage backend.
+
+| Measurement | Metric |
+| --- | --- |
+| Objects submitted for lookup | `resin:cache_storage_lookups_total` |
+| Completed lookup hits / misses | `resin:cache_storage_hits_total`, `resin:cache_storage_misses_total` |
+| Objects submitted for load / store | `resin:cache_storage_loads_total`, `resin:cache_storage_stores_total` |
+| Loaded / absent objects | `resin:cache_storage_load_hits_total`, `resin:cache_storage_load_misses_total` |
+| Successfully stored objects | `resin:cache_storage_stored_objects_total` |
+| Successfully loaded / stored payload bytes | `resin:cache_storage_load_bytes_total`, `resin:cache_storage_store_bytes_total` |
+| Storage errors / restored prompt tokens | `resin:cache_storage_errors_total`, `resin:cache_storage_restored_tokens_total` |
+| Pending lookup / load / store batches | `resin:cache_storage_pending_lookups`, `resin:cache_storage_pending_loads`, `resin:cache_storage_pending_stores` |
+| Payload bytes held by pending transfers | `resin:cache_storage_inflight_bytes` |
+| Lookup / load / store batch latency | `resin:cache_storage_lookup_seconds`, `resin:cache_storage_load_seconds`, `resin:cache_storage_store_seconds` |
+
+Object counters count individual immutable objects; pending gauges count
+submitted batches. A lookup hit does not guarantee that a later load succeeds:
+the object may have been evicted in the meantime. Loaded bytes and stored bytes
+count successful logical payloads, rather than physical network or disk traffic.
+`restored_tokens` counts the full prefix length of successful storage
+materializations, so loading an object that is never restored does not increase
+it. This differs from `storage_cached_tokens`: the latter counts only newly
+reused prompt tokens attributed to storage in completed requests, excluding
+cancellations and tokens already present in the device cache.
+
+Latency histograms contain one observation per retired batch, measured with a
+monotonic clock from submission through retirement, including failures. They
+include queueing and time until the engine observes completion; they do not
+measure backend service time alone. The histograms use the same bounded native
+representation as other engine latencies, and snapshots reject malformed
+histograms and nonfinite or negative sums. Storage snapshots carry the engine's
+`model_name`, `engine_type`, `rank`, and `attn_dp_rank` labels. HTTP scrapes read
+their last published snapshot without polling storage or waiting for transfers.
 
 ## Dashboard queries
 

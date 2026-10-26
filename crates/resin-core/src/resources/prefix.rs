@@ -63,6 +63,18 @@ impl<T> PrefixCache<T> {
         self.alignment
     }
 
+    /// Inspect an exact checkpoint without changing lookup counters or LRU age.
+    pub(crate) fn get_exact(&self, tokens: &[u32]) -> Option<&T> {
+        if tokens.is_empty() || !tokens.len().is_multiple_of(self.alignment as usize) {
+            return None;
+        }
+        let mut node = 0;
+        for block in tokens.chunks_exact(self.alignment as usize) {
+            node = *self.nodes[node].children.get(block)?;
+        }
+        self.nodes[node].entry.as_ref().map(|entry| &entry.snapshot)
+    }
+
     pub(crate) fn find(&mut self, tokens: &[u32], max_prefix_tokens: usize) -> Option<(u32, &T)> {
         let alignment = self.alignment as usize;
         let usable = if tokens.len().is_multiple_of(alignment) {

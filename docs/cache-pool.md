@@ -75,6 +75,11 @@ entries. Prefixes are published only at an alignment shared by every cache
 group. A hit attaches immutable references to the cached pages and schedules
 only the unmatched suffix.
 
+`prefix_cache_storage` optionally retains immutable blocks outside the device
+pool. Cold hits are loaded into fresh pages at admission, with all cache groups
+committed together after transfer completion. See [prefix storage](cache-storage.md)
+for the provider interface, Engine options, and ownership rules.
+
 A model can declare `CacheLayout(replay_suffix_tokens=N)` when a restored
 history needs its final `N` inputs recomputed. Prefix lookup caps the hit at
 `prefill_length - N` before applying cache alignment. The scheduler does not

@@ -2,18 +2,20 @@
 
 use prometheus_client::encoding::prometheus_protobuf::prometheus_data_model as proto;
 use resin_core::{
-    metrics::{EngineMetricsSnapshot, Histogram, RunnerMetricsSnapshot},
+    metrics::{
+        CacheStorageMetricsSnapshot, EngineMetricsSnapshot, Histogram, RunnerMetricsSnapshot,
+    },
     resources::paged_kv::CacheMetrics,
 };
 use std::{collections::BTreeMap, fmt};
 
-/// A histogram count cannot be represented by Prometheus's signed bucket deltas.
+/// A snapshot is invalid or cannot be represented by Prometheus histograms.
 #[derive(Debug)]
-pub struct MetricsEncodeError;
+pub struct MetricsEncodeError(&'static str);
 
 impl fmt::Display for MetricsEncodeError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str("histogram bucket count exceeds Prometheus integer range")
+        f.write_str(self.0)
     }
 }
 impl std::error::Error for MetricsEncodeError {}
@@ -82,9 +84,17 @@ impl MetricsEncoder {
         self.counter(
             "cached_tokens_total",
             "Cached input tokens in completed requests.",
-            r.cached_tokens as f64,
+            r.cached_tokens.saturating_sub(r.storage_cached_tokens) as f64,
             &[("cache_source", "device")],
         );
+        if r.storage_cached_tokens > 0 {
+            self.counter(
+                "cached_tokens_total",
+                "Cached input tokens in completed requests.",
+                r.storage_cached_tokens as f64,
+                &[("cache_source", "storage")],
+            );
+        }
         for (mode, value) in [
             ("prefill_compute", r.prefill_compute_tokens),
             ("prefill_cache", r.prefill_cache_tokens),
@@ -223,7 +233,9 @@ impl MetricsEncoder {
             .counts
             .iter()
             .map(|&count| {
-                let count = i64::try_from(count).map_err(|_| MetricsEncodeError)?;
+                let count = i64::try_from(count).map_err(|_| {
+                    MetricsEncodeError("histogram bucket count exceeds Prometheus integer range")
+                })?;
                 let delta = count - previous;
                 previous = count;
                 Ok(delta)
@@ -347,6 +359,119 @@ impl MetricsEncoder {
             }
         }
     }
+    /// Storage is emitted only when the engine has a configured storage manager.
+    pub fn storage(&mut self, s: &CacheStorageMetricsSnapshot) -> Result<(), MetricsEncodeError> {
+        s.validate().map_err(MetricsEncodeError)?;
+        for (name, help, value) in [
+            (
+                "cache_storage_lookups_total",
+                "Objects submitted for storage lookup.",
+                s.lookups,
+            ),
+            (
+                "cache_storage_hits_total",
+                "Objects found by completed storage lookups.",
+                s.hits,
+            ),
+            (
+                "cache_storage_misses_total",
+                "Objects absent from completed storage lookups.",
+                s.misses,
+            ),
+            (
+                "cache_storage_loads_total",
+                "Objects submitted for storage loading.",
+                s.loads,
+            ),
+            (
+                "cache_storage_stores_total",
+                "Objects submitted for storage writing.",
+                s.stores,
+            ),
+            (
+                "cache_storage_load_hits_total",
+                "Objects successfully loaded from storage.",
+                s.load_hits,
+            ),
+            (
+                "cache_storage_load_misses_total",
+                "Objects absent when storage loading completed.",
+                s.load_misses,
+            ),
+            (
+                "cache_storage_stored_objects_total",
+                "Objects successfully written to storage.",
+                s.stored_objects,
+            ),
+            (
+                "cache_storage_load_bytes_total",
+                "Logical payload bytes successfully loaded from storage.",
+                s.load_bytes,
+            ),
+            (
+                "cache_storage_store_bytes_total",
+                "Logical payload bytes successfully written to storage.",
+                s.store_bytes,
+            ),
+            (
+                "cache_storage_errors_total",
+                "Storage operation errors observed by the engine.",
+                s.errors,
+            ),
+            (
+                "cache_storage_restored_tokens_total",
+                "Prompt tokens restored from storage and committed by the engine.",
+                s.restored_tokens,
+            ),
+        ] {
+            self.counter(name, help, value as f64, &[]);
+        }
+        for (name, help, value) in [
+            (
+                "cache_storage_pending_lookups",
+                "Storage lookup batches awaiting retirement.",
+                s.pending_lookups as f64,
+            ),
+            (
+                "cache_storage_pending_loads",
+                "Storage load batches awaiting retirement.",
+                s.pending_loads as f64,
+            ),
+            (
+                "cache_storage_pending_stores",
+                "Storage store batches awaiting retirement.",
+                s.pending_stores as f64,
+            ),
+            (
+                "cache_storage_inflight_bytes",
+                "Logical payload bytes held by pending storage transfers.",
+                s.inflight_bytes as f64,
+            ),
+        ] {
+            self.gauge(name, help, value, &[]);
+        }
+        for (name, help, histogram) in [
+            (
+                "cache_storage_lookup_seconds",
+                "Storage lookup batch submission to retirement.",
+                &s.lookup_seconds,
+            ),
+            (
+                "cache_storage_load_seconds",
+                "Storage load batch submission to retirement.",
+                &s.load_seconds,
+            ),
+            (
+                "cache_storage_store_seconds",
+                "Storage store batch submission to retirement.",
+                &s.store_seconds,
+            ),
+        ] {
+            self.histogram(name, help, histogram, &[])?;
+        }
+        Ok(())
+    }
+
     pub fn runner(&mut self, r: &RunnerMetricsSnapshot) -> Result<(), MetricsEncodeError> {
         for (category, &value) in &r.forward_execution_seconds {
             self.counter(
@@ -413,6 +538,145 @@ fn label(name: &str, value: &str) -> proto::LabelPair {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn completed_cached_tokens_separate_device_and_storage_without_double_counting() {
+        let snapshot = EngineMetricsSnapshot {
+            cached_tokens: 12,
+            storage_cached_tokens: 8,
+            ..Default::default()
+        };
+        let mut encoder = MetricsEncoder::new("model", 0, 0);
+        encoder.engine(&snapshot, None).unwrap();
+        let families = encoder.finish();
+        let cached = families
+            .iter()
+            .find(|family| family.name == "resin:cached_tokens_total")
+            .unwrap();
+        assert_eq!(cached.metric.len(), 2);
+        for (source, expected) in [("device", 4.0), ("storage", 8.0)] {
+            let metric = cached
+                .metric
+                .iter()
+                .find(|metric| metric.label.contains(&label("cache_source", source)))
+                .unwrap();
+            assert_eq!(metric.counter.as_ref().unwrap().value, expected);
+        }
+    }
+
+    #[test]
+    fn storage_metrics_preserve_counts_pending_gauges_and_rank_labels() {
+        let mut snapshot = CacheStorageMetricsSnapshot {
+            lookups: 5,
+            hits: 3,
+            misses: 2,
+            loads: 3,
+            load_hits: 2,
+            load_misses: 1,
+            stores: 4,
+            stored_objects: 3,
+            load_bytes: 1024,
+            store_bytes: 2048,
+            errors: 1,
+            restored_tokens: 128,
+            pending_lookups: 1,
+            pending_loads: 2,
+            pending_stores: 3,
+            inflight_bytes: 4096,
+            ..Default::default()
+        };
+        snapshot.lookup_seconds.observe(0.0);
+        snapshot.load_seconds.observe(0.25);
+        snapshot.store_seconds.observe(0.5);
+        let json = serde_json::to_value(&snapshot).unwrap();
+        let restored: CacheStorageMetricsSnapshot = serde_json::from_value(json).unwrap();
+        assert_eq!(restored, snapshot);
+
+        let mut encoder = MetricsEncoder::new("model", 3, 1);
+        encoder.storage(&snapshot).unwrap();
+        let families = crate::decode_metrics(&crate::encode_metrics(&encoder.finish())).unwrap();
+        assert_eq!(families.len(), 19);
+        let family = |name: &str| families.iter().find(|family| family.name == name).unwrap();
+        for metric in families.iter().flat_map(|family| &family.metric) {
+            assert_eq!(
+                metric.label,
+                vec![
+                    label("model_name", "model"),
+                    label("engine_type", "resin"),
+                    label("rank", "3"),
+                    label("attn_dp_rank", "1"),
+                ]
+            );
+        }
+        assert_eq!(
+            family("resin:cache_storage_loads_total").metric[0]
+                .counter
+                .as_ref()
+                .unwrap()
+                .value,
+            3.0
+        );
+        assert_eq!(
+            family("resin:cache_storage_pending_stores").metric[0]
+                .gauge
+                .as_ref()
+                .unwrap()
+                .value,
+            3.0
+        );
+        assert_eq!(
+            family("resin:cache_storage_inflight_bytes").metric[0]
+                .gauge
+                .as_ref()
+                .unwrap()
+                .value,
+            4096.0
+        );
+        let load = family("resin:cache_storage_load_seconds").metric[0]
+            .histogram
+            .as_ref()
+            .unwrap();
+        assert_eq!(load.sample_count, 1);
+        assert_eq!(load.sample_sum, 0.25);
+        assert!(!load.positive_span.is_empty());
+        assert_eq!(
+            family("resin:cache_storage_lookup_seconds").metric[0]
+                .histogram
+                .as_ref()
+                .unwrap()
+                .zero_count,
+            1
+        );
+
+        let mut absent = MetricsEncoder::new("model", 3, 1);
+        absent
+            .engine(&EngineMetricsSnapshot::default(), None)
+            .unwrap();
+        assert!(
+            absent
+                .finish()
+                .iter()
+                .all(|family| !family.name.starts_with("resin:cache_storage_"))
+        );
+    }
+
+    #[test]
+    fn storage_encoder_rejects_invalid_snapshots_before_adding_series() {
+        for sum in [f64::NAN, f64::INFINITY, -0.5] {
+            let mut invalid = CacheStorageMetricsSnapshot::default();
+            invalid.load_seconds.sum = sum;
+            let mut encoder = MetricsEncoder::new("model", 0, 0);
+            assert!(encoder.storage(&invalid).is_err());
+            assert!(encoder.finish().is_empty());
+        }
+        let mut invalid = CacheStorageMetricsSnapshot::default();
+        invalid.store_seconds.count = 1;
+        assert!(
+            MetricsEncoder::new("model", 0, 0)
+                .storage(&invalid)
+                .is_err()
+        );
+    }
 
     #[test]
     fn native_wire_preserves_weighted_zero_and_downscaled_observations() {

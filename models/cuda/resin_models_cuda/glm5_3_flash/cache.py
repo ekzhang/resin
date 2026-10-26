@@ -371,6 +371,13 @@ class DeviceCache(SlabDeviceCache):
 class CacheArena(GraphPageTableArena):
     graph_label = "GLM-5.3-Flash"
 
+    @property
+    def cache_storage_block_bytes(self):
+        return (
+            len(self.geometry.full_layers) * self.geometry.unit_bytes,
+            self.geometry.state_bytes,
+        )
+
     def __init__(
         self,
         device: Any,

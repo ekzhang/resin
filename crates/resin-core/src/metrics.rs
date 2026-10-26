@@ -17,6 +17,41 @@ pub struct RunnerMetricsSnapshot {
     pub dp_attention_sync_wait_seconds: Option<Histogram>,
 }
 
+/// Cumulative observations of the engine's configured immutable prefix storage.
+/// Object counters and successful logical payload bytes are independent of a
+/// backend's physical transfers. Pending gauges count submitted batches.
+#[derive(Clone, Debug, Default, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct CacheStorageMetricsSnapshot {
+    pub lookups: u64,
+    pub hits: u64,
+    pub misses: u64,
+    pub loads: u64,
+    pub stores: u64,
+    pub load_hits: u64,
+    pub load_misses: u64,
+    pub stored_objects: u64,
+    pub load_bytes: u64,
+    pub store_bytes: u64,
+    pub errors: u64,
+    pub restored_tokens: u64,
+    pub pending_lookups: usize,
+    pub pending_loads: usize,
+    pub pending_stores: usize,
+    pub inflight_bytes: u64,
+    /// One monotonic submission-to-retirement interval per completed batch.
+    pub lookup_seconds: Histogram,
+    pub load_seconds: Histogram,
+    pub store_seconds: Histogram,
+}
+
+impl CacheStorageMetricsSnapshot {
+    pub fn validate(&self) -> Result<(), &'static str> {
+        self.lookup_seconds.validate()?;
+        self.load_seconds.validate()?;
+        self.store_seconds.validate()
+    }
+}
+
 /// Logical request metrics, counted once by the engine owning each request.
 ///
 /// Completed-request counters exclude cancellations. Live counters include all
@@ -30,6 +65,8 @@ pub struct EngineMetricsSnapshot {
     pub retracted_requests: u64,
     pub prompt_tokens: u64,
     pub cached_tokens: u64,
+    /// Completed-request cached tokens newly restored from external storage.
+    pub storage_cached_tokens: u64,
     pub generation_tokens: u64,
     pub prefill_compute_tokens: u64,
     pub prefill_cache_tokens: u64,
@@ -61,6 +98,7 @@ impl Default for EngineMetricsSnapshot {
             retracted_requests: 0,
             prompt_tokens: 0,
             cached_tokens: 0,
+            storage_cached_tokens: 0,
             generation_tokens: 0,
             prefill_compute_tokens: 0,
             prefill_cache_tokens: 0,
@@ -90,6 +128,7 @@ pub(crate) struct RequestMetricsState {
     last_token_at: Option<Instant>,
     prompt_tokens: u32,
     cached_tokens: u32,
+    storage_cached_tokens: u32,
     output_tokens: u64,
 }
 
@@ -152,8 +191,24 @@ impl EngineMetricsState {
             last_token_at: None,
             prompt_tokens,
             cached_tokens,
+            storage_cached_tokens: 0,
             output_tokens: 0,
         }
+    }
+
+    pub(crate) fn credit_cached_prefix(
+        &mut self,
+        request: &mut RequestMetricsState,
+        tokens: u32,
+        from_storage: bool,
+    ) {
+        let tokens = tokens.min(request.prompt_tokens);
+        let added = tokens.saturating_sub(request.cached_tokens);
+        self.values.prefill_cache_tokens += u64::from(added);
+        if from_storage {
+            request.storage_cached_tokens += added;
+        }
+        request.cached_tokens = request.cached_tokens.max(tokens);
     }
 
     pub(crate) fn commit(
@@ -192,6 +247,7 @@ impl EngineMetricsState {
             values.completed_requests += 1;
             values.prompt_tokens += u64::from(request.prompt_tokens);
             values.cached_tokens += u64::from(request.cached_tokens);
+            values.storage_cached_tokens += u64::from(request.storage_cached_tokens);
             values.generation_tokens += request.output_tokens;
             values
                 .prompt_tokens_histogram
@@ -229,6 +285,30 @@ impl EngineMetricsState {
 mod tests {
     use super::*;
     use std::time::Duration;
+
+    #[test]
+    fn storage_snapshot_owns_histograms_and_rejects_invalid_observations() {
+        let mut snapshot = CacheStorageMetricsSnapshot::default();
+        snapshot.lookup_seconds.observe(0.0);
+        snapshot.load_seconds.observe(0.25);
+        snapshot.store_seconds.observe(0.5);
+        let saved = snapshot.clone();
+        snapshot.load_seconds.observe(1.0);
+        assert_eq!(saved.load_seconds.count, 1);
+        assert_eq!(saved.validate(), Ok(()));
+
+        for sum in [f64::NAN, f64::INFINITY, -1.0] {
+            let mut invalid = saved.clone();
+            invalid.lookup_seconds.sum = sum;
+            assert!(invalid.validate().is_err());
+        }
+        let mut invalid = saved.clone();
+        invalid.load_seconds.count += 1;
+        assert!(invalid.validate().is_err());
+        let mut invalid = saved;
+        invalid.store_seconds.schema = 5;
+        assert!(invalid.validate().is_err());
+    }
 
     #[test]
     fn token_weighted_intervals_and_request_tpot_have_distinct_denominators() {

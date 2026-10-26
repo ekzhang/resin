@@ -6,18 +6,21 @@ use crate::Engine;
 use pyo3::{exceptions::PyValueError, prelude::*, types::PyBytes};
 use pythonize::{depythonize, pythonize};
 use resin_core::{
-    metrics::{EngineMetricsSnapshot, Histogram, RunnerMetricsSnapshot},
+    metrics::{
+        CacheStorageMetricsSnapshot, EngineMetricsSnapshot, Histogram, RunnerMetricsSnapshot,
+    },
     resources::paged_kv,
 };
 use resin_http::MetricsEncoder;
 
-/// An immutable engine snapshot with request, cache, and runner observations.
+/// An immutable engine snapshot with request, cache, runner, and storage observations.
 /// Request and cache properties return independent dictionary views.
 #[pyclass(frozen, module = "resin._resin", skip_from_py_object)]
 pub(crate) struct EngineMetrics {
     requests: EngineMetricsSnapshot,
     cache: Option<paged_kv::CacheMetrics>,
     runner: Option<RunnerMetricsSnapshot>,
+    storage: Option<CacheStorageMetricsSnapshot>,
 }
 
 #[pymethods]
@@ -35,6 +38,11 @@ impl EngineMetrics {
     #[getter]
     fn runner(&self) -> Option<RunnerMetrics> {
         self.runner.clone().map(RunnerMetrics)
+    }
+
+    #[getter]
+    fn storage<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
+        Ok(pythonize(py, &self.storage)?)
     }
 }
 
@@ -62,10 +70,15 @@ impl Engine {
         } else {
             None
         };
+        let storage = self.storage_metrics(py)?;
+        if let Some(storage) = &storage {
+            storage.validate().map_err(PyValueError::new_err)?;
+        }
         Ok(Some(EngineMetrics {
             requests,
             cache: self.core.cache_metrics(),
             runner,
+            storage,
         }))
     }
 }
@@ -84,6 +97,11 @@ impl EngineMetrics {
         if let Some(runner) = &self.runner {
             encoder
                 .runner(runner)
+                .map_err(|error| PyValueError::new_err(error.to_string()))?;
+        }
+        if let Some(storage) = &self.storage {
+            encoder
+                .storage(storage)
                 .map_err(|error| PyValueError::new_err(error.to_string()))?;
         }
         Ok(resin_http::encode_metrics(&encoder.finish()))

@@ -15,6 +15,7 @@ use pyo3::types::{PyDict, PyTuple};
 
 mod arrays;
 mod cache;
+mod cache_storage;
 mod http;
 mod http_distributed;
 mod http_logprobs;
@@ -1241,6 +1242,7 @@ struct Engine {
     overlap_enqueues: u64,
     overlap_continuations: u64,
     runner_metrics: Option<Py<PyAny>>,
+    cache_storage_state: Option<cache_storage::StorageState>,
 }
 
 struct PendingExecution {
@@ -1537,7 +1539,7 @@ impl Engine {
 #[pymethods]
 impl Engine {
     #[new]
-    #[pyo3(signature = (runner: "Runner", *, max_running_requests = 32, context_length = 32768, scheduler_config = None, prefix_cache = false, enable_overlap = true, enable_metrics = true))]
+    #[pyo3(signature = (runner: "Runner", *, max_running_requests = 32, context_length = 32768, scheduler_config = None, prefix_cache = false, prefix_cache_storage = None, prefix_cache_namespace = None, prefix_cache_max_pending = 2, enable_overlap = true, enable_metrics = true))]
     #[allow(
         clippy::too_many_arguments,
         reason = "Python constructor exposes keyword configuration"
@@ -1549,6 +1551,9 @@ impl Engine {
         context_length: u32,
         scheduler_config: Option<Py<SchedulerConfig>>,
         prefix_cache: bool,
+        prefix_cache_storage: Option<Py<PyAny>>,
+        prefix_cache_namespace: Option<Py<PyAny>>,
+        prefix_cache_max_pending: usize,
         enable_overlap: bool,
         enable_metrics: bool,
     ) -> PyResult<Self> {
@@ -1595,6 +1600,30 @@ impl Engine {
         } else {
             None
         };
+        let cache_storage_state = if let Some(provider) = prefix_cache_storage {
+            core.enable_cache_storage(prefix_cache_max_pending)
+                .map_err(core_error)?;
+            let layout = config
+                .cache_layout
+                .as_ref()
+                .expect("storage requires managed cache");
+            Some(cache_storage::StorageState::new(
+                py,
+                &provider,
+                &runner,
+                layout,
+                prefix_cache_namespace.as_ref(),
+                prefix_cache_max_pending,
+                enable_metrics,
+            )?)
+        } else {
+            if prefix_cache_namespace.is_some() {
+                return Err(PyValueError::new_err(
+                    "prefix_cache_namespace requires prefix_cache_storage",
+                ));
+            }
+            None
+        };
         let runner_config = bind_runner_resources(py, resolved, core.cache_pool_id())?;
         Ok(Self {
             core,
@@ -1609,6 +1638,7 @@ impl Engine {
             overlap_enqueues: 0,
             overlap_continuations: 0,
             runner_metrics,
+            cache_storage_state,
         })
     }
     #[pyo3(signature = (
@@ -1711,7 +1741,13 @@ impl Engine {
         phase: Option<BatchPhase>,
         allow_overlap: bool,
     ) -> PyResult<Vec<Py<TokenEvent>>> {
+        if self.cache_storage_state.is_some() {
+            self.poll_storage(py, false)?;
+        }
         let mut current = self.step_once(py, phase, allow_overlap)?;
+        if self.cache_storage_state.is_some() {
+            self.poll_storage(py, false)?;
+        }
         if self.deferred_events.is_empty() {
             return Ok(current);
         }
@@ -1749,6 +1785,14 @@ impl Engine {
     #[getter]
     fn metrics_enabled(&self) -> bool {
         self.core.metrics_enabled()
+    }
+
+    #[getter]
+    fn prefix_cache_storage(&self, py: Python<'_>) -> PyResult<Option<Py<PyAny>>> {
+        self.cache_storage_state
+            .as_ref()
+            .map(|storage| storage.provider(py))
+            .transpose()
     }
 
     #[getter]
@@ -1830,10 +1874,17 @@ impl Engine {
         runner.result(result)
     }
     fn close(&mut self, py: Python<'_>) -> PyResult<()> {
+        if self.core.closed() {
+            return Ok(());
+        }
         if self.pending.is_some() {
             self.harvest(py, false)?;
         }
         self.deferred_events.clear();
+        if self.cache_storage_state.is_some() {
+            self.core.raise_if_open().map_err(core_error)?;
+            self.poll_storage(py, true)?;
+        }
         let mut runner = PythonRunner {
             py,
             forward: &self.runner_forward,
@@ -1976,6 +2027,7 @@ impl Engine {
 impl Drop for Engine {
     fn drop(&mut self) {
         if self.core.closed() || self.core.poisoned() {
+            self.retain_storage_quarantine();
             return;
         }
 
@@ -1989,6 +2041,7 @@ impl Drop for Engine {
                 "Engine destructor could not attach to Python; resources remain quarantined",
             ),
         }
+        self.retain_storage_quarantine();
     }
 }
 
