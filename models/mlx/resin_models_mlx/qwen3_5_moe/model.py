@@ -7,6 +7,7 @@ keys and values. The runner owns writing them back into the Engine's slabs.
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from dataclasses import dataclass
 
 import mlx.core as mx
@@ -17,19 +18,21 @@ from mlx_lm.models.switch_layers import SwitchGLU
 from resin.models.qwen3_5.config import Qwen35Config
 from resin_models_mlx.paged_attention import paged_decode_attention
 
+# Query-key scores materialized per prefill attention call (512 MiB in BF16).
+SCORE_BUDGET = 1 << 28
+
 
 @dataclass(frozen=True, slots=True)
 class AttentionHistory:
-    """Cached keys and values for one full-attention layer.
+    """Every earlier key and value of one full-attention layer.
 
-    ``keys`` and ``values`` have shape ``[rows, history, kv_heads, head_dim]``.
-    ``valid`` marks real history entries; padding is zeroed before use so
-    uninitialized slab bytes can never reach the attention arithmetic.
+    ``keys`` and ``values`` have shape ``[rows, history, kv_heads, head_dim]``
+    and hold exactly the rows' history, with no padding, so ordinary causal
+    masking applies after the step's own tokens are appended.
     """
 
     keys: mx.array
     values: mx.array
-    valid: mx.array
 
 
 @dataclass(frozen=True, slots=True)
@@ -65,6 +68,23 @@ class StepOutput:
     keys: tuple[mx.array, ...]
     values: tuple[mx.array, ...]
     state: LinearState
+
+
+class OffsetRMSNorm(nn.Module):
+    """Qwen RMSNorm whose weight is stored as an offset from one.
+
+    The scale ``1 + w`` is applied in FP32, as in the reference implementation;
+    folding it into a BF16 weight would round it by up to 2^-8.
+    """
+
+    def __init__(self, width: int, eps: float) -> None:
+        super().__init__()
+        self.eps = eps
+        self.weight = mx.zeros((width,))
+
+    def __call__(self, hidden: mx.array) -> mx.array:
+        normed = mx.fast.rms_norm(hidden.astype(mx.float32), None, self.eps)
+        return (normed * (1.0 + self.weight.astype(mx.float32))).astype(hidden.dtype)
 
 
 class GatedRMSNorm(nn.Module):
@@ -146,8 +166,8 @@ class GatedAttention(nn.Module):
         self.k_proj = nn.Linear(hidden, self.kv_heads * self.head_dim, bias=False)
         self.v_proj = nn.Linear(hidden, self.kv_heads * self.head_dim, bias=False)
         self.o_proj = nn.Linear(self.heads * self.head_dim, hidden, bias=False)
-        self.q_norm = nn.RMSNorm(self.head_dim, eps=config.rms_norm_eps)
-        self.k_norm = nn.RMSNorm(self.head_dim, eps=config.rms_norm_eps)
+        self.q_norm = OffsetRMSNorm(self.head_dim, config.rms_norm_eps)
+        self.k_norm = OffsetRMSNorm(self.head_dim, config.rms_norm_eps)
 
     def _rope(self, x: mx.array, offsets: mx.array) -> mx.array:
         # Text-only positions make every interleaved mRoPE axis equal, which
@@ -193,29 +213,50 @@ class GatedAttention(nn.Module):
                 self.scale,
             )[:, :, None]
             return self._project(output, gate, rows, tokens, new_key, new_value)
-        if history is None:
-            mask: mx.array | str | None = "causal" if tokens > 1 else None
-        else:
-            valid = history.valid[:, None, :, None]
-            past_key = mx.where(valid, history.keys.transpose(0, 2, 1, 3), 0)
-            past_value = mx.where(valid, history.values.transpose(0, 2, 1, 3), 0)
-            key = mx.concatenate([past_key, key], axis=2)
-            value = mx.concatenate([past_value, value], axis=2)
-            causal = mx.tril(mx.ones((tokens, tokens), dtype=mx.bool_))
-            mask = mx.concatenate(
-                [
-                    mx.broadcast_to(
-                        history.valid[:, None, None, :],
-                        (rows, 1, tokens, history.valid.shape[1]),
-                    ),
-                    mx.broadcast_to(causal, (rows, 1, tokens, tokens)),
-                ],
-                axis=-1,
+        if history is not None:
+            key = mx.concatenate([history.keys.transpose(0, 2, 1, 3), key], axis=2)
+            value = mx.concatenate(
+                [history.values.transpose(0, 2, 1, 3), value], axis=2
             )
-        output = mx.fast.scaled_dot_product_attention(
-            query, key, value, scale=self.scale, mask=mask
-        )
+        output = self._dense_attention(query, key, value)
         return self._project(output, gate, rows, tokens, new_key, new_value)
+
+    def _dense_attention(self, query: mx.array, key: mx.array, value: mx.array):
+        """Causal attention for queries that end the key sequence.
+
+        MLX's fused kernel streams scores only for head dimensions up to 128;
+        wider heads materialize every query-key score. Splitting the queries
+        bounds that buffer. Each block attends to the keys up to its own last
+        position, and MLX aligns a causal mask to the last query. Blocks are
+        evaluated one at a time: lazily, MLX would allocate them together. On
+        an M4 Max at 98K keys this holds 0.55 GiB instead of 10 GiB, at the
+        same speed.
+        """
+
+        tokens, length = query.shape[2], key.shape[2]
+        if tokens == 1:
+            return mx.fast.scaled_dot_product_attention(
+                query, key, value, scale=self.scale
+            )
+        block = max(1, SCORE_BUDGET // (self.heads * length))
+        if block >= tokens:
+            return mx.fast.scaled_dot_product_attention(
+                query, key, value, scale=self.scale, mask="causal"
+            )
+        outputs = []
+        for start in range(0, tokens, block):
+            end = min(start + block, tokens)
+            visible = length - tokens + end
+            output = mx.fast.scaled_dot_product_attention(
+                query[:, :, start:end],
+                key[:, :, :visible],
+                value[:, :, :visible],
+                scale=self.scale,
+                mask="causal",
+            )
+            mx.eval(output)
+            outputs.append(output)
+        return mx.concatenate(outputs, axis=2)
 
     def _project(self, output, gate, rows, tokens, key, value):
         output = output.transpose(0, 2, 1, 3).reshape(rows, tokens, -1)
@@ -277,14 +318,14 @@ class DecoderLayer(nn.Module):
         else:
             self.self_attn = GatedAttention(config)
         self.mlp = SparseMoe(config)
-        self.input_layernorm = nn.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.post_attention_layernorm = nn.RMSNorm(
-            config.hidden_size, eps=config.rms_norm_eps
+        self.input_layernorm = OffsetRMSNorm(config.hidden_size, config.rms_norm_eps)
+        self.post_attention_layernorm = OffsetRMSNorm(
+            config.hidden_size, config.rms_norm_eps
         )
 
 
 class Qwen35MoeModel(nn.Module):
-    """Text decoder; RMSNorm weights are stored with Qwen's ``1 + w`` folded in."""
+    """Text decoder over Qwen3.5-MoE checkpoint weights."""
 
     def __init__(self, config: Qwen35Config) -> None:
         super().__init__()
@@ -293,7 +334,7 @@ class Qwen35MoeModel(nn.Module):
         self.config = config
         self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size)
         self.layers = [DecoderLayer(config, kind) for kind in config.layer_types]
-        self.norm = nn.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.norm = OffsetRMSNorm(config.hidden_size, config.rms_norm_eps)
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
 
     def __call__(
@@ -301,7 +342,7 @@ class Qwen35MoeModel(nn.Module):
         token_ids: mx.array,
         offsets: mx.array,
         state: LinearState,
-        history: tuple[AttentionHistory | None, ...] | PagedHistory,
+        history: Sequence[AttentionHistory | None] | PagedHistory,
     ) -> StepOutput:
         """Run ``[rows, tokens]`` inputs starting at per-row position ``offsets``."""
 

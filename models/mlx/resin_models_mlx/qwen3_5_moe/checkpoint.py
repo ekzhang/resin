@@ -15,14 +15,8 @@ from resin.backend.loading import read_config
 from resin.models.qwen3_5.config import Qwen35Config
 from resin_models_mlx.qwen3_5_moe.model import Qwen35MoeModel
 
-TEXT_PREFIX = "model.language_model."
-# Qwen stores these RMSNorm weights as offsets from one.
-_OFFSET_NORMS = (
-    ".input_layernorm.weight",
-    ".post_attention_layernorm.weight",
-    ".q_norm.weight",
-    ".k_norm.weight",
-)
+# Multimodal exports nest the text model; text-only exports do not.
+_TEXT_PREFIXES = ("model.language_model.", "model.")
 _EXPERT_PROJECTIONS = ("gate_proj", "up_proj", "down_proj")
 
 
@@ -36,37 +30,41 @@ def load_config(model_path: str | Path) -> tuple[Qwen35Config, dict]:
     return config, raw_config
 
 
-def _tensor_files(model_path: Path) -> dict[str, Path]:
-    index = model_path / "model.safetensors.index.json"
-    if index.exists():
-        weight_map = json.loads(index.read_text())["weight_map"]
-        return {name: model_path / file for name, file in weight_map.items()}
-    single = model_path / "model.safetensors"
-    return {name: single for name in _load(single)}
-
-
 def _load(file: Path) -> dict[str, mx.array]:
     # Safetensors arrays are memory-mapped and read when evaluated.
     return cast(dict[str, mx.array], mx.load(str(file)))
 
 
-def _text_name(name: str) -> str | None:
-    if name == "lm_head.weight":
-        return name
-    if name.startswith(TEXT_PREFIX):
-        return name[len(TEXT_PREFIX) :]
-    # Vision tower and MTP head weights are outside this text runner.
-    return None
+def _tensor_files(
+    model_path: Path, shards: dict[Path, dict[str, mx.array]]
+) -> dict[str, Path]:
+    index = model_path / "model.safetensors.index.json"
+    if index.exists():
+        weight_map = json.loads(index.read_text())["weight_map"]
+        return {name: model_path / file for name, file in weight_map.items()}
+    single = model_path / "model.safetensors"
+    shards[single] = _load(single)
+    return dict.fromkeys(shards[single], single)
+
+
+def _text_prefix(names) -> str:
+    nested = _TEXT_PREFIXES[0]
+    return nested if any(name.startswith(nested) for name in names) else "model."
 
 
 def checkpoint_weights(
     model_path: str | Path, config: Qwen35Config
 ) -> Iterator[tuple[str, mx.array]]:
-    """Yield lazily loaded tensors under the MLX model's parameter names."""
+    """Yield lazily loaded tensors under the MLX model's parameter names.
+
+    Experts may be stored one tensor per expert or fused as Transformers saves
+    them (``experts.gate_up_proj`` and ``experts.down_proj``). Vision tower and
+    MTP weights are outside this text runner and are skipped.
+    """
 
     model_path = Path(model_path)
-    files = _tensor_files(model_path)
     shards: dict[Path, dict[str, mx.array]] = {}
+    files = _tensor_files(model_path, shards)
 
     def tensor(name: str) -> mx.array:
         file = files[name]
@@ -74,22 +72,38 @@ def checkpoint_weights(
             shards[file] = _load(file)
         return shards[file][name]
 
+    prefix = _text_prefix(files)
     experts: dict[str, dict[int, str]] = {}
     for name in files:
-        text = _text_name(name)
-        if text is None:
+        if name == "lm_head.weight":
+            yield name, tensor(name)
             continue
+        if not name.startswith(prefix) or name.startswith("model.visual."):
+            continue
+        text = name[len(prefix) :]
         parts = text.split(".")
         if len(parts) == 7 and parts[3] == "experts":
             # layers.{i}.mlp.experts.{e}.{projection}.weight
             layer, expert, projection = parts[1], int(parts[4]), parts[5]
+            if projection not in _EXPERT_PROJECTIONS:
+                raise ValueError(f"unexpected expert projection {name!r}")
             key = f"layers.{layer}.mlp.switch_mlp.{projection}.weight"
             experts.setdefault(key, {})[expert] = name
             continue
+        if text.endswith("mlp.experts.gate_up_proj"):
+            # [experts, 2 * intermediate, hidden]: gate rows, then up rows.
+            gate_up = tensor(name)
+            middle = gate_up.shape[1] // 2
+            base = text.removesuffix("experts.gate_up_proj") + "switch_mlp."
+            yield base + "gate_proj.weight", gate_up[:, :middle]
+            yield base + "up_proj.weight", gate_up[:, middle:]
+            continue
+        if text.endswith("mlp.experts.down_proj"):
+            base = text.removesuffix("experts.down_proj") + "switch_mlp."
+            yield base + "down_proj.weight", tensor(name)
+            continue
         value = tensor(name)
-        if text.endswith(_OFFSET_NORMS) or text == "norm.weight":
-            value = value.astype(mx.float32) + 1.0
-        elif text.endswith("linear_attn.conv1d.weight"):
+        if text.endswith("linear_attn.conv1d.weight"):
             value = value.moveaxis(2, 1)
         yield text, value
 

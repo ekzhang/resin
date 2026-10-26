@@ -47,16 +47,39 @@ class Qwen3_5MoeMlxRunner:
         model: str | Path | Qwen35MoeModel,
         *,
         weight_bits: int | None = 8,
+        group_size: int = 64,
         memory_utilization: float = 0.85,
         cache_slab_capacity: int | None = None,
+        max_seq_len: int | None = None,
     ) -> None:
         if isinstance(model, Qwen35MoeModel):
             self._model = model
             self.config: Qwen35Config = model.config
             self.model_path = None
+            quantization = "preloaded"
         else:
             self.model_path = Path(model)
-            self._model, self.config, _ = load_model(self.model_path, bits=weight_bits)
+            self._model, self.config, _ = load_model(
+                self.model_path, bits=weight_bits, group_size=group_size
+            )
+            quantization = (
+                "bfloat16"
+                if weight_bits is None
+                else f"mlx-int{weight_bits}-g{group_size}"
+            )
+        limit_positions = self.config.max_position_embeddings
+        self.max_seq_len = limit_positions if max_seq_len is None else max_seq_len
+        if not 0 < self.max_seq_len <= limit_positions:
+            raise ValueError(
+                f"max_seq_len must be between 1 and the checkpoint's "
+                f"{limit_positions} positions"
+            )
+        # Describes how this runner executes for benchmark records.
+        self.benchmark_metadata = {
+            "quant": quantization,
+            "expert_backend": "mlx-gather-qmm",
+            "graphs": {"prefill": "disabled", "decode": "disabled"},
+        }
         self.vocab_size = self.config.vocab_size
         self.eos_token_id = self.config.eos_token_id
         self.cache_geometry = CacheGeometry.from_config(self.config)
@@ -101,19 +124,23 @@ class Qwen3_5MoeMlxRunner:
         self,
         plan: PagedCachePlan,
         rows: np.ndarray,
-        token_ids: np.ndarray,
-        contexts: np.ndarray,
+        tokens: np.ndarray,
     ) -> tuple[StepOutput, mx.array]:
-        """Run ``[len(rows), tokens]`` inputs and commit their cache writes."""
+        """Run ``tokens``, flattened plan indices shaped ``[len(rows), width]``.
 
-        tokens = token_ids.shape[1]
+        Decode passes one token per row; prefill passes one row's chunk.
+        """
+
+        batch = plan.batch
+        contexts = batch.context_lengths[rows].astype(np.int64)
+        token_ids = batch.token_ids[tokens]
         with record_function("resin.mlx.forward"):
-            # Decode attends to history in place; prefill gathers its history
-            # once per chunk for the dense causal kernel.
+            # Decode attends to history in place; prefill gathers one row's
+            # history layer by layer for the dense causal kernel.
             history = (
                 self._cache.paged_history(plan, rows, contexts)
-                if tokens == 1
-                else self._cache.history(plan, rows, contexts)
+                if tokens.shape[1] == 1
+                else self._cache.history(plan, int(rows[0]), int(contexts[0]))
             )
             output = self._model(
                 mx.array(token_ids.astype(np.int32)),
@@ -132,19 +159,17 @@ class Qwen3_5MoeMlxRunner:
                 *output.state.recurrent,
                 *output.state.convolution,
             )
-            # A paged history holds a view of the arena; any live view would
-            # force each write below to copy the entire arena.
+            # History holds views of the arena; any live view would force each
+            # write below to copy the entire arena.
             del history
         with record_function("resin.mlx.cache_write"):
-            positions = (contexts[:, None] + np.arange(tokens)[None, :]).reshape(-1)
             self._cache.write_tokens(
                 plan,
                 tuple(key.reshape(-1, *key.shape[2:]) for key in output.keys),
                 tuple(value.reshape(-1, *value.shape[2:]) for value in output.values),
-                np.repeat(rows, tokens),
-                positions.astype(np.int64),
+                tokens.reshape(-1),
             )
-            self._cache.write_state(plan, rows, contexts + tokens - 1, output.state)
+            self._cache.write_state(plan, tokens[:, -1], output.state)
             # Reads of this step are complete, so the writes can update the arena
             # in place while the host samples and commits. The next step's reads
             # depend on the written arena and therefore run after them.
@@ -169,8 +194,7 @@ class Qwen3_5MoeMlxRunner:
             output, last = self._step(
                 cache_plan,
                 np.array([row]),
-                batch.token_ids[selected][None],
-                batch.context_lengths[row : row + 1].astype(np.int64),
+                np.arange(selected.start, selected.stop)[None],
             )
             logits.append(last)
             if plan.needs_prompt_logprobs:
@@ -190,18 +214,18 @@ class Qwen3_5MoeMlxRunner:
 
     def _decode(self, plan: BatchPlan, cache_plan: PagedCachePlan) -> ForwardOutput:
         batch = cache_plan.batch
-        _, last = self._step(
-            cache_plan,
-            np.arange(batch.num_sequences),
-            batch.token_ids[:, None],
-            batch.context_lengths.astype(np.int64),
-        )
+        rows = np.arange(batch.num_sequences)
+        _, last = self._step(cache_plan, rows, rows[:, None])
         return self._output(plan, last)
 
     def forward(self, plan: BatchPlan) -> ForwardOutput:
         cache_plan = PagedCachePlan.from_plan(plan, self.cache_layout)
         if np.any(cache_plan.token_ids >= self.vocab_size):
             raise ValueError("token id is out of range for Qwen3.5-MoE")
+        if int(np.max(cache_plan.batch.post_lengths)) > self.max_seq_len:
+            raise ValueError(
+                f"sequence exceeds this runner's {self.max_seq_len}-token context"
+            )
         if plan.phase == BatchPhase.PREFILL:
             return self._prefill(plan, cache_plan)
         return self._decode(plan, cache_plan)

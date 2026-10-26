@@ -68,8 +68,11 @@ def _model(seed: int = 0, dtype=None) -> Qwen35MoeModel:
     # Give norms and DeltaNet decay realistic, non-trivial values.
     updates = []
     for name, value in cast(list[tuple[str, Any]], tree_flatten(model.parameters())):
-        if name.endswith("norm.weight"):
+        if name.endswith("linear_attn.norm.weight"):
             updates.append((name, 1.0 + 0.1 * mx.random.normal(value.shape)))
+        elif name.endswith("norm.weight"):
+            # Qwen RMSNorms store an offset from one.
+            updates.append((name, 0.1 * mx.random.normal(value.shape)))
         elif name.endswith("A_log"):
             updates.append((name, mx.random.uniform(-1.0, 1.0, value.shape)))
         elif name.endswith("dt_bias"):
@@ -170,6 +173,11 @@ def _mlx_lm_reference(model: Qwen35MoeModel):
             if name.startswith("lm_head")
             else ("language_model.model.")
         )
+        if name.endswith("norm.weight") and not name.endswith(
+            "linear_attn.norm.weight"
+        ):
+            # mlx-lm folds Qwen's offset into the stored RMSNorm weight.
+            value = 1.0 + value
         weights.append((prefix + name, value))
     reference.load_weights(weights)
     mx.eval(reference.parameters())
@@ -177,14 +185,17 @@ def _mlx_lm_reference(model: Qwen35MoeModel):
 
 
 def test_forward_matches_mlx_lm_reference() -> None:
-    model = _model()
+    # mlx-lm folds Qwen's RMSNorm offset into its weight; FP32 makes folding
+    # exact, so this compares the composition rather than BF16 rounding, which
+    # this randomly initialized network amplifies.
+    model = _model(dtype=mx.float32)
     reference = _mlx_lm_reference(model)
     tokens = _prompt(37, seed=1)
 
     actual = _full_logits(model, tokens)
     expected = reference(mx.array([tokens]))[0].astype(mx.float32)
 
-    assert mx.allclose(actual, expected, atol=2e-2, rtol=2e-2).item()
+    assert mx.allclose(actual, expected, atol=1e-3, rtol=1e-3).item()
     assert (mx.argmax(actual, axis=-1) == mx.argmax(expected, axis=-1)).all().item()
 
 
@@ -204,7 +215,7 @@ def test_incremental_state_matches_full_forward_exactly() -> None:
     from resin_models_mlx.qwen3_5_moe.model import AttentionHistory
 
     history = tuple(
-        AttentionHistory(key, value, mx.ones((1, 13), dtype=mx.bool_))
+        AttentionHistory(key, value)
         for key, value in zip(first.keys, first.values, strict=True)
     )
     second = model(mx.array([tokens[13:]]), mx.array([13]), first.state, history)
@@ -272,7 +283,8 @@ def test_decode_crosses_kv_page_boundary() -> None:
     _assert_greedy(model, prompt, generated, 6)
 
 
-def _assert_checkpoint_loader_matches_transformers() -> None:
+def _assert_checkpoint_loader_matches_transformers(layout: str) -> None:
+    import json
     import tempfile
 
     import torch
@@ -291,20 +303,26 @@ def _assert_checkpoint_loader_matches_transformers() -> None:
             elif name.endswith("A_log"):
                 parameter.uniform_(-1.0, 1.0)
     state = {
-        name.replace("model.", "model.language_model.", 1): tensor.to(torch.bfloat16)
+        name: tensor.to(torch.bfloat16)
         for name, tensor in reference.state_dict().items()
     }
-    # Hugging Face's fused expert tensors are split into per-expert checkpoint
-    # names, matching the published Ornith safetensors.
-    for name in [name for name in state if name.endswith("mlp.experts.gate_up_proj")]:
-        prefix = name.removesuffix("gate_up_proj")
-        gate_up = state.pop(name)
-        down = state.pop(prefix + "down_proj")
-        middle = gate_up.shape[1] // 2
-        for expert in range(gate_up.shape[0]):
-            state[f"{prefix}{expert}.gate_proj.weight"] = gate_up[expert, :middle]
-            state[f"{prefix}{expert}.up_proj.weight"] = gate_up[expert, middle:]
-            state[f"{prefix}{expert}.down_proj.weight"] = down[expert]
+    if layout != "text-only":
+        # Multimodal exports nest the text model.
+        state = {
+            name.replace("model.", "model.language_model.", 1): tensor
+            for name, tensor in state.items()
+        }
+    if layout == "per-expert":
+        # Ornith-1.0 stores one tensor per expert instead of fused experts.
+        for name in [n for n in state if n.endswith("mlp.experts.gate_up_proj")]:
+            prefix = name.removesuffix("gate_up_proj")
+            gate_up = state.pop(name)
+            down = state.pop(prefix + "down_proj")
+            middle = gate_up.shape[1] // 2
+            for expert in range(gate_up.shape[0]):
+                state[f"{prefix}{expert}.gate_proj.weight"] = gate_up[expert, :middle]
+                state[f"{prefix}{expert}.up_proj.weight"] = gate_up[expert, middle:]
+                state[f"{prefix}{expert}.down_proj.weight"] = down[expert]
     reference = reference.to(torch.bfloat16)
     tokens = _prompt(19, seed=8)
     with torch.no_grad():
@@ -312,21 +330,38 @@ def _assert_checkpoint_loader_matches_transformers() -> None:
 
     with tempfile.TemporaryDirectory() as directory:
         path = Path(directory)
-        save_file(
-            {k: v.contiguous() for k, v in state.items()}, path / "model.safetensors"
+        tensors = {name: tensor.contiguous() for name, tensor in state.items()}
+        if layout == "per-expert":
+            # Exercise the sharded index path as well.
+            names = sorted(tensors)
+            shards = {
+                "model-1.safetensors": names[::2],
+                "model-2.safetensors": names[1::2],
+            }
+            for file, members in shards.items():
+                save_file({name: tensors[name] for name in members}, path / file)
+            weight_map = {
+                name: file for file, members in shards.items() for name in members
+            }
+            (path / "model.safetensors.index.json").write_text(
+                json.dumps({"weight_map": weight_map})
+            )
+        else:
+            save_file(tensors, path / "model.safetensors")
+        config = (
+            values
+            if layout == "text-only"
+            else {"model_type": "qwen3_5_moe", "text_config": values}
         )
-        import json
-
-        (path / "config.json").write_text(
-            json.dumps({"model_type": "qwen3_5_moe", "text_config": values})
-        )
+        (path / "config.json").write_text(json.dumps(config))
         model, _, _ = load_model(path, bits=None)
         actual = np.array(_full_logits(model, tokens))
-    np.testing.assert_allclose(actual, expected, atol=5e-2, rtol=5e-2)
+    np.testing.assert_allclose(actual, expected, atol=3e-2, rtol=3e-2)
     assert (actual.argmax(-1) == expected.argmax(-1)).mean() > 0.9
 
 
-def test_checkpoint_loader_matches_transformers_reference() -> None:
+@pytest.mark.parametrize("layout", ["per-expert", "fused", "text-only"])
+def test_checkpoint_loader_matches_transformers_reference(layout: str) -> None:
     tests = Path(__file__).resolve().parent
     subprocess.run(
         [
@@ -337,7 +372,7 @@ def test_checkpoint_loader_matches_transformers_reference() -> None:
                 f"sys.path.insert(0, {str(tests)!r}); "
                 "from test_qwen3_5_moe_mlx import "
                 "_assert_checkpoint_loader_matches_transformers as check; "
-                "check()"
+                f"check({layout!r})"
             ),
         ],
         check=True,
@@ -364,3 +399,36 @@ def test_cache_writes_update_the_arena_in_place() -> None:
     # Prefill and decode both write; a copied arena would double its size.
     assert arena > 1 << 30
     assert growth < arena // 8
+
+
+def test_context_is_capped_by_checkpoint_positions() -> None:
+    model = _model()
+    limit = model.config.max_position_embeddings
+    with pytest.raises(ValueError, match="checkpoint's"):
+        Qwen3_5MoeMlxRunner(model, cache_slab_capacity=8, max_seq_len=limit + 1)
+    runner = Qwen3_5MoeMlxRunner(model, cache_slab_capacity=64, max_seq_len=300)
+    assert runner.benchmark_metadata["quant"] == "preloaded"
+    with Engine(runner, context_length=8192) as engine:
+        engine.submit(
+            _prompt(400, seed=11),
+            sampling_params=SamplingParams(max_output_tokens=2, temperature=0.0),
+        )
+        with pytest.raises(Exception, match="300-token context"):
+            while engine.has_work():
+                engine.step()
+
+
+def test_query_blocked_prefill_attention_matches_one_block(monkeypatch) -> None:
+    import resin_models_mlx.qwen3_5_moe.model as model_module
+
+    model = _model(dtype=mx.float32)
+    attention = model.layers[3].self_attn
+    rng = mx.random.key(3)
+    query = mx.random.normal((1, attention.heads, 37, attention.head_dim), key=rng)
+    key = mx.random.normal((1, attention.kv_heads, 100, attention.head_dim), key=rng)
+    value = mx.random.normal((1, attention.kv_heads, 100, attention.head_dim))
+    whole = attention._dense_attention(query, key, value)
+    # Force blocks of three queries over the 100 keys.
+    monkeypatch.setattr(model_module, "SCORE_BUDGET", attention.heads * 100 * 3)
+    blocked = attention._dense_attention(query, key, value)
+    assert mx.allclose(whole, blocked, atol=1e-5).item()

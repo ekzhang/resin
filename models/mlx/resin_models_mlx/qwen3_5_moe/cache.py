@@ -16,6 +16,7 @@ evaluated, so MLX updates the arena in place instead of copying it.
 from __future__ import annotations
 
 import math
+from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Any, cast
 
@@ -192,60 +193,41 @@ class CacheArena:
 
     # Reads ---------------------------------------------------------------
 
-    def history(
+    def _kv_bases(
         self, plan: PagedCachePlan, rows: np.ndarray, lengths: np.ndarray
-    ) -> tuple[AttentionHistory | None, ...]:
-        """Gather each full-attention layer's first ``lengths[i]`` tokens."""
+    ) -> np.ndarray:
+        """First unit of each block covering ``lengths[i]`` tokens; 0 pads."""
+
+        group = plan.groups[KV_GROUP]
+        layers = self.geometry.full_layers
+        width = max(1, math.ceil(int(lengths.max(initial=0)) / PAGE_TOKENS))
+        bases = np.zeros((len(rows), width), dtype=np.int64)
+        for index, row in enumerate(rows.tolist()):
+            blocks = math.ceil(int(lengths[index]) / PAGE_TOKENS)
+            slabs = group.block_slabs(row)[:blocks]
+            slots = group.block_slots(row)[:blocks]
+            bases[index, :blocks] = self._unit(slabs, slots.astype(np.int64) * layers)
+        return bases
+
+    def history(
+        self, plan: PagedCachePlan, row: int, length: int
+    ) -> Sequence[AttentionHistory | None]:
+        """One row's earlier tokens, gathered per layer only when it is read."""
 
         layers = self.geometry.full_layers
-        longest = int(lengths.max()) if len(lengths) else 0
-        if longest == 0:
+        if length == 0:
             return (None,) * layers
-        count = len(rows)
-        width = math.ceil(longest / PAGE_TOKENS)
-        group = plan.groups[KV_GROUP]
-        slabs = np.zeros((count, width), dtype=np.int64)
-        slots = np.zeros((count, width), dtype=np.int64)
-        for index, row in enumerate(rows):
-            blocks = math.ceil(int(lengths[index]) / PAGE_TOKENS)
-            selected = group.block_slice(int(row))
-            slabs[index, :blocks] = group.block_slab_ids[selected][:blocks]
-            slots[index, :blocks] = group.block_slotnums[selected][:blocks]
-        valid = _mask(np.arange(width * PAGE_TOKENS)[None, :] < lengths[:, None])
-        base = self._unit(slabs, slots * layers).reshape(-1)
-        units = self._units()
-        shape = (count, width, 2, PAGE_TOKENS, self.geometry.kv_heads, -1)
-        result = []
-        for layer in range(layers):
-            pages = mx.take(units, mx.array(base + layer), axis=0).reshape(shape)
-            history = (count, width * PAGE_TOKENS, self.geometry.kv_heads, -1)
-            result.append(
-                AttentionHistory(
-                    pages[:, :, 0].reshape(history),
-                    pages[:, :, 1].reshape(history),
-                    valid,
-                )
-            )
-        return tuple(result)
+        bases = self._kv_bases(plan, np.array([row]), np.array([length]))[0]
+        return _GatheredHistory(self._units(), bases, length, layers, self.geometry)
 
     def paged_history(
         self, plan: PagedCachePlan, rows: np.ndarray, lengths: np.ndarray
     ) -> PagedHistory:
         """Page tables for attending to history in place during decode."""
 
-        width = max(1, math.ceil(int(lengths.max()) / PAGE_TOKENS))
-        group = plan.groups[KV_GROUP]
-        slabs = np.zeros((len(rows), width), dtype=np.int64)
-        slots = np.zeros((len(rows), width), dtype=np.int64)
-        for index, row in enumerate(rows):
-            blocks = math.ceil(int(lengths[index]) / PAGE_TOKENS)
-            selected = group.block_slice(int(row))
-            slabs[index, :blocks] = group.block_slab_ids[selected][:blocks]
-            slots[index, :blocks] = group.block_slotnums[selected][:blocks]
-        pages = self._unit(slabs, slots * self.geometry.full_layers)
         return PagedHistory(
             self._units(),
-            mx.array(pages.astype(np.int32)),
+            mx.array(self._kv_bases(plan, rows, lengths).astype(np.int32)),
             mx.array(lengths.astype(np.int32)),
         )
 
@@ -315,50 +297,56 @@ class CacheArena:
         plan: PagedCachePlan,
         keys: tuple[mx.array, ...],
         values: tuple[mx.array, ...],
-        token_rows: np.ndarray,
-        positions: np.ndarray,
+        tokens: np.ndarray,
     ) -> None:
-        """Scatter ``[tokens, kv_heads, head_dim]`` K/V rows for every layer."""
+        """Scatter K/V rows of every layer for flattened plan ``tokens``.
 
-        slab, slot, offset = _locate(
-            plan.groups[KV_GROUP], token_rows, positions, PAGE_TOKENS
-        )
+        Targets are the plan's validated append addresses.
+        """
+
+        group = plan.groups[KV_GROUP]
+        slab = group.append_slab_ids[tokens]
+        slot = group.append_slotnums[tokens].astype(np.int64)
+        offset = group.append_block_offsets[tokens].astype(np.int64)
         layers = self.geometry.full_layers
-        tokens = len(positions)
+        count = len(tokens)
         units = self._unit(slab[:, None], slot[:, None] * layers + np.arange(layers))
         # Each (token, layer) writes its key row and value row in one unit.
         rows = np.arange(2)[None, None, :] * PAGE_TOKENS + offset[:, None, None]
         update = mx.stack(
             [
-                mx.stack([key.reshape(tokens, -1), value.reshape(tokens, -1)], axis=1)
+                mx.stack([key.reshape(count, -1), value.reshape(count, -1)], axis=1)
                 for key, value in zip(keys, values, strict=True)
             ],
             axis=1,
         )
+        shape = (count, layers, 2)
         self.storage[
             mx.array(
-                np.broadcast_to(units[:, :, None], rows.shape[:1] + (layers, 2))
-                .reshape(-1)
-                .astype(np.int32)
+                np.broadcast_to(units[:, :, None], shape).reshape(-1).astype(np.int32)
             ),
-            mx.array(
-                np.broadcast_to(rows, (tokens, layers, 2)).reshape(-1).astype(np.int32)
-            ),
+            mx.array(np.broadcast_to(rows, shape).reshape(-1).astype(np.int32)),
         ] = update.reshape(-1, self.geometry.kv_width)
 
     def write_state(
-        self,
-        plan: PagedCachePlan,
-        rows: np.ndarray,
-        positions: np.ndarray,
-        state: LinearState,
+        self, plan: PagedCachePlan, last_tokens: np.ndarray, state: LinearState
     ) -> None:
-        """Store each row's checkpoint after processing ``positions[i]``."""
+        """Store each row's checkpoint after its flattened ``last_tokens`` entry.
+
+        Targets are the plan's validated STATE append addresses. Writes are
+        contiguous slice updates per row and layer: on an M4 Max at batch 16 this
+        moves 1 GB in 12 ms, against 13 ms when rows are first concatenated
+        into one update each and 57 ms as one indexed scatter per layer.
+        """
 
         geometry = self.geometry
-        count = len(rows)
+        group = plan.groups[STATE_GROUP]
+        count = len(last_tokens)
         unit_shape = (2 * PAGE_TOKENS, geometry.kv_width)
-        starts = self._state_units(plan, rows, positions.astype(np.int64)).tolist()
+        slots = group.append_slotnums[last_tokens].astype(np.int64)
+        starts = self._unit(
+            group.append_slab_ids[last_tokens], slots * geometry.state_units
+        ).tolist()
         per_layer = self._recurrent_units
         for layer, value in enumerate(state.recurrent):
             units = value.astype(mx.float32).view(mx.bfloat16)
@@ -389,6 +377,39 @@ class CacheArena:
         first = layers * per_layer
         for index, start in enumerate(starts):
             self.storage[start + first : start + first + tail_units] = tails[index]
+
+
+class _GatheredHistory(Sequence[AttentionHistory | None]):
+    """Per-layer history views that gather a layer's pages only on access.
+
+    Nothing holds a layer's gathered keys and values beyond the attention that
+    consumes them, so MLX can free each layer's copy before the next.
+    """
+
+    def __init__(
+        self,
+        units: mx.array,
+        bases: np.ndarray,
+        length: int,
+        layers: int,
+        geometry: CacheGeometry,
+    ) -> None:
+        self._units = units
+        self._bases = bases
+        self._length = length
+        self._layers = layers
+        self._shape = (1, len(bases) * PAGE_TOKENS, geometry.kv_heads, -1)
+
+    def __len__(self) -> int:
+        return self._layers
+
+    def __getitem__(self, layer):  # type: ignore[override]
+        if not isinstance(layer, int) or not 0 <= layer < self._layers:
+            raise IndexError(layer)
+        pages = mx.take(self._units, mx.array(self._bases + layer), axis=0)
+        keys = pages[:, 0].reshape(self._shape)[:, : self._length]
+        values = pages[:, 1].reshape(self._shape)[:, : self._length]
+        return AttentionHistory(keys, values)
 
 
 __all__ = [
