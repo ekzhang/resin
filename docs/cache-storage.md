@@ -41,7 +41,7 @@ using `has_work()` to drive the Engine; outstanding physical transfers remain
 work even after their request finishes or is cancelled. `close()` drains
 accepted transfers before returning resources.
 
-The prototype integrates storage with the local Engine. A distributed runner
+Prefix storage integrates with the local `Engine`. A distributed runner
 needs an adapter that coordinates transfers across every rank holding the
 request's cache; `DistributedWorker` does not yet provide that adapter. A shared
 namespace describes compatibility and does not establish replica coordination.
