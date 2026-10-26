@@ -1,6 +1,6 @@
 use resin_recipe::{
     Recipe,
-    qwen::{Qwen35Recipe, Qwen38Recipe},
+    qwen::{OrnithRecipe, Qwen35Recipe, Qwen38Recipe},
 };
 mod common;
 use common::SemanticParser;
@@ -57,7 +57,7 @@ fn coalesce(events: Vec<Event>) -> Vec<Event> {
 }
 
 #[test]
-fn pinned_hf_templates_match_both_variants_tools_history_and_vision() {
+fn pinned_hf_templates_match_all_variants_tools_history_and_vision() {
     let fixture: serde_json::Value =
         serde_json::from_str(include_str!("fixtures/qwen_hf.json")).unwrap();
     for case in fixture["cases"].as_array().unwrap() {
@@ -225,13 +225,15 @@ fn legacy_reasoning_extraction_preserves_vision_control_spans() {
 
 fn render_fixture(request: &serde_json::Value) -> Result<resin_recipe::Prompt, Error> {
     let mut request = request.clone();
-    let variant35 = request["extra"]["recipe_variant"] == "qwen3_5";
+    let variant = request["extra"]["recipe_variant"]
+        .as_str()
+        .map(str::to_owned);
     if let Some(extra) = request["extra"].as_object_mut() {
         extra.remove("recipe_variant");
     }
-    if variant35 {
-        Qwen35Recipe::default().render(&request)
-    } else {
-        Qwen38Recipe::default().render(&request)
+    match variant.as_deref() {
+        Some("qwen3_5") => Qwen35Recipe::default().render(&request),
+        Some("ornith") => OrnithRecipe::default().render(&request),
+        _ => Qwen38Recipe::default().render(&request),
     }
 }

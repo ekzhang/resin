@@ -1,4 +1,4 @@
-//! Qwen3.5 and Qwen3.8 conversation formats.
+//! Qwen3.5, Qwen3.8 and Ornith conversation formats.
 
 mod parser;
 pub use parser::{QwenParser, QwenTokens};
@@ -94,7 +94,7 @@ fn tool_instructions(prompt: &mut Prompt) {
     prompt.text(tail);
 }
 
-/// Shared construction parameters for the Qwen 3.5 and 3.8 formats.
+/// Shared construction parameters for the Qwen-family formats.
 #[derive(Clone, Debug, Default, serde::Deserialize, serde::Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct QwenRecipeParams {
@@ -107,31 +107,42 @@ pub struct QwenRecipeParams {
     pub media_config: Option<crate::media::qwen::Config>,
 }
 
-pub type Qwen35Recipe = QwenRecipe<true>;
-pub type Qwen38Recipe = QwenRecipe<false>;
+/// Checkpoint template variants rendered by [`QwenRecipe`].
+pub const QWEN35: u8 = 0;
+pub const QWEN38: u8 = 1;
+/// Ornith's modified Qwen3.5 template: always preserves past reasoning and
+/// renders non-string tool arguments as JSON.
+pub const ORNITH: u8 = 2;
+
+pub type Qwen35Recipe = QwenRecipe<QWEN35>;
+pub type Qwen38Recipe = QwenRecipe<QWEN38>;
+pub type OrnithRecipe = QwenRecipe<ORNITH>;
 
 /// One family implementation with a compile-time checkpoint-format variant.
 #[derive(Clone, Debug, Default)]
-pub struct QwenRecipe<const VARIANT35: bool> {
+pub struct QwenRecipe<const FORMAT: u8> {
     params: QwenRecipeParams,
 }
-impl<const VARIANT35: bool> QwenRecipe<VARIANT35> {
+impl<const FORMAT: u8> QwenRecipe<FORMAT> {
     pub fn new(params: QwenRecipeParams) -> Self {
         Self { params }
     }
 }
-impl<const VARIANT35: bool> crate::Recipe for QwenRecipe<VARIANT35> {
+impl<const FORMAT: u8> crate::Recipe for QwenRecipe<FORMAT> {
     fn render(&self, request: &Value) -> Result<Prompt, Error> {
         let request = crate::recipe::request("Qwen", &self.params, request)?;
         let request = &request;
         let messages = messages(request, "Qwen")?;
-        let variant35 = VARIANT35;
+        let variant35 = FORMAT != QWEN38;
         let thinking = option(request, "enable_thinking")
             .and_then(Value::as_bool)
             .unwrap_or(true);
-        let preserve = option(request, "preserve_thinking")
-            .and_then(Value::as_bool)
-            .unwrap_or(!variant35);
+        // Ornith's template renders every past reasoning block unconditionally.
+        let preserve = FORMAT == ORNITH
+            || option(request, "preserve_thinking")
+                .and_then(Value::as_bool)
+                .unwrap_or(!variant35);
+        let python_literals = FORMAT == QWEN35;
         let effort = option(request, "reasoning_effort")
             .and_then(Value::as_str)
             .unwrap_or("xhigh");
@@ -279,14 +290,14 @@ impl<const VARIANT35: bool> crate::Recipe for QwenRecipe<VARIANT35> {
                             for (key, value) in arguments {
                                 let text = match value {
                                     Value::String(text) => text.clone(),
-                                    Value::Bool(value) if variant35 => {
+                                    Value::Bool(value) if python_literals => {
                                         if *value {
                                             "True".into()
                                         } else {
                                             "False".into()
                                         }
                                     }
-                                    Value::Null if variant35 => "None".into(),
+                                    Value::Null if python_literals => "None".into(),
                                     _ => crate::json::spaced(value),
                                 };
                                 prompt

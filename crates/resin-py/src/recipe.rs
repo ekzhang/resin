@@ -799,6 +799,9 @@ pub(crate) fn get_native_recipe(
         "qwen3_8" => Box::new(resin_recipe::qwen::Qwen38Recipe::new(recipe_params(
             image_processor_params(tokenizer, params)?,
         )?)),
+        "ornith" => Box::new(resin_recipe::qwen::OrnithRecipe::new(recipe_params(
+            image_processor_params(tokenizer, params)?,
+        )?)),
         _ => {
             return Err(PyValueError::new_err(format!(
                 "unknown native recipe: {name}"
