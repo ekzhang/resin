@@ -1,8 +1,9 @@
-"""Serve one registry model on a local single-device host.
+"""Serve a local Apple Silicon (MLX) registry preset through Resin's HTTP APIs.
 
 uv run scripts/serve.py --model ornith-1.0-35b --checkpoint ~/models/Ornith-1.0-35B
 
-Distributed CUDA presets use deploy/modal_serve.py instead.
+CUDA presets need graph capture, warmup and runtime preparation; serve them with
+deploy/modal_serve.py.
 """
 
 from __future__ import annotations
@@ -16,7 +17,8 @@ from deploy.models import MODEL_SPECS, create_recipe, create_runner, get_model
 
 def main(argv=None) -> None:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    parser.add_argument("--model", choices=MODEL_SPECS, required=True)
+    local = [name for name, spec in MODEL_SPECS.items() if spec.backend == "mlx"]
+    parser.add_argument("--model", choices=local, required=True)
     parser.add_argument("--checkpoint", type=Path, required=True)
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8000)
@@ -28,22 +30,18 @@ def main(argv=None) -> None:
     from resin.server import HttpServer
 
     spec = get_model(args.model)
-    if spec.world_size != 1:
-        parser.error(f"{spec.name} is distributed; use deploy/modal_serve.py")
     context_length = args.context_length or spec.context_length
     max_batch_size = args.max_batch_size or spec.max_batch_size
     started = time.perf_counter()
     runner = create_runner(
         spec,
         args.checkpoint.expanduser(),
-        device="cuda:0",
+        device="mps",
         context_length=context_length,
         max_batch_size=max_batch_size,
         prefill_chunk_size=spec.prefill_chunk_size,
         draft_tokens=spec.draft_tokens,
     )
-    if hasattr(runner, "capture_cuda_graphs"):
-        runner.capture_cuda_graphs()
     recipe = create_recipe(spec, args.checkpoint.expanduser(), runner=runner)
     batch_tokens = getattr(
         runner.runner_config, "max_batch_tokens", spec.prefill_chunk_size

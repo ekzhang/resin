@@ -86,7 +86,7 @@ def _runner(model, checkpoint, *, device, groups, cases, options, context_capaci
 
 def _apple_silicon(spec) -> bool:
     """Whether this preset runs one MLX process instead of CUDA ranks."""
-    return spec.family == "qwen3_5_moe"
+    return spec.backend == "mlx"
 
 
 def _result_callback(report_path):
@@ -346,17 +346,15 @@ def _rank(
             axis: getattr(topology, axis)
             for axis in ("world_size", "attn_dp", "attn_tp", "cp", "ep")
         },
-        "graphs": (
-            {"prefill": "disabled", "decode": "disabled"}
-            if apple
-            else {
-                "prefill": options["prefill_graph"],
-                "decode": options["decode_graph"],
-            }
-        ),
-        # The MLX runner quantizes BF16 checkpoints at load with gather_qmm experts.
-        "quant": "mlx-int8-g64" if apple else "checkpoint",
-        "expert_backend": "mlx-gather-qmm" if apple else options["expert_backend"],
+        "graphs": {
+            "prefill": options["prefill_graph"],
+            "decode": options["decode_graph"],
+        },
+        "quant": "checkpoint",
+        "expert_backend": options["expert_backend"],
+        # Runners that choose their own execution (for example MLX, which
+        # quantizes at load and has no CUDA graphs) describe it themselves.
+        **getattr(raw, "benchmark_metadata", {}),
         "load_seconds": loaded_seconds,
         "capture_seconds": capture_seconds,
         "profile_graph_phases": options.get("profile_graph_phases", False),
@@ -524,7 +522,10 @@ def _validate_configuration(model, cases, topology, options):
             raise ValueError("GLM native MTP supports at most seven draft tokens")
     if numa not in ("auto", "off", "required"):
         raise ValueError("numa must be 'auto', 'off', or 'required'")
-    if expert_backend not in ("flashinfer", "deepgemm"):
+    if _apple_silicon(spec):
+        if expert_backend != spec.expert_backend:
+            raise ValueError(f"{model} uses {spec.expert_backend} experts")
+    elif expert_backend not in ("flashinfer", "deepgemm"):
         raise ValueError(f"unknown expert backend: {expert_backend}")
     if expert_backend == "deepgemm":
         if model != "deepseek-v41":
@@ -657,6 +658,8 @@ def run_benchmark(
     apple = _apple_silicon(spec)
     if apple and topology.world_size != 1:
         raise ValueError(f"{model} runs on one Apple Silicon device")
+    # Host NUMA placement applies to CUDA ranks only.
+    numa = "off" if apple else numa
     if not apple and torch.cuda.device_count() < topology.world_size:
         raise ValueError(f"the sweep requires {topology.world_size} visible GPUs")
     with tempfile.TemporaryDirectory(prefix="resin-bench-") as directory:
@@ -682,7 +685,7 @@ def run_benchmark(
                 if apple
                 else [f"cuda:{rank}" for rank in range(topology.world_size)]
             ),
-            numa="off" if apple else numa,
+            numa=numa,
         )
         records = json.loads(output.read_text())
         placement = {
@@ -900,6 +903,8 @@ def _configuration(args):
 
     spec = get_model(args.model)
     if args.backend == "modal":
+        if _apple_silicon(spec):
+            raise ValueError(f"{spec.name} runs locally; use --backend local")
         validate_gpu(spec, args.gpu)
     world = spec.world_size if args.world_size is None else args.world_size
     topology = dict(world_size=world, cp=1 if args.cp is None else args.cp)
@@ -1105,7 +1110,9 @@ def main(argv=None) -> None:
         # A local directory is only known to be the pinned revision when it is
         # the registry's own checkpoint path.
         options["metadata"]["checkpoint_revision"] = (
-            spec.revision if Path(checkpoint) == spec.path else "local"
+            spec.revision
+            if spec.model_mount is not None and Path(checkpoint) == spec.path
+            else "local"
         )
         records = run_benchmark(
             spec.name, checkpoint, cases, parallelism=topology, **options
