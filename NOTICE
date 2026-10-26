@@ -149,3 +149,14 @@ The MIT license and copyright notice are retained at
 models/cuda/resin_models_cuda/glm5_3_flash/LICENSE.fla. The adaptation computes
 only accepted recurrent state, with Resin's FP32 beta sigmoid and explicit
 preservation of empty rows; it does not produce attention outputs.
+
+The Qwen3.5-MoE MLX model implementation in
+models/mlx/resin_models_mlx/qwen3_5_moe/model.py contains portions adapted from
+Apple MLX LM (mlx_lm/models/qwen3_5.py and qwen3_next.py), which it also imports
+for its gated delta-rule and switched-expert kernels:
+
+  Copyright © 2023 Apple Inc.
+  https://github.com/ml-explore/mlx-lm
+
+MLX LM is licensed under the MIT License. The MIT notice is retained in that
+model directory's LICENSE.

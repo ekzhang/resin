@@ -35,6 +35,7 @@ dev = [
   "tml-renderers==0.2.0",
   "resin-models-torch",
   "resin-models-cuda",
+  "resin-models-mlx",
   "maturin>=1.9,<2",
   "modal>=1.5.3",
   "pytest>=8,<9",
@@ -74,11 +75,16 @@ select = ["E4", "E7", "E9", "F", "I", "TID252"]
 ban-relative-imports = "all"
 
 [tool.ruff.lint.isort]
-known-first-party = ["resin", "resin_models_cuda", "resin_models_torch"]
+known-first-party = [
+  "resin",
+  "resin_models_cuda",
+  "resin_models_mlx",
+  "resin_models_torch",
+]
 
 [tool.pytest.ini_options]
-pythonpath = [".", "models/cuda", "models/torch"]
-testpaths = ["tests", "models/cuda/tests", "models/torch/tests"]
+pythonpath = [".", "models/cuda", "models/mlx", "models/torch"]
+testpaths = ["tests", "models/cuda/tests", "models/mlx/tests", "models/torch/tests"]
 
 [tool.uv]
 default-groups = ["dev"]
@@ -143,6 +149,7 @@ flash-mla = { FLASH_MLA_BUILD_TARGET_PLATFORM = "CUDA", FLASH_MLA_SKIP_REG_SPILL
 
 [tool.uv.sources]
 resin-models-cuda = { workspace = true }
+resin-models-mlx = { workspace = true }
 resin-models-torch = { workspace = true }
 
 [tool.uv.workspace]
