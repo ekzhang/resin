@@ -44,7 +44,10 @@ def _reference(queries, keys, values, history, scale):
         [3000, 17, 0, 2049],
     ],
 )
-@pytest.mark.parametrize("heads,kv_heads,head_dim", [(16, 2, 256), (4, 2, 64)])
+@pytest.mark.parametrize(
+    "heads,kv_heads,head_dim",
+    [(16, 2, 256), (4, 2, 64), (6, 1, 64), (10, 2, 96), (3, 3, 32)],
+)
 def test_paged_decode_matches_gathered_attention(lengths, heads, kv_heads, head_dim):
     rng = np.random.default_rng(len(lengths) + heads)
     rows = len(lengths)
@@ -85,3 +88,20 @@ def test_paged_decode_matches_gathered_attention(lengths, heads, kv_heads, head_
     np.testing.assert_allclose(
         np.array(actual), np.array(expected), atol=2e-2, rtol=2e-2
     )
+
+
+def test_rejects_head_dims_the_lanes_cannot_cover():
+    queries = mx.zeros((1, 2, 80), dtype=mx.bfloat16)
+    current = mx.zeros((1, 1, 80), dtype=mx.bfloat16)
+    units = mx.zeros((1, 2, PAGE, 80), dtype=mx.bfloat16)
+    with pytest.raises(ValueError, match="divisible by 32"):
+        paged_decode_attention(
+            queries,
+            current,
+            current,
+            units,
+            mx.zeros((1, 1), dtype=mx.int32),
+            mx.array([0], dtype=mx.int32),
+            0,
+            1.0,
+        )

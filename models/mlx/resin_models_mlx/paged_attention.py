@@ -175,8 +175,14 @@ def paged_decode_attention(
     rows, heads, head_dim = queries.shape
     kv_heads = current_keys.shape[1]
     page = units.shape[2]
-    group = min(_HEADS_PER_THREADGROUP, heads // kv_heads)
-    head_groups = heads // kv_heads // group
+    if heads % kv_heads:
+        raise ValueError("query heads must be a multiple of KV heads")
+    if head_dim % 32:
+        raise ValueError("paged decode attention needs head_dim divisible by 32")
+    # Each threadgroup serves an equal share of the query heads of a KV head.
+    shared = heads // kv_heads
+    group = max(g for g in range(1, _HEADS_PER_THREADGROUP + 1) if shared % g == 0)
+    head_groups = shared // group
     longest = pages.shape[1] * page + 1
     partitions = -(-longest // PARTITION_TOKENS)
     partial, maxima, sums = _kernel()(
