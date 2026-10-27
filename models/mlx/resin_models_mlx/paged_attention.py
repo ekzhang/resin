@@ -22,6 +22,8 @@ import mlx.core as mx
 PARTITION_TOKENS = 512
 SIMDGROUPS = 4
 _HEADS_PER_THREADGROUP = 4
+# Metal guarantees 32 KiB of threadgroup memory.
+_THREADGROUP_BYTES = 32 * 1024
 
 _SOURCE = """
     constexpr int LANE_DIMS = D / 32;
@@ -181,7 +183,15 @@ def paged_decode_attention(
         raise ValueError("paged decode attention needs head_dim divisible by 32")
     # Each threadgroup serves an equal share of the query heads of a KV head.
     shared = heads // kv_heads
-    group = max(g for g in range(1, _HEADS_PER_THREADGROUP + 1) if shared % g == 0)
+    # The cross-simdgroup reduction stores float maxima, sums and outputs.
+    fits = [
+        g
+        for g in range(1, _HEADS_PER_THREADGROUP + 1)
+        if shared % g == 0 and SIMDGROUPS * g * (head_dim + 2) * 4 <= _THREADGROUP_BYTES
+    ]
+    if not fits:
+        raise ValueError(f"head_dim {head_dim} exceeds paged decode threadgroup memory")
+    group = max(fits)
     head_groups = shared // group
     longest = pages.shape[1] * page + 1
     partitions = -(-longest // PARTITION_TOKENS)

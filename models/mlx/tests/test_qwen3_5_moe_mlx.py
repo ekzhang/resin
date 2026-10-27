@@ -62,7 +62,7 @@ def _text_config() -> dict[str, Any]:
     }
 
 
-def _model(seed: int = 0, dtype=None) -> Qwen35MoeModel:
+def _model(seed: int = 0, dtype=None, *, all_experts: bool = False) -> Qwen35MoeModel:
     mx.random.seed(seed)
     model = Qwen35MoeModel(Qwen35Config.from_hugging_face(_text_config()))
     # Give norms and DeltaNet decay realistic, non-trivial values.
@@ -81,6 +81,11 @@ def _model(seed: int = 0, dtype=None) -> Qwen35MoeModel:
     selected = mx.bfloat16 if dtype is None else dtype
     model.set_dtype(selected, lambda dtype: dtype == mx.float32)
     mx.eval(model.parameters())
+    if all_experts:
+        # Random routers have near-tied experts, so BF16 rounding can flip a
+        # top-k choice; routing to every expert keeps logits continuous.
+        for layer in model.layers:
+            layer.mlp.top_k = model.config.num_experts
     return model
 
 
@@ -225,7 +230,7 @@ def test_incremental_state_matches_full_forward_exactly() -> None:
 
 
 def test_engine_greedy_matches_reference_across_page_boundaries() -> None:
-    model = _model()
+    model = _model(all_experts=True)
     prompts = [_prompt(length, seed=length) for length in (5, 127, 128, 129)]
 
     with Engine(_runner(model), context_length=8192) as engine:
@@ -245,7 +250,7 @@ def test_batched_decode_matches_individual_requests() -> None:
 
 
 def test_chunked_prefill_crosses_state_checkpoint() -> None:
-    model = _model()
+    model = _model(all_experts=True)
     prompt = _prompt(PREFILL_CHUNK_SIZE + 37, seed=3)
 
     with Engine(_runner(model), context_length=16384) as engine:
@@ -254,7 +259,7 @@ def test_chunked_prefill_crosses_state_checkpoint() -> None:
 
 
 def test_prefix_cache_hit_matches_fresh_run() -> None:
-    model = _model()
+    model = _model(all_experts=True)
     shared = _prompt(PREFILL_CHUNK_SIZE, seed=4)
     suffix = _prompt(9, seed=5)
 
@@ -275,7 +280,7 @@ def test_prefix_cache_hit_matches_fresh_run() -> None:
 
 
 def test_decode_crosses_kv_page_boundary() -> None:
-    model = _model()
+    model = _model(all_experts=True)
     prompt = _prompt(PAGE_TOKENS - 2, seed=7)
 
     with Engine(_runner(model), context_length=8192) as engine:
@@ -302,8 +307,15 @@ def _assert_checkpoint_loader_matches_transformers(layout: str) -> None:
                 parameter.normal_(0.0, 0.1)
             elif name.endswith("A_log"):
                 parameter.uniform_(-1.0, 1.0)
+    # Checkpoints store the DeltaNet decay parameters in float32.
+    decay = ("A_log", "dt_bias")
+    reference_decay = {
+        name: tensor.clone()
+        for name, tensor in reference.state_dict().items()
+        if name.endswith(decay)
+    }
     state = {
-        name: tensor.to(torch.bfloat16)
+        name: tensor if name.endswith(decay) else tensor.to(torch.bfloat16)
         for name, tensor in reference.state_dict().items()
     }
     if layout != "text-only":
@@ -324,6 +336,11 @@ def _assert_checkpoint_loader_matches_transformers(layout: str) -> None:
                 state[f"{prefix}{expert}.up_proj.weight"] = gate_up[expert, middle:]
                 state[f"{prefix}{expert}.down_proj.weight"] = down[expert]
     reference = reference.to(torch.bfloat16)
+    with torch.no_grad():
+        for name, parameter in reference.named_parameters():
+            if name.endswith(decay):
+                parameter.data = parameter.data.float()
+                parameter.data.copy_(reference_decay[name])
     tokens = _prompt(19, seed=8)
     with torch.no_grad():
         expected = reference(torch.tensor([tokens])).logits[0].float().numpy()
@@ -355,6 +372,10 @@ def _assert_checkpoint_loader_matches_transformers(layout: str) -> None:
         )
         (path / "config.json").write_text(json.dumps(config))
         model, _, _ = load_model(path, bits=None)
+        for layer in model.layers:
+            if hasattr(layer, "linear_attn"):
+                assert layer.linear_attn.A_log.dtype == mx.float32
+                assert layer.linear_attn.dt_bias.dtype == mx.float32
         actual = np.array(_full_logits(model, tokens))
     np.testing.assert_allclose(actual, expected, atol=3e-2, rtol=3e-2)
     assert (actual.argmax(-1) == expected.argmax(-1)).mean() > 0.9
@@ -376,8 +397,6 @@ def test_checkpoint_loader_matches_transformers_reference(layout: str) -> None:
             ),
         ],
         check=True,
-        capture_output=True,
-        text=True,
     )
 
 
@@ -423,10 +442,14 @@ def test_query_blocked_prefill_attention_matches_one_block(monkeypatch) -> None:
 
     model = _model(dtype=mx.float32)
     attention = model.layers[3].self_attn
-    rng = mx.random.key(3)
-    query = mx.random.normal((1, attention.heads, 37, attention.head_dim), key=rng)
-    key = mx.random.normal((1, attention.kv_heads, 100, attention.head_dim), key=rng)
-    value = mx.random.normal((1, attention.kv_heads, 100, attention.head_dim))
+    keys = mx.random.split(mx.random.key(3), 3)
+    query = mx.random.normal((1, attention.heads, 37, attention.head_dim), key=keys[0])
+    key = mx.random.normal(
+        (1, attention.kv_heads, 100, attention.head_dim), key=keys[1]
+    )
+    value = mx.random.normal(
+        (1, attention.kv_heads, 100, attention.head_dim), key=keys[2]
+    )
     whole = attention._dense_attention(query, key, value)
     # Force blocks of three queries over the 100 keys.
     monkeypatch.setattr(model_module, "SCORE_BUDGET", attention.heads * 100 * 3)

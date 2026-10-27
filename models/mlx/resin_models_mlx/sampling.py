@@ -25,7 +25,10 @@ def filtered_probabilities(
     probabilities = mx.softmax(mx.take_along_axis(scores, order, axis=-1), axis=-1)
     preceding = mx.cumsum(probabilities, axis=-1) - probabilities
     ranks = mx.arange(scores.shape[-1])[None, :]
-    keep = (preceding < top_ps[:, None]) & (ranks < top_ks[:, None])
+    # top_p == 1 disables the nucleus, as in TorchSampler; float32 cumulative
+    # sums reach 1 before the tail of a large vocabulary.
+    nucleus = (top_ps[:, None] >= 1.0) | (preceding < top_ps[:, None])
+    keep = nucleus & (ranks < top_ks[:, None])
     probabilities = mx.where(keep, probabilities, 0.0)
     return order, probabilities / probabilities.sum(axis=-1, keepdims=True)
 

@@ -5,8 +5,8 @@
 (revision `5df2ed3f675c7beaa490328cc70bb573b65fb660`), on one Apple Silicon GPU
 through Metal. It loads BF16 Hugging Face safetensors (multimodal or text-only
 exports, with per-expert or fused expert tensors) and quantizes them at load time
-to MLX 8-bit affine weights (group size 64). Text only; the vision tower and any
-MTP head are not loaded.
+to MLX 8-bit affine weights (group size 64). Text only: the vision tower and any
+MTP head are not loaded, and the preset's recipe rejects image and video input.
 
 ```bash
 uv run scripts/serve.py --model ornith-1.0-35b --checkpoint ~/models/Ornith-1.0-35B
@@ -21,7 +21,7 @@ uv run scripts/bench.py --model ornith-1.0-35b --backend local \
 | --- | --- |
 | `resin.models.qwen3_5.config` | Backend-neutral Qwen3.5 and Qwen3.5-MoE geometry. |
 | `checkpoint.py` | Map checkpoint names, stack or split experts, quantize layer by layer. |
-| `model.py` | Stateless forward: gated DeltaNet, gated attention, routed and shared experts. Qwen's `1 + w` RMSNorm scale is applied in FP32, as in the reference. |
+| `model.py` | Stateless forward: gated DeltaNet, gated attention, routed and shared experts. Qwen's `1 + w` RMSNorm scale and the DeltaNet decay are computed in FP32, as in the reference. |
 | `cache.py` | Slab geometry and typed reads and writes over the Engine-owned arena. |
 | `../paged_attention.py` | Metal flash-decoding kernel that reads K/V directly from slabs. |
 | `../sampling.py` | Batched GPU sampling with `TorchSampler`'s filtering semantics. |
@@ -72,7 +72,9 @@ about 3.5 GiB above the resident model from 32K to 98K tokens.
 - FP32 incremental state and history against a one-pass forward, exactly;
 - Engine greedy decoding across page boundaries (127/128/129 tokens), chunked
   prefill across the 4096-token checkpoint, and decode across a page boundary,
-  within BF16 tie tolerance of a one-pass reference;
+  within BF16 tie tolerance of a one-pass reference (these route every token to
+  all experts, since BF16 rounding flips near-tied top-k choices of a random
+  router);
 - token-identical continuation after a 4096-token prefix-cache hit;
 - batched decode identical to each request alone;
 - the paged kernel against gathered attention, including NaN-poisoned padding;
@@ -102,15 +104,18 @@ distinct requests per row), decode steps are about 20% slower at batch 1–4
 reading the experts routed to by different requests: 16 rows touch about 100 of
 256 experts per layer.
 
-- **Parity.** On three chat prompts, 64-token greedy continuations match mlx-lm
-  exactly, with 95–100% argmax agreement over prompt positions. Remaining logit
-  differences come from mlx-lm storing `1 + w` in BF16.
+- **Parity.** On three chat prompts, with full argmax agreement over prompt
+  positions, two 64-token greedy continuations match mlx-lm exactly. The third
+  departs at token 42 on a one-BF16-step tie (`iter`+`atively` against
+  `iter`+`ative`+`ly`). Logit differences come from mlx-lm computing `1 + w`
+  and the DeltaNet decay in BF16, where the reference model uses FP32.
 - **Serving.** `scripts/check_server.py` passes chat, logprobs, concurrency,
   stress, robustness and recovery. A repeated 5,243-token prompt reuses 4,096
   cached tokens. Steady TTFT is 0.16 s, 1.7 s, 7.0 s and 15.0 s at 128, 2K, 8K
   and 16K words, with no first-request spike. On 100 seeded MMLU questions
-  (`cais/mmlu` `c30699e`, 50 subjects × 2), the model answers 91 correctly
-  with a 16,384-token reasoning budget; 2 answers are truncated by it.
+  (`cais/mmlu` `c30699e`, 50 subjects × 2), the model answers 93 correctly
+  with a 16,384-token reasoning budget; one answer is truncated by it and one
+  names two options. Image and video requests are refused.
 - **Memory.** Prefill holds 3.3–3.7 GiB above the resident model from 32K to
   98K tokens.
 - **Compilation.** After warmup, unseen context lengths (77 to 9,001 tokens) and

@@ -49,6 +49,22 @@ def test_filtered_distribution_matches_torch_sampler(temperature, top_p, top_k):
         np.testing.assert_allclose(actual[row], expected, atol=1e-6)
 
 
+def test_full_top_p_keeps_the_whole_vocabulary():
+    # Float32 cumulative sums saturate before the tail of a 248K vocabulary;
+    # top_p == 1 must still leave every token reachable, as in TorchSampler.
+    vocab = 248_320
+    logits = (np.random.default_rng(1).standard_normal((2, vocab)) * 8).astype(
+        np.float32
+    )
+    _, probabilities = filtered_probabilities(
+        mx.array(logits),
+        mx.array([1.0, 1.0]),
+        mx.array([1.0, 1.0]),
+        mx.array([vocab] * 2),
+    )
+    assert np.all(np.array(probabilities) > 0)
+
+
 def _plan(params, contexts, mask=None):
     rows = len(params)
     return SimpleNamespace(

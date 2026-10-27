@@ -18,6 +18,7 @@ from resin_models_mlx.qwen3_5_moe.model import Qwen35MoeModel
 # Multimodal exports nest the text model; text-only exports do not.
 _TEXT_PREFIXES = ("model.language_model.", "model.")
 _EXPERT_PROJECTIONS = ("gate_proj", "up_proj", "down_proj")
+_DECAY_PARAMETERS = ("A_log", "dt_bias")
 
 
 def load_config(model_path: str | Path) -> tuple[Qwen35Config, dict]:
@@ -142,10 +143,15 @@ def load_model(
         raise ValueError(f"checkpoint is missing parameters: {missing[:8]}")
     if unexpected := sorted(set(weights) - expected):
         raise ValueError(f"checkpoint has unexpected parameters: {unexpected[:8]}")
-    # The DeltaNet decay parameter keeps its checkpoint precision.
+    # The DeltaNet decay parameters keep their checkpoint precision.
     model.load_weights(
         [
-            (name, value if name.endswith("A_log") else value.astype(mx.bfloat16))
+            (
+                name,
+                value
+                if name.endswith(_DECAY_PARAMETERS)
+                else value.astype(mx.bfloat16),
+            )
             for name, value in weights.items()
         ]
     )

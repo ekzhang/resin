@@ -46,7 +46,7 @@ def _reference(queries, keys, values, history, scale):
 )
 @pytest.mark.parametrize(
     "heads,kv_heads,head_dim",
-    [(16, 2, 256), (4, 2, 64), (6, 1, 64), (10, 2, 96), (3, 3, 32)],
+    [(16, 2, 256), (4, 2, 64), (6, 1, 64), (10, 2, 96), (3, 3, 32), (8, 2, 512)],
 )
 def test_paged_decode_matches_gathered_attention(lengths, heads, kv_heads, head_dim):
     rng = np.random.default_rng(len(lengths) + heads)

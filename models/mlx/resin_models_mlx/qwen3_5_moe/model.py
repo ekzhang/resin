@@ -145,8 +145,9 @@ class GatedDeltaNet(nn.Module):
         k = k.reshape(rows, tokens, self.key_heads, self.key_dim)
         v = v.reshape(rows, tokens, self.value_heads, self.value_dim)
         q, k = normalize_qk(q, k, inv_scale=self.key_dim**-0.5, eps=1e-6)
+        # The decay is computed in float32, as in the reference model.
         output, recurrent = gated_delta_update(
-            q, k, v, a, b, self.A_log, self.dt_bias, recurrent
+            q, k, v, a.astype(mx.float32), b, self.A_log, self.dt_bias, recurrent
         )
         output = self.norm(output, z).reshape(rows, tokens, -1)
         return self.out_proj(output), recurrent, convolution
