@@ -144,6 +144,30 @@ def test_invalid_options_fail_before_remote_dispatch(arguments, fragment, capsys
     assert fragment in capsys.readouterr().err
 
 
+
+@pytest.mark.parametrize("action", ["--download-only", "--publish-only"])
+def test_local_presets_have_no_modal_checkpoint_actions(action, capsys):
+    with pytest.raises(SystemExit) as error:
+        bench.main(["--model", "ornith-1.0-35b", "--backend", "modal", action])
+    assert error.value.code == 2
+    assert "runs locally" in capsys.readouterr().err
+
+
+def test_local_preset_prefill_chunk_is_checked_before_loading(capsys):
+    with pytest.raises(SystemExit) as error:
+        bench.main(
+            [
+                "--model",
+                "ornith-1.0-35b",
+                "--checkpoint",
+                "/missing",
+                "--prefill-chunk-size",
+                "8192",
+            ]
+        )
+    assert error.value.code == 2
+    assert "4096-token chunks" in capsys.readouterr().err
+
 def test_local_requires_explicit_checkpoint(capsys):
     with pytest.raises(SystemExit):
         bench.main(["--model", "gpt-oss-20b"])

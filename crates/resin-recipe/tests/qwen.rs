@@ -1,6 +1,6 @@
 use resin_recipe::{
     Recipe,
-    qwen::{OrnithRecipe, Qwen35Recipe, Qwen38Recipe},
+    qwen::{OrnithRecipe, Qwen35Recipe, Qwen38Recipe, QwenRecipeParams},
 };
 mod common;
 use common::SemanticParser;
@@ -64,6 +64,16 @@ fn pinned_hf_templates_match_all_variants_tools_history_and_vision() {
         let actual = render_fixture(&case["request"]).unwrap().rendered_text();
         assert_eq!(actual, case["text"].as_str().unwrap(), "{}", case["name"]);
     }
+}
+
+#[test]
+fn text_only_recipes_reject_media() {
+    assert!(OrnithRecipe::default().media_config().is_some());
+    let params = QwenRecipeParams {
+        text_only: true,
+        ..Default::default()
+    };
+    assert!(OrnithRecipe::new(params).media_config().is_none());
 }
 
 #[test]

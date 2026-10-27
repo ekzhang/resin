@@ -103,6 +103,9 @@ pub struct QwenRecipeParams {
     pub enable_thinking: Option<bool>,
     pub preserve_thinking: Option<bool>,
     pub add_vision_id: Option<bool>,
+    /// Rejects media for runners that serve only the language model.
+    #[serde(skip_serializing)]
+    pub text_only: bool,
     #[serde(skip_serializing)]
     pub media_config: Option<crate::media::qwen::Config>,
 }
@@ -363,8 +366,7 @@ impl<const FORMAT: u8> crate::Recipe for QwenRecipe<FORMAT> {
         ])
     }
     fn media_config(&self) -> Option<crate::MediaConfig> {
-        Some(crate::MediaConfig::Qwen(
-            self.params.media_config.clone().unwrap_or_default(),
-        ))
+        (!self.params.text_only)
+            .then(|| crate::MediaConfig::Qwen(self.params.media_config.clone().unwrap_or_default()))
     }
 }

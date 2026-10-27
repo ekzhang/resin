@@ -749,5 +749,8 @@ def create_recipe(
         if spec.family == "gemma4" and runner is not None
         else {}
     )
+    if spec.backend == "mlx":
+        # MLX runners serve the language model only.
+        options["text_only"] = True
     name = spec.recipe or ("qwen3_8" if spec.family == "qwen3_5" else spec.family)
     return get_native_recipe(name, processor, **options)

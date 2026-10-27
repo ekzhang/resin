@@ -300,7 +300,8 @@ def _rank(
     # lengths on the charts remain the prompt lengths recorded by the harness.
     capacity = _context_capacity(cases, options)
     if rank == 0:
-        print(f"[bench] loading {model} over {topology.world_size} GPUs", flush=True)
+        devices = hardware if apple else f"{topology.world_size} GPUs"
+        print(f"[bench] loading {model} over {devices}", flush=True)
     started = time.perf_counter()
     raw = _runner(
         model,
@@ -324,7 +325,8 @@ def _rank(
     loaded_seconds = time.perf_counter() - started
     if rank == 0:
         print(
-            f"[bench] weights ready in {loaded_seconds:.1f}s; capturing graphs",
+            f"[bench] weights ready in {loaded_seconds:.1f}s"
+            + ("" if apple else "; capturing graphs"),
             flush=True,
         )
     started = time.perf_counter()
@@ -332,7 +334,7 @@ def _rank(
         raw.capture_cuda_graphs()
     synchronize()
     capture_seconds = time.perf_counter() - started
-    if rank == 0:
+    if rank == 0 and not apple:
         print(f"[bench] graphs ready in {capture_seconds:.1f}s", flush=True)
     overlap = options.get("overlap", True) and callable(getattr(raw, "enqueue", None))
     metadata = {
@@ -525,6 +527,8 @@ def _validate_configuration(model, cases, topology, options):
     if _apple_silicon(spec):
         if expert_backend != spec.expert_backend:
             raise ValueError(f"{model} uses {spec.expert_backend} experts")
+        if prefill_chunk_size != 4096:
+            raise ValueError(f"{model} prefills in 4096-token chunks")
     elif expert_backend not in ("flashinfer", "deepgemm"):
         raise ValueError(f"unknown expert backend: {expert_backend}")
     if expert_backend == "deepgemm":
@@ -1008,9 +1012,7 @@ def main(argv=None) -> None:
     if args.backend == "local" and (args.download_only or args.publish_only):
         parser.error("--download-only/--publish-only require --backend modal")
     if args.backend == "local" and args.gpu is not None:
-        parser.error(
-            "--gpu selects Modal hardware; local runs use visible CUDA devices"
-        )
+        parser.error("--gpu selects Modal hardware; local runs use the visible devices")
     if args.backend == "local" and args.checkpoint is None:
         parser.error("--checkpoint is required for local benchmarks")
     if args.backend == "modal" and (
@@ -1019,6 +1021,10 @@ def main(argv=None) -> None:
         parser.error(
             "Modal uses the pinned model registry; local checkpoint paths require --backend local"
         )
+    if (args.download_only or args.publish_only) and _apple_silicon(
+        get_model(args.model)
+    ):
+        parser.error(f"{args.model} runs locally; pass its checkpoint directory")
     if args.download_only or args.publish_only:
         import modal
 
