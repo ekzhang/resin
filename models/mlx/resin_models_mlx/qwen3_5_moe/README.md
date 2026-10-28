@@ -98,9 +98,9 @@ Prefill runs in 4,096-token chunks for Resin and mlx-lm's default 2,048 for mlx-
 
 | Decode, 8K context | 1 | 2 | 4 | 8 | 16 |
 | --- | ---: | ---: | ---: | ---: | ---: |
-| Resin step (ms) | 18.0 | 22.3 | 30.4 | 47.0 | 101.4 |
+| Resin step (ms) | 18.0 | 22.3 | 30.4 | 47.0 | 79.0 |
 | mlx-lm step (ms) | 12.7 | 15.6 | 21.2 | 31.2 | 50.5 |
-| Resin output tokens/s | 55.6 | 89.6 | 131.7 | 170.2 | 157.8 |
+| Resin output tokens/s | 55.6 | 89.6 | 131.7 | 170.2 | 202.5 |
 | mlx-lm output tokens/s | 78.7 | 128.3 | 188.9 | 256.7 | 317.1 |
 
 | Prefill, one request | 4K | 8K | 16K | 32K |
@@ -108,13 +108,14 @@ Prefill runs in 4,096-token chunks for Resin and mlx-lm's default 2,048 for mlx-
 | Resin input tokens/s | 1,612 | 1,663 | 1,527 | 1,207 |
 | mlx-lm input tokens/s | 2,009 | 1,925 | 1,667 | 1,312 |
 
-Rounds agree within 4%, except Resin at batch 16. Resin's decode steps take about
-1.4–1.5× as long as mlx-lm's through batch 8. At batch 16 they swing between 75
-and 175 ms within a round, so the median is twice mlx-lm's. Prefill is 8–20%
-behind, narrowing with length. The decode gap is per-step overhead in this
-runner and the main open performance item. Sustained load throttles this
-laptop: a 4K prefill took nearly twice as long right after a 16-row, 8K-token
-setup, which is why every window starts cool.
+Rounds agree within 4%. Resin's batch-16 setup prefills 16 rows of 8K tokens,
+which heat-soaks this laptop: after a 75 s pause its steps still climbed from 54
+to 137 ms. Its batch-16 cell is the median of two runs that idle 240 s instead.
+Resin's decode steps take 1.4–1.6× as long as mlx-lm's, and prefill is 8–20%
+behind, narrowing with length. At batch 16 the model forward is 56 ms; copying
+each row's DeltaNet state (63 MB) out of the arena and back adds 18 ms, and
+logits, sampling and host work about 6 ms. That copy is the main open
+performance item.
 
 - **Parity.** On three chat prompts, with full argmax agreement over prompt
   positions, two 64-token greedy continuations match mlx-lm exactly. The third
