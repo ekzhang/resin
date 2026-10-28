@@ -82,27 +82,39 @@ about 3.5 GiB above the resident model from 32K to 98K tokens.
 
 ## Results on an M4 Max (128 GB)
 
-October 27, 2026, mlx 0.32.4 and mlx-lm 0.32.2, Ornith-1.0-35B at the pinned
-revision. Loading the BF16 checkpoint and quantizing it takes 7–12 s and leaves
-about 50 GiB resident. Measurements come from `scripts/bench.py` with 5 warmup
-and 20 measured steps. Laptop thermals and other applications move individual
-points by roughly ±15%.
+October 28, 2026, mlx 0.32.4 and mlx-lm 0.32.2, Ornith-1.0-35B at the pinned
+revision. Loading the BF16 checkpoint and quantizing it takes 4–14 s and leaves
+about 50 GiB resident.
+
+mlx-lm 0.32.2 cannot load Ornith-1.0's per-expert checkpoint directly, so the
+baseline builds mlx-lm's `qwen3_5_moe` model from the same 8-bit weights, in
+eval mode so its DeltaNet layers use the Metal kernel, and times its bare forward
+pass with a plain KV cache and greedy argmax. Resin is timed through the Engine,
+with paged cache, scheduling and sampling. Each engine runs in its own process,
+three rounds in alternating order, and idles 75 s before every timed window so
+neither inherits the other's heat. Decode cells are the median over rounds of the
+median of 20 synchronized steps after 5 warmup steps, with distinct tokens per row.
+Prefill runs in 4,096-token chunks for Resin and mlx-lm's default 2,048 for mlx-lm.
 
 | Decode, 8K context | 1 | 2 | 4 | 8 | 16 |
 | --- | ---: | ---: | ---: | ---: | ---: |
-| Output tokens/s | 51.7 | 84.9 | 119.5 | 144.3 | 146.7 |
-| Tokens/s per request | 51.7 | 42.5 | 29.9 | 18.0 | 9.2 |
+| Resin step (ms) | 18.0 | 22.3 | 30.4 | 47.0 | 101.4 |
+| mlx-lm step (ms) | 12.7 | 15.6 | 21.2 | 31.2 | 50.5 |
+| Resin output tokens/s | 55.6 | 89.6 | 131.7 | 170.2 | 157.8 |
+| mlx-lm output tokens/s | 78.7 | 128.3 | 188.9 | 256.7 | 317.1 |
 
 | Prefill, one request | 4K | 8K | 16K | 32K |
 | --- | ---: | ---: | ---: | ---: |
-| Input tokens/s | 1,595 | 1,120 | 924 | 827 |
+| Resin input tokens/s | 1,612 | 1,663 | 1,527 | 1,207 |
+| mlx-lm input tokens/s | 2,009 | 1,925 | 1,667 | 1,312 |
 
-Against mlx-lm's own model and cache on identical 8-bit weights (8K context,
-distinct requests per row), decode steps are about 20% slower at batch 1–4
-(19.3 vs 16.3 ms, 33.5 vs 27.5 ms) and about 14% faster at batch 16 (109 vs
-127 ms). Prefill is about 3× faster. At batch 8 and above, decode is bounded by
-reading the experts routed to by different requests: 16 rows touch about 100 of
-256 experts per layer.
+Rounds agree within 4%, except Resin at batch 16. Resin's decode steps take about
+1.4–1.5× as long as mlx-lm's through batch 8. At batch 16 they swing between 75
+and 175 ms within a round, so the median is twice mlx-lm's. Prefill is 8–20%
+behind, narrowing with length. The decode gap is per-step overhead in this
+runner and the main open performance item. Sustained load throttles this
+laptop: a 4K prefill took nearly twice as long right after a 16-row, 8K-token
+setup, which is why every window starts cool.
 
 - **Parity.** On three chat prompts, with full argmax agreement over prompt
   positions, two 64-token greedy continuations match mlx-lm exactly. The third
@@ -110,17 +122,19 @@ reading the experts routed to by different requests: 16 rows touch about 100 of
   `iter`+`ative`+`ly`). Logit differences come from mlx-lm computing `1 + w`
   and the DeltaNet decay in BF16, where the reference model uses FP32.
 - **Serving.** `scripts/check_server.py` passes chat, logprobs, concurrency,
-  stress, robustness and recovery. A repeated 5,243-token prompt reuses 4,096
-  cached tokens. Steady TTFT is 0.16 s, 1.7 s, 7.0 s and 15.0 s at 128, 2K, 8K
-  and 16K words, with no first-request spike. On 100 seeded MMLU questions
-  (`cais/mmlu` `c30699e`, 50 subjects × 2), the model answers 93 correctly
-  with a 16,384-token reasoning budget; one answer is truncated by it and one
-  names two options. Image and video requests are refused.
+  stress, robustness and recovery. A repeated 5,245-token prompt reuses 4,096
+  cached tokens. No prompt up to 16K tokens shows a first-request TTFT spike.
+  Measured separately from a cool start, steady TTFT is 0.14 s, 1.0 s, 5.0 s
+  and 11.9 s for prompts of 172, 2,094, 8,235 and 16,421 tokens. On 100 seeded
+  MMLU questions (`cais/mmlu` `c30699e`, 50 subjects × 2), the model
+  answers 93 correctly with a 16,384-token reasoning budget; one answer is
+  truncated by it and one names two options. Image and video requests are
+  refused.
 - **Memory.** Prefill holds 3.3–3.7 GiB above the resident model from 32K to
   98K tokens.
-- **Compilation.** After warmup, unseen context lengths (77 to 9,001 tokens) and
-  sampling settings add no Metal compiler time, measured from
-  `MTLCompilerService` CPU time. A control of 20 new kernels adds 0.57 s.
+- **Compilation.** After warmup, three sets of unseen context lengths (77 to
+  9,001 tokens) with varied sampling settings add 0.00 s of
+  `MTLCompilerService` CPU time, as do idle windows; 20 new kernels add 0.55 s.
 
 ## Limitations
 
