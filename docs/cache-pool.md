@@ -1,8 +1,5 @@
 # Unified paged cache
 
-Optional [prefix storage](cache-storage.md) persists immutable checkpoints
-outside the device pool through a transport-independent provider.
-
 Each Engine owns one pool of equal-sized physical slabs. A runner declares an
 ordered `CacheLayout`; every `CacheGroupLayout` explains how one model state is
 packed into those slabs:
@@ -98,6 +95,9 @@ reserved snapshot destinations; the Engine validates ownership and exact prefix
 length, requires all State groups, and publishes only after outstanding consumers
 have drained. Terminal output truncation never relabels later state as an earlier
 prefix. Cancellation retains physical resources until all queued work finishes.
+
+Optional [prefix storage](cache-storage.md) persists immutable checkpoints
+outside the device pool through a transport-independent provider.
 
 ## Physical sizing
 
