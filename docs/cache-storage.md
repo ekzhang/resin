@@ -15,8 +15,17 @@ three methods over opaque immutable byte keys:
 - `lookup(keys)` returns a future yielding one presence boolean per key.
 - `load(keys, buffers)` and `store(keys, buffers)` return futures yielding a success boolean.
 
-Writes occur when checkpoints are published (write-through). Presence is advisory:
-eviction between lookup and load can cause a miss, which falls back to computation.
+The default `prefix_cache_storage_policy="write_through_selective"` leaves cold
+checkpoints on the GPU. When another request reuses a GPU checkpoint, Resin
+schedules that exact matched checkpoint for storage. Newly computed tails stay cold
+until another request reuses them. Set `prefix_cache_storage_policy="write_through"`
+to write each checkpoint as it is first published.
+Selective storage requires reuse while the checkpoint is GPU-resident; use
+`write_through` if prefixes are usually evicted before their first reuse.
+Selective writes skipped at a full transfer limit can retry on a later GPU cache hit.
+
+Presence is advisory: eviction between lookup and load can cause a miss, which falls
+back to computation.
 
 `buffers[i]` maps stable string names to borrowed contiguous `torch.uint8` views for
 `keys[i]`; an empty dict is a checkpoint manifest. Names label parts of one object,
@@ -39,6 +48,7 @@ A result of `None` means retirement is unknown, so Resin retains those buffers.
 Loads gate only dependent requests; stores pin immutable snapshots. Cancellation does
 not retire transfers. Engine close waits; unknown retirement raises and retains buffers.
 `prefix_cache_max_inflight` sets the positive per-engine limit on outstanding
-lookup/load/store batches (default: 2). Storage and eviction may outlive engines.
+lookup/load/store batches. Omit it to use `max(2, max_running_requests)`, or pass an
+explicit positive limit. Storage and eviction may outlive engines.
 Metrics expose `cache.storage_pending`, `resin:cache_storage_pending`, and restored
 request cached tokens.

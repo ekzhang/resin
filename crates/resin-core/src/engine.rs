@@ -11,6 +11,7 @@ use crate::resources::kv::{KvGroupPlan, KvLayout};
 use crate::resources::paged::{CachePoolError, RequestPages, WriterAccessLease};
 use crate::resources::paged_kv::{
     CacheMetrics, PagedKvBatchView, PagedKvError, PagedKvResources, PrefixStorage,
+    PrefixStoragePolicy,
 };
 use crate::{
     Phase, PlanningConfig, PlanningError, RequestId, RequestProgress, Schedulable, Scheduler,
@@ -630,11 +631,12 @@ impl<P: Clone> EngineCore<P> {
         &mut self,
         storage: Box<dyn PrefixStorage>,
         max_inflight: NonZeroUsize,
+        policy: PrefixStoragePolicy,
     ) -> Result<()> {
         if self.prefix_alignment().is_none() {
             return Err(Error::invalid("storage requires prefix caching"));
         }
-        self.kv_resources.as_mut().unwrap().storage = Some((storage, max_inflight));
+        self.kv_resources.as_mut().unwrap().storage = Some((storage, max_inflight, policy));
         Ok(())
     }
 
@@ -2123,13 +2125,21 @@ impl<P: Clone> EngineCore<P> {
             .iter()
             .filter(|request| request.is_running())
             .count();
-        if running_count <= 1 {
-            return Ok(false);
-        }
+        let resources = self.kv_resources.as_ref().expect("managed cache pressure");
         let Some(request_id) = self
             .scheduler
             .iter()
-            .filter(|request| request.is_running() && request.cache.is_some())
+            .filter(|request| {
+                request.cache.as_ref().is_some_and(|pages| {
+                    if running_count > 1 {
+                        request.is_running()
+                    } else {
+                        !request.is_running()
+                            && request.resident_tokens > 0
+                            && resources.pool().validate_request_idle(pages).is_ok()
+                    }
+                })
+            })
             .min_by_key(|request| (request.generated.len(), Reverse(request.prompt.len())))
             .map(|request| request.id)
         else {
@@ -2141,7 +2151,9 @@ impl<P: Clone> EngineCore<P> {
             .expect("selected retraction victim remains ready");
         let mut request = self.scheduler.remove(index);
 
-        if let Err(error) = execution_call("release", || runner.release(&[request.id])) {
+        if request.is_running()
+            && let Err(error) = execution_call("release", || runner.release(&[request.id]))
+        {
             self.scheduler.restore(index, request);
             self.poison("runner release failed during request retraction", &error);
             return Err(error);

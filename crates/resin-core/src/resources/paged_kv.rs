@@ -78,12 +78,18 @@ pub trait PrefixStorage: fmt::Debug + Send + Sync {
 }
 type StorageJob = (StorageOp, u64, Vec<u32>, Option<RequestPages>);
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PrefixStoragePolicy {
+    WriteThrough,
+    WriteThroughSelective,
+}
+
 #[derive(Debug)]
 pub struct PagedKvResources {
     layout: KvLayout,
     pool: CachePool,
     prefix_cache: Option<PrefixCache<super::paged::CachedPages>>,
-    pub(crate) storage: Option<(Box<dyn PrefixStorage>, NonZeroUsize)>,
+    pub(crate) storage: Option<(Box<dyn PrefixStorage>, NonZeroUsize, PrefixStoragePolicy)>,
     jobs: Vec<StorageJob>,
     prefix_reclaimed_blocks: u64,
     prefix_reclaimed_slabs: u64,
@@ -184,7 +190,7 @@ impl PagedKvResources {
     }
 
     pub(crate) fn start_storage(&mut self, request: u64, tokens: &[u32]) -> bool {
-        let Some((storage, limit)) = &mut self.storage else {
+        let Some((storage, limit, _)) = &mut self.storage else {
             return false;
         };
         if self.jobs.len() >= limit.get() {
@@ -255,7 +261,7 @@ impl PagedKvResources {
                     .map(|g| g.pages().iter().map(|p| p.handle()).collect())
                     .collect();
                 let groups = self.storage_groups(result, tables)?;
-                let (storage, _) = self.storage.as_mut().unwrap();
+                let (storage, _, _) = self.storage.as_mut().unwrap();
                 let operation = storage.transfer(&tokens, &groups, true);
                 self.jobs.push((operation, request, tokens, Some(pages)));
             }
@@ -263,12 +269,16 @@ impl PagedKvResources {
         Ok(())
     }
 
-    fn store_prefix(&mut self, pages: &CachedPages, tokens: &[u32]) -> Result<(), CachePoolError> {
-        if self
-            .storage
-            .as_ref()
-            .is_some_and(|(_, limit)| self.jobs.len() < limit.get())
-        {
+    fn store_prefix(
+        &mut self,
+        pages: &CachedPages,
+        tokens: &[u32],
+        reused: bool,
+    ) -> Result<(), CachePoolError> {
+        if self.storage.as_ref().is_some_and(|(_, limit, policy)| {
+            self.jobs.len() < limit.get()
+                && reused == (*policy == PrefixStoragePolicy::WriteThroughSelective)
+        }) {
             let tables = pages
                 .groups()
                 .iter()
@@ -301,12 +311,15 @@ impl PagedKvResources {
                 .pool
                 .reserve_request(SequenceId::new(u64::MAX), &self.demands(0))?;
             let mut source = self.pool.promote_request(pending);
-            self.pool.attach_shared_prefix(&mut source, pages)?;
+            if let Err(error) = self.pool.attach_shared_prefix(&mut source, pages) {
+                self.pool.retire_request(source).map_err(|f| f.error)?;
+                return Err(error);
+            }
             if let Err(error) = self.pool.retain_shared_request_pages(&mut source, &keep) {
                 self.pool.retire_request(source).map_err(|f| f.error)?;
                 return Err(error);
             }
-            if let Some((storage, _)) = &mut self.storage {
+            if let Some((storage, _, _)) = &mut self.storage {
                 let operation = storage.transfer(tokens, &groups, false);
                 self.jobs.push((operation, 0, Vec::new(), Some(source)));
             }
@@ -551,12 +564,25 @@ impl PagedKvResources {
         state: &mut RequestPages,
         tokens: &[u32],
     ) -> Result<u32, CachePoolError> {
+        let Some(mut cache) = self.prefix_cache.take() else {
+            return Ok(0);
+        };
+        let restored = self.restore_from_cache(&mut cache, state, tokens);
+        self.prefix_cache = Some(cache);
+        restored
+    }
+
+    fn restore_from_cache(
+        &mut self,
+        cache: &mut PrefixCache<CachedPages>,
+        state: &mut RequestPages,
+        tokens: &[u32],
+    ) -> Result<u32, CachePoolError> {
         let maximum = tokens
             .len()
             .saturating_sub(self.layout.replay_suffix_tokens() as usize);
-        let (pool, cache) = (&mut self.pool, &mut self.prefix_cache);
-        let Some((length, snapshot)) = cache.as_mut().and_then(|cache| cache.find(tokens, maximum))
-        else {
+        let pool = &mut self.pool;
+        let Some((length, snapshot)) = cache.find(tokens, maximum) else {
             return Ok(0);
         };
         let mut private = if !self.state_demands.is_empty() {
@@ -590,6 +616,9 @@ impl PagedKvResources {
             self.state_resources
                 .insert(state.sequence().get(), StateResources::new(Some(restore)));
         }
+        // The matched immutable snapshot also holds STATE before its private
+        // restore. Optional backup failure must not reject a successful hit.
+        let _ = self.store_prefix(snapshot, &tokens[..length as usize], true);
         Ok(length)
     }
 
@@ -618,7 +647,7 @@ impl PagedKvResources {
         }
         let demands = self.demands(resident_tokens);
         let pages = self.pool.share_request_prefix(state, &demands)?;
-        self.store_prefix(&pages, &tokens[..length])?;
+        self.store_prefix(&pages, &tokens[..length], false)?;
         let replaced = self
             .prefix_cache
             .as_mut()
@@ -857,7 +886,7 @@ impl PagedKvResources {
             .pool
             .combine_state_snapshots(history, copied, &self.state_groups)?;
         snapshot.ready = false;
-        self.store_prefix(&pages, tokens)?;
+        self.store_prefix(&pages, tokens, false)?;
         let replaced = self
             .prefix_cache
             .as_mut()
@@ -1301,30 +1330,26 @@ mod tests {
 
     use super::*;
 
+    #[derive(Clone, Debug, Default)]
+    struct HeldStorage(Arc<AtomicBool>, Arc<Mutex<Vec<PrefixStorageGroup>>>);
+    impl PrefixStorageOperation for HeldStorage {
+        fn poll(&mut self, _: bool) -> Option<u32> {
+            self.0.load(Ordering::Acquire).then_some(1)
+        }
+    }
+    impl PrefixStorage for HeldStorage {
+        fn lookup(&mut self, _: &[u32], _: u32, _: u32) -> StorageOp {
+            unreachable!("the test only exports checkpoints")
+        }
+        fn transfer(&mut self, _: &[u32], groups: &[PrefixStorageGroup], load: bool) -> StorageOp {
+            assert!(!load);
+            *self.1.lock().unwrap() = groups.to_vec();
+            Box::new(self.clone())
+        }
+    }
+
     #[test]
     fn pending_storage_retains_only_live_window_pages_through_recycling() {
-        #[derive(Clone, Debug)]
-        struct Store(Arc<AtomicBool>, Arc<Mutex<Vec<PrefixStorageGroup>>>);
-        impl PrefixStorageOperation for Store {
-            fn poll(&mut self, _: bool) -> Option<u32> {
-                self.0.load(Ordering::Acquire).then_some(1)
-            }
-        }
-        impl PrefixStorage for Store {
-            fn lookup(&mut self, _: &[u32], _: u32, _: u32) -> StorageOp {
-                unreachable!("the test only exports checkpoints")
-            }
-            fn transfer(
-                &mut self,
-                _: &[u32],
-                groups: &[PrefixStorageGroup],
-                load: bool,
-            ) -> StorageOp {
-                assert!(!load);
-                *self.1.lock().unwrap() = groups.to_vec();
-                Box::new(self.clone())
-            }
-        }
         for (capacity, length, read, first, held) in [
             (96, 4096, Some(128), 31, 33),  // A full snapshot held 64 parents.
             (192, 8576, Some(129), 65, 69), // Live WINDOW slots wrap across 65/0.
@@ -1340,8 +1365,12 @@ mod tests {
             let history = KvGroupLayout::new(128, 1, KvRetention::FullContext).unwrap();
             let layout = KvLayout::new(capacity, vec![history, window]).unwrap();
             let mut r = PagedKvResources::with_prefix_cache(layout).unwrap();
-            let store = Store(Arc::default(), Arc::default());
-            r.storage = Some((Box::new(store.clone()), NonZeroUsize::new(1).unwrap()));
+            let store = HeldStorage::default();
+            r.storage = Some((
+                Box::new(store.clone()),
+                NonZeroUsize::new(1).unwrap(),
+                PrefixStoragePolicy::WriteThrough,
+            ));
             let id = RequestId::new(NonZeroU64::new(1).unwrap());
             let mut request = r.attach(id, length).unwrap();
             let original = request.groups()[1].pages();
@@ -2085,6 +2114,12 @@ mod tests {
         )
         .unwrap();
         let mut resources = PagedKvResources::with_prefix_cache(layout).unwrap();
+        let storage = HeldStorage::default();
+        resources.storage = Some((
+            Box::new(storage.clone()),
+            NonZeroUsize::new(1).unwrap(),
+            PrefixStoragePolicy::WriteThroughSelective,
+        ));
         let first_id = RequestId::new(NonZeroU64::new(1).unwrap());
         let mut first = resources.attach(first_id, 0).unwrap();
         resources.ensure_context(&mut first, 0, 128).unwrap();
@@ -2152,6 +2187,7 @@ mod tests {
         resources
             .publish_state_prefix(&mut first, receipt, &(0..128).collect::<Vec<_>>())
             .unwrap();
+        assert!(resources.jobs.is_empty()); // A cold STATE checkpoint is not exported.
         assert!(first.groups()[1].pages()[0].is_writable());
         assert_eq!(
             resources
@@ -2170,6 +2206,9 @@ mod tests {
                 .unwrap(),
             128
         );
+        assert_eq!(storage.1.lock().unwrap()[1].1, vec![snapshot_address]);
+        let owner = resources.jobs[0].3.as_ref().unwrap();
+        let held = owner.groups()[1].pages()[0].handle();
         resources.ensure_context(&mut second, 128, 129).unwrap();
         let state_pages = second.groups()[1].pages();
         assert_eq!(state_pages.len(), 1);
@@ -2205,6 +2244,15 @@ mod tests {
         );
         resources.release(access.lease);
         resources.retire(second).unwrap();
+        resources.clear_prefix_cache().unwrap();
+        resources.poll_storage(false, |_, _, pages| pages).unwrap();
+        assert_eq!(
+            resources.pool.physical_address(held).unwrap(),
+            snapshot_address
+        );
+        storage.0.store(true, Ordering::Release);
+        resources.poll_storage(false, |_, _, pages| pages).unwrap();
+        assert_eq!(resources.pool.free_parent_count(), 10);
     }
 
     #[test]

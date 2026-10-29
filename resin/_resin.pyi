@@ -505,7 +505,8 @@ class Engine:
         scheduler_config: SchedulerConfig | None = None,
         prefix_cache: bool = False,
         prefix_cache_storage: CacheStorage | None = None,
-        prefix_cache_max_inflight: int = 2,
+        prefix_cache_max_inflight: int | None = None,
+        prefix_cache_storage_policy: Literal["write_through", "write_through_selective"] = "write_through_selective",
         enable_overlap: bool = True,
         enable_metrics: bool = True,
     ) -> Engine: ...
