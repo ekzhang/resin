@@ -3,7 +3,7 @@
     reason = "PyO3 0.29 from_py_object emits Clone::clone for Copy enums"
 )]
 
-use std::num::NonZeroU32;
+use std::num::{NonZeroU32, NonZeroUsize};
 use std::sync::{Arc, OnceLock};
 
 use numpy::{PyArray1, PyArrayLike1, PyReadonlyArray1};
@@ -1539,7 +1539,7 @@ impl Engine {
 #[pymethods]
 impl Engine {
     #[new]
-    #[pyo3(signature = (runner: "Runner", *, max_running_requests = 32, context_length = 32768, scheduler_config = None, prefix_cache = false, prefix_cache_storage = None, prefix_cache_namespace = None, enable_overlap = true, enable_metrics = true))]
+    #[pyo3(signature = (runner: "Runner", *, max_running_requests = 32, context_length = 32768, scheduler_config = None, prefix_cache = false, prefix_cache_storage = None, prefix_cache_namespace = None, prefix_cache_max_inflight = 2, enable_overlap = true, enable_metrics = true))]
     #[allow(
         clippy::too_many_arguments,
         reason = "Python constructor exposes keyword configuration"
@@ -1553,9 +1553,12 @@ impl Engine {
         prefix_cache: bool,
         prefix_cache_storage: Option<Py<PyAny>>,
         prefix_cache_namespace: Option<Py<PyAny>>,
+        prefix_cache_max_inflight: usize,
         enable_overlap: bool,
         enable_metrics: bool,
     ) -> PyResult<Self> {
+        let prefix_cache_max_inflight = NonZeroUsize::new(prefix_cache_max_inflight)
+            .ok_or_else(|| PyValueError::new_err("prefix_cache_max_inflight must be positive"))?;
         let runner_enqueue = optional_runner_callable(py, runner.bind(py), "enqueue")?;
         let (runner_forward, runner_release) = resolve_runner_contract(py, runner.bind(py))?;
         let resolved = resolve_runner_config(py, runner.bind(py))?;
@@ -1609,8 +1612,11 @@ impl Engine {
                     prefix_cache_namespace,
                 ))?
                 .unbind();
-            core.set_prefix_storage(Box::new(cache_storage::PythonPrefixStorage(adapter)))
-                .map_err(core_error)?;
+            core.set_prefix_storage(
+                Box::new(cache_storage::PythonPrefixStorage(adapter)),
+                prefix_cache_max_inflight,
+            )
+            .map_err(core_error)?;
         }
         let runner_config = bind_runner_resources(py, resolved, core.cache_pool_id())?;
         Ok(Self {

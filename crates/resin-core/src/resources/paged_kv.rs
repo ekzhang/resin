@@ -1,6 +1,6 @@
 use std::collections::{HashMap, HashSet};
 use std::fmt;
-use std::num::NonZeroU32;
+use std::num::{NonZeroU32, NonZeroUsize};
 
 use crate::{RequestId, SequenceStep};
 
@@ -83,7 +83,7 @@ pub struct PagedKvResources {
     layout: KvLayout,
     pool: CachePool,
     prefix_cache: Option<PrefixCache<super::paged::CachedPages>>,
-    pub(crate) storage: Option<Box<dyn PrefixStorage>>,
+    pub(crate) storage: Option<(Box<dyn PrefixStorage>, NonZeroUsize)>,
     jobs: Vec<StorageJob>,
     prefix_reclaimed_blocks: u64,
     prefix_reclaimed_slabs: u64,
@@ -184,12 +184,12 @@ impl PagedKvResources {
     }
 
     pub(crate) fn start_storage(&mut self, request: u64, tokens: &[u32]) -> bool {
-        if self.jobs.len() >= 2 {
-            return false;
-        }
-        let Some(storage) = &mut self.storage else {
+        let Some((storage, limit)) = &mut self.storage else {
             return false;
         };
+        if self.jobs.len() >= limit.get() {
+            return false;
+        }
         let maximum = tokens
             .len()
             .saturating_sub(self.layout.replay_suffix_tokens().max(1) as usize);
@@ -255,7 +255,7 @@ impl PagedKvResources {
                     .map(|g| g.pages().iter().map(|p| p.handle()).collect())
                     .collect();
                 let groups = self.storage_groups(result, tables)?;
-                let storage = self.storage.as_mut().unwrap();
+                let (storage, _) = self.storage.as_mut().unwrap();
                 let operation = storage.transfer(&tokens, &groups, true);
                 self.jobs.push((operation, request, tokens, Some(pages)));
             }
@@ -264,7 +264,11 @@ impl PagedKvResources {
     }
 
     fn store_prefix(&mut self, pages: &CachedPages, tokens: &[u32]) -> Result<(), CachePoolError> {
-        if self.storage.is_some() && self.jobs.len() < 2 {
+        if self
+            .storage
+            .as_ref()
+            .is_some_and(|(_, limit)| self.jobs.len() < limit.get())
+        {
             let tables = pages
                 .groups()
                 .iter()
@@ -280,7 +284,7 @@ impl PagedKvResources {
                 .reserve_request(SequenceId::new(u64::MAX), &self.demands(0))?;
             let mut source = self.pool.promote_request(pending);
             self.pool.attach_shared_prefix(&mut source, pages)?;
-            if let Some(storage) = &mut self.storage {
+            if let Some((storage, _)) = &mut self.storage {
                 let operation = storage.transfer(tokens, &groups, false);
                 self.jobs.push((operation, 0, Vec::new(), Some(source)));
             }

@@ -626,11 +626,15 @@ impl<P: Clone> EngineCore<P> {
         self.engine_id
     }
 
-    pub fn set_prefix_storage(&mut self, storage: Box<dyn PrefixStorage>) -> Result<()> {
+    pub fn set_prefix_storage(
+        &mut self,
+        storage: Box<dyn PrefixStorage>,
+        max_inflight: NonZeroUsize,
+    ) -> Result<()> {
         if self.prefix_alignment().is_none() {
             return Err(Error::invalid("storage requires prefix caching"));
         }
-        self.kv_resources.as_mut().unwrap().storage = Some(storage);
+        self.kv_resources.as_mut().unwrap().storage = Some((storage, max_inflight));
         Ok(())
     }
 

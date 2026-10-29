@@ -505,6 +505,7 @@ class Engine:
         prefix_cache: bool = False,
         prefix_cache_storage: Any = None,
         prefix_cache_namespace: str | bytes | None = None,
+        prefix_cache_max_inflight: int = 2,
         enable_overlap: bool = True,
         enable_metrics: bool = True,
     ) -> Engine: ...

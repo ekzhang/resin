@@ -1,4 +1,4 @@
-from concurrent.futures import ThreadPoolExecutor, TimeoutError
+from concurrent.futures import Future, ThreadPoolExecutor, TimeoutError
 from random import Random
 from threading import Event
 from time import sleep
@@ -11,7 +11,7 @@ from resin import CacheGroupLayout, CacheLayout, Engine, SamplingParams
 from resin.cache_storage import MemoryCacheStorage
 
 
-def make_engine(store, fill=0):
+def make_engine(store, fill=0, limit=2):
     runner = RecordingCachedRunner(
         CacheLayout(parent_capacity=32, groups=[CacheGroupLayout(2)])
     )
@@ -22,7 +22,9 @@ def make_engine(store, fill=0):
         return tuple((view[slab : slab + 1],) for slab, _ in groups[0][1])
 
     setattr(runner, "cache_storage_buffers", buffers)
-    options: dict[str, Any] = dict(prefix_cache=True, prefix_cache_namespace="m")
+    options: dict[str, Any] = dict(
+        prefix_cache=True, prefix_cache_namespace="m", prefix_cache_max_inflight=limit
+    )
     engine = Engine(runner, prefix_cache_storage=store, **options)
     return engine, runner, arena
 
@@ -39,6 +41,38 @@ def test_memory_bytes_capacity_and_scatter_gather():
         assert store.load((key,), ((memoryview(target),),)).result()
         assert target == expected and store.nbytes <= 6
         assert sum(store.lookup((b"a", b"b", b"c")).result()) <= 2
+    store.close()
+
+
+@pytest.mark.parametrize("limit", [1, 4])
+def test_storage_inflight_limit(limit):
+    store, pending = MemoryCacheStorage(), []
+
+    def lookup(keys):
+        future = Future()
+        pending.append((future, keys))
+        return future
+
+    setattr(store, "lookup", lookup)
+    with pytest.raises(ValueError, match="prefix_cache_max_inflight"):
+        make_engine(store, limit=0)
+    engine, _, _ = make_engine(store, limit=limit)
+    with engine:
+        try:
+            requests = [
+                engine.submit(
+                    [1, 2, 3], sampling_params=SamplingParams(max_output_tokens=1)
+                )
+                for _ in range(limit + 1)
+            ]
+            assert engine.metrics_snapshot().cache["storage_pending"] == limit
+            assert len(pending) == limit
+            for _ in range(3):
+                engine.step()
+            assert requests[-1].done
+        finally:
+            for future, keys in pending:
+                future.set_result((False,) * len(keys))
     store.close()
 
 

@@ -20,8 +20,9 @@ failure, must prove every buffer access has retired; providers must order GPU st
 A result of `None` means retirement is unknown, so Resin retains those buffers.
 
 Loads gate only dependent requests; stores pin immutable snapshots. Cancellation does
-not retire transfers, and engine close waits. At most two operations retain resources
-per engine. Storage and eviction may outlive engines. The default namespace is private;
+not retire transfers, and engine close waits. `prefix_cache_max_inflight` sets the positive
+per-engine limit on outstanding lookup/load/store batches (default: 2). Storage and
+eviction may outlive engines. The default namespace is private;
 set `prefix_cache_namespace` to share compatible weights/adapters/dtypes/layout/shards.
 Metrics expose `cache.storage_pending`, `resin:cache_storage_pending`, and restored
 request cached tokens.
