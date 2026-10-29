@@ -11,6 +11,8 @@ use resin_http::{ConversationRequest, GenerationEvent, GenerationJob, MetricsEnd
 use serde::{Deserialize, Serialize};
 use tokio::sync::{mpsc, watch};
 
+use crate::http::AdmissionConfig;
+
 /// Native ingress stays typed across the Python coordinator. Only transport
 /// between ranks encodes it; JSON never becomes a Python object graph.
 #[pyclass(
@@ -130,6 +132,7 @@ pub(crate) fn run(
     mut jobs: mpsc::Receiver<GenerationJob>,
     shutdown: watch::Receiver<bool>,
     replicas: usize,
+    admission: AdmissionConfig,
     metrics: Option<MetricsEndpoint>,
 ) -> Result<(), String> {
     let mut clients = HashMap::<String, mpsc::Sender<GenerationEvent>>::new();
@@ -158,9 +161,9 @@ pub(crate) fn run(
             started.remove(id);
         }
         let mut ingress_error = None;
-        for _ in 0..super::http::ADMISSIONS_PER_STEP.saturating_mul(replicas) {
+        for _ in 0..admission.admissions_per_step.saturating_mul(replicas) {
             if *shutdown.borrow()
-                || clients.len() >= super::http::MAX_ACTIVE_REQUESTS.saturating_mul(replicas)
+                || clients.len() >= admission.max_active_requests.saturating_mul(replicas)
             {
                 break;
             }

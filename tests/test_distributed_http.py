@@ -196,6 +196,30 @@ def _serve_rank(rank, world_size, directory, port, case):
                     and groups.drivers.local_rank == 1
                     else 1
                 ),
+                max_active_requests=(
+                    0
+                    if case == "invalid_max_active_requests"
+                    and groups.drivers.local_rank == 1
+                    else 2
+                    if case == "max_active_requests" and groups.drivers.local_rank == 1
+                    else None
+                ),
+                render_workers=(
+                    0
+                    if case == "invalid_render_workers"
+                    and groups.drivers.local_rank == 1
+                    else 2
+                    if case == "render_workers" and groups.drivers.local_rank == 1
+                    else None
+                ),
+                admissions_per_step=(
+                    0
+                    if case == "invalid_admissions_per_step"
+                    and groups.drivers.local_rank == 1
+                    else 2
+                    if case == "admissions_per_step" and groups.drivers.local_rank == 1
+                    else 32
+                ),
             )
             if case == "normal":
 
@@ -364,6 +388,12 @@ def _assert_distributed_metrics(base):
         ("invalid_stream_interval", 2),
         ("request_queue_capacity", 2),
         ("invalid_request_queue_capacity", 2),
+        ("max_active_requests", 2),
+        ("invalid_max_active_requests", 2),
+        ("render_workers", 2),
+        ("invalid_render_workers", 2),
+        ("admissions_per_step", 2),
+        ("invalid_admissions_per_step", 2),
     ],
 )
 def test_distributed_http_routes_real_replica_engines(tmp_path, case, world_size):
@@ -521,11 +551,23 @@ def test_distributed_http_routes_real_replica_engines(tmp_path, case, world_size
         "invalid_stream_interval",
         "request_queue_capacity",
         "invalid_request_queue_capacity",
+        "max_active_requests",
+        "invalid_max_active_requests",
+        "render_workers",
+        "invalid_render_workers",
+        "admissions_per_step",
+        "invalid_admissions_per_step",
     ):
         assert len({record["error"] for record in records}) == 1
         assert records[0]["error"] is not None
         assert all(record["engine_closed"] for record in records)
-        if case in ("stream_interval", "request_queue_capacity"):
+        if case in (
+            "stream_interval",
+            "request_queue_capacity",
+            "max_active_requests",
+            "render_workers",
+            "admissions_per_step",
+        ):
             assert "configuration must agree" in records[0]["error"]
         elif case.startswith("invalid_"):
             setting = case.removeprefix("invalid_")

@@ -25,17 +25,23 @@ class HttpServer:
     inference. Requests select a replica with routed_dp_rank or the
     resin-routed-dp-rank header; unassigned requests use round robin.
 
-    stream_interval batches later output until N generated model tokens have
-    accumulated, checked at step boundaries. The first semantic output is sent
-    immediately, and completion flushes the remainder. Stop matching and
-    cancellation still run on every step.
+    - `stream_interval` batches later output until N generated model tokens have
+      accumulated, checked at step boundaries. The first semantic output is sent
+      immediately, and completion flushes the remainder.
 
-    request_queue_capacity bounds requests waiting for engine admission across
-    all replicas. It does not change the engine's active batch size. A full
-    queue returns HTTP 429 so clients can retry with backoff.
+    - `request_queue_capacity` bounds requests waiting for engine admission on
+      all replicas. A full queue returns HTTP 429.
 
-    OpenAI chat and Responses requests without an output-token limit use the
-    engine's remaining context budget after rendering and tokenizing the prompt.
+    - `max_active_requests` bounds admitted requests, including prompts being
+      rendered. Defaults to the engine's `max_running_requests` plus
+      `render_workers` For distributed engines, the total cap scales with the
+      number of attention-DP replicas.
+
+    - `render_workers` sets the number of threads rendering prompts and media.
+      Defaults to available CPU parallelism, capped at 16.
+
+    - `admissions_per_step` limits how many requests are admitted between
+      inference steps.
     """
 
     def __init__(
@@ -46,6 +52,9 @@ class HttpServer:
         model: str | None = None,
         stream_interval: int = 1,
         request_queue_capacity: int = 1024,
+        max_active_requests: int | None = None,
+        render_workers: int | None = None,
+        admissions_per_step: int = 32,
         enable_openai: bool = True,
         enable_anthropic: bool = True,
         enable_demo: bool = True,
@@ -57,20 +66,17 @@ class HttpServer:
 
         error = None
         try:
-            if (
-                type(stream_interval) is not int
-                or not 1 <= stream_interval <= 2**32 - 1
+            for name, value in (
+                ("stream_interval", stream_interval),
+                ("request_queue_capacity", request_queue_capacity),
+                ("max_active_requests", max_active_requests),
+                ("render_workers", render_workers),
+                ("admissions_per_step", admissions_per_step),
             ):
-                raise ValueError(
-                    "stream_interval must be a positive integer fitting u32"
-                )
-            if (
-                type(request_queue_capacity) is not int
-                or not 1 <= request_queue_capacity <= 2**32 - 1
-            ):
-                raise ValueError(
-                    "request_queue_capacity must be a positive integer fitting u32"
-                )
+                if name in ("max_active_requests", "render_workers") and value is None:
+                    continue
+                if type(value) is not int or not 1 <= value <= 2**32 - 1:
+                    raise ValueError(f"{name} must be a positive integer fitting u32")
             if model is None:
                 tokenizer = recipe.tokenizer
                 model = None if tokenizer is None else tokenizer.name_or_path
@@ -100,6 +106,9 @@ class HttpServer:
                     enable_demo,
                     stream_interval,
                     request_queue_capacity,
+                    max_active_requests,
+                    render_workers,
+                    admissions_per_step,
                     engine.local.metrics_enabled,
                 )
             )
@@ -143,6 +152,9 @@ class HttpServer:
                     model=model,
                     stream_interval=stream_interval,
                     request_queue_capacity=request_queue_capacity,
+                    max_active_requests=max_active_requests,
+                    render_workers=render_workers,
+                    admissions_per_step=admissions_per_step,
                     enable_openai=enable_openai,
                     enable_anthropic=enable_anthropic,
                     enable_demo=enable_demo,

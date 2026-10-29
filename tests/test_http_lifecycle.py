@@ -144,7 +144,9 @@ def test_configured_intake_queue_rejects_overflow_then_drains_and_recovers():
                 assert resume.wait(timeout=5), "test did not release the first render"
             return super().render(messages, tools=tools, options=options)
 
-    with running_server(Runner(), BlockingRecipe(), request_queue_capacity=2) as (
+    with running_server(
+        Runner(), BlockingRecipe(), request_queue_capacity=2, max_active_requests=1
+    ) as (
         _server,
         engine,
         _thread,
@@ -190,6 +192,153 @@ def test_configured_intake_queue_rejects_overflow_then_drains_and_recovers():
         with post(base, request_body()) as response:
             assert json.load(response)["choices"][0]["message"]["content"] == "okok"
         assert not engine.poisoned
+        assert errors == []
+
+
+@pytest.mark.parametrize("max_active_requests,render_workers", [(2, 4), (4, 2)])
+def test_configured_active_and_render_limits_bound_inflight_prompts(
+    max_active_requests, render_workers
+):
+    rendering = threading.Condition()
+    resume = threading.Event()
+    started = 0
+    expected = min(max_active_requests, render_workers)
+
+    class BlockingRecipe(Recipe):
+        def render(self, messages, *, tools=(), options=None):
+            nonlocal started
+            with rendering:
+                started += 1
+                rendering.notify_all()
+            assert resume.wait(timeout=5), "test did not release prompt rendering"
+            return super().render(messages, tools=tools, options=options)
+
+    with running_server(
+        Runner(),
+        BlockingRecipe(),
+        max_active_requests=max_active_requests,
+        render_workers=render_workers,
+    ) as (_server, _engine, _thread, errors, base, _port):
+        with ExitStack() as responses:
+            try:
+                streams = [
+                    responses.enter_context(post(base, request_body(stream=True)))
+                    for _ in range(5)
+                ]
+                with rendering:
+                    assert rendering.wait_for(lambda: started >= expected, timeout=2)
+                    assert not rendering.wait_for(
+                        lambda: started > expected, timeout=0.1
+                    )
+            finally:
+                resume.set()
+            for response in streams:
+                assert response.read().decode().endswith("data: [DONE]\n\n")
+        assert started == 5
+        assert errors == []
+
+
+@pytest.mark.parametrize("max_active_requests", [None, 129])
+def test_configured_active_limit_fills_engine_above_128_requests(max_active_requests):
+    rendering = threading.Event()
+    resume = threading.Event()
+    full_batch = threading.Event()
+
+    class BlockingRecipe(Recipe):
+        def render(self, messages, *, tools=(), options=None):
+            rendering.set()
+            assert resume.wait(timeout=5), "test did not release prompt rendering"
+            return super().render(messages, tools=tools, options=options)
+
+    class BatchRunner(Runner):
+        def forward(self, plan):
+            if plan.num_sequences == 129:
+                full_batch.set()
+            return super().forward(plan)
+
+    with running_server(
+        BatchRunner(),
+        BlockingRecipe(),
+        engine_options={"max_running_requests": 129},
+        **(
+            {}
+            if max_active_requests is None
+            else {"max_active_requests": max_active_requests}
+        ),
+        render_workers=1,
+    ) as (_server, _engine, _thread, errors, base, _port):
+        with ExitStack() as responses:
+            try:
+                for _ in range(129):
+                    responses.enter_context(
+                        post(base, request_body(stream=True, max_tokens=512))
+                    )
+                assert rendering.wait(timeout=2)
+            finally:
+                resume.set()
+            assert full_batch.wait(timeout=5), "HTTP admission never filled the engine"
+        assert errors == []
+
+
+def test_configured_admissions_limit_bounds_new_requests_between_steps():
+    first_step = threading.Event()
+    start_rendering = threading.Event()
+    resume = threading.Event()
+    rendering = threading.Condition()
+    rendered = 0
+    first_render = True
+    admissions = []
+
+    class CountingRecipe(Recipe):
+        def render(self, messages, *, tools=(), options=None):
+            nonlocal rendered, first_render
+            with rendering:
+                first = first_render
+                first_render = False
+            gate = start_rendering if first else first_step
+            assert gate.wait(timeout=5), "test did not release prompt rendering"
+            prompt = super().render(messages, tools=tools, options=options)
+            with rendering:
+                rendered += 1
+                rendering.notify_all()
+            return prompt
+
+    class BlockingRunner(Runner):
+        def forward(self, plan):
+            admissions.append(sum(plan.context_lengths == 0))
+            if not first_step.is_set():
+                first_step.set()
+                assert resume.wait(timeout=5), "test did not release the first step"
+            return super().forward(plan)
+
+    with running_server(BlockingRunner(), CountingRecipe(), admissions_per_step=1) as (
+        _server,
+        _engine,
+        _thread,
+        errors,
+        base,
+        _port,
+    ):
+        with ExitStack() as responses:
+            try:
+                streams = [
+                    responses.enter_context(post(base, request_body(stream=True)))
+                ]
+                for _ in range(5):
+                    streams.append(
+                        responses.enter_context(post(base, request_body(stream=True)))
+                    )
+                start_rendering.set()
+                assert first_step.wait(timeout=2)
+                with rendering:
+                    assert rendering.wait_for(lambda: rendered == 6, timeout=2)
+            finally:
+                start_rendering.set()
+                resume.set()
+            for response in streams:
+                assert response.read().decode().endswith("data: [DONE]\n\n")
+        assert sum(admissions) == 6
+        assert max(admissions) == 1
         assert errors == []
 
 
@@ -527,12 +676,12 @@ def test_admission_burst_yields_to_inference_before_draining_queue():
 
     class ObservingRunner(Runner):
         def forward(self, plan):
-            counts_at_step.append(recipe.admitted)
+            counts_at_step.append(plan.num_sequences)
             first_step.set()
             return super().forward(plan)
 
     connections = []
-    with running_server(ObservingRunner(), recipe) as (
+    with running_server(ObservingRunner(), recipe, admissions_per_step=4) as (
         _server,
         _engine,
         _thread,
@@ -557,7 +706,7 @@ def test_admission_burst_yields_to_inference_before_draining_queue():
                 assert connection.recv(1024).startswith(b"HTTP/1.1 200")
             recipe.resume.set()
             assert first_step.wait(timeout=3)
-            assert counts_at_step[0] == 4
+            assert 1 <= counts_at_step[0] <= 4
             assert errors == []
         finally:
             recipe.resume.set()

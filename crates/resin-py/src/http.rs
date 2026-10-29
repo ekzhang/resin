@@ -19,10 +19,17 @@ use tokio::sync::{mpsc, oneshot, watch};
 use crate::Engine;
 use crate::http_session::{RenderedJob, Session, render_job};
 
-pub(crate) const MAX_ACTIVE_REQUESTS: usize = 128;
-/// Threads that render prompts and prepare media off the engine thread.
-const RENDER_WORKERS: usize = 8;
-pub(crate) const ADMISSIONS_PER_STEP: usize = 4;
+#[derive(Clone, Copy)]
+pub(crate) struct AdmissionConfig {
+    /// Maximum admitted requests, including prompts being rendered and requests
+    /// waiting in the engine.
+    pub max_active_requests: usize,
+    /// Threads that render prompts and prepare media off the engine thread.
+    pub render_workers: usize,
+    /// Maximum requests admitted between inference steps, scaled by replica
+    /// count when distributed.
+    pub admissions_per_step: usize,
+}
 
 #[pyclass(name = "_HttpServer", module = "resin._resin")]
 pub(crate) struct NativeHttpServer {
@@ -32,6 +39,7 @@ pub(crate) struct NativeHttpServer {
     model: String,
     stream_interval: u32,
     request_queue_capacity: u32,
+    admission: AdmissionConfig,
     routes: RouteConfig,
     running: AtomicBool,
     shutdown: Mutex<Option<watch::Sender<bool>>>,
@@ -47,6 +55,9 @@ impl NativeHttpServer {
         model,
         stream_interval = 1,
         request_queue_capacity = 1024,
+        max_active_requests = None,
+        render_workers = None,
+        admissions_per_step = 32,
         enable_openai = true,
         enable_anthropic = true,
         enable_demo = true,
@@ -59,6 +70,9 @@ impl NativeHttpServer {
         model: String,
         stream_interval: u32,
         request_queue_capacity: u32,
+        max_active_requests: Option<u32>,
+        render_workers: Option<u32>,
+        admissions_per_step: u32,
         enable_openai: bool,
         enable_anthropic: bool,
         enable_demo: bool,
@@ -72,6 +86,39 @@ impl NativeHttpServer {
                 "request_queue_capacity must be positive",
             ));
         }
+        if max_active_requests == Some(0) {
+            return Err(PyValueError::new_err(
+                "max_active_requests must be positive",
+            ));
+        }
+        if render_workers == Some(0) {
+            return Err(PyValueError::new_err("render_workers must be positive"));
+        }
+        if admissions_per_step == 0 {
+            return Err(PyValueError::new_err(
+                "admissions_per_step must be positive",
+            ));
+        }
+        let render_workers = render_workers.map_or_else(
+            || {
+                thread::available_parallelism()
+                    .map_or(1, usize::from)
+                    .min(16)
+            },
+            |value| value as usize,
+        );
+        let max_active_requests = max_active_requests.map_or_else(
+            || {
+                Python::attach(|py| {
+                    engine
+                        .bind(py)
+                        .borrow()
+                        .max_running_requests()
+                        .saturating_add(render_workers)
+                })
+            },
+            |value| value as usize,
+        );
         let routed_dp_size = distributed
             .as_ref()
             .map(|coordinator| {
@@ -97,6 +144,11 @@ impl NativeHttpServer {
             model,
             stream_interval,
             request_queue_capacity,
+            admission: AdmissionConfig {
+                max_active_requests,
+                render_workers,
+                admissions_per_step: admissions_per_step as usize,
+            },
             routes: RouteConfig {
                 enable_openai,
                 enable_anthropic,
@@ -131,6 +183,7 @@ impl NativeHttpServer {
         let routes = self.routes;
         let stream_interval = self.stream_interval;
         let request_queue_capacity = self.request_queue_capacity;
+        let admission = self.admission;
         let result = py.detach(move || {
             run_server(
                 engine,
@@ -140,6 +193,7 @@ impl NativeHttpServer {
                 routes,
                 stream_interval,
                 request_queue_capacity,
+                admission,
                 SocketAddr::new(host, port),
                 shutdown,
             )
@@ -179,10 +233,13 @@ impl NativeHttpServer {
 
     fn __repr__(&self) -> String {
         format!(
-            "_HttpServer(model={:?}, stream_interval={}, request_queue_capacity={}, enable_openai={}, enable_anthropic={}, enable_demo={}, running={})",
+            "_HttpServer(model={:?}, stream_interval={}, request_queue_capacity={}, max_active_requests={}, render_workers={}, admissions_per_step={}, enable_openai={}, enable_anthropic={}, enable_demo={}, running={})",
             self.model,
             self.stream_interval,
             self.request_queue_capacity,
+            self.admission.max_active_requests,
+            self.admission.render_workers,
+            self.admission.admissions_per_step,
             self.routes.enable_openai,
             self.routes.enable_anthropic,
             self.routes.enable_demo,
@@ -200,6 +257,7 @@ fn run_server(
     routes: RouteConfig,
     stream_interval: u32,
     request_queue_capacity: u32,
+    admission: AdmissionConfig,
     address: SocketAddr,
     shutdown: watch::Sender<bool>,
 ) -> Result<(), String> {
@@ -226,6 +284,7 @@ fn run_server(
                     receiver,
                     actor_shutdown,
                     routes.routed_dp_size,
+                    admission,
                     actor_metrics,
                 )
             } else {
@@ -235,6 +294,7 @@ fn run_server(
                     receiver,
                     actor_shutdown,
                     stream_interval,
+                    admission,
                     actor_metrics,
                     &actor_model,
                 )
@@ -274,12 +334,14 @@ fn run_server(
         .and(actor_result)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn engine_actor(
     engine: Py<Engine>,
     recipe: Py<PyAny>,
     mut jobs: mpsc::Receiver<GenerationJob>,
     shutdown: watch::Receiver<bool>,
     stream_interval: u32,
+    admission: AdmissionConfig,
     metrics: Option<MetricsEndpoint>,
     model: &str,
 ) -> Result<(), String> {
@@ -290,7 +352,7 @@ fn engine_actor(
     let (render_jobs, render_queue) = std_mpsc::channel::<GenerationJob>();
     let render_queue = Arc::new(Mutex::new(render_queue));
     let (rendered_jobs, rendered_queue) = std_mpsc::channel::<(GenerationJob, RenderedJob)>();
-    for worker in 0..RENDER_WORKERS {
+    for worker in 0..admission.render_workers {
         let queue = render_queue.clone();
         let results = rendered_jobs.clone();
         let recipe = Python::attach(|py| session.recipe().clone_ref(py));
@@ -336,7 +398,7 @@ fn engine_actor(
         loop {
             if disconnected
                 || *shutdown.borrow()
-                || session.active_count() + rendering >= MAX_ACTIVE_REQUESTS
+                || session.active_count() + rendering >= admission.max_active_requests
             {
                 break;
             }
@@ -355,7 +417,7 @@ fn engine_actor(
                 }
             }
         }
-        for _ in 0..ADMISSIONS_PER_STEP * 8 {
+        for _ in 0..admission.admissions_per_step {
             match rendered_queue.try_recv() {
                 Ok((job, rendered)) => {
                     rendering -= 1;

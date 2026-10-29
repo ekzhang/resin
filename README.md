@@ -216,11 +216,18 @@ cache identity; render a new payload when changing an input image.
 
 The bridge bounds queued jobs with `HttpServer(request_queue_capacity=1024)`.
 This shared intake queue absorbs bursts while requests await engine admission;
-it does not reserve GPU cache or change the engine's active batch size. Active
-HTTP sessions (128 per replica), admissions before an inference step (4 per
-replica), and buffered events per client (64) remain bounded. A full intake
-queue returns HTTP 429; slow or disconnected clients are cancelled without
-blocking other requests. Actor failure stops the listener, and
+it does not reserve GPU cache or change the engine's active batch size.
+`max_active_requests` bounds admitted requests, including prompts being rendered,
+and defaults to `engine.max_running_requests + render_workers`. Set it explicitly
+to control how many additional requests can wait inside the Engine. Local prompt
+rendering defaults to the CPU parallelism reported by
+`std::thread::available_parallelism()` (falling back to one thread), capped at 16,
+or an explicit `render_workers` count. `admissions_per_step=32` limits admissions
+between inference steps. For distributed engines, the total active
+and admission limits scale with the number of attention-DP replicas; rendering
+runs on the replica drivers. Buffered events per client remain bounded at 64.
+A full intake queue returns HTTP 429; slow or disconnected clients are cancelled
+without blocking other requests. Actor failure stops the listener, and
 `HttpServer.shutdown()` requests shutdown after the current model step.
 
 ```bash
