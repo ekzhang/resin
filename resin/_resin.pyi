@@ -2,6 +2,7 @@ from collections.abc import Sequence
 from typing import Any, Final, final
 from collections.abc import Mapping
 from typing import Literal
+from resin.cache_storage import CacheStorage
 from resin.recipe import Recipe
 from resin.recipe import ContentBlock
 import numpy as np
@@ -503,7 +504,7 @@ class Engine:
         context_length: int = 32768,
         scheduler_config: SchedulerConfig | None = None,
         prefix_cache: bool = False,
-        prefix_cache_storage: Any = None,
+        prefix_cache_storage: CacheStorage | None = None,
         prefix_cache_namespace: str | bytes | None = None,
         prefix_cache_max_inflight: int = 2,
         enable_overlap: bool = True,

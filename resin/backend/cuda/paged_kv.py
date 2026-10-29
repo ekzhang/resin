@@ -10,6 +10,7 @@ import numpy as np
 import numpy.typing as npt
 import torch
 
+from resin.backend.cache_storage import byte_regions, live_rows
 from resin.backend.resources import CachePoolBinding
 
 if TYPE_CHECKING:
@@ -103,7 +104,19 @@ class PagedKvArena:
         resource: str = "paged KV",
     ) -> None:
         self.capacity = layout.parent_capacity
+        self.layout = layout
         self.page_size = page_size
+        self.cache_storage_format = repr(
+            (
+                "paged-kv-live-v1",
+                layer_count,
+                page_size,
+                num_kv_heads,
+                head_dim,
+                str(dtype),
+                tuple(g.read_window_tokens for g in layout.groups),
+            )
+        ).encode()
         self.binding = CachePoolBinding(layout, resource=resource)
         shape = (2, layer_count, self.capacity + 1, page_size, num_kv_heads, head_dim)
         self.storage = torch.zeros(shape, dtype=dtype, device=device)
@@ -114,19 +127,29 @@ class PagedKvArena:
         if any(page < 0 or page > self.capacity for page in page_ids):
             raise ValueError("BatchPlan cache block ID is outside the physical slab")
 
-    def cache_storage_buffers(self, groups):
+    def cache_storage_buffers(self, groups, *, prefix_length):
         buffers = []
-        for _, addresses in groups:
-            for slab, slot in addresses:
+        for group, (first, addresses) in zip(self.layout.groups, groups):
+            for block, (slab, slot) in enumerate(addresses, first):
                 if not 0 < slab <= self.capacity or slot:
                     raise ValueError(
                         "cache storage address is outside the managed arena"
                     )
+                rows = live_rows(
+                    prefix_length, block, self.page_size, group.read_window_tokens
+                )
+                # FA4 can load the complete page even when attention masks rows.
                 buffers.append(
-                    tuple(
-                        self.storage[kv, layer, slab].view(torch.uint8).reshape(-1)
-                        for kv in range(2)
-                        for layer in range(self.storage.shape[1])
+                    byte_regions(
+                        {
+                            f"{('keys', 'values')[kv]}/{layer}": self.storage[
+                                kv, layer, slab
+                            ]
+                            for kv in range(2)
+                            for layer in range(self.storage.shape[1])
+                        }
+                        if rows.stop > rows.start
+                        else {}
                     )
                 )
         return tuple(buffers)

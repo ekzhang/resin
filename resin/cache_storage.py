@@ -1,8 +1,28 @@
-"""A DRAM LRU for immutable objects, budgeting both key and payload bytes."""
+"""A DRAM LRU for immutable objects, budgeting keys, region names and payloads."""
+
+from __future__ import annotations
 
 from collections import OrderedDict
-from concurrent.futures import ThreadPoolExecutor
-from itertools import chain
+from collections.abc import Mapping, Sequence
+from concurrent.futures import Future, ThreadPoolExecutor
+from typing import TYPE_CHECKING, Protocol
+
+if TYPE_CHECKING:
+    from torch import Tensor
+
+Regions = Mapping[str, "Tensor"]
+
+
+class CacheStorage(Protocol):
+    """Nonblocking submission; terminal transfer results prove buffer retirement."""
+
+    def lookup(self, keys: Sequence[bytes]) -> Future[tuple[bool, ...]]: ...
+    def load(
+        self, keys: Sequence[bytes], buffers: Sequence[Regions]
+    ) -> Future[bool | None]: ...
+    def store(
+        self, keys: Sequence[bytes], buffers: Sequence[Regions]
+    ) -> Future[bool | None]: ...
 
 
 class MemoryCacheStorage:
@@ -18,25 +38,22 @@ class MemoryCacheStorage:
     def load(self, keys, buffers):
         def read():
             for key, regions in zip(keys, buffers, strict=True):
-                data = self.objects[key]
-                if len(data) != sum(r.nbytes for r in regions):
+                data, _ = self.objects[key]
+                if data.keys() != regions.keys() or any(
+                    len(data[name]) != region.nbytes for name, region in regions.items()
+                ):
                     return False
                 self.objects.move_to_end(key)
-                offset = 0
-                for region in regions:
-                    chunk = data[offset : offset + region.nbytes]
+                import torch
+
+                for name, region in regions.items():
+                    chunk = data[name]
                     if not chunk:
                         continue
-                    if hasattr(region, "copy_"):
-                        import torch
-
-                        with torch.inference_mode():
-                            region.reshape(-1).copy_(
-                                torch.frombuffer(bytearray(chunk), dtype=torch.uint8)
-                            )
-                    else:
-                        memoryview(region).cast("B")[:] = chunk
-                    offset += region.nbytes
+                    with torch.inference_mode():
+                        region.view(-1).copy_(
+                            torch.frombuffer(bytearray(chunk), dtype=torch.uint8)
+                        )
             return True
 
         return self._submit(read, buffers)
@@ -47,28 +64,30 @@ class MemoryCacheStorage:
             for key, regions in zip(keys, buffers, strict=True):
                 if key in self.objects:
                     continue
-                size = len(key) + sum(r.nbytes for r in regions)
+                size = len(key) + sum(
+                    len(name.encode()) + region.nbytes
+                    for name, region in regions.items()
+                )
                 if size > self.max_bytes:
                     success = False
                     continue
-                data = b"".join(
-                    r.detach().cpu().numpy().tobytes()
-                    if hasattr(r, "detach")
-                    else bytes(r)
-                    for r in regions
-                )
+                data = {
+                    name: region.detach().cpu().numpy().tobytes()
+                    for name, region in regions.items()
+                }
                 while self.nbytes + size > self.max_bytes:
-                    old_key, old_data = self.objects.popitem(last=False)
-                    self.nbytes -= len(old_key) + len(old_data)
-                self.objects[key] = data
+                    _, (_, old_size) = self.objects.popitem(last=False)
+                    self.nbytes -= old_size
+                self.objects[key] = data, size
                 self.nbytes += size
             return success
 
         return self._submit(write, buffers)
 
     def _submit(self, action, buffers):
-        regions = chain.from_iterable(buffers)
-        devices = {r.device for r in regions if getattr(r, "is_cuda", False)}
+        devices = {
+            r.device for regions in buffers for r in regions.values() if r.is_cuda
+        }
         ready = {}
         if devices:
             import torch

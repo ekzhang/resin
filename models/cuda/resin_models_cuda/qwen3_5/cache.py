@@ -10,6 +10,7 @@ import torch
 from torch import Tensor
 
 from resin import CacheGroupFamily, CacheGroupLayout, CacheLayout
+from resin.backend.cache_storage import byte_regions
 from resin.backend.cuda.slab import (
     DevicePageGroup as DeviceGroup,
 )
@@ -305,15 +306,14 @@ class CacheArena(GraphPageTableArena):
         self.device = device
         self.layout = layout
         self.geometry = geometry
-        sizes = (geometry.full_layers * geometry.unit_bytes, geometry.state_bytes)
-        self.cache_storage_block_bytes = sizes + (
-            (geometry.unit_bytes,) if geometry.include_mtp else ()
-        )
         if kv_dtype is None:
             kv_dtype = torch.bfloat16
         if kv_dtype.itemsize != geometry.kv_element_bytes:
             raise ValueError("Qwen3.5 KV dtype does not match its cache geometry")
         self.kv_dtype = kv_dtype
+        self.cache_storage_format = repr(
+            ("qwen35-live-v1", geometry, str(kv_dtype))
+        ).encode()
         self.binding = CachePoolBinding(layout, resource="Qwen3.5 cache")
         physical = layout.parent_capacity + 1
         self.storage = torch.zeros(
@@ -411,6 +411,34 @@ class CacheArena(GraphPageTableArena):
                 geometry.recurrent_bytes // BF16_BYTES + geometry.convolution_elements
             ),
         )
+
+    def cache_storage_buffers(self, groups, *, prefix_length):
+        buffers, geometry = [], self.geometry
+        for group, (_, addresses) in enumerate(groups):
+            for slab, slot in addresses:
+                if group == STATE_GROUP:
+                    tensors = {
+                        name: getattr(self, name)[slab, slot]
+                        for name in (
+                            "recurrent_states",
+                            "convolution_states",
+                            "target_hidden_states",
+                        )
+                    }
+                else:
+                    layers = geometry.full_layers if group == TARGET_GROUP else 1
+                    tensors = {
+                        f"{name}/{layer}": values[
+                            slab * geometry.slab_units + slot * layers + layer
+                        ]
+                        for name, values in (
+                            ("keys", self.keys),
+                            ("values", self.values),
+                        )
+                        for layer in range(layers)
+                    }
+                buffers.append(byte_regions(tensors))
+        return tuple(buffers)
 
     def reset_null(self) -> None:
         self.storage[0].zero_()

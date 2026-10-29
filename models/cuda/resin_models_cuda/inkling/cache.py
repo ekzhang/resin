@@ -14,6 +14,7 @@ from resin import (
     CacheLayout,
     CacheRetention,
 )
+from resin.backend.cache_storage import byte_regions, live_rows
 from resin.backend.cuda.slab import (
     DevicePageGroup as DeviceGroup,
 )
@@ -133,12 +134,7 @@ class CacheArena(GraphPageTableArena):
 
     graph_label = "Inkling"
 
-    cache_storage_block_bytes = (
-        GLOBAL_LAYERS * UNIT_ELEMENTS * 2,
-        LOCAL_LAYERS * UNIT_ELEMENTS * 2,
-        DRAFT_LAYERS * UNIT_ELEMENTS * 2,
-        STATE_ELEMENTS * 2,
-    )
+    cache_storage_format = b"inkling-live-v1/bf16/7-35-6/8x128/42x3x10240"
 
     def __init__(self, device: Any, layout: CacheLayout) -> None:
         self.device = device
@@ -175,6 +171,33 @@ class CacheArena(GraphPageTableArena):
             ),
         )
         self.state_blocks = {STATE_GROUP: self.states.flatten(2)}
+
+    def cache_storage_buffers(self, groups, *, prefix_length):
+        buffers = []
+        for group, (first, addresses) in enumerate(groups):
+            for block, (slab, slot) in enumerate(addresses, first):
+                if group == STATE_GROUP:
+                    tensors = {"convolution": self.states[slab, slot]}
+                else:
+                    layers = (GLOBAL_LAYERS, LOCAL_LAYERS, DRAFT_LAYERS)[group]
+                    rows = live_rows(
+                        prefix_length,
+                        block,
+                        PAGE_TOKENS,
+                        self.layout.groups[group].read_window_tokens,
+                    )
+                    tensors = {
+                        f"{name}/{layer}": values[
+                            self.unit_page(slab, slot, layers, layer), rows
+                        ]
+                        for name, values in (
+                            ("keys", self.keys),
+                            ("values", self.values),
+                        )
+                        for layer in range(layers)
+                    }
+                buffers.append(byte_regions(tensors))
+        return tuple(buffers)
 
     @staticmethod
     def unit_page(slab_id: int, slotnum: int, layers: int, layer: int) -> int:

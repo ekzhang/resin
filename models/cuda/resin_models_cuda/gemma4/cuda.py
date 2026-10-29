@@ -18,6 +18,7 @@ from resin import (
     CacheRetention,
     RunnerConfig,
 )
+from resin.backend.cache_storage import byte_regions, live_rows
 from resin.backend.capacity import CacheCapacityPlan, plan_cache_capacity
 from resin.backend.cuda.completion import DeviceAcceptance, DeviceCompletion
 from resin.backend.cuda.failures import GraphInputError
@@ -160,8 +161,44 @@ class _Gemma4KvArena:
         )
         global_view = self.storage.view(global_shape).permute(1, 2, 0, 3, 4, 5)
         self.global_keys, self.global_values = global_view[0], global_view[1]
-        size = self.storage[0].numel() * self.storage.element_size()
-        self.cache_storage_block_bytes = (size // packing, size)
+        self.packing = packing
+        self.sliding_window = getattr(config, "sliding_window", SLIDING_WINDOW)
+        self.cache_storage_format = repr(
+            (
+                "gemma4-live-v1",
+                local_shape[2:],
+                global_shape[2:],
+                str(dtype),
+                self.sliding_window,
+            )
+        ).encode()
+
+    def cache_storage_buffers(self, groups, *, prefix_length):
+        buffers = []
+        for group, (first, addresses) in enumerate(groups):
+            keys, values = (
+                (self.global_keys, self.global_values)
+                if group == 0
+                else (self.local_keys, self.local_values)
+            )
+            for block, (slab, slot) in enumerate(addresses, first):
+                rows = live_rows(
+                    prefix_length,
+                    block,
+                    PAGE_SIZE,
+                    None if group == 0 else self.sliding_window,
+                )
+                page = slab * self.packing + slot if group == 0 else slab
+                buffers.append(
+                    byte_regions(
+                        {
+                            f"{name}/{layer}": tensor[layer, page, rows]
+                            for name, tensor in (("keys", keys), ("values", values))
+                            for layer in range(keys.shape[0])
+                        }
+                    )
+                )
+        return tuple(buffers)
 
 
 @dataclass(frozen=True, slots=True)

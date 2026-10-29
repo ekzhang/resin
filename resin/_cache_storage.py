@@ -3,7 +3,6 @@
 import hashlib
 import math
 import os
-from itertools import chain
 
 import numpy as np
 
@@ -28,7 +27,19 @@ class _Operation:
 class _PrefixStorage:
     def __init__(self, store, runner, layout, namespace):
         self.runner = runner
-        self.store, self.buffers = store, runner.cache_storage_buffers
+        buffers = getattr(runner, "cache_storage_buffers", None)
+        format_id = getattr(runner, "cache_storage_format", None)
+        if not callable(buffers) or format_id is None:
+            raise NotImplementedError(
+                "prefix storage requires cache_storage_buffers and cache_storage_format"
+            )
+        if not isinstance(format_id, bytes) or not format_id:
+            raise TypeError("cache_storage_format must be nonempty bytes")
+        if buffers((), prefix_length=0):
+            raise ValueError("empty cache export must return no blocks")
+        self.store, self.buffers = store, buffers
+        if layout is None:
+            raise ValueError("prefix storage requires a managed cache layout")
         self.groups = layout.groups
         self.alignment = math.lcm(*(g.block_tokens for g in self.groups))
         self.history = {
@@ -38,8 +49,9 @@ class _PrefixStorage:
             and g.window_resident_block_count is None
         }
         namespace = os.urandom(32) if namespace is None else namespace
+        identity = namespace.encode() if isinstance(namespace, str) else namespace
         self.namespace = hashlib.sha256(
-            namespace.encode() if isinstance(namespace, str) else namespace
+            hashlib.sha256(identity).digest() + format_id
         ).digest()
 
     def _keys(self, tokens):
@@ -67,25 +79,33 @@ class _PrefixStorage:
         return _Operation(self, self.store.lookup(keys), matched)
 
     def transfer(self, tokens, groups, load):
-        bases, regions = self._keys(tokens), iter(self.buffers(groups))
-        chunks, tail = [()] * len(bases), ()
-        for i, (_, rows) in enumerate(groups):
-            blocks = tuple(next(regions) for _ in rows)
-            if i not in self.history:
-                tail += tuple(chain.from_iterable(blocks))
-            else:
-                width = self.alignment // self.groups[i].block_tokens
-                for j in range(len(bases)):
-                    chunks[j] += tuple(
-                        chain.from_iterable(blocks[j * width : (j + 1) * width])
-                    )
+        import torch
+
+        bases = self._keys(tokens)
+        regions = iter(self.buffers(groups, prefix_length=len(tokens)))
+        chunks, tail = [{} for _ in bases], {}
+        for i, (first, rows) in enumerate(groups):
+            width = self.alignment // self.groups[i].block_tokens
+            for j in range(len(rows)):
+                target = chunks[j // width] if i in self.history else tail
+                for name, region in next(regions).items():
+                    if not isinstance(name, str) or not isinstance(
+                        region, torch.Tensor
+                    ):
+                        raise TypeError(
+                            "cache regions must map string names to tensors"
+                        )
+                    if region.dtype != torch.uint8 or not region.is_contiguous():
+                        raise ValueError("cache regions must be contiguous uint8 views")
+                    target[f"{i}/{first + j}/{name}"] = region
+        if next(regions, None) is not None:
+            raise ValueError("cache export returned too many blocks")
         keys, buffers = ([], [])
         if self.history:
             keys, buffers = [key + b"h" for key in bases], chunks
         # Even an empty tail authenticates this exact checkpoint boundary.
         keys.append(bases[-1] + b"t")
         buffers.append(tail)
-        future = (self.store.load if load else self.store.store)(
-            tuple(keys), tuple(buffers)
-        )
+        buffers = tuple(dict(sorted(regions.items())) for regions in buffers)
+        future = (self.store.load if load else self.store.store)(tuple(keys), buffers)
         return _Operation(self, future, buffers=buffers)

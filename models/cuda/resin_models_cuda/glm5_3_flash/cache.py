@@ -10,6 +10,7 @@ import torch
 from torch import Tensor
 
 from resin import CacheGroupFamily, CacheGroupLayout, CacheLayout
+from resin.backend.cache_storage import byte_regions
 from resin.backend.cuda.slab import (
     GraphPageTableArena,
     SlabDeviceCache,
@@ -380,10 +381,7 @@ class CacheArena(GraphPageTableArena):
         max_batch_size: int,
     ):
         self.device, self.layout, self.geometry = device, layout, geometry
-        self.cache_storage_block_bytes = (
-            len(geometry.full_layers) * geometry.unit_bytes,
-            geometry.state_bytes,
-        )
+        self.cache_storage_format = repr(("glm53-live-v1", geometry)).encode()
         self.max_batch_size = max_batch_size
         self.binding = CachePoolBinding(layout, resource=self.graph_label)
         reserved = 1 + graph_scratch_parent_count(geometry.packings, max_batch_size)
@@ -471,6 +469,37 @@ class CacheArena(GraphPageTableArena):
             from resin_models_cuda.glm5_3_flash.dsa import DsaWorkspace
 
             self.dsa_workspace = DsaWorkspace(device)
+
+    def cache_storage_buffers(self, groups, *, prefix_length):
+        buffers, geometry = [], self.geometry
+        for group, (_, addresses) in enumerate(groups):
+            for slab, slot in addresses:
+                if group == STATE_GROUP:
+                    tensors = {
+                        name: getattr(self, name)[slab, slot]
+                        for name in (
+                            "recurrent_states",
+                            "convolution_states",
+                            "target_hidden_states",
+                            "index_tail_keys",
+                            "index_tail_gates",
+                            "index_tail_ends",
+                        )
+                    }
+                else:
+                    layers = len(geometry.full_layers)
+                    tensors = {
+                        f"{name}/{layer}": values[
+                            slab * geometry.slab_units + slot * layers + layer
+                        ]
+                        for name, values in (
+                            ("latent", self.latent),
+                            ("pooled_keys", self.pooled_keys),
+                        )
+                        for layer in range(layers)
+                    }
+                buffers.append(byte_regions(tensors))
+        return tuple(buffers)
 
     def _graph_padding_address(self, index, row):
         return graph_scratch_address(

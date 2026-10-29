@@ -1,13 +1,20 @@
-"""Borrow model-declared child spans; addresses are authenticated by the Engine."""
+"""Zero-copy helpers for model-declared checkpoint byte ranges."""
 
 
-def slab_buffers(groups, storage, sizes):
+def live_rows(prefix_length, logical_block, block_tokens, read_window=None):
+    first = 0 if read_window is None else max(0, prefix_length - read_window)
+    base = logical_block * block_tokens
+    return slice(
+        max(0, min(block_tokens, first - base)),
+        max(0, min(block_tokens, prefix_length - base)),
+    )
+
+
+def byte_regions(tensors):
     import torch
 
-    raw = storage.view(torch.uint8).reshape(-1)
-    stride = storage[0].numel() * storage.element_size()
-    return tuple(
-        (raw[slab * stride + slot * size : slab * stride + (slot + 1) * size],)
-        for (_, addresses), size in zip(groups, sizes, strict=True)
-        for slab, slot in addresses
-    )
+    return {
+        name: tensor.view(torch.uint8).view(-1)
+        for name, tensor in tensors.items()
+        if tensor.numel()
+    }

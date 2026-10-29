@@ -305,9 +305,15 @@ class CacheArena(GraphPageTableArena):
 
     def __init__(self, device, layout, geometry, *, dtype):
         self.device, self.layout, self.geometry = device, layout, geometry
-        self.cache_storage_block_bytes = tuple(
-            geometry.parent_bytes // p for p in geometry.packings
-        )
+        self.cache_storage_format = repr(
+            (
+                "deepseek-v41-live-v1",
+                geometry.attention_layers,
+                geometry.kv_sources,
+                tuple(geometry.ratios[i] for i in geometry.kv_sources),
+                geometry.window_size,
+            )
+        ).encode()
         self.binding = CachePoolBinding(layout, resource="DeepSeek-V4.1 KV")
         self.storage = torch.empty(
             (
@@ -318,6 +324,44 @@ class CacheArena(GraphPageTableArena):
             device=device,
         )
         self.reset_scratch()
+
+    def cache_storage_buffers(self, groups, *, prefix_length):
+        geometry, buffers = self.geometry, []
+        kv_bytes = sum(
+            PAGE_TOKENS // geometry.ratios[i] * FP4_BYTES for i in geometry.kv_sources
+        )
+        index_bytes = kv_bytes // FP4_BYTES * INDEX_BYTES
+        for group, (first, addresses) in enumerate(groups):
+            size = geometry.parent_bytes // geometry.packings[group]
+            for logical, (slab, slot) in enumerate(addresses, first):
+                page = self.storage[slab, slot * size : (slot + 1) * size]
+                regions = {}
+                if group == COMPRESSED:
+                    regions = {
+                        "kv": page[:kv_bytes],
+                        "index": page[kv_bytes : kv_bytes + index_bytes],
+                    }
+                else:
+                    read = (geometry.window_size + 1, 0, 2, 4)[group]
+                    lo = max(0, prefix_length - read - logical * PAGE_TOKENS)
+                    hi = min(PAGE_TOKENS, prefix_length - logical * PAGE_TOKENS)
+                    if lo < hi:
+                        if group == WINDOW:
+                            for layer in range(geometry.attention_layers):
+                                offset = layer * PAGE_TOKENS * FP8_BYTES
+                                regions[f"layer_{layer}"] = page[
+                                    offset + lo * FP8_BYTES : offset + hi * FP8_BYTES
+                                ]
+                        elif group == COMPRESSOR:
+                            for owner, layer in enumerate(geometry.compressor_sources):
+                                offset = owner * PAGE_TOKENS * 2 * 512 * 4
+                                regions[f"source_{layer}"] = page[
+                                    offset + lo * 4096 : offset + hi * 4096
+                                ]
+                        else:
+                            regions["tokens"] = page[lo * 8 : hi * 8]
+                buffers.append(regions)
+        return tuple(buffers)
 
     def reset_scratch(self):
         self.storage[0].zero_()

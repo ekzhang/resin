@@ -41,6 +41,27 @@ def test_official_checkpoint_geometry_and_distinct_draft_experts():
     assert inference["n_routed_experts"] == 384
     assert inference["dspark_n_routed_experts"] == 128
     assert inference["dspark_n_activated_experts"] == 3
+    geometry = CacheGeometry.build(
+        SimpleNamespace(**inference), prefill_chunk_size=4096
+    )
+    arena = CacheArena("meta", geometry.layout(140), geometry, dtype=torch.bfloat16)
+    groups, parent = [], 1
+    for group, (count, packing) in enumerate(
+        zip((34, 1024, 33, 34), geometry.packings)
+    ):
+        groups.append(
+            (
+                0 if group == 1 else 1024 - count,
+                [(parent + i // packing, i % packing) for i in range(count)],
+            )
+        )
+        parent += (count + packing - 1) // packing
+    views = iter(arena.cache_storage_buffers(groups, prefix_length=131072))
+    totals = [
+        sum(view.nbytes for _ in addresses for view in next(views).values())
+        for _, addresses in groups
+    ]
+    assert totals == [2_928_816, 1024 * 113_920, 24_576, 32]
 
 
 @pytest.mark.parametrize("runner_type", [DeepSeekV41CudaRunner, DeepSeekV41CudaRunner])

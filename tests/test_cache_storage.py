@@ -5,23 +5,26 @@ from time import sleep
 from typing import Any
 
 import pytest
+import torch
 from test_flat_cache import RecordingCachedRunner
 
 from resin import CacheGroupLayout, CacheLayout, Engine, SamplingParams
 from resin.cache_storage import MemoryCacheStorage
 
 
-def make_engine(store, fill=0, limit=2):
+def make_engine(store, fill=0, limit=2, format_id=b"fixture-v1"):
     runner = RecordingCachedRunner(
         CacheLayout(parent_capacity=32, groups=[CacheGroupLayout(2)])
     )
-    arena = bytearray([fill] * 33)
+    arena = torch.full((33,), fill, dtype=torch.uint8)
 
-    def buffers(groups):
-        view = memoryview(arena)
-        return tuple((view[slab : slab + 1],) for slab, _ in groups[0][1])
+    def buffers(groups, *, prefix_length):
+        return tuple(
+            {"value": arena[slab : slab + 1]} for _, rows in groups for slab, _ in rows
+        )
 
     setattr(runner, "cache_storage_buffers", buffers)
+    setattr(runner, "cache_storage_format", format_id)
     options: dict[str, Any] = dict(
         prefix_cache=True, prefix_cache_namespace="m", prefix_cache_max_inflight=limit
     )
@@ -30,23 +33,64 @@ def make_engine(store, fill=0, limit=2):
 
 
 def test_memory_bytes_capacity_and_scatter_gather():
-    store, known = MemoryCacheStorage(max_bytes=6), {}
+    store, known = MemoryCacheStorage(max_bytes=10), {}
     for i, key in enumerate(Random(7).choices((b"a", b"b", b"c"), k=400)):
-        source = bytearray([i % 256, 255 - i % 256])
+        source = torch.tensor([i % 256, 255 - i % 256], dtype=torch.uint8)
         expected = known[key] if store.lookup((key,)).result()[0] else bytes(source)
-        known[key], view = expected, memoryview(source)
-        assert store.store((key,), ((view[:1], view[1:]),)).result()
-        source[:] = b"zz"
-        target = bytearray(2)
-        assert store.load((key,), ((memoryview(target),),)).result()
-        assert target == expected and store.nbytes <= 6
+        known[key] = expected
+        assert store.store((key,), ({"x": source[:1], "y": source[1:]},)).result()
+        source.fill_(122)
+        target = torch.empty(2, dtype=torch.uint8)
+        assert store.load((key,), ({"y": target[1:], "x": target[:1]},)).result()
+        assert bytes(target) == expected and store.nbytes <= 10
         assert sum(store.lookup((b"a", b"b", b"c")).result()) <= 2
+    assert not store.load((key,), ({"different": target},)).result()
+    store.close()
+    store = MemoryCacheStorage()
+    for format_id, cached in ((b"a", 0), (b"a", 2), (b"b", 0)):
+        engine, _, arena = make_engine(
+            store, 73 if not cached else 0, format_id=format_id
+        )
+        with engine:
+            request = engine.submit(
+                [1, 2, 3], sampling_params=SamplingParams(max_output_tokens=2)
+            )
+            while engine.has_work():
+                engine.step()
+                sleep(0.001)
+            assert request.cached_tokens == cached
+            assert not cached or bool((arena == 73).any())
     store.close()
 
 
 @pytest.mark.parametrize("limit", [1, 4])
 def test_storage_inflight_limit(limit):
     store, pending = MemoryCacheStorage(), []
+
+    def unavailable(*args, **kwargs):
+        raise NotImplementedError("cache_storage_buffers unavailable")
+
+    def empty(*args, **kwargs):
+        return ()
+
+    for missing in ("hook", "implementation", "format"):
+        unsupported = RecordingCachedRunner(
+            CacheLayout(parent_capacity=8, groups=[CacheGroupLayout(2)])
+        )
+        if missing != "format":
+            setattr(unsupported, "cache_storage_format", b"fixture-v1")
+        if missing != "hook":
+            setattr(
+                unsupported,
+                "cache_storage_buffers",
+                unavailable if missing == "implementation" else empty,
+            )
+        with pytest.raises(NotImplementedError, match="cache_storage"):
+            Engine(unsupported, prefix_cache=True, prefix_cache_storage=store)
+        assert unsupported.bindings == []
+        setattr(unsupported, "cache_storage_buffers", empty)
+        setattr(unsupported, "cache_storage_format", b"fixture-v1")
+        Engine(unsupported, prefix_cache=True, prefix_cache_storage=store).close()
 
     def lookup(keys):
         future = Future()
@@ -110,7 +154,9 @@ def test_async_progress_cancellation_and_retirement(delay):
         for _ in range(3):
             engine.step()
         assert any(running.id in p.sequence_ids for p in runner.plans[start:])
-        held = tuple(r for _, batch in pending for regions in batch for r in regions)
+        held = tuple(
+            r for _, batch in pending for regions in batch for r in regions.values()
+        )
         before = tuple(bytes(r) for r in held)
         assert engine.cancel(running)
         if delay != "lookup":
