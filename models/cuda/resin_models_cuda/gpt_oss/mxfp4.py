@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import replace
 from typing import TYPE_CHECKING, Any
 
@@ -137,155 +138,142 @@ def shard_checkpoint_tensor(
     return tensor
 
 
-def kernel_expert_factory(
-    kernel,
-    config: MXFP4Config,
-    *,
-    parallel_groups: ParallelGroups | None = None,
-):
-    class KernelExperts(torch.nn.Module):
-        storage_format = "mxfp4"
+class KernelExperts(torch.nn.Module):
+    """Prepared MXFP4 experts with optional distributed dispatch."""
 
-        def __init__(self, args) -> None:
-            super().__init__()
-            actual = (
-                args.num_local_experts,
-                args.hidden_size,
-                args.intermediate_size,
-                args.num_experts_per_tok,
+    storage_format = "mxfp4"
+
+    def __init__(
+        self,
+        args,
+        kernel,
+        config: MXFP4Config,
+        *,
+        parallel_groups: ParallelGroups | None = None,
+    ) -> None:
+        super().__init__()
+        self._kernel = kernel
+        self._config = config
+        actual = (
+            args.num_local_experts,
+            args.hidden_size,
+            args.intermediate_size,
+            args.num_experts_per_tok,
+        )
+        expected = (
+            config.num_experts * parallel_groups.ep.size
+            if parallel_groups is not None
+            else config.num_experts,
+            config.hidden_size,
+            config.intermediate_size,
+            config.top_k,
+        )
+        if actual != expected:
+            raise ValueError(
+                f"expert module dimensions {actual} do not match kernel {expected}"
             )
-            expected = (
-                config.num_experts * parallel_groups.ep.size
-                if parallel_groups is not None
-                else config.num_experts,
-                config.hidden_size,
-                config.intermediate_size,
-                config.top_k,
+        self._prepared_weights = None
+        self._device = None
+        self._expert_start = (
+            parallel_groups.ep.local_rank * config.num_experts
+            if parallel_groups is not None
+            else 0
+        )
+        self._dispatch = (
+            ExpertParallelDispatch(
+                self.forward_local,
+                num_experts=args.num_local_experts,
+                groups=parallel_groups,
+                # CP prefill rows differ; head shards and attention copies
+                # share the same complete FFN input rows.
+                replication=(
+                    parallel_groups.attn_tp,
+                    parallel_groups.attn_replication,
+                ),
             )
-            if actual != expected:
-                raise ValueError(
-                    f"expert module dimensions {actual} do not match kernel {expected}"
-                )
-            self._prepared_weights = None
-            self._device = None
-            self._expert_start = (
-                parallel_groups.ep.local_rank * config.num_experts
-                if parallel_groups is not None
-                else 0
+            if parallel_groups is not None
+            else None
+        )
+
+    def load_weights(self, checkpoint_tensors: Mapping[str, Any]) -> None:
+        if self._prepared_weights is not None:
+            raise RuntimeError("packed expert weights are already installed")
+        raw_tensors = {}
+        for name, tensor in checkpoint_tensors.items():
+            standard_name = _CHECKPOINT_TO_STANDARD[name]
+            if name.endswith("_blocks"):
+                if tensor.ndim != 4 or tensor.shape[-1] != 16:
+                    raise ValueError(
+                        f"{name} must have checkpoint shape [E, N, K/32, 16], "
+                        f"got {tuple(tensor.shape)}"
+                    )
+                tensor = tensor.reshape(tensor.shape[0], tensor.shape[1], -1)
+            raw_tensors[standard_name] = tensor
+
+        raw = MXFP4Weights(
+            gate_up=raw_tensors["gate_up"],
+            down=raw_tensors["down"],
+            gate_up_scales=raw_tensors["gate_up_scales"],
+            down_scales=raw_tensors["down_scales"],
+            gate_up_bias=raw_tensors["gate_up_bias"],
+            down_bias=raw_tensors["down_bias"],
+        )
+        self._prepared_weights = self._kernel.prepare_weights(raw, self._config)
+        self._device = raw.gate_up.device
+
+    @property
+    def is_prepared(self) -> bool:
+        return self._prepared_weights is not None
+
+    def forward(self, hidden, indices, weights):
+        if self._prepared_weights is None:
+            raise RuntimeError("packed expert weights have not been loaded")
+        if self._dispatch is not None:
+            # Keep the collective ABI identical for cuTile and torch
+            # routers, and for ranks entering an empty expert round.
+            return self._dispatch(
+                hidden, indices.to(torch.int32), weights.to(torch.float32)
             )
-            self._dispatch = (
-                ExpertParallelDispatch(
-                    self.forward_local,
-                    num_experts=args.num_local_experts,
-                    groups=parallel_groups,
-                    # CP prefill rows differ; head shards and attention copies
-                    # share the same complete FFN input rows.
-                    replication=(
-                        parallel_groups.attn_tp,
-                        parallel_groups.attn_replication,
-                    ),
-                )
-                if parallel_groups is not None
-                else None
-            )
+        return self._kernel.forward(hidden, indices, weights, self._prepared_weights)
 
-        def install_prepared_weights(self, weights, *, device=None) -> None:
-            if self._prepared_weights is not None:
-                raise RuntimeError("packed expert weights are already installed")
-            self._prepared_weights = weights
-            self._device = device
+    def forward_local(self, hidden, indices, weights):
+        """Execute owned experts with their original global routing weights."""
 
-        @property
-        def is_prepared(self) -> bool:
-            return self._prepared_weights is not None
+        if self._prepared_weights is None:
+            raise RuntimeError("packed expert weights have not been loaded")
+        if hidden.shape[0] == 0:
+            return torch.zeros_like(hidden, dtype=torch.float32)
+        config = self._config
+        local = indices - self._expert_start
+        owned = (local >= 0) & (local < config.num_experts)
+        # Local num_experts is the inactive sentinel: substituting expert
+        # zero could hide a real route because CUTLASS takes the first match.
+        return self._kernel.forward_partial(
+            hidden,
+            torch.where(owned, local, config.num_experts),
+            weights.masked_fill(~owned, 0),
+            self._prepared_weights,
+        )
 
-        def forward(self, hidden, indices, weights):
-            if self._prepared_weights is None:
-                raise RuntimeError("packed expert weights have not been loaded")
-            if self._dispatch is not None:
-                # Keep the collective ABI identical for cuTile and torch
-                # routers, and for ranks entering an empty expert round.
-                return self._dispatch(
-                    hidden, indices.to(torch.int32), weights.to(torch.float32)
-                )
-            return kernel.forward(hidden, indices, weights, self._prepared_weights)
+    def forward_empty(self) -> None:
+        """Participate in EP while this attention replica has no token rows."""
 
-        def forward_local(self, hidden, indices, weights):
-            """Execute owned experts with their original global routing weights."""
-
-            if self._prepared_weights is None:
-                raise RuntimeError("packed expert weights have not been loaded")
-            if hidden.shape[0] == 0:
-                return torch.zeros_like(hidden, dtype=torch.float32)
-            local = indices - self._expert_start
-            owned = (local >= 0) & (local < config.num_experts)
-            # Local num_experts is the inactive sentinel: substituting expert
-            # zero could hide a real route because CUTLASS takes the first match.
-            return kernel.forward_partial(
-                hidden,
-                torch.where(owned, local, config.num_experts),
-                weights.masked_fill(~owned, 0),
-                self._prepared_weights,
-            )
-
-        def forward_empty(self) -> None:
-            """Participate in EP while this attention replica has no token rows."""
-
-            if self._dispatch is None or self._device is None:
-                raise RuntimeError("empty expert rounds require prepared EP weights")
-            hidden = torch.empty(
-                (0, config.hidden_size), device=self._device, dtype=torch.bfloat16
-            )
-            indices = torch.empty(
-                (0, config.top_k), device=self._device, dtype=torch.int32
-            )
-            weights = torch.empty(
-                (0, config.top_k), device=self._device, dtype=torch.float32
-            )
-            self._dispatch(hidden, indices, weights)
-
-    return lambda args: KernelExperts(args)
-
-
-def install_expert_layer(
-    model,
-    kernel,
-    config: MXFP4Config,
-    layer_index: int,
-    checkpoint_tensors: dict[str, Any],
-) -> None:
-    raw_tensors = {}
-    for name, tensor in checkpoint_tensors.items():
-        standard_name = _CHECKPOINT_TO_STANDARD[name]
-        if name.endswith("_blocks"):
-            if tensor.ndim != 4 or tensor.shape[-1] != 16:
-                raise ValueError(
-                    f"{name} must have checkpoint shape [E, N, K/32, 16], "
-                    f"got {tuple(tensor.shape)}"
-                )
-            tensor = tensor.reshape(tensor.shape[0], tensor.shape[1], -1)
-        raw_tensors[standard_name] = tensor
-
-    raw = MXFP4Weights(
-        gate_up=raw_tensors["gate_up"],
-        down=raw_tensors["down"],
-        gate_up_scales=raw_tensors["gate_up_scales"],
-        down_scales=raw_tensors["down_scales"],
-        gate_up_bias=raw_tensors["gate_up_bias"],
-        down_bias=raw_tensors["down_bias"],
-    )
-    prepared = kernel.prepare_weights(raw, config)
-    model.model.layers[layer_index].mlp.experts.install_prepared_weights(
-        prepared, device=raw.gate_up.device
-    )
-    # Released raw tensors become unreachable after this call, allowing the
-    # allocator to reuse their storage while the next layer is streamed.
+        if self._dispatch is None or self._device is None:
+            raise RuntimeError("empty expert rounds require prepared EP weights")
+        config = self._config
+        hidden = torch.empty(
+            (0, config.hidden_size), device=self._device, dtype=torch.bfloat16
+        )
+        indices = torch.empty((0, config.top_k), device=self._device, dtype=torch.int32)
+        weights = torch.empty(
+            (0, config.top_k), device=self._device, dtype=torch.float32
+        )
+        self._dispatch(hidden, indices, weights)
 
 
 __all__ = [
     "EXPERT_CHECKPOINT_NAMES",
-    "install_expert_layer",
-    "kernel_expert_factory",
+    "KernelExperts",
     "shard_checkpoint_tensor",
     "shard_model_config",
 ]

@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 from dataclasses import replace
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 
 import torch
 
@@ -22,8 +22,7 @@ from resin_models_cuda.gpt_oss.flashinfer import MXFP4Config
 from resin_models_cuda.gpt_oss.model import MoEForCausalLM
 from resin_models_cuda.gpt_oss.mxfp4 import (
     EXPERT_CHECKPOINT_NAMES,
-    install_expert_layer,
-    kernel_expert_factory,
+    KernelExperts,
     shard_checkpoint_tensor,
     shard_model_config,
 )
@@ -168,11 +167,13 @@ def load_model(
     kernel_moe.validate_device(target)
     kernel_moe.validate(kernel_config)
     with torch.device("meta"):
-        model = MoEForCausalLM(
+        model = MoEForCausalLM(local_args)
+    for layer in model.model.layers:
+        layer.mlp.experts = KernelExperts(
             local_args,
-            kernel_expert_factory(
-                kernel_moe, kernel_config, parallel_groups=parallel_groups
-            ),
+            kernel_moe,
+            kernel_config,
+            parallel_groups=parallel_groups,
         )
 
     load_gpt_oss_weights(
@@ -190,13 +191,9 @@ def load_model(
             expert_parallel=expert_parallel,
             expert_tensor_parallel=expert_tensor_parallel,
         ),
-        install_expert_layer=lambda layer, tensors: install_expert_layer(
-            model,
-            kernel_moe,
-            kernel_config,
-            layer,
-            dict(tensors),
-        ),
+        install_expert_layer=lambda layer, tensors: cast(
+            KernelExperts, model.model.layers[layer].mlp.experts
+        ).load_weights(tensors),
     )
 
     model.materialize_buffers(target)

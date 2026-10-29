@@ -6,7 +6,7 @@
 from __future__ import annotations
 
 import math
-from collections.abc import Callable, Sequence
+from collections.abc import Sequence
 from typing import cast
 
 import torch
@@ -205,18 +205,13 @@ class DenseExperts(nn.Module):
         return torch.einsum("tkh,tk->th", output, routing_weights)
 
 
-ExpertFactory = Callable[[GptOssConfig], nn.Module]
-
-
 class MLP(nn.Module):
-    def __init__(
-        self, config: GptOssConfig, expert_factory: ExpertFactory | None
-    ) -> None:
+    experts: nn.Module
+
+    def __init__(self, config: GptOssConfig) -> None:
         super().__init__()
         self.router = TopKRouter(config)
-        self.experts = (
-            DenseExperts(config) if expert_factory is None else expert_factory(config)
-        )
+        self.experts = DenseExperts(config)
 
     def forward(self, hidden: Tensor) -> Tensor:
         shape = hidden.shape
@@ -226,23 +221,16 @@ class MLP(nn.Module):
 
 
 class MoEDecoderLayer(nn.Module):
-    def __init__(
-        self,
-        config: GptOssConfig,
-        layer_index: int,
-        expert_factory: ExpertFactory | None,
-    ) -> None:
+    def __init__(self, config: GptOssConfig, layer_index: int) -> None:
         super().__init__()
         self.self_attn = SinkAttention(config, layer_index)
-        self.mlp = MLP(config, expert_factory)
+        self.mlp = MLP(config)
         self.input_layernorm = RMSNorm(config.hidden_size, config.rms_norm_eps)
         self.post_attention_layernorm = RMSNorm(config.hidden_size, config.rms_norm_eps)
 
 
 class MoETransformerModel(nn.Module):
-    def __init__(
-        self, config: GptOssConfig, expert_factory: ExpertFactory | None
-    ) -> None:
+    def __init__(self, config: GptOssConfig) -> None:
         super().__init__()
         self.embed_tokens = nn.Embedding(
             config.vocab_size, config.hidden_size, padding_idx=config.pad_token_id
@@ -250,7 +238,7 @@ class MoETransformerModel(nn.Module):
         self.layers = cast(
             Sequence[MoEDecoderLayer],
             nn.ModuleList(
-                MoEDecoderLayer(config, index, expert_factory)
+                MoEDecoderLayer(config, index)
                 for index in range(config.num_hidden_layers)
             ),
         )
@@ -259,13 +247,11 @@ class MoETransformerModel(nn.Module):
 
 
 class MoEForCausalLM(nn.Module):
-    def __init__(
-        self, config: GptOssConfig, expert_factory: ExpertFactory | None = None
-    ) -> None:
+    def __init__(self, config: GptOssConfig) -> None:
         super().__init__()
         self.config = config
         self.args = config
-        self.model = MoETransformerModel(config, expert_factory)
+        self.model = MoETransformerModel(config)
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
         self.apply(self._initialize)
 
@@ -295,7 +281,6 @@ class MoEForCausalLM(nn.Module):
 
 __all__ = [
     "DenseExperts",
-    "ExpertFactory",
     "MLP",
     "MoEDecoderLayer",
     "MoEForCausalLM",

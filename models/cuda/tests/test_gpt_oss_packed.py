@@ -1,8 +1,5 @@
 from __future__ import annotations
 
-from collections.abc import Sequence
-from typing import cast
-
 import torch
 
 from resin_models_cuda.gpt_oss.flashinfer import MXFP4Config
@@ -10,10 +7,7 @@ from resin_models_cuda.gpt_oss.flashinfer import MXFP4Config
 
 class TestGptOssPackedBridge:
     def test_official_block_layout_is_flattened_and_installed(self) -> None:
-        from resin_models_cuda.gpt_oss.mxfp4 import (
-            install_expert_layer,
-            kernel_expert_factory,
-        )
+        from resin_models_cuda.gpt_oss.mxfp4 import KernelExperts
 
         config = MXFP4Config(
             top_k=2,
@@ -44,29 +38,7 @@ class TestGptOssPackedBridge:
             num_experts_per_tok = 2
 
         kernel = Kernel()
-        factory = kernel_expert_factory(kernel, config)
-
-        class MLP(torch.nn.Module):
-            def __init__(self) -> None:
-                super().__init__()
-                self.experts = factory(Args())
-
-        class Layer(torch.nn.Module):
-            def __init__(self) -> None:
-                super().__init__()
-                self.mlp = MLP()
-
-        class Backbone(torch.nn.Module):
-            def __init__(self) -> None:
-                super().__init__()
-                self.layers = cast(Sequence[Layer], torch.nn.ModuleList([Layer()]))
-
-        class Model(torch.nn.Module):
-            def __init__(self) -> None:
-                super().__init__()
-                self.model = Backbone()
-
-        model = Model()
+        module = KernelExperts(Args(), kernel, config)
         tensors = {
             "gate_up_proj_blocks": torch.zeros(4, 64, 1, 16, dtype=torch.uint8),
             "gate_up_proj_scales": torch.zeros(4, 64, 1, dtype=torch.uint8),
@@ -75,19 +47,19 @@ class TestGptOssPackedBridge:
             "down_proj_scales": torch.zeros(4, 32, 1, dtype=torch.uint8),
             "down_proj_bias": torch.zeros(4, 32),
         }
-        install_expert_layer(model, kernel, config, 0, tensors)
+        module.load_weights(tensors)
 
         assert len(kernel.prepared) == 1
         weights, actual_config = kernel.prepared[0]
         assert actual_config is config
         assert weights.gate_up.shape == (4, 64, 16)
         assert weights.down.shape == (4, 32, 16)
-        assert model.model.layers[0].mlp.experts.is_prepared
+        assert module.is_prepared
 
         hidden = torch.ones(3, 32, dtype=torch.bfloat16)
         indices = torch.tensor([[0, 1], [2, 3], [1, 2]])
         route_weights = torch.full((3, 2), 0.5)
-        output = model.model.layers[0].mlp.experts(hidden, indices, route_weights)
+        output = module(hidden, indices, route_weights)
         assert output is hidden
         assert len(kernel.calls) == 1
         assert kernel.calls[0][0] is indices

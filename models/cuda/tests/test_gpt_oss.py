@@ -162,10 +162,9 @@ class TestGptOssTorch:
                 calls.append((hidden.shape, indices.shape, weights.shape))
                 return torch.zeros_like(hidden)
 
-        model = MoEForCausalLM(
-            self.args, expert_factory=lambda _args: RecordingExperts()
-        ).eval()
+        model = MoEForCausalLM(self.args).eval()
         mlp = model.model.layers[0].mlp
+        mlp.experts = RecordingExperts()
         hidden = torch.randn(1, 3, self.args.hidden_size)
         with torch.inference_mode():
             output = mlp(hidden)

@@ -19,7 +19,7 @@ from resin_models_cuda.gpt_oss.flashinfer import (
 )
 from resin_models_cuda.gpt_oss.mxfp4 import (
     EXPERT_CHECKPOINT_NAMES,
-    kernel_expert_factory,
+    KernelExperts,
     shard_checkpoint_tensor,
     shard_model_config,
 )
@@ -403,10 +403,11 @@ def test_ep_local_adapter_preserves_global_routing_weights_and_skips_empty(monke
                 result += hidden * scales * (expert + 5)
             return result
 
-    module = kernel_expert_factory(
-        Kernel(), config, parallel_groups=cast(ParallelGroups, groups)
-    )(args)
-    module.install_prepared_weights(storage, device=torch.device("cpu"))
+    module = KernelExperts(
+        args, Kernel(), config, parallel_groups=cast(ParallelGroups, groups)
+    )
+    module._prepared_weights = storage
+    module._device = torch.device("cpu")
     hidden = torch.ones(3, 32, dtype=torch.bfloat16)
     indices = torch.tensor([[0, 4], [7, 3], [5, 6]])
     weights = torch.tensor([[0.2, 0.8], [0.4, 0.6], [0.3, 0.7]])
@@ -430,7 +431,7 @@ def test_ep_local_adapter_preserves_global_routing_weights_and_skips_empty(monke
         routed.append((hidden, indices, weights))
         return hidden
 
-    module._dispatch = dispatch
+    monkeypatch.setattr(module, "_dispatch", dispatch)
     module(hidden, indices, weights.bfloat16())
     module.forward_empty()
     for _, expert_ids, probabilities in routed:
@@ -456,11 +457,12 @@ def test_ep_requires_prepared_weights_before_local_execution_or_dispatch(monkeyp
         attn_tp=RankGroup((0,), object(), 0),
         attn_replication=RankGroup((0,), object(), 0),
     )
-    module = kernel_expert_factory(
+    module = KernelExperts(
+        args,
         FlashInferSM90MXFP4Kernel(),
         config,
         parallel_groups=cast(ParallelGroups, groups),
-    )(args)
+    )
     hidden = torch.ones(1, args.hidden_size, dtype=torch.bfloat16)
     indices = torch.tensor([[0, 7]])
     weights = torch.tensor([[0.25, 0.75]])
