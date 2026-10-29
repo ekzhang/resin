@@ -13,7 +13,7 @@ import torch
 
 
 @cache
-def _load_native_module(source_name):
+def _load_native_module(source_name: str):
     """Build once during eager warmup, using FlashInfer's existing toolchain."""
     if torch.cuda.is_current_stream_capturing():
         raise RuntimeError("warm the native sampler once before CUDA graph capture")
@@ -21,17 +21,17 @@ def _load_native_module(source_name):
     from flashinfer.jit import gen_jit_spec
 
     source = Path(__file__).with_name(source_name)
-    digest = hashlib.sha256(source.read_bytes() + flashinfer.__version__.encode()).hexdigest()[:16]
-    return gen_jit_spec(
-        f"resin_{source.stem}_{digest}", [source]
-    ).build_and_load()
+    digest = hashlib.sha256(
+        source.read_bytes() + flashinfer.__version__.encode()
+    ).hexdigest()[:16]
+    return gen_jit_spec(f"resin_{source.stem}_{digest}", [source]).build_and_load()
 
 
-def _air_workspace_size(rows, vocab):
+def _air_workspace_size(rows: int, vocab: int) -> int:
     # Matches air_top_p::Counter<float>, NUM_BUCKETS and calcBufLen<float>.
     # The native binding checks this against sizeof(Counter), so a changed
     # installed FlashInfer ABI fails clearly instead of overrunning scratch.
-    def align256(size):
+    def align256(size: int) -> int:
         return (size + 255) // 256 * 256
 
     buffer_length = align256(vocab // 32)
@@ -44,8 +44,14 @@ def _air_workspace_size(rows, vocab):
 
 
 def air_top_p_cutoff(
-    weights, top_ps, active, *, out=None, guard_mass=None, guard_active=None
-):
+    weights: torch.Tensor,
+    top_ps: torch.Tensor,
+    active: torch.Tensor,
+    *,
+    out: torch.Tensor | None = None,
+    guard_mass: torch.Tensor | None = None,
+    guard_active: torch.Tensor | None = None,
+) -> torch.Tensor:
     """Find inclusive top-p cutoffs for contiguous FP32 CUDA weights [B,V].
 
     Callers provide nonnegative finite weights, with at least one positive
@@ -85,7 +91,9 @@ def air_top_p_cutoff(
             or value.device != weights.device
             or not value.is_contiguous()
         ):
-            raise ValueError(f"{name} must be contiguous row-aligned {dtype} on weights device")
+            raise ValueError(
+                f"{name} must be contiguous row-aligned {dtype} on weights device"
+            )
     if (guard_mass is None) != (guard_active is None):
         raise ValueError("AIR guard_mass and guard_active must be provided together")
     guard_inputs = ()
@@ -99,14 +107,18 @@ def air_top_p_cutoff(
             or guard_mass.device != weights.device
             or not guard_mass.is_contiguous()
         ):
-            raise ValueError("AIR guard_mass must be contiguous FP64 [rows,tiles,2] on weights device")
+            raise ValueError(
+                "AIR guard_mass must be contiguous FP64 [rows,tiles,2] on weights device"
+            )
         if (
             guard_active.shape != (rows,)
             or guard_active.dtype != torch.bool
             or guard_active.device != weights.device
             or not guard_active.is_contiguous()
         ):
-            raise ValueError("AIR guard_active must be contiguous row-aligned bool on weights device")
+            raise ValueError(
+                "AIR guard_active must be contiguous row-aligned bool on weights device"
+            )
         guard_inputs = (("guard_mass", guard_mass), ("guard_active", guard_active))
     if out is None:
         out = torch.empty(rows, dtype=torch.float32, device=weights.device)
@@ -116,10 +128,13 @@ def air_top_p_cutoff(
         or out.device != weights.device
         or out.stride(0) <= 0
     ):
-        raise ValueError("AIR output must be row-aligned FP32 with positive stride on weights device")
+        raise ValueError(
+            "AIR output must be row-aligned FP32 with positive stride on weights device"
+        )
     _check_no_overlap(
         (("weights", weights), ("top_ps", top_ps), ("active", active)) + guard_inputs,
-        (), out,
+        (),
+        out,
     )
     if rows == 0:
         return out
@@ -134,7 +149,13 @@ def air_top_p_cutoff(
     return out
 
 
-def topk_cutoffs(logits, top_ks, active, *, out=None):
+def topk_cutoffs(
+    logits: torch.Tensor,
+    top_ks: torch.Tensor,
+    active: torch.Tensor,
+    *,
+    out: torch.Tensor | None = None,
+) -> torch.Tensor:
     """Find inclusive raw-logit top-k cutoffs; inactive rows emit -inf.
 
     Logits may use FP16/BF16/FP32 and arbitrary nonnegative strides. Policies
@@ -144,7 +165,9 @@ def topk_cutoffs(logits, top_ks, active, *, out=None):
 
     rows, vocab = _geometry(logits)
     if rows >= 2**31 or any(stride < 0 for stride in logits.stride()):
-        raise ValueError("native top-k requires rows < 2**31 and nonnegative logits strides")
+        raise ValueError(
+            "native top-k requires rows < 2**31 and nonnegative logits strides"
+        )
     for name, value, dtype in (
         ("top_ks", top_ks, torch.int32),
         ("active", active, torch.bool),
@@ -164,7 +187,9 @@ def topk_cutoffs(logits, top_ks, active, *, out=None):
         or out.device != logits.device
         or out.stride(0) <= 0
     ):
-        raise ValueError("top-k output must be row-aligned FP32 with positive stride on logits device")
+        raise ValueError(
+            "top-k output must be row-aligned FP32 with positive stride on logits device"
+        )
     _check_no_overlap(
         (("logits", logits), ("top_ks", top_ks), ("active", active)), (), out
     )

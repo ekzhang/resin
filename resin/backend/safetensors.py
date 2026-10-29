@@ -4,7 +4,10 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
-from typing import Any, Self
+from typing import TYPE_CHECKING, Any, Self
+
+if TYPE_CHECKING:
+    from torch import Tensor
 
 
 def indexed_tensor_files(root: Path, *, require_index: bool = False) -> dict[str, Path]:
@@ -86,7 +89,7 @@ class SafetensorReader:
         assert self._handle is not None
         return self._handle
 
-    def read(self, path: Path, key: str):
+    def read(self, path: Path, key: str) -> Tensor:
         return self._open(path).get_tensor(key)
 
     def read_slice(
@@ -96,7 +99,7 @@ class SafetensorReader:
         slices: tuple[slice, ...],
         *,
         shape: tuple[int, ...] | None = None,
-    ):
+    ) -> Tensor:
         """Read bounded contiguous axis intervals without materializing the rest.
 
         ``shape`` describes the full checkpoint tensor, before slicing. Reject

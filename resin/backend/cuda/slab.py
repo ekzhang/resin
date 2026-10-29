@@ -5,12 +5,16 @@ from __future__ import annotations
 import math
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, replace
-from typing import Any, Protocol
+from typing import TYPE_CHECKING, Protocol, Self, cast
 
 import numpy as np
 import torch
 
 from resin import CacheGroupFamily, CacheLayout, CacheRetention
+
+if TYPE_CHECKING:
+    from resin.backend.cuda.staging import TensorStager
+    from resin.backend.plans import PagedCachePlan
 
 _SLAB_NAMES = ("slabs", "slots", "first")
 _PARENT_NAMES = ("parent_ids", "child_slots", "first_blocks")
@@ -18,16 +22,18 @@ _PARENT_NAMES = ("parent_ids", "child_slots", "first_blocks")
 
 @dataclass(frozen=True, slots=True)
 class DevicePageGroup:
-    slab_ids: Any
-    slotnums: Any
-    first_blocks: Any
+    slab_ids: torch.Tensor
+    slotnums: torch.Tensor
+    first_blocks: torch.Tensor
     live_state: bool = False
 
     parent_ids = property(lambda self: self.slab_ids)
     child_slots = property(lambda self: self.slotnums)
 
 
-def slice_page_groups(groups: Sequence[DevicePageGroup], row: int):
+def slice_page_groups(
+    groups: Sequence[DevicePageGroup], row: int
+) -> tuple[DevicePageGroup, ...]:
     return tuple(
         DevicePageGroup(
             group.slab_ids[row : row + 1],
@@ -39,7 +45,12 @@ def slice_page_groups(groups: Sequence[DevicePageGroup], row: int):
     )
 
 
-def slab_locations(groups, group_index, positions, block_tokens):
+def slab_locations(
+    groups: Sequence[DevicePageGroup],
+    group_index: int,
+    positions: torch.Tensor,
+    block_tokens: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     group = groups[group_index]
     logical = positions.div(block_tokens, rounding_mode="floor")
     first = group.first_blocks.view((-1,) + (1,) * (positions.ndim - 1))
@@ -78,13 +89,15 @@ class SlabDeviceCache:
     def slab_units(self) -> int:
         return self.geometry.slab_units
 
-    def row(self, index: int):
+    def row(self, index: int) -> Self:
         return replace(self, groups=slice_page_groups(self.groups, index))
 
-    def locations(self, group_index: int, positions, *, block_tokens: int):
+    def locations(
+        self, group_index: int, positions: torch.Tensor, *, block_tokens: int
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         return slab_locations(self.groups, group_index, positions, block_tokens)
 
-    def pages(self, group_index: int, layer: int, layer_count: int):
+    def pages(self, group_index: int, layer: int, layer_count: int) -> torch.Tensor:
         if not 0 <= layer < layer_count:
             raise ValueError("cache layer lies outside its cache group")
         group = self.groups[group_index]
@@ -92,7 +105,9 @@ class SlabDeviceCache:
             group.slab_ids * self.slab_units + group.slotnums * layer_count + layer
         ).to(torch.int32)
 
-    def rows(self, group_index: int, layer: int, layer_count: int, positions):
+    def rows(
+        self, group_index: int, layer: int, layer_count: int, positions: torch.Tensor
+    ) -> torch.Tensor:
         slabs, slots, offsets = self.locations(
             group_index, positions, block_tokens=self.page_tokens
         )
@@ -101,12 +116,12 @@ class SlabDeviceCache:
 
 
 def stage_page_groups(
-    plan,
-    staging,
+    plan: PagedCachePlan,
+    staging: TensorStager,
     *,
-    names=_SLAB_NAMES,
+    names: tuple[str, str, str] = _SLAB_NAMES,
     width: Callable[[int], int] = lambda value: value,
-):
+) -> tuple[DevicePageGroup, ...]:
     groups = []
     for index, source in enumerate(plan.groups):
         columns = width(max(len(source.block_slabs(row)) for row in range(plan.rows)))
@@ -131,22 +146,24 @@ def stage_page_groups(
     return tuple(groups)
 
 
-def graph_page_widths(layout, sequence_capacity: int) -> tuple[int, ...]:
+def graph_page_widths(layout: CacheLayout, sequence_capacity: int) -> tuple[int, ...]:
     if sequence_capacity <= 0:
         raise ValueError("graph sequence capacity must be positive")
     widths = []
     for group in layout.groups:
         blocks = math.ceil(sequence_capacity / group.block_tokens)
         if group.retention is CacheRetention.WINDOW:
-            blocks = min(blocks, group.window_resident_block_count)
+            blocks = min(blocks, cast(int, group.window_resident_block_count))
         elif group.family is CacheGroupFamily.STATE:
             blocks = 1
         widths.append(max(blocks, 1))
     return tuple(widths)
 
 
-def empty_page_groups(device, batch_size: int, widths):
-    def empty(*shape):
+def empty_page_groups(
+    device: str | torch.device, batch_size: int, widths: Sequence[int]
+) -> tuple[DevicePageGroup, ...]:
+    def empty(*shape: int) -> torch.Tensor:
         return torch.empty(shape, dtype=torch.int32, device=device)
 
     return tuple(
@@ -157,11 +174,13 @@ def empty_page_groups(device, batch_size: int, widths):
     )
 
 
-def graph_scratch_parent_count(packings, batch_size: int) -> int:
+def graph_scratch_parent_count(packings: Sequence[int], batch_size: int) -> int:
     return sum(math.ceil(batch_size / packing) for packing in packings)
 
 
-def graph_scratch_address(parent_capacity, packings, batch_size, group, row):
+def graph_scratch_address(
+    parent_capacity: int, packings: Sequence[int], batch_size: int, group: int, row: int
+) -> tuple[int, int]:
     """Give each graph-padding row its own writable child in each cache group."""
     if not 0 <= row < batch_size:
         raise ValueError("graph batch exceeds reserved scratch capacity")
@@ -170,7 +189,9 @@ def graph_scratch_address(parent_capacity, packings, batch_size, group, row):
     return parent_capacity + preceding + parent + 1, slot
 
 
-def page_group_device_inputs(groups, *, names=_SLAB_NAMES) -> dict[str, object]:
+def page_group_device_inputs(
+    groups: Sequence[DevicePageGroup], *, names: tuple[str, str, str] = _SLAB_NAMES
+) -> dict[str, torch.Tensor]:
     return {
         f"cache.{index}.{name}": value
         for index, group in enumerate(groups)
@@ -181,10 +202,10 @@ def page_group_device_inputs(groups, *, names=_SLAB_NAMES) -> dict[str, object]:
 
 
 def page_group_capture_inputs(
-    widths,
+    widths: Sequence[int],
     batch_size: int,
     *,
-    names=_SLAB_NAMES,
+    names: tuple[str, str, str] = _SLAB_NAMES,
     padding_address: Callable[[int, int], tuple[int, int]] = lambda _index, _row: (
         0,
         0,
@@ -202,11 +223,11 @@ def page_group_capture_inputs(
 
 
 def page_group_plan_inputs(
-    groups,
-    plan,
+    groups: Sequence[DevicePageGroup],
+    plan: PagedCachePlan,
     *,
     label: str,
-    names=_SLAB_NAMES,
+    names: tuple[str, str, str] = _SLAB_NAMES,
     padding_address: Callable[[int, int], tuple[int, int]] = lambda _index, _row: (
         0,
         0,
@@ -254,7 +275,7 @@ class GraphPageTableArena:
     def _graph_widths(self, sequence_capacity: int) -> tuple[int, ...]:
         return graph_page_widths(self.layout, sequence_capacity)
 
-    def graph_can_fit_plan(self, plan, shape) -> bool:
+    def graph_can_fit_plan(self, plan: PagedCachePlan, shape: tuple[int, ...]) -> bool:
         """Fit the complete native lease, including currently unreadable tail pages."""
         return plan.rows <= shape[0] and all(
             int(np.diff(group.block_indptr).max()) <= width
@@ -275,7 +296,7 @@ class GraphPageTableArena:
         )
         return self._make_graph_cache(groups)
 
-    def graph_device_inputs(self, cache) -> dict[str, object]:
+    def graph_device_inputs(self, cache) -> dict[str, torch.Tensor]:
         return page_group_device_inputs(cache.groups, names=self.graph_input_names)
 
     def graph_shape_capture_inputs(
@@ -288,7 +309,7 @@ class GraphPageTableArena:
             padding_address=self._graph_padding_address,
         )
 
-    def graph_plan_inputs(self, cache, plan) -> dict[str, object]:
+    def graph_plan_inputs(self, cache, plan: PagedCachePlan) -> dict[str, object]:
         return page_group_plan_inputs(
             cache.groups,
             plan,

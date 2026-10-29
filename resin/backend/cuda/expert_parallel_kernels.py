@@ -4,6 +4,7 @@ Collectives, expert execution, and their lifetime remain in expert_parallel.py.
 Rows and source strides are runtime values; topology and feature widths are fixed.
 """
 
+from collections.abc import Iterator
 from typing import Any, cast
 
 import torch
@@ -69,16 +70,16 @@ def _prepare(
 
 
 def prepare_dispatch(
-    hidden,
-    indices,
-    weights,
-    capacity,
+    hidden: torch.Tensor,
+    indices: torch.Tensor,
+    weights: torch.Tensor,
+    capacity: int,
     *,
-    source,
-    valid_rows,
-    expert_tp,
-    experts_per_rank,
-):
+    source: bool,
+    valid_rows: torch.Tensor | None,
+    expert_tp: int,
+    experts_per_rank: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     rows, width = hidden.shape
     topk = indices.shape[1]
     padded_hidden = hidden.new_empty((capacity, width))
@@ -196,16 +197,16 @@ def _routes(
 
 
 def prepare_routes(
-    owners,
-    active,
-    indices,
-    weights,
+    owners: torch.Tensor,
+    active: torch.Tensor,
+    indices: torch.Tensor,
+    weights: torch.Tensor,
     *,
-    world_size,
-    rank,
-    num_experts,
-    max_destinations_per_pass=22,
-):
+    world_size: int,
+    rank: int,
+    num_experts: int,
+    max_destinations_per_pass: int = 22,
+) -> Iterator[tuple[torch.Tensor, torch.Tensor, torch.Tensor]]:
     capacity, owner_count = owners.shape
     topk = indices.shape[1]
     dedup = owner_count > max_destinations_per_pass
@@ -298,7 +299,14 @@ def _receive(
         tl.store(CleanWeights + row * TOPK + slot, weight, slot < TOPK)
 
 
-def prepare_receive(hidden, indices, weights, *, num_experts, weight_dtype):
+def prepare_receive(
+    hidden: torch.Tensor,
+    indices: torch.Tensor,
+    weights: torch.Tensor,
+    *,
+    num_experts: int,
+    weight_dtype: torch.dtype,
+) -> tuple[torch.Tensor, torch.Tensor]:
     sources, capacity, width = hidden.shape
     topk = indices.shape[-1]
     clean_hidden = hidden.new_empty((sources * capacity, width))

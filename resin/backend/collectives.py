@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from collections.abc import Iterator
+from collections.abc import Generator, Iterator
 from contextlib import ExitStack, contextmanager
 
 import torch
@@ -27,7 +27,9 @@ class LayerCollective(ABC):
         """Release shared buffers; repeated calls must be harmless."""
 
     @contextmanager
-    def fixed_capacity(self, rows: int, *, valid_rows: Tensor | None = None):
+    def fixed_capacity(
+        self, rows: int, *, valid_rows: Tensor | None = None
+    ) -> Generator[None, None, None]:
         """Select common token capacity and optionally a device scalar of valid rows."""
         if type(rows) is not int or rows <= 0:
             raise ValueError("collective capacity must be a positive integer")
@@ -48,7 +50,7 @@ class LayerCollective(ABC):
 @contextmanager
 def fixed_layer_capacity(
     model: torch.nn.Module, capacity: int, *, valid_rows: Tensor | None = None
-):
+) -> Generator[None, None, None]:
     """Select fixed-capacity layer collectives throughout a captured model."""
 
     with ExitStack() as contexts:

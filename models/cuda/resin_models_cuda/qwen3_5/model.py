@@ -84,7 +84,7 @@ class Qwen35GatedRMSNorm(nn.Module):
         if hidden.is_cuda:
             from fla.modules.fused_norm_gate import rms_norm_gated
 
-            # FLA supports bias=None but its public annotation omits it.
+            # FLA supports bias=None despite its public Tensor annotation.
             return rms_norm_gated(hidden, gate, self.weight, None, eps=self.eps)  # ty: ignore[invalid-argument-type]
         normalized = hidden.float() * torch.rsqrt(
             hidden.float().square().mean(-1, keepdim=True) + self.eps

@@ -310,7 +310,7 @@ class _CudaGraphWorkspace:
     """Lazily allocated resources shared by one executor's serialized graphs."""
 
     pool: Any | None = None
-    stream: Any | None = None
+    stream: torch.cuda.Stream | None = None
 
 
 @dataclass(slots=True)
@@ -318,7 +318,7 @@ class _GraphEntry:
     shape: GraphShape
     program: CudaGraphProgram | None = None
     staging: TensorStagerPool | None = None
-    graphs: tuple[Any | None, ...] = ()
+    graphs: tuple[torch.cuda.CUDAGraph | None, ...] = ()
     captured: bool = False
     captures: int = 0
     replays: int = 0
@@ -343,7 +343,7 @@ class CudaGraphCache:
 
     def __init__(
         self,
-        device,
+        device: str | torch.device,
         shapes: tuple[GraphShape, ...],
         *,
         build: Callable[[GraphShape], CudaGraphStep | CudaGraphProgram],
@@ -603,14 +603,16 @@ class CudaGraphCache:
         for region in program.regions:
             region.launch()
 
-    def _capture_regions(self, entry: _GraphEntry, stream) -> tuple[Any | None, ...]:
+    def _capture_regions(
+        self, entry: _GraphEntry, stream: torch.cuda.Stream
+    ) -> tuple[torch.cuda.CUDAGraph | None, ...]:
         program = entry.program
         assert program is not None
         workspace = self._workspace
         assert workspace is not None
         if workspace.pool is None:
             workspace.pool = torch.cuda.graph_pool_handle()
-        graphs: list[Any | None] = []
+        graphs: list[torch.cuda.CUDAGraph | None] = []
         for region in program.regions:
             if not region.capture:
                 graphs.append(None)
@@ -636,7 +638,9 @@ class CudaGraphCache:
         return tuple(graphs)
 
     @staticmethod
-    def _replay(program: CudaGraphProgram, graphs: tuple[Any | None, ...]) -> None:
+    def _replay(
+        program: CudaGraphProgram, graphs: tuple[torch.cuda.CUDAGraph | None, ...]
+    ) -> None:
         if len(graphs) != len(program.regions):
             raise RuntimeError("CUDA graph program capture is incomplete")
         for region, graph in zip(program.regions, graphs, strict=True):
@@ -706,7 +710,7 @@ class CudaGraphExecutor:
 
     def __init__(
         self,
-        device,
+        device: str | torch.device,
         modes: Mapping[str, CudaGraphMode],
         *,
         synchronize_failure: Callable[[], None],

@@ -48,7 +48,13 @@ def _copy_state(
     )
 
 
-def copy_state(storage, addresses, *, candidates=None, ends=None):
+def copy_state(
+    storage: torch.Tensor,
+    addresses: torch.Tensor,
+    *,
+    candidates: torch.Tensor | None = None,
+    ends: torch.Tensor | None = None,
+) -> torch.Tensor:
     if storage.ndim != 3 or storage.stride(2) != 1:
         raise ValueError("STATE storage must be [slab, slot, contiguous elements]")
     count, width = len(addresses), storage.shape[2]

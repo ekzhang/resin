@@ -14,7 +14,7 @@ if TYPE_CHECKING:
 class SharedWorkspace:
     """Keep FlashInfer's cooperative peer allocation alive beside its tensor view."""
 
-    def __init__(self, group: RankGroup, size: int, *, device: torch.device):
+    def __init__(self, group: RankGroup, size: int, *, device: torch.device) -> None:
         from flashinfer.comm.dlpack_utils import pack_strided_memory
         from flashinfer.comm.mnnvl import (
             SymmDeviceMemory,

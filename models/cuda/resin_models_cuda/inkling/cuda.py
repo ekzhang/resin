@@ -451,7 +451,7 @@ class InklingCudaRunner(CudaRunner):
                 row_logits = project(row_logits[:, -1:])
             logits.append(row_logits[:, -1])
         values = torch.cat(logits)
-        scores = PromptScores.concat(prompt_rows)
+        scores = PromptScores.concat(cast(list[PromptScores], prompt_rows))
         return format_output(
             values, self._sample(values, plan), plan, prompt_logprobs=scores
         )

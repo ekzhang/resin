@@ -18,7 +18,7 @@ class ShardedEmbeddingLookup(LayerCollective):
     Results alias reusable buffers until the next lookup on this collective.
     """
 
-    def __init__(self, group: RankGroup, dimension: int):
+    def __init__(self, group: RankGroup, dimension: int) -> None:
         super().__init__()
         self.group, self.dimension = group, dimension
         self._buffers = {}
@@ -26,10 +26,10 @@ class ShardedEmbeddingLookup(LayerCollective):
         self._events = {}
 
     @property
-    def allocated(self):
+    def allocated(self) -> bool:
         return bool(self._buffers)
 
-    def close(self):
+    def close(self) -> None:
         if self._stream is not None:
             self._stream.synchronize()
         self._stream = None
@@ -38,7 +38,7 @@ class ShardedEmbeddingLookup(LayerCollective):
 
     def __call__(
         self, indices: Tensor, local: Callable[[Tensor, Tensor | None], Tensor]
-    ):
+    ) -> Tensor:
         return self._lookup(indices, local)
 
     def prefetch(
@@ -80,14 +80,22 @@ class ShardedEmbeddingLookup(LayerCollective):
                 event = self._events[key]
                 event.record(self._stream)
 
-                def wait(value=value, event=event):
+                def wait(
+                    value: Tensor = value, event: torch.cuda.Event = event
+                ) -> Tensor:
                     torch.cuda.current_stream(value.device).wait_event(event)
                     return value
 
                 hooks.append(wait)
         return hooks
 
-    def _lookup(self, indices, local, *, slot=None):
+    def _lookup(
+        self,
+        indices: Tensor,
+        local: Callable[[Tensor, Tensor | None], Tensor],
+        *,
+        slot: int | None = None,
+    ) -> Tensor:
         shape, columns = indices.shape, indices.shape[-1]
         flat = indices.reshape(-1, columns)
         rows, group = len(flat), self.group

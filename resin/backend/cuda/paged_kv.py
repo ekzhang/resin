@@ -2,14 +2,20 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
-from typing import Any, Protocol
+from typing import TYPE_CHECKING, Any, Protocol, cast
 
 import numpy as np
+import numpy.typing as npt
 import torch
 
 from resin.backend.resources import CachePoolBinding
+
+if TYPE_CHECKING:
+    from resin import BatchPhase, CacheLayout
+    from resin.backend.cuda.staging import TensorStager
+    from resin.backend.paged_attention import PagedAttentionBatch, PagedAttentionGroup
 
 
 class SlabPageGroup(Protocol):
@@ -43,9 +49,11 @@ class SlabPagedKvCache(Protocol):
     @property
     def values(self) -> torch.Tensor: ...
 
-    def rows(self, group_index, layer, layer_count, positions): ...
+    def rows(
+        self, group_index: int, layer: int, layer_count: int, positions: torch.Tensor
+    ) -> torch.Tensor: ...
 
-    def pages(self, group_index, layer, layer_count): ...
+    def pages(self, group_index: int, layer: int, layer_count: int) -> torch.Tensor: ...
 
 
 class PagedCacheMapping(Protocol):
@@ -84,14 +92,14 @@ class PagedKvArena:
 
     def __init__(
         self,
-        device,
-        layout,
+        device: str | torch.device,
+        layout: CacheLayout,
         *,
         layer_count: int,
         page_size: int,
         num_kv_heads: int,
         head_dim: int,
-        dtype,
+        dtype: torch.dtype,
         resource: str = "paged KV",
     ) -> None:
         self.capacity = layout.parent_capacity
@@ -102,7 +110,7 @@ class PagedKvArena:
         self.keys = self.storage[0]
         self.values = self.storage[1]
 
-    def check_pages(self, page_ids) -> None:
+    def check_pages(self, page_ids: Iterable[int | np.integer]) -> None:
         if any(page < 0 or page > self.capacity for page in page_ids):
             raise ValueError("BatchPlan cache block ID is outside the physical slab")
 
@@ -111,9 +119,9 @@ class PagedKvArena:
 class PagedKvTable:
     """Dense page table, logical lengths, and append slots for one KV group."""
 
-    page_table: Any
-    lengths: Any
-    append_slots: Any
+    page_table: torch.Tensor
+    lengths: torch.Tensor
+    append_slots: torch.Tensor
     min_length: int
     max_length: int
 
@@ -122,23 +130,23 @@ class PagedKvTable:
 class PagedKvCsr:
     """CSR page metadata shared by paged append and decode kernels."""
 
-    indptr: Any
-    page_ids: Any
-    last_page_lengths: Any
-    append_batch_indices: Any
-    append_positions: Any
+    indptr: torch.Tensor
+    page_ids: torch.Tensor
+    last_page_lengths: torch.Tensor
+    append_batch_indices: torch.Tensor
+    append_positions: torch.Tensor
 
 
 @dataclass(frozen=True, slots=True)
 class DevicePagedAttentionBatch:
     """CUDA tensors for one backend-neutral named paged-attention batch."""
 
-    phase: Any
+    phase: BatchPhase
     round_index: int
-    token_indices: Any
-    sequence_indices: Any
-    last_token_indices: Any
-    cu_seqlens_q: Any
+    token_indices: torch.Tensor
+    sequence_indices: torch.Tensor
+    last_token_indices: torch.Tensor
+    cu_seqlens_q: torch.Tensor
     max_seqlen_q: int
     groups: tuple[tuple[str, PagedKvTable], ...]
 
@@ -151,10 +159,12 @@ class DevicePagedAttentionBatch:
             raise KeyError(f"unknown device paged attention group: {name!r}") from error
 
 
-def stage_paged_attention_batch(batch, staging, prefix: str):
+def stage_paged_attention_batch(
+    batch: PagedAttentionBatch, staging: TensorStager, prefix: str
+) -> DevicePagedAttentionBatch:
     """Copy one semantic paged-attention batch to CUDA tensors."""
 
-    def device(name, values, dtype):
+    def device(name: str, values: object, dtype: torch.dtype) -> torch.Tensor:
         return staging.device(f"{prefix}.{name}", values, dtype)
 
     cu_seqlens_q = [0]
@@ -165,7 +175,7 @@ def stage_paged_attention_batch(batch, staging, prefix: str):
     for group in batch.groups:
         if (
             group.page_table.size
-            and int(group.page_table.max()) > np.iinfo(np.int32).max
+            and int(cast(np.ndarray, group.page_table).max()) > np.iinfo(np.int32).max
         ):
             raise ValueError(f"paged attention group {group.name!r} exceeds CUDA int32")
         groups.append(
@@ -201,7 +211,7 @@ def stage_paged_attention_batch(batch, staging, prefix: str):
 
 
 def empty_decode_paged_attention_batch(
-    device,
+    device: str | torch.device,
     batch_size: int,
     group_shapes: Mapping[str, tuple[int, int]],
 ) -> DevicePagedAttentionBatch:
@@ -228,7 +238,7 @@ def empty_decode_paged_attention_batch(
         ):
             raise ValueError("paged attention group shapes must be positive pairs")
 
-    def empty(dtype, *shape):
+    def empty(dtype: torch.dtype, *shape: int) -> torch.Tensor:
         return torch.empty(shape, dtype=dtype, device=device)
 
     groups = tuple(
@@ -258,7 +268,9 @@ def empty_decode_paged_attention_batch(
     )
 
 
-def paged_attention_graph_inputs(batch: DevicePagedAttentionBatch) -> dict[str, Any]:
+def paged_attention_graph_inputs(
+    batch: DevicePagedAttentionBatch,
+) -> dict[str, torch.Tensor]:
     """Expose stable graph input names for one device batch."""
 
     inputs = {
@@ -272,7 +284,9 @@ def paged_attention_graph_inputs(batch: DevicePagedAttentionBatch) -> dict[str, 
     return inputs
 
 
-def pad_paged_attention_table(group, width: int):
+def pad_paged_attention_table(
+    group: PagedAttentionGroup, width: int
+) -> npt.NDArray[np.uint64]:
     """Pad each host row by repeating one page already owned by that row."""
 
     if group.width > width:
@@ -286,7 +300,7 @@ def pad_paged_attention_table(group, width: int):
 
 
 def paged_attention_host_inputs(
-    batch, group_widths: Mapping[str, int]
+    batch: PagedAttentionBatch, group_widths: Mapping[str, int]
 ) -> dict[str, Any]:
     """Build named host values matching :func:`paged_attention_graph_inputs`."""
 

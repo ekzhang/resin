@@ -295,12 +295,10 @@ def test_shared_columns_join_per_sequence_rows_without_losing_empty_score_groups
     )
     hidden = TransitionRunner().table[[1, 2, 3, 4]]
     whole = prompt_scores(plan, hidden)
-    parts = PromptScores.concat(
-        [
-            prompt_scores(plan, hidden[:2]),
-            prompt_scores(plan, hidden[2:], token_start=2),
-        ]
-    )
+    first = prompt_scores(plan, hidden[:2])
+    second = prompt_scores(plan, hidden[2:], token_start=2)
+    assert first is not None and second is not None
+    parts = PromptScores.concat([first, second])
     assert whole is not None and parts is not None
     expected, actual = whole.output(plan), parts.output(plan)
     assert expected.keys() == actual.keys()

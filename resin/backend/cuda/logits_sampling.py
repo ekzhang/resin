@@ -7,6 +7,7 @@ vocabulary arithmetic. Seeded choices differ from Gumbel-max and FlashInfer;
 request seeds and offsets remain invariant under batching and reordering.
 """
 
+from collections.abc import Iterable
 from dataclasses import dataclass
 
 import torch
@@ -252,7 +253,7 @@ class LogitsSamplingWorkspace:
     output: torch.Tensor
 
 
-def _geometry(logits):
+def _geometry(logits: torch.Tensor) -> tuple[int, int]:
     if not logits.is_cuda or logits.ndim != 2:
         raise ValueError("logits must be a CUDA matrix")
     if logits.dtype not in (torch.float16, torch.bfloat16, torch.float32):
@@ -263,7 +264,7 @@ def _geometry(logits):
     return rows, vocab
 
 
-def prepare_workspace(logits):
+def prepare_workspace(logits: torch.Tensor) -> LogitsSamplingWorkspace:
     """Allocate fixed scratch outside capture when explicitly managing lifetime."""
     rows, vocab = _geometry(logits)
     shape = (rows, triton.cdiv(vocab, 1024))
@@ -276,7 +277,7 @@ def prepare_workspace(logits):
     )
 
 
-def _byte_span(value):
+def _byte_span(value: torch.Tensor) -> tuple[int, int] | None:
     """Conservative address bounds from tensor metadata; never reads device data."""
     if value.numel() == 0:
         return None
@@ -289,7 +290,11 @@ def _byte_span(value):
     )
 
 
-def _check_no_overlap(inputs, scratch, out):
+def _check_no_overlap(
+    inputs: Iterable[tuple[str, torch.Tensor]],
+    scratch: Iterable[tuple[str, torch.Tensor]],
+    out: torch.Tensor,
+) -> None:
     reads = [(name, _byte_span(value)) for name, value in inputs]
     writes = [("output", _byte_span(out))]
     writes.extend((name, _byte_span(value)) for name, value in scratch)
@@ -306,16 +311,16 @@ def _check_no_overlap(inputs, scratch, out):
 
 
 def sample_logits(
-    logits,
-    temperatures,
-    seeds,
-    offsets,
-    stochastic_mask,
+    logits: torch.Tensor,
+    temperatures: torch.Tensor,
+    seeds: torch.Tensor,
+    offsets: torch.Tensor,
+    stochastic_mask: torch.Tensor,
     *,
-    out=None,
-    workspace=None,
-    filter_state=None,
-):
+    out: torch.Tensor | None = None,
+    workspace: LogitsSamplingWorkspace | None = None,
+    filter_state: torch.Tensor | None = None,
+) -> torch.Tensor:
     """Sample logits using optional inclusive device filter thresholds.
 
     Positive finite temperatures and usable logits define a categorical draw.

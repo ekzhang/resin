@@ -33,7 +33,7 @@ class SparseExpertTransport:
         dtype: torch.dtype,
         top_k: int,
         device: torch.device,
-    ):
+    ) -> None:
         from flashinfer.comm.trtllm_moe_alltoall import (
             moe_a2a_get_workspace_size_per_rank,
             moe_a2a_initialize,

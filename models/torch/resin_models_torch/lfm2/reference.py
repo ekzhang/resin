@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, cast
 
 import numpy as np
 import torch
@@ -128,7 +128,7 @@ class Lfm2TorchRunner(Runner):
         if sampler is None:
             sampler = self._sampler = TorchSampler()
         logits = torch.cat(logits_rows)
-        scores = PromptScores.concat(prompt_rows)
+        scores = PromptScores.concat(cast(list[PromptScores], prompt_rows))
         return format_output(
             logits, sampler(logits, plan), plan, prompt_logprobs=scores
         )

@@ -2,8 +2,9 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable, Iterator, Sequence
 from dataclasses import dataclass
-from typing import Any, TypedDict
+from typing import TYPE_CHECKING, Any, TypedDict, cast
 
 import numpy as np
 import numpy.typing as npt
@@ -11,10 +12,20 @@ import torch
 
 from resin import SamplingParams
 
+if TYPE_CHECKING:
+    from resin import BatchPlan, ForwardOutput
+
+_TokenIds = (
+    torch.Tensor
+    | npt.NDArray
+    | Sequence[int | np.integer]
+    | Sequence[Sequence[int | np.integer]]
+)
+
 SAMPLING_OFFSET_STRIDE = 32
 
 
-def _offsets(counts):
+def _offsets(counts: npt.NDArray[np.uint32]) -> npt.NDArray[np.uint32]:
     return np.concatenate((np.zeros(1, np.uint32), counts.cumsum(dtype=np.uint32)))
 
 
@@ -24,7 +35,7 @@ class _ScoreColumns:
     token_ids: torch.Tensor
     logprobs: torch.Tensor
 
-    def output(self, prefix):
+    def output(self, prefix: str) -> dict[str, Any]:
         return {
             f"{prefix}_indptr": _offsets(self.counts),
             f"{prefix}_token_ids": self.token_ids.detach()
@@ -34,7 +45,9 @@ class _ScoreColumns:
         }
 
     @classmethod
-    def concat(cls, parts, lengths):
+    def concat(
+        cls, parts: Sequence[_ScoreColumns | None], lengths: Sequence[int]
+    ) -> _ScoreColumns | None:
         present = [part for part in parts if part is not None]
         if not present:
             return None
@@ -59,7 +72,7 @@ class PromptScores:
     targets: _ScoreColumns | None = None
 
     @classmethod
-    def concat(cls, parts):
+    def concat(cls, parts: Sequence[PromptScores]) -> PromptScores | None:
         if not parts:
             return None
         if len(parts) == 1:
@@ -71,7 +84,7 @@ class PromptScores:
             _ScoreColumns.concat([part.targets for part in parts], lengths),
         )
 
-    def output(self, plan):
+    def output(self, plan: BatchPlan) -> dict[str, Any]:
         columns = {
             "prompt_logprobs": self.logprobs.detach().cpu().numpy(),
             "prompt_logprob_indptr": np.asarray(
@@ -86,8 +99,12 @@ class PromptScores:
 
 
 def _score_distribution(
-    logits, selected, top_counts, target_counts=None, target_ids=None
-):
+    logits: torch.Tensor,
+    selected: torch.Tensor,
+    top_counts: npt.NDArray[np.uint32],
+    target_counts: npt.NDArray[np.uint32] | None = None,
+    target_ids: npt.NDArray[np.uint32] | None = None,
+) -> PromptScores:
     """Normalize once, then gather all requested views of each distribution."""
     vocab = logits.shape[-1]
     # Check on CPU before gather: an invalid CUDA index poisons the device.
@@ -119,7 +136,13 @@ def _score_distribution(
     return PromptScores(chosen, top, targets)
 
 
-def prompt_scores(plan, hidden, project=None, *, token_start=0):
+def prompt_scores(
+    plan: BatchPlan,
+    hidden: torch.Tensor,
+    project: Callable[[torch.Tensor], torch.Tensor] | None = None,
+    *,
+    token_start: int = 0,
+) -> PromptScores | None:
     """Score this forward's prompt predecessors, projecting at most 128 rows."""
     if not plan.needs_prompt_logprobs:
         return None
@@ -167,7 +190,9 @@ def prompt_scores(plan, hidden, project=None, *, token_start=0):
     )
 
 
-def _token_columns(token_ids, counts=None):
+def _token_columns(
+    token_ids: _TokenIds, counts: npt.ArrayLike | None = None
+) -> tuple[npt.NDArray[np.uint32], npt.NDArray[np.uint32]]:
     """Pack accepted tokens into native output columns without Python scalars."""
     if isinstance(token_ids, torch.Tensor):
         # A graph may reuse its device output immediately after this call.
@@ -212,9 +237,10 @@ def _token_columns(token_ids, counts=None):
             if token_ids and np.isscalar(token_ids[0])
             else token_ids
         )
+        rows = cast(Sequence[Sequence[int]], rows)
         lengths = np.fromiter(map(len, rows), dtype=np.uint32)
 
-        def checked_tokens():
+        def checked_tokens() -> Iterator[int | np.integer]:
             for row in rows:
                 for token in row:
                     if not isinstance(token, (int, np.integer)) or isinstance(
@@ -229,7 +255,9 @@ def _token_columns(token_ids, counts=None):
     return ids, _offsets(lengths)
 
 
-def token_output(token_ids, *, counts=None):
+def token_output(
+    token_ids: _TokenIds, *, counts: npt.ArrayLike | None = None
+) -> ForwardOutput:
     """Materialize token-only results using the shared array-based output contract."""
     from resin import ForwardOutput
 
@@ -237,7 +265,13 @@ def token_output(token_ids, *, counts=None):
     return ForwardOutput(token_ids=ids, token_indptr=offsets)
 
 
-def format_output(logits, token_ids, plan, *, prompt_logprobs=None):
+def format_output(
+    logits: torch.Tensor | None,
+    token_ids: _TokenIds,
+    plan: BatchPlan,
+    *,
+    prompt_logprobs: PromptScores | torch.Tensor | None = None,
+) -> ForwardOutput:
     """Materialize accepted tokens and optional raw-model logprob columns.
 
     Logits have shape [rows, vocab] or [rows, verification positions, vocab].
@@ -266,6 +300,7 @@ def format_output(logits, token_ids, plan, *, prompt_logprobs=None):
             }
     if not plan.needs_logprobs:
         return ForwardOutput(token_ids=ids, token_indptr=offsets, **prompt_columns)
+    logits = cast(torch.Tensor, logits)
     if logits.ndim == 2:
         logits = logits[:, None, :]
     if logits.ndim != 3 or len(lengths) != logits.shape[0]:
@@ -323,7 +358,7 @@ class SamplingInputs(TypedDict):
     sampling_mask: npt.NDArray[np.bool_]
 
 
-def batch_sampling_inputs(plan, vocab_size: int) -> SamplingInputs:
+def batch_sampling_inputs(plan: BatchPlan, vocab_size: int) -> SamplingInputs:
     """Extract backend-friendly primitive arrays from one immutable plan."""
 
     if vocab_size <= 0:
@@ -371,7 +406,13 @@ class TorchSampler:
         value = ((value ^ (value >> 27)) * 0x94D049BB133111EB) & ((1 << 64) - 1)
         return (value ^ (value >> 31)) & ((1 << 63) - 1)
 
-    def __call__(self, logits, plan=None, *, out=None):
+    def __call__(
+        self,
+        logits: torch.Tensor,
+        plan: BatchPlan | None = None,
+        *,
+        out: torch.Tensor | None = None,
+    ) -> torch.Tensor:
         if plan is None:
             result = logits.argmax(dim=-1)
             if out is None:

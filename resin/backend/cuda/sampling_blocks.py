@@ -80,7 +80,9 @@ def _expand_metadata(
     tl.store(ExpandedMask + index, tl.load(Mask + row * sm, valid, other=False), valid)
 
 
-def expand_sampling(tensors: SamplingTensors, width: int, start_step: int):
+def expand_sampling(
+    tensors: SamplingTensors, width: int, start_step: int
+) -> SamplingTensors:
     """Allocate invocation-owned metadata; inputs are validated by sample_block."""
     count = tensors.temperatures.numel() * width
     device = tensors.temperatures.device

@@ -2,10 +2,11 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable, Mapping
-from contextlib import contextmanager, nullcontext
+from collections.abc import Callable, Generator, Mapping
+from contextlib import AbstractContextManager, contextmanager, nullcontext
 from dataclasses import replace
 from time import perf_counter
+from typing import Protocol, cast
 
 import torch
 
@@ -42,6 +43,12 @@ from resin.backend.topology import ParallelismCapabilities
 from resin.protocols import Runner
 
 _SAMPLING_DEFAULTS = (1.0, 1.0, None, 0, 0, False)
+
+
+class _PrefillCallback(Protocol):
+    def __call__(
+        self, hidden: torch.Tensor, token_ids: torch.Tensor | None = None, /
+    ) -> torch.Tensor: ...
 
 
 def resolve_kv_cache_dtype(value: str) -> torch.dtype:
@@ -105,7 +112,7 @@ class CudaRunner(Runner):
         self._sampler = FusedSampler()
         self._cache_binding: CachePoolBinding | None = None
         self._cuda_graph_executor: CudaGraphExecutor | None = None
-        self._parallel_graph_model = None
+        self._parallel_graph_model: torch.nn.Module | None = None
         self._parallel_graph_groups = None
         self._parallel_graph_catalogs = {}
         self._parallel_graph_control = None
@@ -147,7 +154,7 @@ class CudaRunner(Runner):
         metrics = getattr(self, "_metrics", None)
         return None if metrics is None else metrics.eager_phases(categories)
 
-    def _configure_parallel_graphs(self, model, groups) -> None:
+    def _configure_parallel_graphs(self, model: torch.nn.Module, groups) -> None:
         """Coordinate capture catalogs and collectives across the execution mesh."""
 
         self._parallel_graph_model, self._parallel_graph_groups = model, groups
@@ -156,7 +163,9 @@ class CudaRunner(Runner):
             None if groups is None else ControlPlane(groups.distributed)
         )
 
-    def _parallel_graph_capacity(self, capacity: int, *, valid_rows=None):
+    def _parallel_graph_capacity(
+        self, capacity: int, *, valid_rows: torch.Tensor | None = None
+    ) -> AbstractContextManager[None]:
         if getattr(self, "_parallel_graph_groups", None) is None:
             return nullcontext()
         model = self._parallel_graph_model
@@ -425,14 +434,16 @@ class CudaRunner(Runner):
 
     def _configure_prefill_graphs(
         self,
-        operations: tuple[Callable, ...],
+        operations: tuple[
+            Callable[[torch.Tensor, torch.Tensor | None], torch.Tensor], ...
+        ],
         *,
         hidden_size: int,
         max_tokens: int,
         token_ids: bool = False,
         pad_up_to: int = 128,
         capture_context: Callable = nullcontext,
-    ) -> tuple[Callable, ...]:
+    ) -> tuple[_PrefillCallback, ...]:
         """Capture row-independent compute regions used by the existing forward.
 
         Operations accept flattened BF16 hidden states and optional token IDs.
@@ -484,7 +495,7 @@ class CudaRunner(Runner):
         return graphs.callbacks
 
     @contextmanager
-    def _prefill_graphs(self):
+    def _prefill_graphs(self) -> Generator[None, None, None]:
         active = self._prefill_graph_active
         self._prefill_graph_active = self.cuda_graph_prefill == "breakable" and (
             not getattr(self, "_distributed_prefill_scope", False)
@@ -501,7 +512,9 @@ class CudaRunner(Runner):
         finally:
             self._prefill_graph_active = active
 
-    def _run_prefill_region(self, region: int, hidden, token_ids=None):
+    def _run_prefill_region(
+        self, region: int, hidden: torch.Tensor, token_ids: torch.Tensor | None = None
+    ) -> torch.Tensor:
         flat_input = hidden.ndim == 2
         flattened = hidden if flat_input else hidden.reshape(-1, hidden.shape[-1])
         ids = (
@@ -512,8 +525,15 @@ class CudaRunner(Runner):
         if not self._prefill_graph_active:
             output = self._prefill_operations[region](flattened, ids)
         else:
-            values = (flattened, ids) if self._prefill_token_ids else (flattened,)
-            output = self._prefill_tensor_graphs["prefill"].invoke(region, *values)
+            values = (
+                (flattened, cast(torch.Tensor, ids))
+                if self._prefill_token_ids
+                else (flattened,)
+            )
+            output = cast(
+                torch.Tensor,
+                self._prefill_tensor_graphs["prefill"].invoke(region, *values),
+            )
         return output if flat_input else output.view_as(hidden)
 
     @property
@@ -675,7 +695,9 @@ def capture_sampling_inputs(
     }
 
 
-def pad_sampling_inputs(sampler, plan, vocab_size: int, padding: int):
+def pad_sampling_inputs(
+    sampler: FusedSampler, plan: BatchPlan, vocab_size: int, padding: int
+) -> dict[str, tuple]:
     inputs = sampler.host_inputs(plan, vocab_size)
     defaults = (*_SAMPLING_DEFAULTS[:2], vocab_size, *_SAMPLING_DEFAULTS[3:])
     for (name, values), default in zip(inputs.items(), defaults, strict=True):
@@ -683,7 +705,9 @@ def pad_sampling_inputs(sampler, plan, vocab_size: int, padding: int):
     return inputs
 
 
-def graph_sample(sampler, logits, sampling: SamplingTensors, step: int):
+def graph_sample(
+    sampler: FusedSampler, logits: torch.Tensor, sampling: SamplingTensors, step: int
+) -> torch.Tensor:
     return sampler.sample_tensors(
         logits,
         SamplingTensors(
@@ -700,8 +724,13 @@ def graph_sample(sampler, logits, sampling: SamplingTensors, step: int):
 
 
 def graph_sample_block(
-    sampler, logits, sampling: SamplingTensors, *, out=None, start_step: int = 0
-):
+    sampler: FusedSampler,
+    logits: torch.Tensor,
+    sampling: SamplingTensors,
+    *,
+    out: torch.Tensor | None = None,
+    start_step: int = 0,
+) -> torch.Tensor:
     """Sample a complete verification block with request-local column offsets."""
     return sampler.sample_block(logits, sampling, out=out, start_step=start_step)
 

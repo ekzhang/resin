@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Iterable
 from dataclasses import dataclass, replace
 from itertools import accumulate
 
@@ -29,7 +30,9 @@ class ContextParallelPlan:
     capacity: int
 
     @classmethod
-    def build(cls, query_lengths, *, rank: int, size: int) -> ContextParallelPlan:
+    def build(
+        cls, query_lengths: Iterable[int], *, rank: int, size: int
+    ) -> ContextParallelPlan:
         lengths = tuple(query_lengths)
         if type(size) is not int or size <= 0:
             raise ValueError("context-parallel size must be a positive integer")
@@ -82,7 +85,14 @@ class ContextParallelTokens:
     shapes depend only on the host plan, making gather CUDA-graph capturable.
     """
 
-    def __init__(self, query_lengths, group: RankGroup, *, device, distributed=dist):
+    def __init__(
+        self,
+        query_lengths: Iterable[int],
+        group: RankGroup,
+        *,
+        device: str | torch.device,
+        distributed=dist,
+    ) -> None:
         self.plan = ContextParallelPlan.build(
             query_lengths, rank=group.local_rank, size=group.size
         )

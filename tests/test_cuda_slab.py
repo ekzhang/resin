@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from types import SimpleNamespace
+from typing import cast
 
 import numpy as np
 import pytest
@@ -8,6 +9,7 @@ import torch
 
 from resin import CacheGroupLayout, CacheLayout
 from resin.backend.cuda.slab import GraphPageTableArena
+from resin.backend.plans import PagedCachePlan
 
 
 @pytest.mark.parametrize("private_scratch", [False, True])
@@ -32,16 +34,19 @@ def test_graph_replay_pads_unused_rows_with_the_capture_scratch_parents(
 
     arena = Arena()
     cache = arena.graph_cache(2, 256)
-    plan = SimpleNamespace(
-        rows=1,
-        groups=tuple(
-            SimpleNamespace(
-                block_slabs=lambda row: np.array([7], dtype=np.uint32),
-                block_slots=lambda row: np.array([1], dtype=np.uint32),
-                block_table_start_indices=np.array([3], dtype=np.uint32),
-                block_indptr=np.array([0, 1], dtype=np.uint32),
-            )
-            for _ in range(2)
+    plan = cast(
+        PagedCachePlan,
+        SimpleNamespace(
+            rows=1,
+            groups=tuple(
+                SimpleNamespace(
+                    block_slabs=lambda row: np.array([7], dtype=np.uint32),
+                    block_slots=lambda row: np.array([1], dtype=np.uint32),
+                    block_table_start_indices=np.array([3], dtype=np.uint32),
+                    block_indptr=np.array([0, 1], dtype=np.uint32),
+                )
+                for _ in range(2)
+            ),
         ),
     )
 

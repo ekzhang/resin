@@ -3,11 +3,15 @@
 from __future__ import annotations
 
 import json
+from typing import TYPE_CHECKING
 
 import numpy as np
 import torch
 
 from resin.backend.plan_transport import PlanPacket, RequestRegistration
+
+if TYPE_CHECKING:
+    from torch.distributed import ProcessGroup
 
 
 class CommandTransport:
@@ -31,7 +35,9 @@ class CommandTransport:
     _version = 3
     _header_size = 13
 
-    def __init__(self, distributed, group, *, source=0):
+    def __init__(
+        self, distributed, group: ProcessGroup | None, *, source: int = 0
+    ) -> None:
         self.distributed, self.group, self.source = distributed, group, source
 
     def _broadcast(self, array):

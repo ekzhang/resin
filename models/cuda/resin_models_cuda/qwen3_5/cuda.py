@@ -1223,7 +1223,7 @@ class Qwen3_5CudaRunner(CudaRunner):
                 hidden[:, -1],
             )
             outputs.append(int(sampled[row]))
-        scores = PromptScores.concat(prompt_rows)
+        scores = PromptScores.concat(cast(list[PromptScores], prompt_rows))
         return format_output(logits, outputs, plan, prompt_logprobs=scores)
 
     @torch.inference_mode()

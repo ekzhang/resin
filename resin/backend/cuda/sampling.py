@@ -3,10 +3,14 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import TYPE_CHECKING
 
 import torch
 
 from resin.backend.sampling import SAMPLING_OFFSET_STRIDE, batch_sampling_inputs
+
+if TYPE_CHECKING:
+    from resin import BatchPlan
 
 
 @dataclass(frozen=True, slots=True)
@@ -41,7 +45,7 @@ class FusedSampler:
 
     @staticmethod
     def host_inputs(
-        plan, vocab_size: int, *, offset_delta: int = 0
+        plan: BatchPlan, vocab_size: int, *, offset_delta: int = 0
     ) -> dict[str, tuple]:
         if offset_delta < 0:
             raise ValueError("sampling offset delta cannot be negative")
@@ -65,7 +69,7 @@ class FusedSampler:
             ),
         }
 
-    def empty(self, batch_size: int, device) -> SamplingTensors:
+    def empty(self, batch_size: int, device: str | torch.device) -> SamplingTensors:
         return SamplingTensors(
             temperatures=torch.empty(batch_size, dtype=torch.float32, device=device),
             top_ps=torch.empty(batch_size, dtype=torch.float32, device=device),
@@ -76,7 +80,7 @@ class FusedSampler:
         )
 
     @staticmethod
-    def graph_inputs(tensors: SamplingTensors) -> dict[str, object]:
+    def graph_inputs(tensors: SamplingTensors) -> dict[str, torch.Tensor]:
         return {
             "sampling_temperatures": tensors.temperatures,
             "sampling_top_ps": tensors.top_ps,
@@ -86,7 +90,13 @@ class FusedSampler:
             "sampling_stochastic_mask": tensors.stochastic_mask,
         }
 
-    def sample_tensors(self, logits, tensors: SamplingTensors, *, out=None):
+    def sample_tensors(
+        self,
+        logits: torch.Tensor,
+        tensors: SamplingTensors,
+        *,
+        out: torch.Tensor | None = None,
+    ) -> torch.Tensor:
         self._validate_inputs(
             logits,
             tensors.temperatures,
@@ -115,8 +125,13 @@ class FusedSampler:
         )
 
     def sample_block(
-        self, logits, tensors: SamplingTensors, *, out=None, start_step: int = 0
-    ):
+        self,
+        logits: torch.Tensor,
+        tensors: SamplingTensors,
+        *,
+        out: torch.Tensor | None = None,
+        start_step: int = 0,
+    ) -> torch.Tensor:
         """Sample all [request, verified position, vocabulary] logits together.
 
         Each request keeps its seed and policy. Column i uses its original
@@ -175,7 +190,14 @@ class FusedSampler:
         result = self.sample_tensors(flat_logits, expanded, out=flat_out)
         return out if out is not None else result.view(rows, width)
 
-    def __call__(self, logits, plan=None, *, out=None, offset_delta: int = 0):
+    def __call__(
+        self,
+        logits: torch.Tensor,
+        plan: BatchPlan | None = None,
+        *,
+        out: torch.Tensor | None = None,
+        offset_delta: int = 0,
+    ) -> torch.Tensor:
         if plan is None:
             result = logits.argmax(dim=-1)
             if out is None:

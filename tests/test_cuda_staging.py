@@ -2,12 +2,15 @@
 
 from contextlib import nullcontext
 from types import SimpleNamespace
-from typing import Any
+from typing import TYPE_CHECKING, Any, cast
 
 import numpy as np
 import pytest
 
 from resin.backend.cuda import graphs, staging
+
+if TYPE_CHECKING:
+    from torch import Tensor
 
 
 class _Tensor:
@@ -242,7 +245,7 @@ def test_stager_buffers_remain_mutable_after_first_inference_scope(cpu_torch, fi
     def stage(value):
         source = torch.tensor([value]) if field != "array" else [value]
         if field == "output":
-            return stager.output("value", source)
+            return stager.output("value", cast("Tensor", source))
         return stager.host("value", source, torch.int64)
 
     with torch.inference_mode():

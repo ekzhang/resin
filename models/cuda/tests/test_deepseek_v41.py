@@ -13,6 +13,7 @@ import torch
 from resin import Parallelism
 from resin.backend.cuda.parallel import TensorParallelContext, TensorParallelLayout
 from resin.backend.cuda.slab import DevicePageGroup
+from resin.backend.plans import PagedCachePlan
 from resin.models.deepseek_v41.config import DeepSeekV41Config
 from resin_models_cuda.deepseek_v41.cache import CacheArena, CacheGeometry
 from resin_models_cuda.deepseek_v41.checkpoint import DEFAULT_REVISION
@@ -366,15 +367,18 @@ def test_graph_replay_padding_uses_its_own_reserved_scratch_children():
     geometry = CacheGeometry.build(_args(), prefill_chunk_size=32, max_batch_size=4)
     arena = CacheArena("cpu", geometry.layout(8), geometry, dtype=torch.bfloat16)
     cache = arena.graph_cache(4, 256)
-    plan = SimpleNamespace(
-        rows=1,
-        groups=tuple(
-            SimpleNamespace(
-                block_slabs=lambda row: np.array([1], dtype=np.uint32),
-                block_slots=lambda row: np.array([0], dtype=np.uint32),
-                block_table_start_indices=np.array([0], dtype=np.uint32),
-            )
-            for _ in range(4)
+    plan = cast(
+        PagedCachePlan,
+        SimpleNamespace(
+            rows=1,
+            groups=tuple(
+                SimpleNamespace(
+                    block_slabs=lambda row: np.array([1], dtype=np.uint32),
+                    block_slots=lambda row: np.array([0], dtype=np.uint32),
+                    block_table_start_indices=np.array([0], dtype=np.uint32),
+                )
+                for _ in range(4)
+            ),
         ),
     )
     replay = arena.graph_plan_inputs(cache, plan)

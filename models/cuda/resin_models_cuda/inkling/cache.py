@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, cast
 
 import torch
 from torch import Tensor
@@ -191,7 +191,10 @@ class CacheArena(GraphPageTableArena):
     def tensorize(self, plan: PagedCachePlan, staging: Any) -> DeviceCache:
         return DeviceCache(
             self.geometry,
-            stage_page_groups(plan, staging),  # type: ignore[arg-type]
+            cast(
+                tuple[DeviceGroup, DeviceGroup, DeviceGroup, DeviceGroup],
+                stage_page_groups(plan, staging),
+            ),
             self.keys,
             self.values,
             self.states,

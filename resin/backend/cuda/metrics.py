@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections import Counter, defaultdict, deque
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from functools import wraps
 from typing import ParamSpec, TypeVar
@@ -52,7 +52,9 @@ class GraphPhaseTiming:
     so overlapped execution needs neither a synchronization nor extra kernels.
     """
 
-    def __init__(self, categories: tuple[str, ...], *, device) -> None:
+    def __init__(
+        self, categories: tuple[str, ...], *, device: str | torch.device
+    ) -> None:
         self.device = device
         self.categories = categories
         self.events = tuple(
@@ -65,7 +67,11 @@ class GraphPhaseTiming:
     def mark(self, index: int) -> None:
         self.events[index].record(torch.cuda.current_stream(self.device))
 
-    def _bind(self, graphs, events) -> None:
+    def _bind(
+        self,
+        graphs: Sequence[torch.cuda.CUDAGraph | None],
+        events: Sequence[torch.cuda.Event],
+    ) -> None:
         from cuda.bindings import runtime
 
         if self._nodes is None:
@@ -101,7 +107,9 @@ class GraphPhaseTiming:
                 )
             )
 
-    def replay(self, graphs) -> _PhaseMeasurement:
+    def replay(
+        self, graphs: Sequence[torch.cuda.CUDAGraph | None]
+    ) -> _PhaseMeasurement:
         if self.available:
             events = self.available.pop()
         else:
@@ -113,11 +121,11 @@ class GraphPhaseTiming:
         self._bind(graphs, events)
         return _PhaseMeasurement(self, events)
 
-    def prepare(self, graphs) -> None:
+    def prepare(self, graphs: Sequence[torch.cuda.CUDAGraph | None]) -> None:
         """Discover captured marker nodes during startup, outside inference."""
         self._bind(graphs, self.events)
 
-    def unobserved(self, graphs) -> None:
+    def unobserved(self, graphs: Sequence[torch.cuda.CUDAGraph | None]) -> None:
         # An unobserved launch must not overwrite the last observed generation,
         # which can still be pending when a benchmark calls a graph directly.
         if self._nodes is not None:
@@ -142,7 +150,7 @@ class CudaMetrics:
     The active scope also collapses many prefill region replays into one pass.
     """
 
-    def __init__(self, device, *, speculation=None) -> None:
+    def __init__(self, device: str | torch.device, *, speculation=None) -> None:
         self.device = device
         self.active: _Execution | None = None
         self.pending: deque[_Execution] = deque()

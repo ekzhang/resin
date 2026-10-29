@@ -156,6 +156,10 @@ def test_scores_use_model_distribution_and_cover_only_accepted_positions():
         sampling_mask=[True, False],
     )
     output = format_output(logits, [[1, 2], [2]], plan)
+    assert output.logprobs is not None
+    assert output.top_indptr is not None
+    assert output.top_token_ids is not None
+    assert output.top_logprobs is not None
     expected = logits.log_softmax(-1)
     np.testing.assert_array_equal(output.token_ids, [1, 2, 2])
     np.testing.assert_array_equal(output.token_indptr, [0, 2, 3])
@@ -198,6 +202,7 @@ def test_logprob_options_survive_broadcast_and_do_not_change_sampling():
     tokens = TorchSampler()(logits, plan)
     output = format_output(logits, tokens, plan)
     np.testing.assert_array_equal(output.token_ids, tokens.numpy())
+    assert output.top_logprobs is not None
     assert len(output.top_logprobs) == 3
     with pytest.raises(ValueError, match="top_logprobs"):
         SamplingParams(top_logprobs=1001)
@@ -217,6 +222,7 @@ def test_mixed_top_k_requests_use_packed_columns():
         ],
     )
     output = format_output(logits, torch.tensor([1, 2, 0]), plan)
+    assert output.logprobs is not None
     np.testing.assert_array_equal(output.top_indptr, [0, 1, 1, 4])
     np.testing.assert_allclose(
         output.logprobs, logits.log_softmax(-1)[range(3), [1, 2, 0]].numpy()

@@ -20,12 +20,12 @@ class _CheckpointReport:
     flags: torch.Tensor
     owner: object
 
-    def stage(self, staging):
+    def stage(self, staging: TensorStager) -> _CheckpointReport:
         return _CheckpointReport(
             self.reservation_ids, staging.output("state_checkpoints", self.flags), self
         )
 
-    def attach(self, output):
+    def attach(self, output: ForwardOutput) -> ForwardOutput:
         # One native reservation covers every STATE group at a row/prefix.
         # A receipt certifies the complete snapshot, not an individual layer.
         snapshots = dict.fromkeys(self.reservation_ids, True)
@@ -38,7 +38,7 @@ class _CheckpointReport:
 
 
 class _StateExecution:
-    def __init__(self, plan, arena):
+    def __init__(self, plan, arena) -> None:
         self.plan, self.arena = plan, arena
         self.staging = TensorStager(arena.device)
         self.groups = tuple(
@@ -48,7 +48,12 @@ class _StateExecution:
             storage = arena.state_blocks[group.group_index]
             state = group.state
 
-            def address(slab, slot, *, destination=False):
+            def address(
+                slab: int | np.integer,
+                slot: int | np.integer,
+                *,
+                destination: bool = False,
+            ) -> None:
                 if not (
                     int(destination) <= slab <= arena.layout.parent_capacity
                     and slab < storage.shape[0]
@@ -73,7 +78,7 @@ class _StateExecution:
                 address(group.block_slab_ids[row], group.block_slotnums[row])
                 address(slab, slot, destination=True)
 
-    def restore(self):
+    def restore(self) -> None:
         from resin.backend.cuda.state_triton import copy_state
 
         for group in self.groups:
@@ -95,7 +100,9 @@ class _StateExecution:
             )
             copy_state(self.arena.state_blocks[group.group_index], addresses)
 
-    def finish(self, result):
+    def finish(
+        self, result: DeviceCompletion | ForwardOutput
+    ) -> DeviceCompletion | ForwardOutput:
         from resin.backend.cuda.state_triton import copy_state
 
         if isinstance(result, DeviceCompletion):

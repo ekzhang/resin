@@ -11,7 +11,7 @@ import json
 from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import TYPE_CHECKING, Literal, overload
+from typing import TYPE_CHECKING, Literal, cast, overload
 
 import numpy as np
 import torch
@@ -1267,7 +1267,9 @@ class DeepSeekV41CudaRunner(CudaRunner):
                 )
                 row_logits = self._model.head(row_logits[:, -1:])
             logits.append(row_logits)
-        return torch.cat(logits, dim=0), PromptScores.concat(prompt_rows)
+        return torch.cat(logits, dim=0), PromptScores.concat(
+            cast(list[PromptScores], prompt_rows)
+        )
 
     def _broadcast_tokens(self, token_ids: torch.Tensor) -> torch.Tensor:
         groups = self.parallel_groups

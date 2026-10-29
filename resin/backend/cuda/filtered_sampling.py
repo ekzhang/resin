@@ -386,8 +386,15 @@ def _filter_thresholds(
 
 
 def validate_filtered_inputs(
-    logits, temperatures, top_ks, top_ps, seeds, offsets, stochastic_mask, out=None
-):
+    logits: torch.Tensor,
+    temperatures: torch.Tensor,
+    top_ks: torch.Tensor,
+    top_ps: torch.Tensor,
+    seeds: torch.Tensor,
+    offsets: torch.Tensor,
+    stochastic_mask: torch.Tensor,
+    out: torch.Tensor | None = None,
+) -> tuple[int, int]:
     """Validate metadata before any sampling launch can overwrite a policy view."""
     rows, vocab = _geometry(logits)
     inputs = [("logits", logits)]
@@ -579,8 +586,13 @@ def _filter_weights(
 
 
 def _prepare_parallel_filters(
-    logits, temperatures, top_ks, top_ps, stochastic_mask, state
-):
+    logits: torch.Tensor,
+    temperatures: torch.Tensor,
+    top_ks: torch.Tensor,
+    top_ps: torch.Tensor,
+    stochastic_mask: torch.Tensor,
+    state: torch.Tensor,
+) -> torch.Tensor:
     from resin.backend.cuda.sampling_native import air_top_p_cutoff, topk_cutoffs
 
     rows, vocab = logits.shape
@@ -592,7 +604,9 @@ def _prepare_parallel_filters(
     active_p = torch.empty_like(active_k)
     p = torch.empty(rows, dtype=torch.float32, device=logits.device)
     weights = torch.empty((rows, vocab), dtype=torch.float32, device=logits.device)
-    guard_mass = torch.empty((rows, parts, 2), dtype=torch.float64, device=logits.device)
+    guard_mass = torch.empty(
+        (rows, parts, 2), dtype=torch.float64, device=logits.device
+    )
     _filter_stats.run(
         logits,
         temperatures,
@@ -652,22 +666,26 @@ def _prepare_parallel_filters(
         num_warps=4,
     )
     air_top_p_cutoff(
-        weights, p, active_p, out=state[:, 1],
-        guard_mass=guard_mass, guard_active=active_k,
+        weights,
+        p,
+        active_p,
+        out=state[:, 1],
+        guard_mass=guard_mass,
+        guard_active=active_k,
     )
     return state
 
 
 def prepare_filters(
-    logits,
-    temperatures,
-    top_ks,
-    top_ps,
-    stochastic_mask,
+    logits: torch.Tensor,
+    temperatures: torch.Tensor,
+    top_ks: torch.Tensor,
+    top_ps: torch.Tensor,
+    stochastic_mask: torch.Tensor,
     *,
-    block_size=1024,
-    num_warps=8,
-):
+    block_size: int = 1024,
+    num_warps: int = 8,
+) -> torch.Tensor:
     """Return FP32 [rows, 3] logit cutoff, probability cutoff, and global maximum.
 
     Policies use positive top-k and 0 < top-p <= 1, as validated by the engine.

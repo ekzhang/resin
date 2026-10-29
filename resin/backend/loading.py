@@ -5,12 +5,13 @@ from __future__ import annotations
 import json
 from collections.abc import Callable, Collection, Mapping
 from pathlib import Path
-from typing import Any
+from typing import Any, TypeVar, cast
 from weakref import WeakKeyDictionary
 
 import torch
 
 MODEL_FILES = ("config.json", "model*.safetensors", "model.safetensors.index.json")
+_ModelT = TypeVar("_ModelT", bound=torch.nn.Module)
 
 
 def prepare_model(
@@ -163,11 +164,11 @@ def load_safetensor_weights(
 def materialize_safetensor_model(
     model_path: Path,
     *,
-    device,
-    dtype,
-    build: Callable[[], Any],
-    after_cast: Callable[[Any], None] | None = None,
-):
+    device: str | torch.device,
+    dtype: str | torch.dtype | None,
+    build: Callable[[], _ModelT],
+    after_cast: Callable[[_ModelT], None] | None = None,
+) -> _ModelT:
     """Build a meta model, assign safetensors, and finalize inference buffers."""
 
     target = torch.device(device)
@@ -175,7 +176,7 @@ def materialize_safetensor_model(
     with torch.device("meta"):
         model = build()
     load_safetensor_weights(model_path, model, device=load_target)
-    model.materialize_buffers(load_target)
+    cast(Callable[[torch.device], None], model.materialize_buffers)(load_target)
     if target != load_target:
         model.to(target)
 
@@ -188,18 +189,18 @@ def materialize_safetensor_model(
         after_cast(model)
     # Module.to(dtype=...) casts floating-point buffers too. Each model's
     # materializer restores computed buffers such as RoPE frequencies.
-    model.materialize_buffers(target)
+    cast(Callable[[torch.device], None], model.materialize_buffers)(target)
     model.eval()
     return model
 
 
 def assign_model_tensor(
-    model,
+    model: torch.nn.Module,
     key: str,
-    tensor,
+    tensor: torch.Tensor,
     *,
-    device,
-    dtype=None,
+    device: str | torch.device,
+    dtype: torch.dtype | None = None,
 ) -> None:
     """Validate and assign one parameter or buffer into a materialized module."""
 
@@ -219,6 +220,7 @@ def assign_model_tensor(
         existing, parameter = module._buffers[name], False
     else:
         raise ValueError(f"checkpoint tensor has no model target: {key!r}")
+    existing = cast(torch.Tensor, existing)
     if tuple(existing.shape) != tuple(tensor.shape):
         raise ValueError(
             f"shape mismatch for {key!r}: checkpoint {tuple(tensor.shape)}, "

@@ -2,17 +2,22 @@
 
 from __future__ import annotations
 
-from collections.abc import Iterable, Mapping
+from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from types import MappingProxyType
-from typing import Any
+from typing import TYPE_CHECKING, Any, Self
 
 import numpy as np
+import numpy.typing as npt
 import torch
 
 from resin.backend.cuda.failures import GraphInputError
 from resin.backend.cuda.staging import TensorStager
 from resin.backend.sampling import SAMPLING_OFFSET_STRIDE, token_output
+
+if TYPE_CHECKING:
+    from resin import BatchPlan, ForwardOutput
+    from resin.backend.speculative import SpeculativeStats
 
 
 @dataclass(frozen=True, slots=True)
@@ -22,14 +27,14 @@ class DeviceFeedback:
     token_ids: torch.Tensor
     positions: torch.Tensor
 
-    def restrict(self, rows):
+    def restrict(self, rows: int) -> Self:
         # Scratch rows must remain at their reserved initial position across
         # arbitrarily many continuations; they have no logical request progress.
         self.token_ids[rows:].zero_()
         self.positions[rows:].fill_(1)
         return self
 
-    def inputs(self):
+    def inputs(self) -> dict[str, torch.Tensor]:
         return {
             "token_ids": self.token_ids[:, None],
             "positions": self.positions,
@@ -52,7 +57,14 @@ class DeviceAcceptance:
     draft_tokens: int
 
     @classmethod
-    def from_samples(cls, drafts, targets, positions, *, fixed_acceptance=None):
+    def from_samples(
+        cls,
+        drafts: torch.Tensor,
+        targets: torch.Tensor,
+        positions: torch.Tensor,
+        *,
+        fixed_acceptance: int | torch.Tensor | None = None,
+    ) -> Self:
         if drafts.ndim != 2 or targets.shape != (len(drafts), drafts.shape[1] + 1):
             raise ValueError(
                 "target samples must contain one bonus after the draft block"
@@ -89,7 +101,14 @@ class DeviceAcceptance:
         return cls.from_accepted(tokens, accepted, positions, draft_tokens=draft_tokens)
 
     @classmethod
-    def from_accepted(cls, tokens, accepted_drafts, positions, *, draft_tokens):
+    def from_accepted(
+        cls,
+        tokens: torch.Tensor,
+        accepted_drafts: torch.Tensor,
+        positions: torch.Tensor,
+        *,
+        draft_tokens: int,
+    ) -> Self:
         if (
             type(draft_tokens) is not int
             or draft_tokens < 0
@@ -107,12 +126,18 @@ class DeviceAcceptance:
             draft_tokens,
         )
 
-    def feedback(self):
+    def feedback(self) -> DeviceFeedback:
         bonus = self.tokens.gather(1, self.accepted_drafts[:, None]).squeeze(1)
         return DeviceFeedback(bonus.clone(), self.positions + self.counts)
 
 
-def accepted_block(output, positions, draft_tokens, *, fixed_acceptance=None):
+def accepted_block(
+    output: torch.Tensor,
+    positions: torch.Tensor,
+    draft_tokens: int,
+    *,
+    fixed_acceptance: int | torch.Tensor | None = None,
+) -> tuple[torch.Tensor, torch.Tensor, DeviceFeedback]:
     """Compatibility wrapper for runners adopting DeviceAcceptance separately."""
     if not draft_tokens:
         output = output.reshape(-1, 1)
@@ -144,10 +169,15 @@ class GraphDeviceFeedback(DeviceFeedback):
 class CudaContinuation:
     """Validate retained graph ownership independently of model feedback payloads."""
 
-    def __init__(self):
+    def __init__(self) -> None:
         self._active: ContinuationState | None = None
 
-    def begin(self, sequence_ids: Iterable[int], shape, inputs) -> ContinuationState:
+    def begin(
+        self,
+        sequence_ids: Iterable[int],
+        shape: Sequence[int],
+        inputs: Mapping[str, torch.Tensor],
+    ) -> ContinuationState:
         ids = tuple(map(int, sequence_ids))
         if len(set(ids)) != len(ids) or not shape or shape[0] < len(ids):
             raise GraphInputError("continuation rows do not fit their graph bucket")
@@ -158,8 +188,12 @@ class CudaContinuation:
         return state
 
     def resume(
-        self, sequence_ids: Iterable[int], state: ContinuationState, *, shape=None
-    ):
+        self,
+        sequence_ids: Iterable[int],
+        state: ContinuationState,
+        *,
+        shape: Sequence[int] | None = None,
+    ) -> dict[str, torch.Tensor]:
         if not isinstance(state, ContinuationState) or state is not self._active:
             raise GraphInputError(
                 "continuation no longer owns its admitted cache lease"
@@ -170,7 +204,7 @@ class CudaContinuation:
             raise GraphInputError("continuation changed its graph bucket")
         return dict(state.inputs)
 
-    def drain(self, state: ContinuationState | None = None):
+    def drain(self, state: ContinuationState | None = None) -> None:
         if state is None or self._active is state:
             self._active = None
 
@@ -183,7 +217,9 @@ class DeviceCompletion:
     """
 
     @classmethod
-    def from_acceptance(cls, acceptance: DeviceAcceptance, *, feedback=None, **kwargs):
+    def from_acceptance(
+        cls, acceptance: DeviceAcceptance, *, feedback=None, **kwargs
+    ) -> Self:
         stats = kwargs.get("stats")
         if stats is not None and stats.draft_tokens != acceptance.draft_tokens:
             raise ValueError(
@@ -199,18 +235,18 @@ class DeviceCompletion:
 
     def __init__(
         self,
-        tokens,
-        counts,
+        tokens: torch.Tensor,
+        counts: torch.Tensor,
         feedback,
         *,
-        rows,
-        stats=None,
-        device=None,
-        plan=None,
-        logits=None,
-        accepted_end_positions=None,
+        rows: int,
+        stats: SpeculativeStats | None = None,
+        device: str | torch.device | None = None,
+        plan: BatchPlan | None = None,
+        logits: torch.Tensor | None = None,
+        accepted_end_positions: torch.Tensor | None = None,
         state_checkpoints=None,
-    ):
+    ) -> None:
         self.accepted_end_positions = (
             feedback.positions
             if accepted_end_positions is None
@@ -235,12 +271,12 @@ class DeviceCompletion:
             self._state_checkpoints = state_checkpoints.stage(self._staging)
         self._record_event()
 
-    def _record_event(self):
+    def _record_event(self) -> None:
         event = torch.cuda.Event()
         event.record(torch.cuda.current_stream(self._device))
         self._event = event
 
-    def attach_state_checkpoints(self, prepared_report):
+    def attach_state_checkpoints(self, prepared_report) -> Self:
         """Queue a report before exposing this completion to the Engine.
 
         Snapshot copies must already follow model state commit on the same
@@ -257,7 +293,9 @@ class DeviceCompletion:
         self._record_event()
         return self
 
-    def _stage_scores(self, tokens, plan, logits):
+    def _stage_scores(
+        self, tokens: torch.Tensor, plan: BatchPlan, logits: torch.Tensor | None
+    ) -> None:
         if logits is None:
             raise ValueError("requested logprobs require target logits")
         if logits.ndim == 2:
@@ -301,7 +339,9 @@ class DeviceCompletion:
             self._top_ids = self._staging.output("top_ids", top_ids)
             self._top_logprobs = self._staging.output("top_logprobs", top_values)
 
-    def _scored_output(self, output, counts):
+    def _scored_output(
+        self, output: ForwardOutput, counts: npt.NDArray[np.integer]
+    ) -> ForwardOutput:
         from resin import ForwardOutput
 
         assert self._logprobs is not None
@@ -335,11 +375,11 @@ class DeviceCompletion:
         )
 
     @property
-    def positions(self):
+    def positions(self) -> npt.NDArray[np.integer]:
         self.result()
         return self._positions[: self._rows].numpy()
 
-    def result(self):
+    def result(self) -> ForwardOutput:
         if self._result is None:
             if self._event is None:
                 raise RuntimeError(

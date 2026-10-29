@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 
 import numpy as np
@@ -20,11 +20,11 @@ class TensorStager:
     Use :class:`TensorStagerPool` when enqueuing successive device batches.
     """
 
-    def __init__(self, device) -> None:
+    def __init__(self, device: str | torch.device) -> None:
         self.target_device = device
         self.host_tensors: dict[str, torch.Tensor] = {}
 
-    def host(self, name: str, values, dtype):
+    def host(self, name: str, values: object, dtype: torch.dtype) -> torch.Tensor:
         if not isinstance(values, torch.Tensor):
             values = np.asarray(values)
         tensor = self._host_buffer(name, values.shape, dtype)
@@ -35,7 +35,9 @@ class TensorStager:
             np.copyto(tensor.numpy(), values, casting="unsafe")
         return tensor
 
-    def _host_buffer(self, name: str, shape, dtype):
+    def _host_buffer(
+        self, name: str, shape: Sequence[int], dtype: torch.dtype
+    ) -> torch.Tensor:
         tensor = self.host_tensors.get(name)
         if tensor is None or tensor.shape != shape or tensor.dtype != dtype:
             # These mutable buffers outlive the caller's inference-mode scope.
@@ -49,17 +51,19 @@ class TensorStager:
             self.host_tensors[name] = tensor
         return tensor
 
-    def device(self, name: str, values, dtype):
+    def device(self, name: str, values: object, dtype: torch.dtype) -> torch.Tensor:
         return self.host(name, values, dtype).to(
             device=self.target_device, non_blocking=True
         )
 
-    def output(self, name: str, source):
+    def output(self, name: str, source: torch.Tensor) -> torch.Tensor:
         tensor = self._host_buffer(name, source.shape, source.dtype)
         tensor.copy_(source, non_blocking=True)
         return tensor
 
-    def tensors(self, fields: Mapping[str, tuple[object, object]], *, device: bool):
+    def tensors(
+        self, fields: Mapping[str, tuple[object, torch.dtype]], *, device: bool
+    ) -> dict[str, torch.Tensor]:
         stage = self.device if device else self.host
         return {
             name: stage(name, values, dtype) for name, (values, dtype) in fields.items()
@@ -123,7 +127,7 @@ class TensorStagerPool:
     their allocations without blocking the submitting CPU thread.
     """
 
-    def __init__(self, device) -> None:
+    def __init__(self, device: str | torch.device) -> None:
         self.target_device = device
         self._available: list[TensorStager] = []
         self._pending: list[_PendingStaging] = []

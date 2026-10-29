@@ -17,7 +17,7 @@ class RMSNorm(nn.Module):
         width: int,
         eps: float,
         *,
-        weight_dtype=torch.float32,
+        weight_dtype: torch.dtype = torch.float32,
         with_scale: bool = True,
     ) -> None:
         super().__init__()

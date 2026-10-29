@@ -5,11 +5,12 @@ from __future__ import annotations
 from collections.abc import Callable
 from contextlib import nullcontext
 from dataclasses import dataclass
+from typing import cast
 
 import torch
 
 from resin.backend.collectives import layer_collectives
-from resin.backend.cuda.graphs import CudaGraphMode, CudaGraphStep
+from resin.backend.cuda.graphs import CudaGraphMode, CudaGraphStep, GraphShape
 
 
 @dataclass(frozen=True, slots=True)
@@ -29,7 +30,7 @@ class CudaGraphTensorRegion:
     """
 
     name: str
-    operation: Callable
+    operation: Callable[..., torch.Tensor | tuple[torch.Tensor, ...]]
     inputs: tuple[TensorSpec, ...]
     output: TensorSpec | tuple[TensorSpec, ...]
 
@@ -54,7 +55,7 @@ class PrefillTensorGraphs:
         capture_context: Callable = nullcontext,
         mode: str = "prefill_attention",
         coordinated: bool = False,
-    ):
+    ) -> None:
         self.runner, self.regions, self.mode = runner, tuple(regions), mode
         self.pad_up_to, self.capture_context = pad_up_to, capture_context
         self.coordinated = coordinated
@@ -77,12 +78,14 @@ class PrefillTensorGraphs:
             ),
         )
 
-    def _buffers(self, tokens, region):
+    def _buffers(
+        self, tokens: int, region: int
+    ) -> tuple[dict[str, torch.Tensor], torch.Tensor | tuple[torch.Tensor, ...]]:
         spec = self.regions[region - 1]
         key = tokens, spec.inputs, spec.output
         if key not in self.buffers:
 
-            def allocate(layout):
+            def allocate(layout: TensorSpec) -> torch.Tensor:
                 return torch.zeros(
                     (tokens, *layout.shape),
                     dtype=layout.dtype,
@@ -106,11 +109,11 @@ class PrefillTensorGraphs:
             self.buffers[key] = inputs, output
         return self.buffers[key]
 
-    def build(self, shape):
+    def build(self, shape: GraphShape) -> CudaGraphStep:
         inputs, output = self._buffers(*shape)
         spec = self.regions[shape[1] - 1]
 
-        def launch():
+        def launch() -> None:
             with (
                 self.runner._parallel_graph_capacity(
                     shape[0], valid_rows=inputs.get("ep_valid_rows")
@@ -126,11 +129,13 @@ class PrefillTensorGraphs:
                     for target, value in zip(output, result, strict=True):
                         target.copy_(value)
                 else:
-                    output.copy_(result)
+                    cast(torch.Tensor, output).copy_(cast(torch.Tensor, result))
 
         return CudaGraphStep(inputs, output, launch)
 
-    def invoke(self, region, *values):
+    def invoke(
+        self, region: int, *values: torch.Tensor
+    ) -> torch.Tensor | tuple[torch.Tensor, ...]:
         spec = self.regions[region]
         if not self.runner._prefill_graph_active:
             return spec.operation(*values)
@@ -164,7 +169,7 @@ class PrefillTensorGraphs:
         if reason is not None:
             self.runner._cuda_graph_fallback(self.mode, reason)
             return spec.operation(*values)
-        inputs, _ = self._buffers(bucket, region + 1)
+        inputs, _ = self._buffers(cast(int, bucket), region + 1)
         if "ep_valid_rows" in inputs:
             inputs["ep_valid_rows"].fill_(tokens)
         for index, value in enumerate(values):
@@ -182,7 +187,9 @@ class PrefillTensorGraphs:
         return output[:tokens]
 
     @property
-    def callbacks(self):
+    def callbacks(
+        self,
+    ) -> tuple[Callable[..., torch.Tensor | tuple[torch.Tensor, ...]], ...]:
         return tuple(
             lambda *values, region=region: self.invoke(region, *values)
             for region in range(len(self.regions))

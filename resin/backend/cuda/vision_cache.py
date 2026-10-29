@@ -30,7 +30,9 @@ class VisionFeatureCache:
     graph pool or an encoder's reusable workspace.
     """
 
-    def __init__(self, *, max_entries: int = 64, max_bytes: int = 256 * 1024**2):
+    def __init__(
+        self, *, max_entries: int = 64, max_bytes: int = 256 * 1024**2
+    ) -> None:
         if max_entries < 0 or max_bytes < 0:
             raise ValueError("vision cache limits must be nonnegative")
         self.max_entries = max_entries
