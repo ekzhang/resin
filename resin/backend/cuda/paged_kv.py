@@ -111,6 +111,7 @@ class PagedKvArena:
         self.storage = torch.zeros(shape, dtype=dtype, device=device)
         self.keys = self.storage[0]
         self.values = self.storage[1]
+        self._cache_storage_views: dict[int, dict[str, torch.Tensor]] = {}
 
     def check_pages(self, page_ids: Iterable[int | np.integer]) -> None:
         if any(page < 0 or page > self.capacity for page in page_ids):
@@ -128,8 +129,12 @@ class PagedKvArena:
                     prefix_length, block, self.page_size, group.read_window_tokens
                 )
                 # FA4 can load the complete page even when attention masks rows.
-                buffers.append(
-                    byte_regions(
+                if rows.stop <= rows.start:
+                    buffers.append({})
+                    continue
+                regions = self._cache_storage_views.get(slab)
+                if regions is None:
+                    regions = byte_regions(
                         {
                             f"{('keys', 'values')[kv]}/{layer}": self.storage[
                                 kv, layer, slab
@@ -137,10 +142,9 @@ class PagedKvArena:
                             for kv in range(2)
                             for layer in range(self.storage.shape[1])
                         }
-                        if rows.stop > rows.start
-                        else {}
                     )
-                )
+                    self._cache_storage_views[slab] = regions
+                buffers.append(regions)
         return tuple(buffers)
 
 
