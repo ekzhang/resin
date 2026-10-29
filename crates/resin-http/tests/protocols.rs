@@ -586,6 +586,86 @@ async fn output_token_limits_preserve_omission_and_explicit_values() {
 }
 
 #[tokio::test]
+async fn request_cacheable_defaults_to_true_and_is_forwarded() {
+    for (path, input) in [
+        (
+            "/v1/chat/completions",
+            json!({"messages": [{"role": "user", "content": "hi"}]}),
+        ),
+        ("/v1/responses", json!({"input": "hi"})),
+        (
+            "/v1/messages",
+            json!({"messages": [{"role": "user", "content": "hi"}], "max_tokens": 8}),
+        ),
+    ] {
+        for (cacheable, expected) in [
+            (Value::Null, json!(true)),
+            (json!(true), json!(true)),
+            (json!(false), json!(false)),
+        ] {
+            let mut body = input.clone();
+            body["model"] = json!("test-model");
+            if !cacheable.is_null() {
+                body["cacheable"] = cacheable;
+            }
+            let (status, response) = json_response(
+                recording_router(1),
+                Request::post(path)
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "{path}: {body}");
+            let content = match path {
+                "/v1/chat/completions" => &response["choices"][0]["message"]["content"],
+                "/v1/responses" => &response["output"][0]["content"][0]["text"],
+                _ => &response["content"][0]["text"],
+            };
+            let normalized: Value = serde_json::from_str(content.as_str().unwrap()).unwrap();
+            assert_eq!(normalized["cacheable"], expected, "{path}: {body}");
+            assert!(
+                normalized["extra"].get("cacheable").is_none(),
+                "cacheable must not be treated as a recipe extra: {path}: {body}"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn invalid_request_cacheable_is_rejected() {
+    for (path, input) in [
+        (
+            "/v1/chat/completions",
+            json!({"messages": [{"role": "user", "content": "hi"}]}),
+        ),
+        ("/v1/responses", json!({"input": "hi"})),
+        (
+            "/v1/messages",
+            json!({"messages": [{"role": "user", "content": "hi"}], "max_tokens": 8}),
+        ),
+    ] {
+        for cacheable in [json!(1), json!("no"), json!([])] {
+            let mut body = input.clone();
+            body["model"] = json!("test-model");
+            body["cacheable"] = cacheable;
+            let response = recording_router(1)
+                .oneshot(
+                    Request::post(path)
+                        .header(header::CONTENT_TYPE, "application/json")
+                        .body(Body::from(body.to_string()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            let status = response.status();
+            assert_ne!(status, StatusCode::OK, "{path}: {body}");
+            assert!(status.is_client_error(), "{path}: {body} returned {status}");
+        }
+    }
+}
+
+#[tokio::test]
 async fn explicit_zero_output_limit_requires_prompt_logprobs() {
     for (path, input, limits) in [
         (

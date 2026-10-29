@@ -26,7 +26,14 @@ pub struct ConversationRequest {
     pub reasoning_effort: Option<String>,
     #[serde(default)]
     pub cache_salt: Option<String>,
+    /// When false, skip prefix-cache lookup and do not publish prefixes.
+    #[serde(default = "default_true")]
+    pub cacheable: bool,
     pub extra: BTreeMap<String, Value>,
+}
+
+const fn default_true() -> bool {
+    true
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]

@@ -308,6 +308,78 @@ class TestFlatCacheEngine:
         assert engine.prefix_cache_stats == (0, 1, 1, 2)
         assert engine.cache_occupied_block_count == 0
 
+    def test_uncacheable_request_skips_lookup_and_does_not_publish(self) -> None:
+        layout = CacheLayout(parent_capacity=16, groups=[CacheGroupLayout(2)])
+        runner = RecordingCachedRunner(layout)
+        engine = Engine(runner, prefix_cache=True)
+
+        private = engine.submit(
+            [1, 2, 3, 4],
+            cacheable=False,
+            sampling_params=SamplingParams(max_output_tokens=1),
+        )
+        while engine.has_work():
+            engine.step()
+        assert private.done
+        assert private.cached_tokens == 0
+        assert engine.prefix_cache_stats == (0, 0, 0, 0)
+
+        published = engine.submit(
+            [1, 2, 3, 4], sampling_params=SamplingParams(max_output_tokens=1)
+        )
+        assert published.cached_tokens == 0
+        while engine.has_work():
+            engine.step()
+        assert engine.prefix_cache_stats == (2, 0, 1, 0)
+
+        skipped = engine.submit(
+            [1, 2, 3, 4, 5],
+            cacheable=False,
+            sampling_params=SamplingParams(max_output_tokens=1),
+        )
+        assert skipped.cached_tokens == 0
+        assert engine.prefix_cache_stats == (2, 0, 1, 0)
+        engine.step()
+        assert runner.plans[-1].context_lengths.tolist() == [0]
+        assert runner.plans[-1].token_ids[0] == 1
+        while engine.has_work():
+            engine.step()
+
+        reused = engine.submit(
+            [1, 2, 3, 4, 5], sampling_params=SamplingParams(max_output_tokens=1)
+        )
+        assert reused.cached_tokens == 4
+        assert engine.prefix_cache_stats == (2, 1, 1, 0)
+        engine.step()
+        assert runner.plans[-1].token_ids.tolist() == [5]
+        engine.close()
+
+    def test_uncacheable_media_request_skips_prefix_reuse(self) -> None:
+        class Media:
+            token_ids = [1, 2, 3, 4]
+            token_spans = ()
+            cache_key = (1, 101, 102, 4)
+
+        layout = CacheLayout(parent_capacity=4, groups=[CacheGroupLayout(2)])
+        runner = RecordingCachedRunner(layout)
+        engine = Engine(runner, prefix_cache=True)
+
+        engine.submit(
+            media=Media(), sampling_params=SamplingParams(max_output_tokens=1)
+        )
+        while engine.has_work():
+            engine.step()
+
+        skipped = engine.submit(
+            media=Media(),
+            cacheable=False,
+            sampling_params=SamplingParams(max_output_tokens=1),
+        )
+        assert skipped.cached_tokens == 0
+        engine.step()
+        assert runner.plans[-1].context_lengths.tolist() == [0]
+        engine.close()
+
     def test_media_digest_identity_controls_prefix_reuse(self) -> None:
         class Media:
             token_ids = [1, 2, 3, 4]

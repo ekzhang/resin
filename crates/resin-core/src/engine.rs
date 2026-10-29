@@ -947,9 +947,9 @@ impl<P: Clone> EngineCore<P> {
             .transpose()?;
         // Media may provide a same-length, digest-derived identity stream. A
         // media object without one stays out of the token-only prefix cache.
-        let cache_identity = cache_prompt
-            .as_deref()
-            .or_else(|| cacheable.then_some(token_ids.as_slice()));
+        // Uncacheable requests skip lookup entirely, including media identity.
+        let cache_identity =
+            cacheable.then(|| cache_prompt.as_deref().unwrap_or(token_ids.as_slice()));
         // KV entries do not retain predecessor distributions. Scoring must run
         // the prompt once, even when an ordinary request could reuse its KV.
         let cache_identity = cache_identity.filter(|_| !prompt_logprobs);

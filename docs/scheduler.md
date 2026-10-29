@@ -22,6 +22,7 @@ request = engine.submit(
     prompt.token_ids,
     priority=5,
     batch_key=7,
+    cacheable=True,
     sampling_params=SamplingParams(
         max_output_tokens=64,  # optional hard stop, not a KV reservation
         stop_token_ids=recipe.stop_token_ids,
@@ -32,6 +33,9 @@ request = engine.submit(
     ),
 )
 ```
+
+`cacheable` defaults to true. False skips prefix lookup and publishing for that
+request; see [unified paged cache](cache-pool.md).
 
 `context_length` is an Engine-level model limit, not a batching preference. It
 defaults to 32768 and rejects requests whose requested sequence would exceed

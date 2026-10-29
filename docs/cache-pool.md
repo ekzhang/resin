@@ -73,7 +73,9 @@ performs these transfers outside model graphs and attaches completion receipts.
 `Engine(..., prefix_cache=True)` enables an exact-token block trie with LRU
 entries. Prefixes are published only at an alignment shared by every cache
 group. A hit attaches immutable references to the cached pages and schedules
-only the unmatched suffix.
+only the unmatched suffix. `Engine.submit(..., cacheable=True)` (the default)
+participates in lookup and publishing. `cacheable=False` skips prefix lookup,
+including a media `cache_key`, and does not publish prefixes for that request.
 
 A model can declare `CacheLayout(replay_suffix_tokens=N)` when a restored
 history needs its final `N` inputs recomputed. Prefix lookup caps the hit at

@@ -197,6 +197,8 @@ columns. The same result type covers ordinary and speculative decoding.
 Managed history and recurrent state are cache groups declared through a frozen
 `RunnerConfig`. The Engine binds their one physical arena during construction.
 Pass `prefix_cache=True` to reuse aligned prefixes across requests.
+Individual requests can set `cacheable=False` to skip prefix lookup and
+publishing.
 
 ## Local HTTP server
 
@@ -216,7 +218,10 @@ uv run python scripts/lfm2_serve.py
 Then open <http://127.0.0.1:8000>. The page reports prompt and generated token
 counts, elapsed generation time, and output tokens per second. The same process
 serves `/v1/chat/completions`, `/v1/responses`, `/v1/messages`, and `/v1/models`.
-Both examples explicitly use the CPU Torch runner.
+Both examples explicitly use the CPU Torch runner. Generation requests accept
+`cacheable` (default `true`); `false` opts that request out of prefix lookup
+and publishing when the Engine has prefix caching enabled. See
+[unified paged cache](docs/cache-pool.md).
 
 ## Modal HTTP endpoints
 

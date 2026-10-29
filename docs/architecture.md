@@ -49,9 +49,9 @@ for implementing and validating a runner.
 1. The runner publishes a frozen `RunnerConfig`.
 2. The Engine creates the declared `CacheLayout` and calls
    `bind_resources(ResourceBinding)` once.
-3. `submit()` records tokens, generation limits, priority, batch key, and
-   sampling policy. With prefix caching enabled, it attaches the longest aligned
-   cached prefix.
+3. `submit()` records tokens, generation limits, priority, batch key,
+   cacheability, and sampling policy. With prefix caching enabled, it attaches
+   the longest aligned cached prefix unless `cacheable` is false.
 4. The scheduler selects a phase- and key-compatible cohort, respecting token
    and cache capacity.
 5. The cache coordinator grows each request, creates ordered group page tables,

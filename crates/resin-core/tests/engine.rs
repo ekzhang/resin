@@ -182,6 +182,67 @@ fn admission_credits_restored_physical_prefix_pages_only() {
     }
 }
 
+#[test]
+fn uncacheable_requests_skip_prefix_lookup_and_publish() {
+    let mut engine = EngineCore::new(
+        RunnerConfig {
+            cache_layout: Some(
+                KvLayout::new(
+                    8,
+                    vec![KvGroupLayout::new(2, 1, KvRetention::FullContext).unwrap()],
+                )
+                .unwrap(),
+            ),
+            continuation_prefill: true,
+            ..Default::default()
+        },
+        4,
+        32,
+        SchedulerConfig {
+            max_batch_tokens: NonZeroU32::new(32),
+            prefill_chunk_size: NonZeroU32::new(32).unwrap(),
+            ..Default::default()
+        },
+        true,
+    )
+    .unwrap();
+    let mut model = Model::default();
+    let mut private = input(vec![1, 2, 3, 4], 1);
+    private.cacheable = false;
+    let first = engine.submit(private).unwrap();
+    assert_eq!(first.cached_tokens(), 0);
+    while engine.has_work() {
+        engine.step(&mut model).unwrap();
+    }
+    first.take_result().unwrap();
+    assert_eq!(engine.prefix_cache_stats(), Some((0, 0, 0, 0)));
+
+    let second = engine.submit(input(vec![1, 2, 3, 4, 5], 1)).unwrap();
+    assert_eq!(second.cached_tokens(), 0);
+    while engine.has_work() {
+        engine.step(&mut model).unwrap();
+    }
+    second.take_result().unwrap();
+    let published = engine.prefix_cache_stats().unwrap();
+    assert!(published.0 > 0, "cacheable request should publish prefixes");
+    assert_eq!(published.1, 0);
+
+    let mut skipped = input(vec![1, 2, 3, 4, 5, 6], 1);
+    skipped.cacheable = false;
+    let third = engine.submit(skipped).unwrap();
+    assert_eq!(third.cached_tokens(), 0);
+    assert_eq!(engine.prefix_cache_stats().unwrap().1, 0);
+    while engine.has_work() {
+        engine.step(&mut model).unwrap();
+    }
+    third.take_result().unwrap();
+
+    let fourth = engine.submit(input(vec![1, 2, 3, 4, 5], 1)).unwrap();
+    assert!(fourth.cached_tokens() > 0);
+    assert_eq!(engine.prefix_cache_stats().unwrap().1, 1);
+    engine.close(&mut model).unwrap();
+}
+
 fn check_stopped_speculative_prefix(stop_token: bool) {
     for family in [KvGroupFamily::State, KvGroupFamily::History] {
         for truncated in [true, false] {

@@ -671,6 +671,7 @@ fn admit_rendered(
             media,
             None,
             job.request.cache_salt.clone(),
+            job.request.cacheable,
         )?;
         let lease_ref = lease.bind(py).borrow();
         let request_id = lease_ref.request_id();

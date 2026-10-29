@@ -42,6 +42,8 @@ pub(crate) struct MessagesRequest {
     #[serde(default)]
     stream: bool,
     cache_salt: Option<String>,
+    #[serde(default = "default_true")]
+    cacheable: bool,
     #[serde(flatten)]
     extra: BTreeMap<String, Value>,
 }
@@ -52,6 +54,10 @@ const fn default_temperature() -> f64 {
 
 const fn default_top_p() -> f64 {
     1.0
+}
+
+const fn default_true() -> bool {
+    true
 }
 
 pub async fn messages(
@@ -177,6 +183,7 @@ fn conversation_request(
         stop: body.stop_sequences,
         reasoning_effort: None,
         cache_salt: body.cache_salt,
+        cacheable: body.cacheable,
         extra: body.extra,
     })
 }

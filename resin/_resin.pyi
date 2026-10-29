@@ -602,6 +602,7 @@ class Engine:
         media: "MediaInput | None" = None,
         prompt_target_logprobs: Sequence[Sequence[int]] | None = None,
         cache_salt: str | None = None,
+        cacheable: bool = True,
     ) -> RequestLease: ...
 
 @final
