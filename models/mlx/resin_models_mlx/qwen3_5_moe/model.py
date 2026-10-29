@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 from dataclasses import dataclass
+from functools import partial
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -20,6 +21,24 @@ from resin_models_mlx.paged_attention import paged_decode_attention
 
 # Query-key scores materialized per prefill attention call (512 MiB in BF16).
 SCORE_BUDGET = 1 << 28
+
+
+# Elementwise tails are compiled into single kernels, as in mlx-lm. Decode is
+# launch-bound, and each unfused cast or multiply is a separate launch.
+@partial(mx.compile, shapeless=True)
+def _swiglu(gate: mx.array, up: mx.array) -> mx.array:
+    return nn.silu(gate) * up
+
+
+@partial(mx.compile, shapeless=True)
+def _gated(normed: mx.array, gate: mx.array) -> mx.array:
+    gate = nn.silu(gate.astype(mx.float32))
+    return (gate * normed.astype(mx.float32)).astype(normed.dtype)
+
+
+@partial(mx.compile, shapeless=True)
+def _sigmoid_gate(value: mx.array, gate: mx.array) -> mx.array:
+    return value * mx.sigmoid(gate)
 
 
 @dataclass(frozen=True, slots=True)
@@ -74,17 +93,24 @@ class OffsetRMSNorm(nn.Module):
     """Qwen RMSNorm whose weight is stored as an offset from one.
 
     The scale ``1 + w`` is applied in FP32, as in the reference implementation;
-    folding it into a BF16 weight would round it by up to 2^-8.
+    folding it into a BF16 weight would round it by up to 2^-8. MLX's fused
+    kernel normalizes in FP32 and, given an FP32 scale, matches the reference
+    bit for bit. The scale is computed once per loaded weight.
     """
 
     def __init__(self, width: int, eps: float) -> None:
         super().__init__()
         self.eps = eps
         self.weight = mx.zeros((width,))
+        self._scale: tuple[mx.array, mx.array] | None = None
 
     def __call__(self, hidden: mx.array) -> mx.array:
-        normed = mx.fast.rms_norm(hidden.astype(mx.float32), None, self.eps)
-        return (normed * (1.0 + self.weight.astype(mx.float32))).astype(hidden.dtype)
+        if self._scale is None or self._scale[0] is not self.weight:
+            scale = 1.0 + self.weight.astype(mx.float32)
+            mx.eval(scale)
+            self._scale = (self.weight, scale)
+        normed = mx.fast.rms_norm(hidden, self._scale[1], self.eps)
+        return normed.astype(hidden.dtype)
 
 
 class GatedRMSNorm(nn.Module):
@@ -94,9 +120,7 @@ class GatedRMSNorm(nn.Module):
         self.weight = mx.ones((width,))
 
     def __call__(self, hidden: mx.array, gate: mx.array) -> mx.array:
-        normed = mx.fast.rms_norm(hidden, self.weight, self.eps)
-        gate = nn.silu(gate.astype(mx.float32))
-        return (gate * normed.astype(mx.float32)).astype(hidden.dtype)
+        return _gated(mx.fast.rms_norm(hidden, self.weight, self.eps), gate)
 
 
 class GatedDeltaNet(nn.Module):
@@ -261,7 +285,7 @@ class GatedAttention(nn.Module):
 
     def _project(self, output, gate, rows, tokens, key, value):
         output = output.transpose(0, 2, 1, 3).reshape(rows, tokens, -1)
-        output = output * mx.sigmoid(gate.reshape(rows, tokens, -1))
+        output = _sigmoid_gate(output, gate.reshape(rows, tokens, -1))
         return (
             self.o_proj(output),
             key.transpose(0, 2, 1, 3),
@@ -277,7 +301,7 @@ class FeedForward(nn.Module):
         self.down_proj = nn.Linear(intermediate, hidden, bias=False)
 
     def __call__(self, hidden: mx.array) -> mx.array:
-        return self.down_proj(nn.silu(self.gate_proj(hidden)) * self.up_proj(hidden))
+        return self.down_proj(_swiglu(self.gate_proj(hidden), self.up_proj(hidden)))
 
 
 class SparseMoe(nn.Module):
@@ -304,8 +328,8 @@ class SparseMoe(nn.Module):
         if self.norm_topk_prob:
             scores = scores / scores.sum(axis=-1, keepdims=True)
         routed = (self.switch_mlp(hidden, experts) * scores[..., None]).sum(axis=-2)
-        shared = mx.sigmoid(self.shared_expert_gate(hidden)) * self.shared_expert(
-            hidden
+        shared = _sigmoid_gate(
+            self.shared_expert(hidden), self.shared_expert_gate(hidden)
         )
         return routed + shared
 
