@@ -3,6 +3,8 @@
 Pass `Engine(runner, prefix_cache=True, prefix_cache_storage=provider)`.
 `MemoryCacheStorage(max_bytes=...)` provides an asynchronous, bounded CPU DRAM tier.
 The caller must set `max_bytes`; its LRU budget counts key, region-name and payload bytes.
+The DRAM tier reserves that arena at construction, using pinned memory when CUDA is
+available. GPU transfers use persistent private streams without serializing tensors.
 The caller owns the provider and calls `provider.close()` after closing its engines.
 
 Resin hashes token prefixes, selects published checkpoints, and maps cache groups to bytes.
@@ -12,6 +14,9 @@ three methods over opaque immutable byte keys:
 
 - `lookup(keys)` returns a future yielding one presence boolean per key.
 - `load(keys, buffers)` and `store(keys, buffers)` return futures yielding a success boolean.
+
+Writes occur when checkpoints are published (write-through). Presence is advisory:
+eviction between lookup and load can cause a miss, which falls back to computation.
 
 `buffers[i]` maps stable string names to borrowed contiguous `torch.uint8` views for
 `keys[i]`; an empty dict is a checkpoint manifest. Names label parts of one object,

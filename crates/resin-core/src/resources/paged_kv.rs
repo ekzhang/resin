@@ -278,12 +278,34 @@ impl PagedKvResources {
                     table
                 })
                 .collect();
-            let groups = self.storage_groups(tokens.len() as u32, tables)?;
+            let mut groups = self.storage_groups(tokens.len() as u32, tables)?;
+            let mut keep = Vec::with_capacity(groups.len());
+            for (layout, (first, addresses)) in self.layout.groups().iter().zip(&mut groups) {
+                let mut mask = vec![true; addresses.len()];
+                if !layout.is_recurrent()
+                    && let Some(read) = layout.read_window_tokens()
+                    && Some(read) != layout.retention().window_tokens()
+                {
+                    let live_first = (tokens.len() as u32).saturating_sub(read.get())
+                        / layout.block_tokens().get();
+                    let count = mask.len();
+                    for logical in *first..live_first {
+                        mask[logical as usize % count] = false;
+                    }
+                    addresses.drain(..(live_first - *first) as usize);
+                    *first = live_first;
+                }
+                keep.push(mask);
+            }
             let pending = self
                 .pool
                 .reserve_request(SequenceId::new(u64::MAX), &self.demands(0))?;
             let mut source = self.pool.promote_request(pending);
             self.pool.attach_shared_prefix(&mut source, pages)?;
+            if let Err(error) = self.pool.retain_shared_request_pages(&mut source, &keep) {
+                self.pool.retire_request(source).map_err(|f| f.error)?;
+                return Err(error);
+            }
             if let Some((storage, _)) = &mut self.storage {
                 let operation = storage.transfer(tokens, &groups, false);
                 self.jobs.push((operation, 0, Vec::new(), Some(source)));
@@ -1272,10 +1294,124 @@ fn page_index(group: KvGroupLayout, page_count: usize, logical: u32) -> Option<u
 #[cfg(test)]
 mod tests {
     use std::num::{NonZeroU32, NonZeroU64};
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::{Arc, Mutex};
 
     use crate::{Phase, TokenRange};
 
     use super::*;
+
+    #[test]
+    fn pending_storage_retains_only_live_window_pages_through_recycling() {
+        #[derive(Clone, Debug)]
+        struct Store(Arc<AtomicBool>, Arc<Mutex<Vec<PrefixStorageGroup>>>);
+        impl PrefixStorageOperation for Store {
+            fn poll(&mut self, _: bool) -> Option<u32> {
+                self.0.load(Ordering::Acquire).then_some(1)
+            }
+        }
+        impl PrefixStorage for Store {
+            fn lookup(&mut self, _: &[u32], _: u32, _: u32) -> StorageOp {
+                unreachable!("the test only exports checkpoints")
+            }
+            fn transfer(
+                &mut self,
+                _: &[u32],
+                groups: &[PrefixStorageGroup],
+                load: bool,
+            ) -> StorageOp {
+                assert!(!load);
+                *self.1.lock().unwrap() = groups.to_vec();
+                Box::new(self.clone())
+            }
+        }
+        for (capacity, length, read, first, held) in [
+            (96, 4096, Some(128), 31, 33),  // A full snapshot held 64 parents.
+            (192, 8576, Some(129), 65, 69), // Live WINDOW slots wrap across 65/0.
+            (192, 8576, None, 1, 133),      // Unspecified read window keeps all pages.
+        ] {
+            let retention = KvRetention::SlidingWindow {
+                tokens: NonZeroU32::new(8319).unwrap(),
+            };
+            let mut window = KvGroupLayout::new(128, 1, retention).unwrap();
+            if let Some(read) = read {
+                window = window.with_read_window_tokens(read).unwrap();
+            }
+            let history = KvGroupLayout::new(128, 1, KvRetention::FullContext).unwrap();
+            let layout = KvLayout::new(capacity, vec![history, window]).unwrap();
+            let mut r = PagedKvResources::with_prefix_cache(layout).unwrap();
+            let store = Store(Arc::default(), Arc::default());
+            r.storage = Some((Box::new(store.clone()), NonZeroUsize::new(1).unwrap()));
+            let id = RequestId::new(NonZeroU64::new(1).unwrap());
+            let mut request = r.attach(id, length).unwrap();
+            let original = request.groups()[1].pages();
+            let expected = (first..length / 128)
+                .map(|i| {
+                    let index = i as usize % original.len();
+                    r.pool.physical_address(original[index].handle()).unwrap()
+                })
+                .collect::<Vec<_>>();
+            assert!(
+                r.publish_prefix(&mut request, &vec![7; length as usize], length)
+                    .unwrap()
+            );
+            {
+                let groups = store.1.lock().unwrap();
+                assert_eq!(groups[0].1.len(), (length / 128) as usize);
+                assert_eq!(groups[1], (first, expected));
+            }
+            let owner = r.jobs[0].3.as_mut().unwrap();
+            let claim = owner.access_claim(&owner.groups()[0].pages()[0]);
+            let prepared = r.pool.prepare_writer_access(vec![claim]).unwrap();
+            let reader = r.pool.acquire_writer_access(prepared).unwrap();
+            // A malformed later mask cannot release the earlier valid group.
+            let mut live = Vec::new();
+            let mut masks = Vec::new();
+            for group in owner.groups() {
+                live.extend(group.pages().iter().map(|p| p.handle()));
+                masks.push(vec![false; group.pages().len()]);
+            }
+            masks[1].push(true);
+            assert_eq!(
+                r.pool.retain_shared_request_pages(owner, &masks),
+                Err(CachePoolError::StaleHandle)
+            );
+            masks[1].pop();
+            for mask in &mut masks {
+                mask.fill(true);
+            }
+            r.pool.retain_shared_request_pages(owner, &masks).unwrap();
+            r.retire(request).unwrap();
+            r.clear_prefix_cache().unwrap();
+            assert_eq!(r.metrics().occupied_slabs, held);
+            // Allocate every released guard while the source remains in flight.
+            let demands = [
+                GroupDemand::new(GroupId::new(0), (capacity - held) as usize),
+                GroupDemand::new(GroupId::new(1), 0),
+            ];
+            let sequence = SequenceId::new(2);
+            let pending = r.pool.reserve_request(sequence, &demands).unwrap();
+            let filler = r.pool.promote_request(pending);
+            assert_eq!(r.metrics().occupied_slabs, capacity);
+            r.poll_storage(false, |_, _, pages| pages).unwrap();
+            assert_eq!(r.jobs.len(), 1);
+            assert!(
+                live.iter()
+                    .all(|&handle| r.pool.physical_address(handle).is_ok())
+            );
+            store.0.store(true, Ordering::Release);
+            r.poll_storage(false, |_, _, pages| pages).unwrap();
+            assert!(r.pool.physical_address(live[0]).is_ok());
+            assert_eq!(r.metrics().occupied_slabs, capacity - held + 1);
+            r.pool.release_writer_access(reader);
+            assert!(
+                live.iter()
+                    .all(|&handle| r.pool.physical_address(handle).is_err())
+            );
+            r.pool.retire_request(filler).unwrap();
+            assert_eq!(r.pool.free_parent_count(), capacity as usize);
+        }
+    }
 
     #[test]
     fn ancestor_eviction_counts_no_reclaimed_storage_until_the_last_checkpoint() {

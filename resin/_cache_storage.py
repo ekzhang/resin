@@ -36,6 +36,7 @@ class _PrefixStorage:
             raise ValueError("prefix storage requires a managed cache layout")
         self.groups = layout.groups
         self.alignment = math.lcm(*(g.block_tokens for g in self.groups))
+        self.widths = tuple(self.alignment // g.block_tokens for g in self.groups)
         self.history = {
             i
             for i, g in enumerate(self.groups)
@@ -70,23 +71,23 @@ class _PrefixStorage:
     def transfer(self, tokens, groups, load):
         import torch
 
+        tensor_type, byte_dtype = torch.Tensor, torch.uint8
         bases = self._keys(tokens)
         regions = iter(self.buffers(groups, prefix_length=len(tokens)))
         chunks, tail = [{} for _ in bases], {}
         for i, (first, rows) in enumerate(groups):
-            width = self.alignment // self.groups[i].block_tokens
+            width = self.widths[i]
             for j in range(len(rows)):
                 target = chunks[j // width] if i in self.history else tail
+                name_prefix = f"{i}/{first + j}/"
                 for name, region in next(regions).items():
-                    if not isinstance(name, str) or not isinstance(
-                        region, torch.Tensor
-                    ):
+                    if not isinstance(name, str) or not isinstance(region, tensor_type):
                         raise TypeError(
                             "cache regions must map string names to tensors"
                         )
-                    if region.dtype != torch.uint8 or not region.is_contiguous():
+                    if region.dtype != byte_dtype or not region.is_contiguous():
                         raise ValueError("cache regions must be contiguous uint8 views")
-                    target[f"{i}/{first + j}/{name}"] = region
+                    target[name_prefix + name] = region
         if next(regions, None) is not None:
             raise ValueError("cache export returned too many blocks")
         keys, buffers = ([], [])
@@ -95,6 +96,6 @@ class _PrefixStorage:
         # Even an empty tail authenticates this exact checkpoint boundary.
         keys.append(bases[-1] + b"t")
         buffers.append(tail)
-        buffers = tuple(dict(sorted(regions.items())) for regions in buffers)
+        buffers = tuple(buffers)
         future = (self.store.load if load else self.store.store)(tuple(keys), buffers)
         return _Operation(self, future, buffers=buffers)

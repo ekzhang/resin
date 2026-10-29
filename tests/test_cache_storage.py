@@ -32,16 +32,33 @@ def make_engine(store, fill=0, limit=2):
 def test_memory_bytes_capacity_and_scatter_gather():
     store, known = MemoryCacheStorage(max_bytes=10), {}
     for i, key in enumerate(Random(7).choices((b"a", b"b", b"c"), k=400)):
-        source = torch.tensor([i % 256, 255 - i % 256], dtype=torch.uint8)
-        expected = known[key] if store.lookup((key,)).result()[0] else bytes(source)
+        source = torch.tensor(
+            [(i + j) % 256 for j in range(2 + i % 6)], dtype=torch.uint8
+        )
+        expected = (
+            known[key] if store.lookup((key,)).result()[0] else bytes(source.tolist())
+        )
         known[key] = expected
         assert store.store((key,), ({"x": source[:1], "y": source[1:]},)).result()
         source.fill_(122)
-        target = torch.empty(2, dtype=torch.uint8)
+        target = torch.empty(len(expected), dtype=torch.uint8)
         assert store.load((key,), ({"y": target[1:], "x": target[:1]},)).result()
-        assert bytes(target) == expected and store.nbytes <= 10
+        assert bytes(target.tolist()) == expected and store.nbytes <= 10
         assert sum(store.lookup((b"a", b"b", b"c")).result()) <= 2
     assert not store.load((key,), ({"different": target},)).result()
+    store.close()
+    store = MemoryCacheStorage(max_bytes=0)
+    assert store.store((b"",), ({},)).result()
+    assert store.lookup((b"",)).result() == (True,)
+    assert store.load((b"",), ({},)).result() and store.nbytes == 0
+    store.close()
+    store = MemoryCacheStorage(max_bytes=6)
+    regions = ({"x": torch.tensor([1], dtype=torch.uint8)},) * 3
+    assert store.store((b"a", b"b"), regions[:2]).result()
+    assert store.store((b"a", b"c"), regions[:2]).result()
+    assert store.lookup((b"a", b"b", b"c")).result() == (True, False, True)
+    assert not store.store((b"a", b"c", b"d"), regions).result()
+    assert store.lookup((b"a", b"c", b"d")).result() == (True, True, False)
     store.close()
     store, other = (
         MemoryCacheStorage(max_bytes=4096),
