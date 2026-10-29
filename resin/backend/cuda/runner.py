@@ -404,10 +404,6 @@ class CudaRunner(Runner):
             )
         return arena
 
-    @property
-    def cache_storage_format(self):
-        return self._cache_storage_arena().cache_storage_format
-
     def cache_storage_buffers(self, groups, *, prefix_length):
         return self._cache_storage_arena().cache_storage_buffers(
             groups, prefix_length=prefix_length

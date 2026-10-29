@@ -163,15 +163,6 @@ class _Gemma4KvArena:
         self.global_keys, self.global_values = global_view[0], global_view[1]
         self.packing = packing
         self.sliding_window = getattr(config, "sliding_window", SLIDING_WINDOW)
-        self.cache_storage_format = repr(
-            (
-                "gemma4-live-v1",
-                local_shape[2:],
-                global_shape[2:],
-                str(dtype),
-                self.sliding_window,
-            )
-        ).encode()
 
     def cache_storage_buffers(self, groups, *, prefix_length):
         buffers = []

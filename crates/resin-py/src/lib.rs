@@ -1539,7 +1539,7 @@ impl Engine {
 #[pymethods]
 impl Engine {
     #[new]
-    #[pyo3(signature = (runner: "Runner", *, max_running_requests = 32, context_length = 32768, scheduler_config = None, prefix_cache = false, prefix_cache_storage = None, prefix_cache_namespace = None, prefix_cache_max_inflight = 2, enable_overlap = true, enable_metrics = true))]
+    #[pyo3(signature = (runner: "Runner", *, max_running_requests = 32, context_length = 32768, scheduler_config = None, prefix_cache = false, prefix_cache_storage = None, prefix_cache_max_inflight = 2, enable_overlap = true, enable_metrics = true))]
     #[allow(
         clippy::too_many_arguments,
         reason = "Python constructor exposes keyword configuration"
@@ -1552,7 +1552,6 @@ impl Engine {
         scheduler_config: Option<Py<SchedulerConfig>>,
         prefix_cache: bool,
         prefix_cache_storage: Option<Py<PyAny>>,
-        prefix_cache_namespace: Option<Py<PyAny>>,
         prefix_cache_max_inflight: usize,
         enable_overlap: bool,
         enable_metrics: bool,
@@ -1605,12 +1604,7 @@ impl Engine {
         if let Some(provider) = prefix_cache_storage {
             let adapter = PyModule::import(py, "resin._cache_storage")?
                 .getattr("_PrefixStorage")?
-                .call1((
-                    provider,
-                    runner,
-                    &config.cache_layout,
-                    prefix_cache_namespace,
-                ))?
+                .call1((provider, runner, &config.cache_layout))?
                 .unbind();
             core.set_prefix_storage(
                 Box::new(cache_storage::PythonPrefixStorage(adapter)),

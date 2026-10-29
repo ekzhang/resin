@@ -381,7 +381,6 @@ class CacheArena(GraphPageTableArena):
         max_batch_size: int,
     ):
         self.device, self.layout, self.geometry = device, layout, geometry
-        self.cache_storage_format = repr(("glm53-live-v1", geometry)).encode()
         self.max_batch_size = max_batch_size
         self.binding = CachePoolBinding(layout, resource=self.graph_label)
         reserved = 1 + graph_scratch_parent_count(geometry.packings, max_batch_size)

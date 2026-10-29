@@ -2,7 +2,6 @@
 
 import hashlib
 import math
-import os
 
 import numpy as np
 
@@ -25,16 +24,11 @@ class _Operation:
 
 
 class _PrefixStorage:
-    def __init__(self, store, runner, layout, namespace):
+    def __init__(self, store, runner, layout):
         self.runner = runner
         buffers = getattr(runner, "cache_storage_buffers", None)
-        format_id = getattr(runner, "cache_storage_format", None)
-        if not callable(buffers) or format_id is None:
-            raise NotImplementedError(
-                "prefix storage requires cache_storage_buffers and cache_storage_format"
-            )
-        if not isinstance(format_id, bytes) or not format_id:
-            raise TypeError("cache_storage_format must be nonempty bytes")
+        if not callable(buffers):
+            raise NotImplementedError("prefix storage requires cache_storage_buffers")
         if buffers((), prefix_length=0):
             raise ValueError("empty cache export must return no blocks")
         self.store, self.buffers = store, buffers
@@ -48,15 +42,10 @@ class _PrefixStorage:
             if g.family != CacheGroupFamily.STATE
             and g.window_resident_block_count is None
         }
-        namespace = os.urandom(32) if namespace is None else namespace
-        identity = namespace.encode() if isinstance(namespace, str) else namespace
-        self.namespace = hashlib.sha256(
-            hashlib.sha256(identity).digest() + format_id
-        ).digest()
 
     def _keys(self, tokens):
         encoded, width = np.asarray(tokens, dtype="<u4").tobytes(), self.alignment * 4
-        digest, keys = hashlib.sha256(self.namespace), []
+        digest, keys = hashlib.sha256(), []
         for start in range(0, len(encoded) - width + 1, width):
             digest.update(encoded[start : start + width])
             keys.append(digest.digest())

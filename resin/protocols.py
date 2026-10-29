@@ -124,9 +124,7 @@ class ManagedRunner(Runner, Protocol):
 
 
 class CacheExporter(Protocol):
-    """Versioned, zero-copy live restore views; empty groups export no blocks."""
-
-    cache_storage_format: bytes
+    """Zero-copy live restore views; empty groups export no blocks."""
 
     def cache_storage_buffers(
         self,

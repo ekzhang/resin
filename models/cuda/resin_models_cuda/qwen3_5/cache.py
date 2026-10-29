@@ -311,9 +311,6 @@ class CacheArena(GraphPageTableArena):
         if kv_dtype.itemsize != geometry.kv_element_bytes:
             raise ValueError("Qwen3.5 KV dtype does not match its cache geometry")
         self.kv_dtype = kv_dtype
-        self.cache_storage_format = repr(
-            ("qwen35-live-v1", geometry, str(kv_dtype))
-        ).encode()
         self.binding = CachePoolBinding(layout, resource="Qwen3.5 cache")
         physical = layout.parent_capacity + 1
         self.storage = torch.zeros(

@@ -12,7 +12,7 @@ from resin import CacheGroupLayout, CacheLayout, Engine, SamplingParams
 from resin.cache_storage import MemoryCacheStorage
 
 
-def make_engine(store, fill=0, limit=2, format_id=b"fixture-v1"):
+def make_engine(store, fill=0, limit=2):
     runner = RecordingCachedRunner(
         CacheLayout(parent_capacity=32, groups=[CacheGroupLayout(2)])
     )
@@ -24,10 +24,7 @@ def make_engine(store, fill=0, limit=2, format_id=b"fixture-v1"):
         )
 
     setattr(runner, "cache_storage_buffers", buffers)
-    setattr(runner, "cache_storage_format", format_id)
-    options: dict[str, Any] = dict(
-        prefix_cache=True, prefix_cache_namespace="m", prefix_cache_max_inflight=limit
-    )
+    options: dict[str, Any] = dict(prefix_cache=True, prefix_cache_max_inflight=limit)
     engine = Engine(runner, prefix_cache_storage=store, **options)
     return engine, runner, arena
 
@@ -46,11 +43,9 @@ def test_memory_bytes_capacity_and_scatter_gather():
         assert sum(store.lookup((b"a", b"b", b"c")).result()) <= 2
     assert not store.load((key,), ({"different": target},)).result()
     store.close()
-    store = MemoryCacheStorage()
-    for format_id, cached in ((b"a", 0), (b"a", 2), (b"b", 0)):
-        engine, _, arena = make_engine(
-            store, 73 if not cached else 0, format_id=format_id
-        )
+    store, other = MemoryCacheStorage(), MemoryCacheStorage()
+    for provider, cached in ((store, 0), (store, 2), (other, 0)):
+        engine, _, arena = make_engine(provider, 73 if not cached else 0)
         with engine:
             request = engine.submit(
                 [1, 2, 3], sampling_params=SamplingParams(max_output_tokens=2)
@@ -61,6 +56,7 @@ def test_memory_bytes_capacity_and_scatter_gather():
             assert request.cached_tokens == cached
             assert not cached or bool((arena == 73).any())
     store.close()
+    other.close()
 
 
 @pytest.mark.parametrize("limit", [1, 4])
@@ -73,23 +69,16 @@ def test_storage_inflight_limit(limit):
     def empty(*args, **kwargs):
         return ()
 
-    for missing in ("hook", "implementation", "format"):
+    for missing in ("hook", "implementation"):
         unsupported = RecordingCachedRunner(
             CacheLayout(parent_capacity=8, groups=[CacheGroupLayout(2)])
         )
-        if missing != "format":
-            setattr(unsupported, "cache_storage_format", b"fixture-v1")
         if missing != "hook":
-            setattr(
-                unsupported,
-                "cache_storage_buffers",
-                unavailable if missing == "implementation" else empty,
-            )
+            setattr(unsupported, "cache_storage_buffers", unavailable)
         with pytest.raises(NotImplementedError, match="cache_storage"):
             Engine(unsupported, prefix_cache=True, prefix_cache_storage=store)
         assert unsupported.bindings == []
         setattr(unsupported, "cache_storage_buffers", empty)
-        setattr(unsupported, "cache_storage_format", b"fixture-v1")
         Engine(unsupported, prefix_cache=True, prefix_cache_storage=store).close()
 
     def lookup(keys):

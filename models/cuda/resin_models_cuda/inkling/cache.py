@@ -134,8 +134,6 @@ class CacheArena(GraphPageTableArena):
 
     graph_label = "Inkling"
 
-    cache_storage_format = b"inkling-live-v1/bf16/7-35-6/8x128/42x3x10240"
-
     def __init__(self, device: Any, layout: CacheLayout) -> None:
         self.device = device
         self.layout = layout

@@ -106,17 +106,6 @@ class PagedKvArena:
         self.capacity = layout.parent_capacity
         self.layout = layout
         self.page_size = page_size
-        self.cache_storage_format = repr(
-            (
-                "paged-kv-live-v1",
-                layer_count,
-                page_size,
-                num_kv_heads,
-                head_dim,
-                str(dtype),
-                tuple(g.read_window_tokens for g in layout.groups),
-            )
-        ).encode()
         self.binding = CachePoolBinding(layout, resource=resource)
         shape = (2, layer_count, self.capacity + 1, page_size, num_kv_heads, head_dim)
         self.storage = torch.zeros(shape, dtype=dtype, device=device)

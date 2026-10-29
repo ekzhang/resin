@@ -305,15 +305,6 @@ class CacheArena(GraphPageTableArena):
 
     def __init__(self, device, layout, geometry, *, dtype):
         self.device, self.layout, self.geometry = device, layout, geometry
-        self.cache_storage_format = repr(
-            (
-                "deepseek-v41-live-v1",
-                geometry.attention_layers,
-                geometry.kv_sources,
-                tuple(geometry.ratios[i] for i in geometry.kv_sources),
-                geometry.window_size,
-            )
-        ).encode()
         self.binding = CachePoolBinding(layout, resource="DeepSeek-V4.1 KV")
         self.storage = torch.empty(
             (
