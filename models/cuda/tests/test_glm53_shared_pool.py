@@ -61,7 +61,7 @@ def test_glm_decode_uses_one_pool_without_changing_graph_catalog(
         device="cpu",
         max_seq_len=131236,
         max_batch_size=maximum,
-        speculative_tokens=drafts,
+        speculative_draft_tokens=drafts,
         cuda_graph_decode_shapes=catalog,
     )
     mode = getattr(runner, "observed_modes")["decode"]

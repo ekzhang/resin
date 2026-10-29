@@ -7,7 +7,6 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from resin.backend.cuda.completion import accepted_block
 from resin.backend.cuda.slab import DevicePageGroup
 from resin_models_cuda.glm5_3_flash import kernels
 from resin_models_cuda.glm5_3_flash.attention import rms_norm
@@ -136,7 +135,7 @@ def test_speculation_verifies_once_and_repairs_first_middle_all_acceptance():
         sampling_calls.append(logits.shape)
         return logits.argmax(-1)
 
-    output, logits = speculative_step(
+    acceptance, logits = speculative_step(
         model,
         cache,
         torch.tensor([1, 8, 16]),
@@ -145,7 +144,11 @@ def test_speculation_verifies_once_and_repairs_first_middle_all_acceptance():
         sample,
         projection_rows=64,
     )
-    tokens, counts, feedback = accepted_block(output, positions, 3)
+    tokens, counts, feedback = (
+        acceptance.tokens,
+        acceptance.counts,
+        acceptance.feedback(),
+    )
     assert len(model.target_calls) == 1
     assert model.target_calls[0].tolist() == [1, 2, 3, 4, 8, 9, 10, 11, 16, 17, 18, 19]
     assert logits.shape == (3, 4, 32)
@@ -176,7 +179,7 @@ def test_speculation_verifies_once_and_repairs_first_middle_all_acceptance():
 def test_fixed_acceptance_is_runtime_data_and_commits_matching_state(depth):
     model, cache = _ToyModel(), _ToyCache()
     positions = torch.tensor([3, 6, 10])
-    speculative_step(
+    acceptance, _ = speculative_step(
         model,
         cache,
         torch.tensor([1, 8, 16]),
@@ -190,6 +193,8 @@ def test_fixed_acceptance_is_runtime_data_and_commits_matching_state(depth):
         torch.tensor([1, 2, 4]) if depth < 0 else torch.full((3,), depth + 1)
     )
     torch.testing.assert_close(cache.committed_lengths, positions + expected_counts)
+    torch.testing.assert_close(acceptance.counts.long(), expected_counts)
+    torch.testing.assert_close(acceptance.feedback().positions, cache.committed_lengths)
 
 
 def test_empty_mtp_priming_still_joins_expert_collective():

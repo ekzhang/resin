@@ -146,6 +146,8 @@ class TestSamplingContract:
 
     def test_verified_block_advances_sampling_offset_per_committed_token(self) -> None:
         class BlockRunner:
+            runner_config = resin.RunnerConfig(max_accepted_per_step=3)
+
             def __init__(self) -> None:
                 self.plans = []
 

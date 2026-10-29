@@ -14,6 +14,45 @@ from resin_models_cuda.paged_kv import append_slab_kv
 append_kv = append_slab_kv
 
 
+def _mtp_jit_args(head_dim: int, kv_dtype: torch.dtype) -> list[Any]:
+    """Exclude physical slot zero in the MTP group's shifted storage.
+
+    FlashInfer's paged CSR describes whole pages. A static logits mask preserves
+    the logical history without a request-sized custom-mask allocation.
+    """
+    declaration = r"""
+struct QwenMtpAttention : flashinfer::AttentionVariantBase {
+  float sm_scale_log2;
+  uint32_t qo_len, kv_len, window_left;
+  template <typename Params>
+  __device__ __host__ QwenMtpAttention(const Params& params, uint32_t batch, uint8_t*) {
+    qo_len = params.get_qo_len(batch);
+    kv_len = params.get_kv_len(batch);
+    window_left = kv_len;
+    sm_scale_log2 = flashinfer::math::log2e * SCALE;
+  }
+  REGISTER_LOGITS_MASK(params, batch_idx, qo_idx, kv_idx, qo_head_idx, kv_head_idx, {
+    return kv_idx > 0;
+  })
+};
+""".replace("SCALE", repr(head_dim**-0.5))
+    return [
+        f"resin_qwen_mtp_origin1_{head_dim}_{str(kv_dtype).replace('torch.', '')}",
+        torch.bfloat16,
+        kv_dtype,
+        torch.bfloat16,
+        torch.int32,
+        head_dim,
+        head_dim,
+        [],
+        [],
+        [],
+        [],
+        "QwenMtpAttention",
+        declaration,
+    ]
+
+
 def _plan_wrapper(
     wrapper,
     tokens: int,
@@ -91,6 +130,7 @@ class PagedAttentionRuntime:
         self.prefill = BatchPrefillWithPagedKVCacheWrapper(
             self.workspace, "NHD", backend="auto"
         )
+        self._mtp_wrappers: dict[torch.dtype, tuple[Any, Any]] = {}
         self.decode = BatchDecodeWithPagedKVCacheWrapper(
             self.workspace,
             "NHD",
@@ -141,7 +181,36 @@ class PagedAttentionRuntime:
             "o_data_type": torch.bfloat16,
             "sm_scale": softmax_scale,
         }
-        wrapper = self.decode if tokens == 1 else self.prefill
+        if group_index == 2:
+            if bool(torch.any(group.first_blocks != 0)):
+                raise ValueError("shifted Qwen MTP history must retain its first page")
+            wrappers = self._mtp_wrappers.get(cache.keys.dtype)
+            if wrappers is None:
+                from flashinfer import (
+                    BatchDecodeWithPagedKVCacheWrapper,
+                    BatchPrefillWithPagedKVCacheWrapper,
+                )
+
+                custom = _mtp_jit_args(self.head_dim, cache.keys.dtype)
+                wrappers = (
+                    BatchDecodeWithPagedKVCacheWrapper(
+                        self.workspace,
+                        "NHD",
+                        use_tensor_cores=True,
+                        backend="fa2",
+                        jit_args=custom,
+                    ),
+                    BatchPrefillWithPagedKVCacheWrapper(
+                        self.workspace,
+                        "NHD",
+                        backend="fa2",
+                        jit_args=custom,
+                    ),
+                )
+                self._mtp_wrappers[cache.keys.dtype] = wrappers
+            wrapper = wrappers[0 if tokens == 1 else 1]
+        else:
+            wrapper = self.decode if tokens == 1 else self.prefill
         _plan_wrapper(
             wrapper,
             tokens,
@@ -172,6 +241,7 @@ class GraphAttentionSpec:
     layer_count: int
     tokens: int
     sequence_offset: int
+    storage_origin: int = 0
 
 
 @dataclass(slots=True)
@@ -224,7 +294,10 @@ class GraphPagedAttentionRuntime:
             ):
                 raise ValueError("invalid Qwen3.5 graph attention geometry")
             group = cache.groups[spec.group_index]
-            initial_pages = (spec.tokens + cache.page_tokens - 1) // cache.page_tokens
+            initial_tokens = spec.tokens + spec.storage_origin
+            initial_pages = (
+                initial_tokens + cache.page_tokens - 1
+            ) // cache.page_tokens
             if initial_pages > group.slab_ids.shape[1]:
                 raise ValueError(
                     "Qwen3.5 graph attention queries exceed its page capacity"
@@ -252,7 +325,7 @@ class GraphPagedAttentionRuntime:
             )
             initial_last = torch.full(
                 (batch_size,),
-                (spec.tokens - 1) % cache.page_tokens + 1,
+                (initial_tokens - 1) % cache.page_tokens + 1,
                 dtype=torch.int32,
                 device=device,
             )
@@ -266,6 +339,9 @@ class GraphPagedAttentionRuntime:
                     paged_kv_indices_buffer=physical_pages,
                     paged_kv_last_page_len_buffer=last,
                     backend="fa2",
+                    jit_args=_mtp_jit_args(head_dim, cache.keys.dtype)
+                    if spec.storage_origin
+                    else None,
                 )
             else:
                 qo_indptr = torch.empty(
@@ -280,6 +356,9 @@ class GraphPagedAttentionRuntime:
                     paged_kv_indices_buf=physical_pages,
                     paged_kv_last_page_len_buf=last,
                     backend="fa2",
+                    jit_args=_mtp_jit_args(head_dim, cache.keys.dtype)
+                    if spec.storage_origin
+                    else None,
                 )
             _plan_wrapper(
                 wrapper,
@@ -334,8 +413,8 @@ class GraphPagedAttentionRuntime:
                 call.last_page_lengths,
                 call.prepared.base_pages,
                 page=self.cache.page_tokens,
-                tokens=spec.tokens,
-                offset=spec.sequence_offset,
+                tokens=spec.tokens + spec.storage_origin,
+                offset=spec.sequence_offset + spec.storage_origin,
                 slab_units=self.cache.slab_units,
                 layers=spec.layer_count,
             )
@@ -390,7 +469,9 @@ class GraphPagedAttentionRuntime:
             spec = call.spec
             group = cache_plan.groups[spec.group_index]
             graph_width = self.cache.groups[spec.group_index].slab_ids.shape[1]
-            lengths = positions + spec.sequence_offset
+            if spec.storage_origin and np.any(group.block_table_start_indices != 0):
+                raise ValueError("shifted Qwen MTP history must retain its first page")
+            lengths = positions + spec.sequence_offset + spec.storage_origin
             used = (
                 lengths
                 - group.block_table_start_indices.astype(np.int64)

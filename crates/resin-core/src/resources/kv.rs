@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::fmt;
 use std::num::NonZeroU32;
 
@@ -8,7 +9,8 @@ pub const MAX_KERNEL_VALUE: u32 = i32::MAX as u32;
 pub enum KvGroupFamily {
     /// Token-addressed attention or rolling model state.
     History,
-    /// A page-aligned recurrent checkpoint ring.
+    /// A private, position-independent live state slot with optional immutable
+    /// prefix snapshots at the declared checkpoint cadence.
     State,
 }
 
@@ -140,7 +142,7 @@ impl KvGroupLayout {
         self.family
     }
 
-    /// Whether this group stores a page-aligned recurrent-state snapshot.
+    /// Whether this group stores position-independent live recurrent state.
     pub const fn is_recurrent(self) -> bool {
         matches!(self.family, KvGroupFamily::State)
     }
@@ -157,13 +159,13 @@ impl KvGroupLayout {
     }
 
     pub(crate) fn active_blocks(self, context: u32) -> (u32, u32) {
+        if self.is_recurrent() {
+            return (0, u32::from(context > 0));
+        }
         let total = context.div_ceil(self.block_tokens.get());
-        let count = if self.is_recurrent() {
-            total.min(2)
-        } else {
-            self.window_resident_blocks()
-                .map_or(total, |maximum| total.min(maximum.get()))
-        };
+        let count = self
+            .window_resident_blocks()
+            .map_or(total, |maximum| total.min(maximum.get()));
         (total - count, count)
     }
 }
@@ -171,9 +173,27 @@ impl KvGroupLayout {
 /// Frozen geometry for every cache group sharing one parent pool.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct KvLayout {
+    /// Number of physical slabs shared by all groups.
     parent_capacity: NonZeroU32,
+
+    /// Ordered cache geometry; each group can pack a different number of blocks
+    /// into one slab.
     groups: Box<[KvGroupLayout]>,
+
+    /// Final prompt tokens that must be rebuilt after a prefix hit. Also known
+    /// as "SWA Bounded Replay" for DeepSeekV4.1-Flash.
+    ///
+    /// Models must not read omitted prefix state before rebuilding this suffix;
+    /// snapshots may retain those opaque bytes without making them valid.
     replay_suffix_tokens: u32,
+
+    /// Additional persistent writes beyond the maximum accepted output count.
+    /// Usually 0 or 1.
+    ///
+    /// For example, Qwen3.5 and GLM-5.3-Flash repair the draft cache after
+    /// verifying target tokens, generating an extra draft for the next step as
+    /// a side-effect.
+    decode_write_extra_tokens: u32,
 }
 
 impl KvLayout {
@@ -221,12 +241,10 @@ impl KvLayout {
             parent_capacity,
             groups: groups.into_boxed_slice(),
             replay_suffix_tokens: 0,
+            decode_write_extra_tokens: 0,
         })
     }
 
-    /// Require rebuilding this many final prompt tokens after a prefix hit.
-    /// Models must not read omitted prefix state before rebuilding this suffix;
-    /// snapshots may retain those opaque bytes without making them valid inputs.
     pub fn with_replay_suffix_tokens(mut self, tokens: u32) -> Self {
         self.replay_suffix_tokens = tokens;
         self
@@ -234,6 +252,15 @@ impl KvLayout {
 
     pub const fn replay_suffix_tokens(&self) -> u32 {
         self.replay_suffix_tokens
+    }
+
+    pub fn with_decode_write_extra_tokens(mut self, tokens: u32) -> Self {
+        self.decode_write_extra_tokens = tokens;
+        self
+    }
+
+    pub const fn decode_write_extra_tokens(&self) -> u32 {
+        self.decode_write_extra_tokens
     }
 
     pub const fn parent_capacity(&self) -> NonZeroU32 {
@@ -338,6 +365,38 @@ impl std::error::Error for KvLayoutError {}
 
 /// Executor-facing block table and append locations for one cache group.
 #[derive(Clone, Debug, Eq, PartialEq, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
+pub struct StateCopy {
+    pub row: u32,
+    pub source_slab_id: u32,
+    pub source_slotnum: u32,
+    pub destination_slab_id: u32,
+    pub destination_slotnum: u32,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
+pub struct StateCheckpointSlot {
+    pub reservation_id: u64,
+    pub row: u32,
+    pub prefix_length: u32,
+    pub destination_slab_id: u32,
+    pub destination_slotnum: u32,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
+pub struct StatePlan {
+    pub live_slab_ids: Vec<u32>,
+    pub live_slotnums: Vec<u32>,
+    pub restore_copies: Vec<StateCopy>,
+    pub checkpoint_slots: Vec<StateCheckpointSlot>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct StateCheckpoint {
+    pub reservation_id: u64,
+    pub prefix_length: u32,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
 pub struct KvGroupPlan {
     pub group_index: u32,
     pub blocks_per_slab: u32,
@@ -348,6 +407,7 @@ pub struct KvGroupPlan {
     pub append_slab_ids: Vec<u32>,
     pub append_slotnums: Vec<u32>,
     pub append_block_offsets: Vec<u32>,
+    pub state: Option<StatePlan>,
 }
 
 impl KvGroupPlan {
@@ -374,6 +434,7 @@ impl KvGroupPlan {
             append_slab_ids,
             append_slotnums,
             append_block_offsets,
+            state: None,
         };
         plan.validate()?;
         Ok(plan)
@@ -428,6 +489,101 @@ impl KvGroupPlan {
                 .any(|(&slab, &slotnum)| slab == 0 || slotnum >= self.blocks_per_slab)
         {
             return Err(KvPlanError("append physical addresses are malformed"));
+        }
+        if let Some(state) = &self.state {
+            let rows = self.block_table_start_indices.len();
+            if state.live_slab_ids.len() != rows || state.live_slotnums.len() != rows {
+                return Err(KvPlanError("live state addresses must cover every row"));
+            }
+            if state
+                .live_slab_ids
+                .iter()
+                .zip(&state.live_slotnums)
+                .any(|(&slab, &slot)| slab == 0 || slot >= self.blocks_per_slab)
+                || state.restore_copies.iter().any(|copy| {
+                    copy.row as usize >= rows
+                        || copy.source_slotnum >= self.blocks_per_slab
+                        || copy.destination_slab_id == 0
+                        || copy.destination_slotnum >= self.blocks_per_slab
+                })
+                || state.checkpoint_slots.iter().any(|slot| {
+                    slot.row as usize >= rows
+                        || slot.reservation_id == 0
+                        || slot.prefix_length == 0
+                        || slot.destination_slab_id == 0
+                        || slot.destination_slotnum >= self.blocks_per_slab
+                })
+            {
+                return Err(KvPlanError("state copy or checkpoint address is malformed"));
+            }
+            let live: HashSet<_> = state
+                .live_slab_ids
+                .iter()
+                .copied()
+                .zip(state.live_slotnums.iter().copied())
+                .collect();
+            if live.len() != rows
+                || self.block_slab_ids != state.live_slab_ids
+                || self.block_slotnums != state.live_slotnums
+                || self
+                    .block_indptr
+                    .iter()
+                    .enumerate()
+                    .any(|(row, &offset)| offset as usize != row)
+                || self
+                    .block_table_start_indices
+                    .iter()
+                    .any(|&first| first != 0)
+                || self
+                    .append_slab_ids
+                    .iter()
+                    .copied()
+                    .zip(self.append_slotnums.iter().copied())
+                    .any(|address| !live.contains(&address))
+                || self.append_block_offsets.iter().any(|&offset| offset != 0)
+            {
+                return Err(KvPlanError(
+                    "state tables must address distinct private live slots",
+                ));
+            }
+            let mut restored = HashSet::new();
+            for copy in &state.restore_copies {
+                let source = (copy.source_slab_id, copy.source_slotnum);
+                let destination = (copy.destination_slab_id, copy.destination_slotnum);
+                if !restored.insert(copy.row)
+                    || (copy.source_slab_id == 0 && copy.source_slotnum != 0)
+                    || live.contains(&source)
+                    || destination
+                        != (
+                            state.live_slab_ids[copy.row as usize],
+                            state.live_slotnums[copy.row as usize],
+                        )
+                {
+                    return Err(KvPlanError(
+                        "state restores must initialize each live row at most once",
+                    ));
+                }
+            }
+            let mut ids = HashSet::new();
+            let mut destinations = HashSet::new();
+            let mut counts = vec![0; rows];
+            for slot in &state.checkpoint_slots {
+                let destination = (slot.destination_slab_id, slot.destination_slotnum);
+                counts[slot.row as usize] += 1;
+                if !ids.insert(slot.reservation_id)
+                    || !destinations.insert(destination)
+                    || live.contains(&destination)
+                    || state
+                        .restore_copies
+                        .iter()
+                        .any(|copy| destination == (copy.source_slab_id, copy.source_slotnum))
+                    || counts[slot.row as usize] > 2
+                {
+                    return Err(KvPlanError(
+                        "state checkpoints must use separate bounded destinations",
+                    ));
+                }
+            }
         }
         Ok(())
     }
@@ -486,6 +642,10 @@ mod tests {
         assert_eq!(replay.replay_suffix_tokens(), 140);
         assert_eq!(replay.clone(), replay);
         assert_ne!(layout, replay);
+        let shifted = layout.clone().with_decode_write_extra_tokens(1);
+        assert_eq!(layout.decode_write_extra_tokens(), 0);
+        assert_eq!(shifted.decode_write_extra_tokens(), 1);
+        assert_ne!(layout, shifted);
     }
 
     #[test]
@@ -519,14 +679,11 @@ mod tests {
         let layout = KvLayout::new(1, vec![full(4, 2), window, state]).unwrap();
         assert_eq!(layout.estimated_parent_count(&[]).unwrap(), 0);
         assert_eq!(layout.estimated_parent_count(&[0, 0]).unwrap(), 0);
-        // 9 full blocks / 2 + 6 window blocks / 4 + 5 state blocks / 2,
+        // 9 full blocks / 2 + 6 window blocks / 4 + 4 private state slots / 2,
         // rounding each group up after summing across requests.
-        assert_eq!(
-            layout.estimated_parent_count(&[0, 1, 4, 5, 17]).unwrap(),
-            10
-        );
+        assert_eq!(layout.estimated_parent_count(&[0, 1, 4, 5, 17]).unwrap(), 9);
         assert_eq!(window.active_blocks(17), (3, 2));
-        assert_eq!(state.active_blocks(17), (1, 2));
+        assert_eq!(state.active_blocks(17), (0, 1));
         let large = KvLayout::new(1, vec![full(1, 1)]).unwrap();
         assert_eq!(
             large.estimated_parent_count(&[u32::MAX, u32::MAX]).unwrap(),
@@ -549,14 +706,15 @@ mod tests {
                 .unwrap();
         let layout = KvLayout::new(1, vec![full(4, 2), window, state]).unwrap();
         // Shared 16-token history plus two private blocks per request: five
-        // parents. Window and recurrent state each reserve three more.
+        // parents. Window reserves three more; three private live states pack
+        // into two parents independently of shared prefix length.
         assert_eq!(
             layout
                 .estimated_parent_count_with_shared_prefix(&[24; 3], 16)
                 .unwrap(),
-            11
+            10
         );
-        assert_eq!(layout.estimated_parent_count(&[24; 3]).unwrap(), 15);
+        assert_eq!(layout.estimated_parent_count(&[24; 3]).unwrap(), 14);
         assert!(
             layout
                 .estimated_parent_count_with_shared_prefix(&[24; 3], 15)
@@ -624,5 +782,64 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn state_plan_validates_private_live_restore_and_snapshot_destinations() {
+        let mut plan = KvGroupPlan::new(
+            0,
+            vec![0, 1],
+            vec![7],
+            vec![0],
+            vec![0],
+            vec![7],
+            vec![0],
+            vec![0],
+            NonZeroU32::new(1).unwrap(),
+        )
+        .unwrap();
+        plan.state = Some(StatePlan {
+            live_slab_ids: vec![7],
+            live_slotnums: vec![0],
+            restore_copies: vec![StateCopy {
+                row: 0,
+                source_slab_id: 0,
+                source_slotnum: 0,
+                destination_slab_id: 7,
+                destination_slotnum: 0,
+            }],
+            checkpoint_slots: vec![StateCheckpointSlot {
+                reservation_id: 1,
+                row: 0,
+                prefix_length: 128,
+                destination_slab_id: 8,
+                destination_slotnum: 0,
+            }],
+        });
+        plan.validate().unwrap();
+        let corrupt: [fn(&mut KvGroupPlan); 9] = [
+            |plan| plan.append_slab_ids[0] = 8,
+            |plan| plan.append_block_offsets[0] = 1,
+            |plan| plan.block_table_start_indices[0] = 1,
+            |plan| plan.state.as_mut().unwrap().live_slab_ids[0] = 8,
+            |plan| plan.state.as_mut().unwrap().restore_copies[0].destination_slab_id = 8,
+            |plan| plan.state.as_mut().unwrap().restore_copies[0].source_slab_id = 7,
+            |plan| {
+                let state = plan.state.as_mut().unwrap();
+                state.restore_copies.push(state.restore_copies[0].clone());
+            },
+            |plan| plan.state.as_mut().unwrap().checkpoint_slots[0].destination_slab_id = 7,
+            |plan| {
+                let state = plan.state.as_mut().unwrap();
+                state
+                    .checkpoint_slots
+                    .push(state.checkpoint_slots[0].clone());
+            },
+        ];
+        for mutate in corrupt {
+            let mut malformed = plan.clone();
+            mutate(&mut malformed);
+            assert!(malformed.validate().is_err());
+        }
     }
 }

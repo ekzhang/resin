@@ -383,15 +383,15 @@ def _distributed_process(rank, world_size, rendezvous, directory):
         )
     with pytest.raises(DistributedExecutionError, match="configurations must agree"):
         DistributedWorker(divergent, groups)
-    for lookaheads in ((0, 2), (2, 5)):
+    for max_accepted in ((1, 3), (3, 6)):
         divergent = CollectiveRunner(groups, "normal")
         divergent.runner_config = RunnerConfig(
             cache_layout=CacheLayout(parent_capacity=64, groups=[CacheGroupLayout(2)]),
-            cache_write_lookahead_tokens=lookaheads[
+            max_accepted_per_step=max_accepted[
                 groups.topology.coordinates(rank)[0]
             ],
         )
-        with pytest.raises(DistributedExecutionError, match="lookahead must agree"):
+        with pytest.raises(DistributedExecutionError, match="max_accepted_per_step must agree"):
             DistributedWorker(divergent, groups)
         assert divergent.calls == []
 
@@ -406,7 +406,7 @@ def _distributed_process(rank, world_size, rendezvous, directory):
         max_batch_tokens=4 + replica,
         prefill_chunk_size=2 + replica,
         continuation_prefill=bool(replica),
-        cache_write_lookahead_tokens=2,
+        max_accepted_per_step=3,
     )
     DistributedWorker(independent, groups)
     records = {}

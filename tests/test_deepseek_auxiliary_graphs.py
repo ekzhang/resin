@@ -38,7 +38,7 @@ def _compressor(ratio):
 
 def _configured(monkeypatch):
     runner: Any = _runner()
-    runner.prefill_chunk_size, runner.speculative_tokens = 1024, 3
+    runner.prefill_chunk_size, runner.speculative_draft_tokens = 1024, 3
     runner._prefill_compute_context = nullcontext
     c1, c2 = _compressor(1), _compressor(2)
     indexer = SimpleNamespace(

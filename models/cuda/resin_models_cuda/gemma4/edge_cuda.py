@@ -11,7 +11,11 @@ import torch
 from torch import Tensor
 
 from resin import BatchPhase
-from resin.backend.cuda.completion import DeviceCompletion, accepted_block
+from resin.backend.cuda.completion import (
+    CudaContinuation,
+    DeviceAcceptance,
+    DeviceCompletion,
+)
 from resin.backend.cuda.failures import GraphInputError
 from resin.backend.cuda.metrics import observe_execution
 from resin.backend.cuda.runner import pad_sampling_inputs
@@ -73,13 +77,20 @@ class _EdgeHiddenPool:
 class _EdgeDeviceFeedback:
     """Owned accepted inputs plus target-hidden state for one continuation."""
 
-    __slots__ = ("_base", "hidden_lease", "sequence_ids", "shape")
+    __slots__ = ("_base", "hidden_lease", "continuation")
 
-    def __init__(self, base, hidden_lease, sequence_ids, shape):
+    def __init__(self, base, hidden_lease, continuation):
         self._base = base
         self.hidden_lease = hidden_lease
-        self.sequence_ids = tuple(sequence_ids)
-        self.shape = shape
+        self.continuation = continuation
+
+    @property
+    def sequence_ids(self):
+        return self.continuation.sequence_ids
+
+    @property
+    def shape(self):
+        return self.continuation.shape
 
     @property
     def target_hidden(self):
@@ -125,15 +136,11 @@ class Gemma4EdgeCudaRunner(Gemma4CudaRunner):
         *,
         compact_prefill: bool = True,
         cross_page_overlap: bool = True,
-        cache_write_reservation_tokens: int = 72,
         **kwargs,
     ) -> None:
+        self._continuation = CudaContinuation()
+        self._edge_graph_inputs = {}
         self.cross_page_overlap = cross_page_overlap
-        self._cache_write_reservation_tokens = (
-            cache_write_reservation_tokens
-            if cross_page_overlap and kwargs.get("speculative_tokens", 0)
-            else 0
-        )
         self.compact_prefill = compact_prefill
         self._compact_prefill_state = None
         groups = kwargs.get("parallel_groups")
@@ -143,7 +150,7 @@ class Gemma4EdgeCudaRunner(Gemma4CudaRunner):
         if str(model) == DEFAULT_MODEL:
             kwargs.setdefault("revision", DEFAULT_REVISION)
         if (
-            kwargs.get("speculative_tokens", 0)
+            kwargs.get("speculative_draft_tokens", 0)
             and kwargs.get("assistant_model") is None
         ):
             if str(model) != DEFAULT_MODEL:
@@ -401,7 +408,7 @@ class Gemma4EdgeCudaRunner(Gemma4CudaRunner):
     def _wide_graph(self, shape):
         return (
             getattr(self, "cross_page_overlap", False)
-            and bool(self.speculative_tokens)
+            and bool(self.speculative_draft_tokens)
             and shape[0] >= 32
         )
 
@@ -426,7 +433,7 @@ class Gemma4EdgeCudaRunner(Gemma4CudaRunner):
         CudaGraphStep before replay. The plan-object identity invalidates this
         cache if another owner explicitly re-plans the same wrapper.
         """
-        if self.speculative_tokens:
+        if self.speculative_draft_tokens:
             wrappers = self._graph_spec_attention[shape]
             stages = (
                 ("assistant_", wrappers[:2], None),
@@ -538,7 +545,7 @@ class Gemma4EdgeCudaRunner(Gemma4CudaRunner):
 
         return UniformCausalPagedVerifyWrapper(
             *args,
-            query_width=self.speculative_tokens + 1,
+            query_width=self.speculative_draft_tokens + 1,
             split_kv=not self._wide_graph(
                 (len(kwargs["paged_kv_last_page_len_buf"]), 0)
             ),
@@ -583,21 +590,17 @@ class Gemma4EdgeCudaRunner(Gemma4CudaRunner):
                     device=self.device,
                 )
 
-            if not hasattr(self, "_edge_reserved_graph_inputs"):
-                self._edge_reserved_graph_inputs = {}
-            self._edge_reserved_graph_inputs[shape] = step.inputs
-
             def launch_reserved():
                 update_reserved_paged_metadata(
                     step.inputs,
-                    query_width=self.speculative_tokens + 1,
+                    query_width=self.speculative_draft_tokens + 1,
                     sliding_window=self.sliding_window,
                 )
                 step.launch()
 
             return replace(step, launch=launch_reserved)
         columns = torch.arange(
-            self.speculative_tokens + 1,
+            self.speculative_draft_tokens + 1,
             dtype=torch.int64,
             device=self.device,
         )[None, :]
@@ -608,9 +611,9 @@ class Gemma4EdgeCudaRunner(Gemma4CudaRunner):
             # CSR counts are invariant under Engine's two-step block guard.
             positions = step.inputs["positions"]
             assistant_last = ((positions - 1) % PAGE_SIZE + 1).to(torch.int32)
-            verify_last = ((positions + self.speculative_tokens) % PAGE_SIZE + 1).to(
-                torch.int32
-            )
+            verify_last = (
+                (positions + self.speculative_draft_tokens) % PAGE_SIZE + 1
+            ).to(torch.int32)
             offsets = ((positions[:, None] + columns) % PAGE_SIZE).reshape(-1)
             for kind in ("local", "global"):
                 step.inputs[f"assistant_{kind}_last_page_lengths"].copy_(assistant_last)
@@ -622,6 +625,19 @@ class Gemma4EdgeCudaRunner(Gemma4CudaRunner):
             step.launch()
 
         return replace(step, launch=launch)
+
+    def _new_decode_graph_step(self, shape):
+        step = super()._new_decode_graph_step(shape)
+        self._edge_graph_inputs[shape] = step.inputs
+        return step
+
+    def release(self, request_ids):
+        self._continuation.drain()
+        super().release(request_ids)
+
+    def forward(self, plan):
+        self._continuation.drain()
+        return super().forward(plan)
 
     def _speculative_graph_forward(self, native, batch):
         if self.cross_page_overlap:
@@ -635,7 +651,7 @@ class Gemma4EdgeCudaRunner(Gemma4CudaRunner):
             return None
         sequence_ids = tuple(map(int, native.sequence_ids))
         if (
-            self.speculative_tokens
+            self.speculative_draft_tokens
             and feedback is None
             and any(sequence not in self._target_hidden for sequence in sequence_ids)
         ):
@@ -656,14 +672,11 @@ class Gemma4EdgeCudaRunner(Gemma4CudaRunner):
             return None
         graph_rows, graph_history_width = shape
         padding = graph_rows - rows
-        width = self.speculative_tokens + 1
+        width = self.speculative_draft_tokens + 1
         if feedback is not None:
             if not isinstance(feedback, _EdgeDeviceFeedback):
                 raise GraphInputError("Gemma continuation requires owned Edge feedback")
-            if feedback.sequence_ids != sequence_ids or feedback.shape != shape:
-                raise GraphInputError(
-                    "Gemma continuation changed its row or graph ownership"
-                )
+            self._continuation.resume(sequence_ids, feedback.continuation, shape=shape)
             host = np.asarray(batch.positions)
             if not self._wide_graph(shape) and np.any(
                 (host - width) // PAGE_SIZE != (host + width - 1) // PAGE_SIZE
@@ -675,13 +688,14 @@ class Gemma4EdgeCudaRunner(Gemma4CudaRunner):
             "token_ids": np.pad(batch.token_ids, (0, padding)),
             "positions": np.pad(batch.positions, (0, padding), constant_values=1),
         }
-        if self.speculative_tokens:
+        if self.speculative_draft_tokens:
             context = gemma4_assistant_context(
                 batch, local_window_tokens=self.sliding_window
             )
+            fixed = self._speculation.validated_benchmark_accepted_drafts
             verify = expand_gemma4_decode_batch(
                 batch,
-                np.zeros((rows, self.speculative_tokens), dtype=np.int64),
+                np.zeros((rows, self.speculative_draft_tokens), dtype=np.int64),
             )
             if feedback is None:
                 hidden = self._gather_target_hidden(sequence_ids, graph_rows)
@@ -689,6 +703,7 @@ class Gemma4EdgeCudaRunner(Gemma4CudaRunner):
                 hidden = feedback.target_hidden
             inputs.update(
                 target_hidden=hidden,
+                fixed_acceptance=-1 if fixed is None else fixed,
                 verify_qo_indptr=np.arange(
                     0, (graph_rows + 1) * width, width, dtype=np.int32
                 ),
@@ -750,18 +765,23 @@ class Gemma4EdgeCudaRunner(Gemma4CudaRunner):
     def _enqueue_reserved_continuation(self, native, feedback):
         shape = feedback.shape
         sequence_ids = tuple(map(int, native.sequence_ids))
-        if feedback.sequence_ids != sequence_ids:
-            raise GraphInputError("reserved continuation changed its row ownership")
         # Engine retains the same immutable lease and row order until this
         # completion drains. Unchanged graph inputs alias their own buffers, so
         # staging copies only the newly accepted token, position and hidden data.
-        inputs = dict(self._edge_reserved_graph_inputs[shape])
+        inputs = self._continuation.resume(sequence_ids, feedback.continuation)
         return self._finish_enqueue(native, shape, inputs, feedback, None)
 
     def _finish_enqueue(self, native, shape, inputs, feedback, host_positions):
         sequence_ids = tuple(map(int, native.sequence_ids))
         rows, graph_rows = native.num_sequences, shape[0]
-        width = self.speculative_tokens + 1
+        width = self.speculative_draft_tokens + 1
+        continuation = (
+            self._continuation.begin(
+                sequence_ids, shape, self._edge_graph_inputs[shape]
+            )
+            if feedback is None
+            else feedback.continuation
+        )
         if feedback is not None:
             inputs.update(feedback.inputs())
             positions = feedback.positions
@@ -777,21 +797,21 @@ class Gemma4EdgeCudaRunner(Gemma4CudaRunner):
         if feedback is not None and feedback.hidden_lease is not None:
             # Retain the prior hidden source through its queued consumer graph.
             feedback.hidden_lease.record_use()
-        tokens, counts, next_inputs = accepted_block(
-            output,
-            positions,
-            self.speculative_tokens,
-            fixed_acceptance=self._speculation.benchmark_accepted_drafts,
+        accepted = (
+            self._graph_acceptance[shape]
+            if self.speculative_draft_tokens
+            else DeviceAcceptance.from_samples(output[:, :0], output, positions)
         )
+        next_inputs = accepted.feedback()
         hidden_lease = None
-        if self.speculative_tokens:
+        if self.speculative_draft_tokens:
             if not hasattr(self, "_edge_hidden_pool"):
                 self._edge_hidden_pool = _EdgeHiddenPool(
                     self.device, self.config.hidden_size
                 )
             hidden_lease = self._edge_hidden_pool.acquire(graph_rows)
             selected = hidden_lease.tensor
-            indices = (counts.to(torch.int64) - 1)[:, None, None].expand(
+            indices = accepted.accepted_drafts[:, None, None].expand(
                 -1, 1, self.config.hidden_size
             )
             torch.gather(
@@ -801,15 +821,12 @@ class Gemma4EdgeCudaRunner(Gemma4CudaRunner):
                 out=selected[:, None, :],
             )
             self._set_target_hidden(sequence_ids, selected[:rows])
-        next_feedback = _EdgeDeviceFeedback(
-            next_inputs, hidden_lease, sequence_ids, shape
-        )
-        completion = DeviceCompletion(
-            tokens,
-            counts,
-            next_feedback,
+        next_feedback = _EdgeDeviceFeedback(next_inputs, hidden_lease, continuation)
+        completion = DeviceCompletion.from_acceptance(
+            accepted,
+            feedback=next_feedback,
             rows=rows,
-            stats=self._speculation if self.speculative_tokens else None,
+            stats=self._speculation if self.speculative_draft_tokens else None,
             device=self.device,
         )
         if hidden_lease is not None:
@@ -821,6 +838,7 @@ class Gemma4EdgeCudaRunner(Gemma4CudaRunner):
             lower = host - width if feedback is not None else host
             if np.any(lower // PAGE_SIZE != (host + 2 * width - 1) // PAGE_SIZE):
                 completion.feedback = None
+                self._continuation.drain(continuation)
         self._edge_device_metadata_rebuilds = getattr(
             self, "_edge_device_metadata_rebuilds", 0
         ) + int(self._wide_graph(shape))
@@ -834,6 +852,8 @@ class Gemma4EdgeCudaRunner(Gemma4CudaRunner):
     @observe_execution
     def enqueue(self, plan, *, feedback=None):
         """Queue genuine graph work; Engine owns completion and writer leases."""
+        if feedback is None:
+            self._continuation.drain()
         if plan.phase != BatchPhase.DECODE or plan.needs_logprobs:
             if feedback is not None:
                 raise GraphInputError(

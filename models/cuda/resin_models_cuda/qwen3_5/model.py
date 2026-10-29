@@ -382,7 +382,7 @@ class Qwen35Attention(nn.Module):
                 group_index=self.cache_group,
                 layer=self.cache_layer,
                 layer_count=self.cache_layer_count,
-                positions=positions,
+                positions=positions + int(self.cache_group == MTP_GROUP),
                 keys=key,
                 values=value,
             )
@@ -685,7 +685,7 @@ class Qwen35MTP(nn.Module):
                 cache,
                 group_index=MTP_GROUP,
                 layer_count=1,
-                sequence_lengths=sequence_lengths,
+                sequence_lengths=sequence_lengths + 1,
                 tokens=positions.shape[1],
                 softmax_scale=self.config.head_dim**-0.5,
             )

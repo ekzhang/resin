@@ -109,7 +109,7 @@ def test_deepseek_decode_policy_places_broadcast_inside_or_between_graphs(
     monkeypatch, policy, parallel
 ):
     runner = object.__new__(DeepSeekV41CudaRunner)
-    runner.speculative_tokens = 0
+    runner.speculative_draft_tokens = 0
     runner.parallel_groups = None
     runner.vocab_size = 2
     runner.cuda_graph_decode = policy
@@ -120,6 +120,7 @@ def test_deepseek_decode_policy_places_broadcast_inside_or_between_graphs(
         SimpleNamespace(enabled=parallel, process_group=object()),
     )
     runner._graph_device_caches = {}
+    runner._graph_inputs = {}
     runner._graph_logits = {}
     setattr(
         runner,

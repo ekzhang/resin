@@ -122,7 +122,14 @@ def test_mtp_origin_is_layer_local_and_reserves_one_graph_token(mtp):
     shape = geometry(mtp=mtp)
     arena = CacheArena("cpu", shape.layout(3), shape, max_batch_size=2)
     assert arena._graph_widths(64) == ((2, 1) if mtp else (1, 1))
-    assert arena._graph_widths(65) == (2, 2)
+    assert arena._graph_widths(65) == (2, 1)
+    state_blocks = arena.state_blocks[1]
+    assert state_blocks.shape[1:] == (shape.packings[1], shape.state_bytes)
+    assert state_blocks.stride(-1) == 1
+    assert (
+        state_blocks.untyped_storage().data_ptr()
+        == arena.storage.untyped_storage().data_ptr()
+    )
     cache = arena._make_graph_cache((group(1), group(2)))
     batch = cache.batch(
         torch.tensor([1]), torch.tensor([0]), torch.tensor([0, 1]), torch.tensor([1])

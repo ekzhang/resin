@@ -440,7 +440,7 @@ def test_runner_replay_policy_keeps_dspark_absolute_positions_and_full_scores(
 
     runner = object.__new__(DeepSeekV41CudaRunner)
     runner._swa_replay_tokens, runner._swa_replay_mode = 140, mode
-    runner.speculative_tokens = 3
+    runner.speculative_draft_tokens = 3
     stores = []
 
     def forward(

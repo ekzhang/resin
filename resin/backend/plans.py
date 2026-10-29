@@ -8,7 +8,13 @@ from typing import Any
 import numpy as np
 import numpy.typing as npt
 
-from resin._resin import BatchPhase, BatchPlan, CacheGroupPlan, CacheLayout
+from resin._resin import (
+    BatchPhase,
+    BatchPlan,
+    CacheGroupPlan,
+    CacheLayout,
+    CacheStatePlan,
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -83,6 +89,7 @@ class CacheGroupView:
     append_slab_ids: npt.NDArray[np.uint32]
     append_slotnums: npt.NDArray[np.uint32]
     append_block_offsets: npt.NDArray[np.uint32]
+    state: CacheStatePlan | None
 
     @classmethod
     def from_plan(
@@ -127,6 +134,7 @@ class CacheGroupView:
             append_slab_ids,
             native.append_slotnums,
             append_offsets,
+            native.state,
         )
 
     def block_slice(self, row: int) -> slice:
@@ -152,7 +160,11 @@ class CacheGroupView:
     def address(self, row: int, logical_block: int) -> tuple[int, int]:
         """Resolve one covered logical block to its physical slab and slot."""
 
-        column = logical_block - int(self.block_table_start_indices[row])
+        column = (
+            0
+            if self.state is not None
+            else logical_block - int(self.block_table_start_indices[row])
+        )
         addresses = self.row_addresses(row)
         if not 0 <= column < len(addresses):
             raise ValueError("cache row does not cover the logical block")
@@ -175,7 +187,7 @@ class CacheGroupView:
 
 @dataclass(frozen=True, slots=True)
 class PagedCachePlan:
-    """Validated exact active cache tables for one native batch plan."""
+    """Validated physical cache leases for one native batch plan."""
 
     batch: BatchView
     layout: CacheLayout
@@ -188,21 +200,18 @@ class PagedCachePlan:
         layout: CacheLayout,
         *,
         decode_lookahead: int = 0,
-        decode_reservation_tokens: int = 0,
     ) -> PagedCachePlan:
         """Validate group order, physical bounds, extents, and append ownership.
 
-        Decode reservations admit bounded, frozen full-history tables. Recurrent
-        checkpoints retain their exact active range, and window layouts retain
-        the ordinary strict contract until a runner supplies window-aware views.
+        Decode tables describe the Engine's frozen lease, which can include
+        future write destinations. Readable history still ends at the actual
+        device position. Prefill tables describe the exact active range.
         """
 
         from resin._resin import CacheGroupFamily
 
         if decode_lookahead < 0:
             raise ValueError("decode_lookahead cannot be negative")
-        if type(decode_reservation_tokens) is not int or decode_reservation_tokens < 0:
-            raise ValueError("decode_reservation_tokens must be a nonnegative integer")
         if not isinstance(layout, CacheLayout):
             raise TypeError("paged cache plans require a native CacheLayout")
         batch = BatchView.from_plan(plan)
@@ -213,23 +222,16 @@ class PagedCachePlan:
         row_ids = np.repeat(np.arange(batch.num_sequences), query_lengths)
         positions = batch.positions.astype(np.int64)
         lookahead = decode_lookahead if batch.phase == BatchPhase.DECODE else 0
-        reservation = (
-            decode_reservation_tokens if batch.phase == BatchPhase.DECODE else 0
-        )
         # Native fields are u32, but a leased decode span can extend beyond u32.
         # Keep even oversized caller-supplied lookahead from wrapping arithmetic.
         post_lengths = batch.context_lengths.astype(np.int64) + query_lengths
         arithmetic = (
             object
-            if max(lookahead, reservation)
-            > np.iinfo(np.int64).max - int(post_lengths.max())
+            if lookahead > np.iinfo(np.int64).max - int(post_lengths.max())
             else np.int64
         )
         write_tokens = query_lengths.astype(arithmetic) + lookahead
         leased = batch.context_lengths.astype(arithmetic) + write_tokens
-        reserved = np.maximum(
-            leased, batch.context_lengths.astype(arithmetic) + reservation
-        )
 
         groups = []
         for index, descriptor in enumerate(layout.groups):
@@ -242,6 +244,32 @@ class PagedCachePlan:
                 block_tokens=block_tokens,
             )
             window_blocks = descriptor.window_resident_block_count
+            if descriptor.family == CacheGroupFamily.STATE:
+                if group.state is None:
+                    raise ValueError(f"cache group {index} requires private live state")
+                if (
+                    np.any(np.diff(group.block_indptr) != 1)
+                    or np.any(group.block_table_start_indices != 0)
+                    or not np.array_equal(
+                        group.block_slab_ids, group.state.live_slab_ids
+                    )
+                    or not np.array_equal(
+                        group.block_slotnums, group.state.live_slotnums
+                    )
+                    or not np.array_equal(
+                        group.append_slab_ids, group.state.live_slab_ids[row_ids]
+                    )
+                    or not np.array_equal(
+                        group.append_slotnums, group.state.live_slotnums[row_ids]
+                    )
+                ):
+                    raise ValueError(
+                        f"cache group {index} must address its private live state"
+                    )
+                groups.append(group)
+                continue
+            if group.state is not None:
+                raise ValueError(f"cache group {index} is not a STATE group")
             invalid_span = np.zeros(batch.num_sequences, dtype=np.bool_)
             maximum = 0
             if window_blocks is not None:
@@ -250,30 +278,33 @@ class PagedCachePlan:
                 maximum = descriptor.window_tokens - descriptor.read_window_tokens + 1
                 invalid_span = write_tokens > maximum
             last_blocks = (leased - 1) // block_tokens
-            if descriptor.family == CacheGroupFamily.STATE:
-                expected_first = np.maximum(0, last_blocks - 1)
-            elif window_blocks is not None:
+            if window_blocks is not None:
                 expected_first = np.maximum(0, last_blocks + 1 - window_blocks)
             else:
                 expected_first = np.zeros(batch.num_sequences, dtype=np.int64)
             invalid_range = (group.block_table_start_indices != expected_first) | (
                 np.diff(group.block_indptr) != last_blocks - expected_first + 1
             )
-            if reservation and descriptor.family != CacheGroupFamily.STATE:
-                if window_blocks is not None:
-                    raise ValueError(
-                        "decode reservations require full-history token groups"
+            if batch.phase == BatchPhase.DECODE:
+                # The native table is the lease authority, including any tail
+                # reserved for queued steps. Validate coverage without requiring
+                # the runner to reproduce the Engine's reservation policy.
+                expected_first = group.block_table_start_indices.astype(np.int64)
+                count = np.diff(group.block_indptr).astype(np.int64)
+                table_end = expected_first + count
+                invalid_range = table_end <= last_blocks
+                if window_blocks is None:
+                    invalid_range |= expected_first != 0
+                else:
+                    assert descriptor.read_window_tokens is not None
+                    earliest_read = np.maximum(
+                        0,
+                        batch.context_lengths.astype(np.int64)
+                        - (descriptor.read_window_tokens - 1),
                     )
-                # A continuation's conservative host position may advance while
-                # this page envelope stays fixed. Every required write must fit,
-                # but unused, already leased tail pages remain valid.
-                count = np.diff(group.block_indptr)
-                maximum_count = (reserved - 1) // block_tokens + 1
-                invalid_range = (
-                    (group.block_table_start_indices != 0)
-                    | (count < last_blocks + 1)
-                    | (count > maximum_count)
-                )
+                    invalid_range |= (
+                        expected_first != np.maximum(0, table_end - window_blocks)
+                    ) | (expected_first > earliest_read // block_tokens)
 
             logical_blocks = positions // block_tokens
             # Layout-inconsistent extents must be rejected before indexing.
@@ -307,7 +338,7 @@ class PagedCachePlan:
                     )
                 if invalid_range[row]:
                     raise ValueError(
-                        f"cache group {index} row {row} is not its exact active range"
+                        f"cache group {index} row {row} has an invalid active range"
                     )
                 raise ValueError(
                     f"cache group {index} row {row} append target is not row-owned"

@@ -395,13 +395,13 @@ def _selection_worker(rank, rendezvous):
 
         # Equal physical graph shapes do not imply the same expert schedule:
         # ordinary decode and different draft lengths have different rounds.
-        for lookaheads in ((0, 2), (2, 5)):
+        for max_accepted in ((1, 3), (3, 6)):
             speculative = _CpuRunner(groups)
             speculative.runner_config = RunnerConfig(
                 cache_layout=CacheLayout(
                     parent_capacity=64, groups=[CacheGroupLayout(2)]
                 ),
-                cache_write_lookahead_tokens=lookaheads[rank],
+                max_accepted_per_step=max_accepted[rank],
             )
             speculative._cuda_graph_executor.capture_all = lambda **_: launched.append(
                 True

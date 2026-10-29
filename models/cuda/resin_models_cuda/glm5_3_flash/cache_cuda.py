@@ -59,11 +59,12 @@ def _gather_state(
     RECURRENT_BLOCKS: tl.constexpr,
     CONVOLUTION_BLOCKS: tl.constexpr,
     BLOCK: tl.constexpr,
+    LIVE_STATE: tl.constexpr,
 ):
     tile, sequence, layer = tl.program_id(0), tl.program_id(1), tl.program_id(2)
     context = tl.load(Contexts + sequence).to(tl.int64)
     first = tl.load(FirstBlocks + sequence).to(tl.int64)
-    column = tl.maximum(context - 1, 0) // STATE_TOKENS - first
+    column = 0 if LIVE_STATE else tl.maximum(context - 1, 0) // STATE_TOKENS - first
     valid = (column >= 0) & (column < table_width)
     parent = tl.load(
         Parents + sequence.to(tl.int64) * table_stride + column, valid, other=0
@@ -239,6 +240,7 @@ def gather_state_layer_major(
         recurrent_blocks,
         convolution_blocks,
         block,
+        LIVE_STATE=group.live_state,
         num_warps=4,
     )
     return out
@@ -285,6 +287,7 @@ def _scatter_state(
     CBLOCKS: tl.constexpr,
     LAYERS: tl.constexpr,
     BLOCK: tl.constexpr,
+    LIVE_STATE: tl.constexpr,
 ):
     tile, sequence, layer = tl.program_id(0), tl.program_id(1), tl.program_id(2)
     position = tl.load(Positions + sequence).to(tl.int64)
@@ -295,8 +298,10 @@ def _scatter_state(
         -((-position + STATE_TOKENS - 1) // STATE_TOKENS),
         position // STATE_TOKENS,
     )
-    column = logical - first
+    column = 0 if LIVE_STATE else logical - first
     valid = (column >= 0) & (column < table_width)
+    if LIVE_STATE:
+        valid = valid & (position >= 0)
     parent = tl.load(
         Parents + sequence.to(tl.int64) * table_stride + column, valid, other=0
     ).to(tl.int64)
@@ -454,6 +459,7 @@ def scatter_state_layers(
         cb,
         n,
         block,
+        LIVE_STATE=group.live_state,
         num_warps=4,
     )
 
@@ -496,10 +502,13 @@ def _gather_index_tails(
     STATE: tl.constexpr,
     WIDTH: tl.constexpr,
     BLOCK: tl.constexpr,
+    LIVE_STATE: tl.constexpr,
 ):
     seq, layer = tl.program_id(0).to(tl.int64), tl.program_id(1).to(tl.int64)
     context = tl.load(Contexts + seq)
-    column = tl.maximum(context - 1, 0) // STATE - tl.load(First + seq)
+    column = (
+        0 if LIVE_STATE else tl.maximum(context - 1, 0) // STATE - tl.load(First + seq)
+    )
     valid = (column >= 0) & (column < table_width)
     parent = tl.load(Parents + seq * table_stride + column, valid, other=0).to(tl.int64)
     slot = tl.load(Slots + seq * table_stride + column, valid, other=0).to(tl.int64)
@@ -563,6 +572,7 @@ def gather_index_tails(cache, contexts):
             g.state_tokens,
             4 * g.index_dim,
             triton.next_power_of_2(4 * g.index_dim),
+            LIVE_STATE=group.live_state,
         )
     return [IndexTail(keys[i], gates[i], ends[i]) for i in range(layers)]
 
@@ -602,14 +612,17 @@ def _scatter_index_tails(
     WIDTH: tl.constexpr,
     LAYERS: tl.constexpr,
     BLOCK: tl.constexpr,
+    LIVE_STATE: tl.constexpr,
 ):
     seq, layer = tl.program_id(0).to(tl.int64), tl.program_id(1).to(tl.int64)
     position = tl.load(Positions + seq)
     logical = tl.where(
         position < 0, -((-position + STATE - 1) // STATE), position // STATE
     )
-    column = logical - tl.load(First + seq)
+    column = 0 if LIVE_STATE else logical - tl.load(First + seq)
     valid = (column >= 0) & (column < table_width)
+    if LIVE_STATE:
+        valid = valid & (position >= 0)
     parent = tl.load(Parents + seq * table_stride + column, valid, other=0).to(tl.int64)
     slot = tl.load(Slots + seq * table_stride + column, valid, other=0).to(tl.int64)
     offset = tl.arange(0, BLOCK)
@@ -660,4 +673,5 @@ def scatter_index_tails(cache, positions, tails):
             4 * g.index_dim,
             len(tails),
             triton.next_power_of_2(4 * g.index_dim),
+            LIVE_STATE=group.live_state,
         )

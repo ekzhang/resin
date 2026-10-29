@@ -129,9 +129,21 @@ after the GPU may have accepted work.
 ## Paged state and prefix reuse
 
 Declare one `CacheLayout` for full attention, sliding-window attention, and
-recurrent checkpoints. The Engine allocates the pages and passes their physical
+recurrent state. The Engine allocates the pages and passes their physical
 IDs in `BatchPlan.cache_groups`; the model only maps those IDs to its device
 arena. Do not keep a second request-to-page allocator in Python.
+
+STATE groups use one private live slot per request, independent of token position.
+`CacheGroupPlan.state` identifies that slot, one-time zero/restore copies, and
+optional checkpoint destinations. Apply restores before model execution and
+copy live state into a checkpoint only when its reserved prefix length equals
+the actual accepted cache-valid length. Report the completed reservation through
+`ForwardOutput.state_checkpoints`. All STATE groups must materialize the same
+prefix before the Engine publishes it. Never relabel terminal state after EOS or
+output-length truncation as an earlier prefix. CUDA runners use the shared
+`execute_state` wrapper; their arena exposes complete `[slab, slot, elements]`
+state views and their model commits only the accepted state before returning.
+Snapshots and restore sources remain pinned until queued consumers finish.
 
 Consume each cache block's structured slab ID and slot number. Do not
 invent or decode a flattened kernel page ID independently in every runner or
@@ -167,27 +179,31 @@ mutating shared pages. Cover:
 
 Compare cached continuation output with a fresh full prefill under greedy
 sampling. Run the comparison repeatedly; coherent first output is not enough to
-detect stale recurrent state or a bad ring offset.
+detect stale recurrent state or a bad sliding-window offset.
 
 ## Speculative decode
 
 Speculative decoding belongs inside the runner. Set
-`cache_write_lookahead_tokens` to cover the maximum additional cache writes
-beyond the scheduled decode anchor. The Engine reserves these writes and limits
-each returned row to `cache_write_lookahead_tokens + 1` tokens, before applying
-stop or length limits. Write drafts only into leased destinations, commit exactly
+`speculative_draft_tokens` (default zero) and derive
+`RunnerConfig.max_accepted_per_step = speculative_draft_tokens + 1`. The Engine
+limits each raw returned row to this total, before applying stop or length limits.
+Use the ordinary `draft -> target_verify [anchor, drafts] -> commit` flow, without
+an extra target-decode pass that silently increases the output bound.
+`CacheLayout.decode_write_extra_tokens` accounts for model-specific shifted
+persistent writes beyond that block; it is physical geometry, not a second
+runner output setting. Write drafts only into leased destinations, commit exactly
 the accepted prefix, and clear or logically hide rejected recurrent/SWA state
 before the next step.
 
-An overlap-capable runner may opt into `cache_write_reservation_tokens`, a
-preferred total write span including the anchor. Its default, zero, preserves
-the ordinary reservation and same-page continuation guard. A nonzero span must
-cover at least two maximum decode steps and fit the sliding-window read/write
-guard; recurrent-state groups do not support it. For example, lookahead 3 and
-reservation 72 still permit at most four returned tokens per invocation. The
-Engine uses the ordinary one-step reservation for the whole cohort if any row
-is too close to its output/context limit or the optional span cannot fit the
-available cache. Runners must accept both ordinary and wider envelopes.
+The Engine chooses overlap reservations from the per-step advance and cache
+geometry; runners do not configure a second token bound. The plan's page tables
+are the actual immutable lease, including destinations for queued steps. Runners
+derive readable history from device positions and select graphs that cover the
+leased tables. For example, three drafts permit at most four returned tokens per
+invocation even when the Engine reserves another page. Stable live recurrent
+state has no rotating checkpoint boundary that forces a drain. The Engine falls
+back to a one-step reservation if the wider span cannot fit window, context,
+output, or capacity limits. Runners must accept both lease shapes.
 
 The Engine allocates, copies on write, and leases the complete envelope before
 enqueueing work. Its physical page tables remain immutable until all accepted

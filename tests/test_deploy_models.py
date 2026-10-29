@@ -171,7 +171,13 @@ def test_glm_serving_checkpoints_allow_real_engine_prefix_reuse(
 ):
     from output_helpers import forward_output
 
-    from resin import Engine, RunnerConfig, SamplingParams, SchedulerConfig
+    from resin import (
+        Engine,
+        RunnerConfig,
+        SamplingParams,
+        SchedulerConfig,
+        StateCheckpoint,
+    )
     from resin.models.glm5_3_flash.config import Glm53Config
     from resin_models_cuda.glm5_3_flash.cache import CacheGeometry
 
@@ -189,7 +195,7 @@ def test_glm_serving_checkpoints_allow_real_engine_prefix_reuse(
             max_batch_tokens=chunk,
             prefill_chunk_size=chunk,
             continuation_prefill=True,
-            cache_write_lookahead_tokens=4 if include_mtp else 0,
+            max_accepted_per_step=4 if include_mtp else 1,
         )
 
         def __init__(self):
@@ -200,9 +206,24 @@ def test_glm_serving_checkpoints_allow_real_engine_prefix_reuse(
 
         def forward(self, plan):
             self.plans.append(plan)
-            return forward_output(
+            output = forward_output(
                 [int(plan.token_ids[end - 1]) + 1 for end in plan.token_indptr[1:]]
             )
+            receipts = {}
+            for group in plan.cache_groups:
+                if group.state is None:
+                    continue
+                for slot in group.state.checkpoint_slots:
+                    start, end = plan.token_range(slot.row)
+                    if (
+                        int(plan.context_lengths[slot.row]) + end - start
+                        == slot.prefix_length
+                    ):
+                        receipts[slot.reservation_id] = StateCheckpoint(
+                            reservation_id=slot.reservation_id,
+                            prefix_length=slot.prefix_length,
+                        )
+            return output.with_state_checkpoints(tuple(receipts.values()))
 
     runner = Runner()
     with Engine(

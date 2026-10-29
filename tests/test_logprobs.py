@@ -227,7 +227,7 @@ class ScoredRunner:
     def __init__(self):
         self.runner_config = RunnerConfig(
             cache_layout=CacheLayout(parent_capacity=4, groups=[CacheGroupLayout(2)]),
-            cache_write_lookahead_tokens=2,
+            max_accepted_per_step=3,
         )
         self.calls = 0
         self.released = []

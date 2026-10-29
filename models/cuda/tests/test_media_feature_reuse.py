@@ -9,6 +9,7 @@ import pytest
 import torch
 
 from resin import BatchPhase, BatchPlan
+from resin.backend.cuda.completion import CudaContinuation
 from resin.backend.cuda.vision_cache import VisionFeatureCache
 from resin.recipe import (
     DeepSeekV41Image,
@@ -46,6 +47,10 @@ def _case(name):
     runner.config = SimpleNamespace(hidden_size=3, image_token_id=8, video_token_id=9)
     runner._media_features = {}
     runner._target_hidden = {}
+    if name in ("deepseek", "glm", "qwen"):
+        runner._continuation = CudaContinuation()
+    if name == "qwen":
+        runner._drafts, runner._draft_hidden = {}, {}
     if name == "gemma":
         runner._hidden_bank = None
         runner._hidden_free_slots, runner._hidden_slot_generation = [], 0

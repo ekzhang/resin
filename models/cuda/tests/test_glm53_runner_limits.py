@@ -79,7 +79,7 @@ def test_direct_constructor_preserves_common_ordinary_decode_catalog(
         device="cpu",
         max_seq_len=4096,
         max_batch_size=8,
-        speculative_tokens=drafts,
+        speculative_draft_tokens=drafts,
         parallel_groups=SimpleNamespace(
             topology=Parallelism(world_size=4, attn_dp=4, ep=ep)
         ),
@@ -96,7 +96,7 @@ def runner(drafts):
     result = object.__new__(Glm53FlashCudaRunner)
     result.max_seq_len = 4096
     result.max_batch_size = 2
-    result.speculative_tokens = drafts
+    result.speculative_draft_tokens = drafts
     result.target_projection_rows = 64
     result._projection_batch_buckets = (1, 2)
     return result
@@ -163,7 +163,8 @@ def test_graph_selection_uses_public_width_and_capture_reserves_verification(dra
     model = runner(drafts)
     required, allocated = [], []
 
-    def select(mode, context, *, required_shape):
+    def select(mode, context, *, required_shape, eligible=True):
+        assert eligible
         required.append(required_shape)
         return None
 
@@ -201,7 +202,7 @@ def test_real_engine_leases_are_prepared_at_page_and_public_boundaries(drafts, c
         max_batch_tokens=512,
         prefill_chunk_size=512,
         continuation_prefill=True,
-        cache_write_lookahead_tokens=drafts + 1 if drafts else 0,
+        max_accepted_per_step=drafts + 1,
         cache_layout=model.cache_layout,
     )
     prepared = []
@@ -221,7 +222,7 @@ def test_real_engine_leases_are_prepared_at_page_and_public_boundaries(drafts, c
 
     # A target-only diagnostic forward may use fewer writes than its lease.
     # Its validation must still use the RunnerConfig installed in the Engine.
-    model.speculative_tokens = 0
+    model.speculative_draft_tokens = 0
     engine = Engine(PlanRunner(), context_length=4096, max_running_requests=1)
     request = engine.submit(
         [1] * context, sampling_params=SamplingParams(max_output_tokens=2)
@@ -232,6 +233,10 @@ def test_real_engine_leases_are_prepared_at_page_and_public_boundaries(drafts, c
     decode = [item for item in prepared if item.phase == BatchPhase.DECODE]
     assert len(decode) == 1
     assert decode[0].batch.context_lengths.tolist() == [context]
-    expected_end = context + 1 + model.runner_config.cache_write_lookahead_tokens
+    expected_end = (
+        context
+        + model.runner_config.max_accepted_per_step
+        + model.cache_layout.decode_write_extra_tokens
+    )
     assert len(decode[0].groups[0].block_slab_ids) == (expected_end + 63) // 64
     engine.close()

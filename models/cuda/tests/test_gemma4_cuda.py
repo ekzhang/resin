@@ -70,19 +70,18 @@ def test_hidden_storage_owns_rows_across_rebatch_growth_and_release() -> None:
 
 
 def test_hidden_storage_saves_mixed_acceptance_and_prefill_final_rows() -> None:
-    from resin.backend.speculative import SpeculativeStats
+    from resin.backend.cuda.completion import DeviceAcceptance
 
     runner = _hidden_storage_runner()
-    runner._speculation = SpeculativeStats(3)
     verification = torch.arange(60, dtype=torch.bfloat16).reshape(3, 4, 5)
     expected = torch.stack((verification[0, 0], verification[1, 1], verification[2, 3]))
-    tokens = runner._accept_speculative(
-        [10, 30, 40],
-        [[1, 2, 3], [4, 5, 6], [7, 8, 9]],
-        [[0, 1, 2, 3], [4, 0, 0, 0], [7, 8, 9, 10]],
-        verification,
+    accepted = DeviceAcceptance.from_samples(
+        torch.tensor([[1, 2, 3], [4, 5, 6], [7, 8, 9]]),
+        torch.tensor([[0, 1, 2, 3], [4, 0, 0, 0], [7, 8, 9, 10]]),
+        torch.zeros(3, dtype=torch.int64),
     )
-    assert tokens == [[0], [4, 0], [7, 8, 9, 10]]
+    assert accepted.accepted_drafts.tolist() == [0, 1, 3]
+    runner._store_accepted_hidden([10, 30, 40], accepted.accepted_drafts, verification)
     verification.zero_()
     assert torch.equal(runner._gather_target_hidden([10, 30, 40], 3), expected)
 
@@ -173,7 +172,7 @@ def test_cuda_graphs_use_shared_static_step_lifecycle() -> None:
     parameters = inspect.signature(Gemma4CudaRunner.__init__).parameters
     source = inspect.getsource(Gemma4CudaRunner)
     assert "cuda_graph_decode_shapes" in parameters
-    assert "speculative_tokens" in parameters
+    assert "speculative_draft_tokens" in parameters
     assert issubclass(Gemma4CudaRunner, CudaRunner)
     assert "self._configure_cuda_graphs(" in source
     assert "def capture_cuda_graphs" not in source
@@ -182,9 +181,9 @@ def test_cuda_graphs_use_shared_static_step_lifecycle() -> None:
 
 
 @pytest.mark.parametrize("capacity,expected_width", [(2, 8), (32, 11)])
-@pytest.mark.parametrize("speculative_tokens", [0, 3])
+@pytest.mark.parametrize("speculative_draft_tokens", [0, 3])
 def test_default_graph_history_uses_packed_cache_and_context_bounds(
-    monkeypatch, capacity, expected_width, speculative_tokens
+    monkeypatch, capacity, expected_width, speculative_draft_tokens
 ) -> None:
     class ConfiguredGraphs(Exception):
         pass
@@ -238,18 +237,20 @@ def test_default_graph_history_uses_packed_cache_and_context_bounds(
         Gemma4CudaRunner(
             device="cuda",
             cache_parent_capacity=capacity,
-            speculative_tokens=speculative_tokens,
+            speculative_draft_tokens=speculative_draft_tokens,
         )
     assert received == [
         default_decode_graph_shapes(
-            expected_width, speculative=bool(speculative_tokens), max_batch_size=128
+            expected_width,
+            speculative=bool(speculative_draft_tokens),
+            max_batch_size=128,
         )
     ]
 
 
 def test_ordinary_graph_capture_rows_stay_inside_null_page() -> None:
     runner = object.__new__(Gemma4CudaRunner)
-    runner.speculative_tokens = 0
+    runner.speculative_draft_tokens = 0
 
     inputs = runner._graph_capture_inputs((128, 4096), vocab_size=256)
 
@@ -400,9 +401,9 @@ def test_prefill_feed_forward_can_reuse_output_storage_across_layers() -> None:
     torch.testing.assert_close(run(), expected, rtol=0, atol=0)
 
 
-@pytest.mark.parametrize("speculative_tokens", [0, 3])
+@pytest.mark.parametrize("speculative_draft_tokens", [0, 3])
 def test_graph_attention_contract_matches_capture_and_replay(
-    monkeypatch, speculative_tokens
+    monkeypatch, speculative_draft_tokens
 ) -> None:
     import flashinfer
 
@@ -437,7 +438,7 @@ def test_graph_attention_contract_matches_capture_and_replay(
             vocab_size=16,
         ),
     )
-    runner.speculative_tokens = speculative_tokens
+    runner.speculative_draft_tokens = speculative_draft_tokens
     runner.attention_config = runner.config
     setattr(runner, "_assistant", object())
     setattr(
@@ -470,7 +471,7 @@ def test_graph_attention_contract_matches_capture_and_replay(
     runner._prepare_graph_attention(shape, inputs)
 
     assert step.inputs.keys() <= inputs.keys()
-    assert len(wrappers) == (4 if speculative_tokens else 2)
+    assert len(wrappers) == (4 if speculative_draft_tokens else 2)
     for wrapper in wrappers:
         (initial, initial_options), (current, current_options) = wrapper.calls
         assert initial_options == current_options
@@ -485,9 +486,11 @@ def test_graph_attention_contract_matches_capture_and_replay(
         if verify:
             assert current[0].tolist() == [0, 4, 8]
             assert current[-5].tolist() == [5, 5]
-        assert wrapper.options["backend"] == ("auto" if speculative_tokens else "fa2")
+        assert wrapper.options["backend"] == (
+            "auto" if speculative_draft_tokens else "fa2"
+        )
         assert wrapper.options.get("use_tensor_cores", False) is (
-            not speculative_tokens
+            not speculative_draft_tokens
         )
 
 
@@ -498,7 +501,7 @@ def test_speculative_failure_after_state_update_is_not_retryable(
     state = [0]
     synchronized = []
     runner = object.__new__(Gemma4CudaRunner)
-    runner.speculative_tokens = 1
+    runner.speculative_draft_tokens = 1
     setattr(runner, "cache_layout", object())
     setattr(runner, "_check_cuda_graphs", lambda _phase: None)
     runner._cuda_failure = CudaFailureGuard(
@@ -534,7 +537,7 @@ def cached_edge_runner():
 
     runner = object.__new__(Gemma4EdgeCudaRunner)
     runner.device = torch.device("cpu")
-    runner.speculative_tokens = 3
+    runner.speculative_draft_tokens = 3
     shape = (2, 256)
     wrappers = [
         SimpleNamespace(_plan_info=object(), workspace_revision=0) for _ in range(4)

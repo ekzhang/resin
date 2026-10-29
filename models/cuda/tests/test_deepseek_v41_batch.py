@@ -383,6 +383,19 @@ def test_native_metadata_matches_reference_across_query_lengths(draft):
     """Exercise runtime loops, the inline/copy split, and physical index mapping."""
     from dataclasses import fields
 
+    def compare(expected, actual):
+        for field in fields(expected):
+            if field.name.startswith("_"):
+                continue
+            left, right = getattr(expected, field.name), getattr(actual, field.name)
+            pairs = (
+                ((left[key], right[key]) for key in left)
+                if isinstance(left, dict)
+                else ((left, right),)
+            )
+            for reference, native in pairs:
+                torch.testing.assert_close(native.cpu(), reference, rtol=0, atol=0)
+
     cache, starts = cache_and_positions()
     device_cache = DeviceCache(
         cache.geometry,
@@ -407,17 +420,7 @@ def test_native_metadata_matches_reference_across_query_lengths(draft):
                 draft=draft,
                 valid_tokens=None if mask is None else mask.cuda(),
             )
-            for field in fields(expected):
-                if field.name.startswith("_"):
-                    continue
-                left, right = getattr(expected, field.name), getattr(actual, field.name)
-                pairs = (
-                    ((left[key], right[key]) for key in left)
-                    if isinstance(left, dict)
-                    else ((left, right),)
-                )
-                for reference, native in pairs:
-                    torch.testing.assert_close(native.cpu(), reference, rtol=0, atol=0)
+            compare(expected, actual)
             selected = torch.tensor([0, -1, 2, 511, 3, 128, -1, 1], dtype=torch.int32)
             selected = selected.expand(3, queries, -1).clone()
             torch.testing.assert_close(
@@ -426,3 +429,32 @@ def test_native_metadata_matches_reference_across_query_lengths(draft):
                 rtol=0,
                 atol=0,
             )
+            if queries == (3 if draft else 4) and masked:
+                # Retain one lease and one captured metadata program while the
+                # accepted GPU anchors cross pages at unequal rates.
+                anchors = positions.cuda()
+                assert mask is not None
+                valid = mask.cuda()
+                stream = torch.cuda.Stream()
+                stream.wait_stream(torch.cuda.current_stream())
+                with torch.cuda.stream(stream):
+                    for _ in range(3):
+                        replayed = device_cache.prepare_metadata(
+                            anchors, draft=draft, valid_tokens=valid
+                        )
+                torch.cuda.current_stream().wait_stream(stream)
+                graph = torch.cuda.CUDAGraph()
+                with torch.cuda.graph(graph):
+                    replayed = device_cache.prepare_metadata(
+                        anchors, draft=draft, valid_tokens=valid
+                    )
+                for advances in ((0, 0, 0), (1, 4, 3), (4, 7, 6), (128, 132, 131)):
+                    actual_positions = positions + torch.tensor(advances)[:, None]
+                    anchors.copy_(actual_positions)
+                    graph.replay()
+                    compare(
+                        cache.prepare_metadata(
+                            actual_positions, draft=draft, valid_tokens=mask
+                        ),
+                        replayed,
+                    )

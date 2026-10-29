@@ -35,12 +35,12 @@ class Runner:
             max_batch_tokens=5 if chunked else None,
             prefill_chunk_size=3 if chunked else None,
             continuation_prefill=chunked,
-            cache_write_lookahead_tokens=drafts,
+            max_accepted_per_step=drafts + 1,
             cache_layout=CacheLayout(parent_capacity=256, groups=[CacheGroupLayout(2)])
             if drafts
             else None,
         )
-        self.speculative_tokens = drafts
+        self.speculative_draft_tokens = drafts
         self._speculation = SpeculativeStats(drafts)
         self.plans = []
         self.processed_counts = []
@@ -50,9 +50,9 @@ class Runner:
 
     def forward(self, plan):
         self.plans.append(plan)
-        if plan.phase == BatchPhase.DECODE and self.speculative_tokens:
-            drafts = [[2] * self.speculative_tokens for _ in plan.sequence_ids]
-            targets = [[9] * (self.speculative_tokens + 1) for _ in plan.sequence_ids]
+        if plan.phase == BatchPhase.DECODE and self.speculative_draft_tokens:
+            drafts = [[2] * self.speculative_draft_tokens for _ in plan.sequence_ids]
+            targets = [[9] * (self.speculative_draft_tokens + 1) for _ in plan.sequence_ids]
             acceptance = self._speculation.accept(drafts, targets)
             self.processed_counts.append(acceptance.processed_counts)
             return forward_output(acceptance.token_rows)
@@ -83,7 +83,7 @@ def test_benchmark_does_not_wrap_noncallable_result_as_pending():
     runner = InvalidRunner()
     runner.runner_config = RunnerConfig(
         cache_layout=CacheLayout(parent_capacity=16, groups=[CacheGroupLayout(128)]),
-        cache_write_lookahead_tokens=2,
+        max_accepted_per_step=3,
     )
     engine = Engine(BenchmarkRunner(runner))
     request = engine.submit([1], sampling_params=SamplingParams(max_output_tokens=8))
@@ -244,7 +244,7 @@ def test_overlap_benchmark_defers_reduction_and_observes_harvested_positions():
 
     class PipelinedRunner(AsyncRunner):
         vocab_size = 1024
-        speculative_tokens = 2
+        speculative_draft_tokens = 2
 
         def __init__(self):
             super().__init__()
@@ -424,7 +424,7 @@ def test_overlap_trace_has_two_full_completions_without_metric_collectives():
 
     class PipelinedRunner(AsyncRunner):
         vocab_size = 1024
-        speculative_tokens = 2
+        speculative_draft_tokens = 2
 
     raw = PipelinedRunner()
     runner = BenchmarkRunner(raw)
@@ -477,7 +477,7 @@ def test_decode_trace_submits_two_fresh_forwards_with_exact_context_headroom(
                 cache_layout=CacheLayout(
                     parent_capacity=256, groups=[CacheGroupLayout(64)]
                 ),
-                cache_write_lookahead_tokens=drafts + 1 if drafts else 0,
+                max_accepted_per_step=drafts + 1,
             )
 
         def output(self, plan, feedback=None):
@@ -514,7 +514,7 @@ def test_decode_trace_submits_two_fresh_forwards_with_exact_context_headroom(
             draft_tokens=drafts,
             overlap=overlap,
             trace_passes=2 + int(overlap) if traced else 0,
-            cache_write_lookahead_tokens=raw.runner_config.cache_write_lookahead_tokens,
+            max_accepted_per_step=raw.runner_config.max_accepted_per_step,
         )
         engine = Engine(
             runner,
@@ -801,7 +801,7 @@ def test_deepseek_fixed_acceptance_reaches_actual_compressor_rollback(monkeypatc
 
     runner = DeepSeekV41CudaRunner.__new__(DeepSeekV41CudaRunner)
     runner.device = torch.device("cpu")
-    runner.speculative_tokens = 4
+    runner.speculative_draft_tokens = 4
     runner._speculation = SpeculativeStats(4, benchmark_accepted_drafts=3)
     observed = []
     monkeypatch.setattr(

@@ -34,7 +34,10 @@ mod recipe_media;
 mod recipe_types;
 mod runner;
 
-use cache::{CacheGroupFamily, CacheGroupLayout, CacheGroupPlan, CacheLayout, CacheRetention};
+use cache::{
+    CacheGroupFamily, CacheGroupLayout, CacheGroupPlan, CacheLayout, CacheRetention,
+    CacheStatePlan, StateCheckpoint, StateCheckpointSlot, StateCopy,
+};
 use output::{BorrowedLogprobs, BorrowedOutput, ForwardOutput};
 use parallelism::Parallelism;
 use resin_core::engine::{self as core, CompletionReason};
@@ -1160,6 +1163,7 @@ struct PythonRunner<'a, 'py> {
     error: Option<PyErr>,
     logprobs: Option<BorrowedLogprobs<'py>>,
     prompt_logprobs: Option<BorrowedLogprobs<'py>>,
+    state_checkpoints: Vec<resin_core::resources::kv::StateCheckpoint>,
 }
 impl PythonRunner<'_, '_> {
     fn failed(&mut self, error: PyErr, accepted: bool) -> core::Error {
@@ -1201,6 +1205,7 @@ impl<'py> core::Runner<RequestPayload> for PythonRunner<'_, 'py> {
         let tokens = tokens.to_owned();
         self.logprobs = output.logprobs;
         self.prompt_logprobs = output.prompt_logprobs;
+        self.state_checkpoints = output.state_checkpoints;
         Ok(tokens)
     }
     fn logprobs(&self) -> Option<core::LogprobView<'_>> {
@@ -1208,6 +1213,9 @@ impl<'py> core::Runner<RequestPayload> for PythonRunner<'_, 'py> {
     }
     fn prompt_logprobs(&self) -> Option<core::LogprobView<'_>> {
         self.prompt_logprobs.as_ref().map(BorrowedLogprobs::view)
+    }
+    fn state_checkpoints(&self) -> &[resin_core::resources::kv::StateCheckpoint] {
+        &self.state_checkpoints
     }
     fn release(&mut self, ids: &[u64]) -> core::Result<()> {
         if let Some(release) = self.release {
@@ -1352,17 +1360,22 @@ impl Engine {
             error: None,
             logprobs: None,
             prompt_logprobs: None,
+            state_checkpoints: Vec::new(),
         };
-        let Some(plan) = self
-            .core
-            .prepare_step(&mut runner, phase.map(BatchPhase::core))
-            .map_err(|error| runner.error.take().unwrap_or_else(|| core_error(error)))?
+        let overlap_admission = self.overlap && allow_overlap && self.runner_enqueue.is_some();
+        let prepared = if overlap_admission {
+            self.core
+                .prepare_overlap_step(&mut runner, phase.map(BatchPhase::core))
+        } else {
+            self.core
+                .prepare_step(&mut runner, phase.map(BatchPhase::core))
+        };
+        let Some(plan) =
+            prepared.map_err(|error| runner.error.take().unwrap_or_else(|| core_error(error)))?
         else {
             return Ok(events);
         };
-        let can_enqueue = self.overlap
-            && allow_overlap
-            && self.runner_enqueue.is_some()
+        let can_enqueue = overlap_admission
             && plan.phase == resin_core::Phase::Decode
             && self.core.retain_continuation(&plan);
         let plan = match Py::new(py, planning::from_core(plan)) {
@@ -1426,6 +1439,7 @@ impl Engine {
             error: None,
             logprobs: None,
             prompt_logprobs: None,
+            state_checkpoints: Vec::new(),
         };
         let tokens;
         let output = match extract_runner_output(output) {
@@ -1433,6 +1447,7 @@ impl Engine {
                 tokens = output.tokens;
                 runner.logprobs = output.logprobs;
                 runner.prompt_logprobs = output.prompt_logprobs;
+                runner.state_checkpoints = output.state_checkpoints;
                 tokens
                     .view()
                     .and_then(|tokens| {
@@ -1493,6 +1508,7 @@ impl Engine {
             error: None,
             logprobs: None,
             prompt_logprobs: None,
+            state_checkpoints: Vec::new(),
         };
         let accepted = accepted || runner_error_is_post_accept(py, &error);
         let failure = runner.failed(error, accepted);
@@ -1550,8 +1566,7 @@ impl Engine {
                 max_batch_tokens: config.max_batch_tokens,
                 prefill_chunk_size: config.prefill_chunk_size,
                 continuation_prefill: config.continuation_prefill,
-                cache_write_lookahead_tokens: config.cache_write_lookahead_tokens,
-                cache_write_reservation_tokens: config.cache_write_reservation_tokens,
+                max_accepted_per_step: config.max_accepted_per_step,
                 cache_layout: config
                     .cache_layout
                     .as_ref()
@@ -1810,6 +1825,7 @@ impl Engine {
             error: None,
             logprobs: None,
             prompt_logprobs: None,
+            state_checkpoints: Vec::new(),
         };
         let result = self.core.cancel(&mut runner, &request.inner);
         runner.result(result)
@@ -1826,6 +1842,7 @@ impl Engine {
             error: None,
             logprobs: None,
             prompt_logprobs: None,
+            state_checkpoints: Vec::new(),
         };
         let result = self.core.close(&mut runner);
         runner.result(result)
@@ -2049,8 +2066,9 @@ mod _resin {
     #[pymodule_export]
     use super::{
         BatchPhase, BatchPlan, CacheGroupFamily, CacheGroupLayout, CacheGroupPlan, CacheLayout,
-        CacheRetention, Engine, ForwardOutput, Parallelism, RequestLease, ResourceBinding,
-        RunnerConfig, SamplingParams, SchedulerConfig, TokenEvent, TokenLogprobs,
+        CacheRetention, CacheStatePlan, Engine, ForwardOutput, Parallelism, RequestLease,
+        ResourceBinding, RunnerConfig, SamplingParams, SchedulerConfig, StateCheckpoint,
+        StateCheckpointSlot, StateCopy, TokenEvent, TokenLogprobs,
     };
 
     #[pymodule_export]

@@ -1240,6 +1240,96 @@ impl CachePool {
         Ok(())
     }
 
+    /// Install fresh private live-state pages while retaining immutable restore
+    /// inputs in a separate owner. Both owners are idle and authenticated before
+    /// the first mutation; no shared snapshot is ever made writable.
+    pub(crate) fn exchange_state_restore_pages(
+        &mut self,
+        request: &mut RequestPages,
+        restore: &mut RequestPages,
+        state_groups: &[bool],
+    ) -> Result<(), CachePoolError> {
+        self.validate_request_idle(request)?;
+        self.validate_request_idle(restore)?;
+        if request.groups.len() != restore.groups.len()
+            || request.groups.len() != state_groups.len()
+        {
+            return Err(CachePoolError::StaleHandle);
+        }
+        for ((live, fresh), &state) in request.groups.iter().zip(&restore.groups).zip(state_groups)
+        {
+            if state
+                && (live.pages.len() != 1
+                    || fresh.pages.len() != 1
+                    || live.pages[0].writable
+                    || !fresh.pages[0].writable)
+            {
+                return Err(CachePoolError::StaleHandle);
+            }
+            if !state && !fresh.pages.is_empty() {
+                return Err(CachePoolError::StaleHandle);
+            }
+        }
+        for ((live, fresh), &state) in request
+            .groups
+            .iter_mut()
+            .zip(&mut restore.groups)
+            .zip(state_groups)
+        {
+            if state {
+                let handle = fresh.pages[0].handle;
+                self.slot_mut(handle).mode = Some(PageMode::Mutable {
+                    writer: request.writer,
+                });
+                std::mem::swap(&mut live.pages, &mut fresh.pages);
+                live.snapshot = Weak::new();
+                fresh.snapshot = Weak::new();
+            }
+        }
+        Ok(())
+    }
+
+    /// Combine history snapshots and separately copied STATE snapshots without
+    /// ever freezing the live state slots of the history owner.
+    pub(crate) fn combine_state_snapshots(
+        &self,
+        mut history: CachedPages,
+        mut state: CachedPages,
+        state_groups: &[bool],
+    ) -> Result<CachedPages, CachePoolError> {
+        if history.pool_id != self.id
+            || state.pool_id != self.id
+            || history.groups.len() != state.groups.len()
+            || history.groups.len() != state_groups.len()
+            || history
+                .groups
+                .iter()
+                .zip(&state.groups)
+                .zip(state_groups)
+                .any(|((left, right), &is_state)| {
+                    left.group != right.group
+                        || if is_state {
+                            !left.is_empty() || right.len() != 1
+                        } else {
+                            !right.is_empty()
+                        }
+                })
+        {
+            return Err(CachePoolError::StaleHandle);
+        }
+        for ((left, right), &is_state) in history
+            .groups
+            .iter_mut()
+            .zip(&mut state.groups)
+            .zip(state_groups)
+        {
+            if is_state {
+                std::mem::swap(left, right);
+            }
+        }
+        Ok(history)
+    }
+
     pub fn retire_cached_prefix(&mut self, cached: CachedPages) -> Result<(), CachePoolError> {
         if cached.pool_id != self.id {
             return Err(CachePoolError::ForeignPool);
@@ -1707,7 +1797,10 @@ impl CachePool {
         }
     }
 
-    fn validate_request_idle(&self, request: &RequestPages) -> Result<(), CachePoolError> {
+    pub(crate) fn validate_request_idle(
+        &self,
+        request: &RequestPages,
+    ) -> Result<(), CachePoolError> {
         self.validate_request_access(request, true)
     }
 

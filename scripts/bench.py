@@ -110,9 +110,7 @@ def _decode_budget(options, raw=None):
         draft_tokens=options["draft_tokens"],
         overlap=overlap,
         trace_passes=2 + int(overlap) if options.get("trace_dir") else 0,
-        cache_write_lookahead_tokens=getattr(
-            config, "cache_write_lookahead_tokens", None
-        ),
+        max_accepted_per_step=getattr(config, "max_accepted_per_step", None),
     )
 
 
@@ -141,8 +139,12 @@ def _cache_preflight(raw, cases, options, groups=None):
                 # Include the same output reservation as admission, plus actual
                 # cache writes beyond the final public token position.
                 config = getattr(raw, "runner_config", None)
-                lookahead = getattr(
-                    config, "cache_write_lookahead_tokens", options["draft_tokens"]
+                lookahead = (
+                    getattr(
+                        config, "max_accepted_per_step", options["draft_tokens"] + 1
+                    )
+                    - 1
+                    + layout.decode_write_extra_tokens
                 )
                 context += _decode_budget(options, raw) + lookahead
             else:

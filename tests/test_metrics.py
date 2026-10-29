@@ -11,6 +11,7 @@ from resin import (
     Engine,
     EngineMetrics,
     ForwardOutput,
+    RunnerConfig,
     SamplingParams,
 )
 
@@ -56,6 +57,8 @@ def test_metrics_default_on_with_an_explicit_opt_out_and_no_new_runner_methods()
 
 def test_stop_clipping_and_cancellation_keep_live_and_completed_totals_distinct():
     class SpeculativeRunner(Runner):
+        runner_config = RunnerConfig(max_accepted_per_step=3)
+
         def forward(self, plan: BatchPlan) -> ForwardOutput:
             return forward_output(
                 [[2] if plan.phase == BatchPhase.PREFILL else [3, 4, 5]]

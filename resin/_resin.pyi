@@ -255,6 +255,82 @@ class CacheGroupLayout:
         """
 
 @final
+class StateCopy:
+    def __new__(
+        cls,
+        /,
+        *,
+        row: int,
+        source_slab_id: int,
+        source_slotnum: int,
+        destination_slab_id: int,
+        destination_slotnum: int,
+    ) -> StateCopy: ...
+    @property
+    def row(self, /) -> int: ...
+    @property
+    def source_slab_id(self, /) -> int: ...
+    @property
+    def source_slotnum(self, /) -> int: ...
+    @property
+    def destination_slab_id(self, /) -> int: ...
+    @property
+    def destination_slotnum(self, /) -> int: ...
+
+@final
+class StateCheckpointSlot:
+    def __new__(
+        cls,
+        /,
+        *,
+        reservation_id: int,
+        row: int,
+        prefix_length: int,
+        destination_slab_id: int,
+        destination_slotnum: int,
+    ) -> StateCheckpointSlot: ...
+    @property
+    def reservation_id(self, /) -> int: ...
+    @property
+    def row(self, /) -> int: ...
+    @property
+    def prefix_length(self, /) -> int: ...
+    @property
+    def destination_slab_id(self, /) -> int: ...
+    @property
+    def destination_slotnum(self, /) -> int: ...
+
+@final
+class CacheStatePlan:
+    def __new__(
+        cls,
+        /,
+        *,
+        live_slab_ids: Sequence[int] | npt.NDArray[np.uint32],
+        live_slotnums: Sequence[int] | npt.NDArray[np.uint32],
+        restore_copies: Sequence[StateCopy] = (),
+        checkpoint_slots: Sequence[StateCheckpointSlot] = (),
+    ) -> CacheStatePlan: ...
+    @property
+    def live_slab_ids(self, /) -> npt.NDArray[np.uint32]: ...
+    @property
+    def live_slotnums(self, /) -> npt.NDArray[np.uint32]: ...
+    @property
+    def restore_copies(self, /) -> tuple[StateCopy, ...]: ...
+    @property
+    def checkpoint_slots(self, /) -> tuple[StateCheckpointSlot, ...]: ...
+
+@final
+class StateCheckpoint:
+    def __new__(
+        cls, /, *, reservation_id: int, prefix_length: int
+    ) -> StateCheckpoint: ...
+    @property
+    def reservation_id(self, /) -> int: ...
+    @property
+    def prefix_length(self, /) -> int: ...
+
+@final
 class CacheGroupPlan:
     """
     Plan for one type of cache in a BatchPlan.
@@ -270,7 +346,7 @@ class CacheGroupPlan:
     - `block_slab_ids`: One-based slab IDs for the flattened block table.
     - `block_slotnums`: Zero-based block slots within those slabs.
     - `block_table_start_indices`: Logical index of each row's first block;
-      zero for full history, advancing for window and recurrent rings. Block
+      zero for full history and private live state, advancing for window rows. Block
       `b` starts at token position `b * CacheGroupLayout.block_tokens`.
     - `append_slab_ids`: Destination slab for each flattened `BatchPlan` token.
     - `append_slotnums`: Destination block slot for each token.
@@ -289,7 +365,10 @@ class CacheGroupPlan:
         append_slotnums: "Sequence[int] | npt.NDArray[np.uint32]",
         append_block_offsets: "Sequence[int] | npt.NDArray[np.uint32]",
         blocks_per_slab: int = 1,
+        state: CacheStatePlan | None = None,
     ) -> CacheGroupPlan: ...
+    @property
+    def state(self, /) -> CacheStatePlan | None: ...
     def __repr__(self, /) -> str: ...
     @property
     def append_block_offsets(self, /) -> npt.NDArray[np.uint32]:
@@ -333,7 +412,7 @@ class CacheGroupPlan:
         """
         Absolute logical-block index at which each sequence's table row starts.
         This is zero for full-attention history and advances for sliding-window
-        and recurrent rings. It has one entry per sequence and is unrelated to
+        rows. Private live state always uses zero. It has one entry per sequence and is unrelated to
         the physical slab ID.
         """
     @property
@@ -366,6 +445,7 @@ class CacheLayout:
         parent_capacity: int,
         groups: Sequence[CacheGroupLayout],
         replay_suffix_tokens: int = 0,
+        decode_write_extra_tokens: int = 0,
     ) -> CacheLayout: ...
     def __repr__(self, /) -> str: ...
     def estimated_parent_count(
@@ -380,6 +460,14 @@ class CacheLayout:
     def group_count(self, /) -> int:
         """
         Number of logical cache groups.
+        """
+    @property
+    def decode_write_extra_tokens(self, /) -> int:
+        """
+        Persistent decode writes beyond the maximum accepted output count.
+        Qwen3.5 and GLM-5.3-Flash repair their assistant caches after target
+        verification, preparing one extra assistant position for the next draft.
+        This extra storage does not increase the accepted output limit.
         """
     def group_kernel_page_capacity(self, /, group_index: int) -> int: ...
     def group_kernel_page_count(self, /, group_index: int) -> int: ...
@@ -406,7 +494,7 @@ class CacheRetention:
 
     For history groups, `HISTORY` retains every logical block and `WINDOW`
     retains the suffix selected by `CacheGroupLayout.window_tokens`. Recurrent
-    state groups use `HISTORY` and retain their two-page checkpoint ring.
+    state groups use `HISTORY` with one private live slot per request.
     """
 
     HISTORY: Final[CacheRetention]
@@ -615,6 +703,12 @@ class ForwardOutput:
         prompt_target_indptr: "npt.NDArray[np.uint32] | None" = None,
         prompt_target_token_ids: "npt.NDArray[np.uint32] | None" = None,
         prompt_target_logprobs: "npt.NDArray[np.float32] | None" = None,
+        state_checkpoints: Sequence[StateCheckpoint] = (),
+    ) -> ForwardOutput: ...
+    @property
+    def state_checkpoints(self, /) -> tuple[StateCheckpoint, ...]: ...
+    def with_state_checkpoints(
+        self, records: Sequence[StateCheckpoint], /
     ) -> ForwardOutput: ...
     @property
     def logprob_indptr(self, /) -> npt.NDArray[np.uint32] | None: ...
@@ -1126,17 +1220,14 @@ class RunnerConfig:
         max_batch_tokens: int | None = None,
         prefill_chunk_size: int | None = None,
         continuation_prefill: bool = False,
-        cache_write_lookahead_tokens: int = 0,
-        cache_write_reservation_tokens: int = 0,
+        max_accepted_per_step: int = 1,
         cache_layout: CacheLayout | None = None,
     ) -> RunnerConfig: ...
     def __repr__(self, /) -> str: ...
     @property
     def cache_layout(self, /) -> CacheLayout | None: ...
     @property
-    def cache_write_lookahead_tokens(self, /) -> int: ...
-    @property
-    def cache_write_reservation_tokens(self, /) -> int: ...
+    def max_accepted_per_step(self, /) -> int: ...
     @property
     def continuation_prefill(self, /) -> bool: ...
     @property

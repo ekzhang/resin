@@ -19,14 +19,24 @@ fn positive_u32(name: &str, value: Option<u32>) -> PyResult<Option<NonZeroU32>> 
 ///
 /// Runners without special requirements may omit `runner_config` entirely.
 #[pyclass(frozen, module = "resin._resin", skip_from_py_object)]
-#[derive(Default)]
 pub(crate) struct RunnerConfig {
     pub(super) max_batch_tokens: Option<NonZeroU32>,
     pub(super) prefill_chunk_size: Option<NonZeroU32>,
     pub(super) continuation_prefill: bool,
-    pub(super) cache_write_lookahead_tokens: u32,
-    pub(super) cache_write_reservation_tokens: u32,
+    pub(super) max_accepted_per_step: u32,
     pub(super) cache_layout: Option<Py<CacheLayout>>,
+}
+
+impl Default for RunnerConfig {
+    fn default() -> Self {
+        Self {
+            max_batch_tokens: None,
+            prefill_chunk_size: None,
+            continuation_prefill: false,
+            max_accepted_per_step: 1,
+            cache_layout: None,
+        }
+    }
 }
 
 impl RunnerConfig {
@@ -35,8 +45,7 @@ impl RunnerConfig {
             max_batch_tokens: self.max_batch_tokens,
             prefill_chunk_size: self.prefill_chunk_size,
             continuation_prefill: self.continuation_prefill,
-            cache_write_lookahead_tokens: self.cache_write_lookahead_tokens,
-            cache_write_reservation_tokens: self.cache_write_reservation_tokens,
+            max_accepted_per_step: self.max_accepted_per_step,
             cache_layout: self
                 .cache_layout
                 .as_ref()
@@ -53,44 +62,33 @@ impl RunnerConfig {
         max_batch_tokens = None,
         prefill_chunk_size = None,
         continuation_prefill = false,
-        cache_write_lookahead_tokens = 0,
-        cache_write_reservation_tokens = 0,
+        max_accepted_per_step = 1,
         cache_layout = None
     ))]
     fn new(
-        _py: Python<'_>,
+        py: Python<'_>,
         max_batch_tokens: Option<u32>,
         prefill_chunk_size: Option<u32>,
         continuation_prefill: bool,
-        cache_write_lookahead_tokens: u32,
-        cache_write_reservation_tokens: u32,
+        max_accepted_per_step: u32,
         cache_layout: Option<Py<CacheLayout>>,
     ) -> PyResult<Self> {
-        if cache_write_lookahead_tokens > 0 && cache_layout.is_none() {
+        if max_accepted_per_step == 0 {
             return Err(PyValueError::new_err(
-                "cache_write_lookahead_tokens requires cache_layout",
+                "max_accepted_per_step must be positive",
             ));
         }
-        if cache_write_reservation_tokens > 0 {
-            if cache_layout.is_none() {
-                return Err(PyValueError::new_err(
-                    "cache_write_reservation_tokens requires cache_layout",
-                ));
-            }
-            if u64::from(cache_write_reservation_tokens)
-                < 2 * (u64::from(cache_write_lookahead_tokens) + 1)
-            {
-                return Err(PyValueError::new_err(
-                    "cache_write_reservation_tokens must cover two maximum decode steps",
-                ));
-            }
-        }
+        let extra = cache_layout.as_ref().map_or(0, |layout| {
+            layout.borrow(py).inner_native().decode_write_extra_tokens()
+        });
+        max_accepted_per_step
+            .checked_add(extra)
+            .ok_or_else(|| PyValueError::new_err("decode cache write footprint overflows u32"))?;
         Ok(Self {
             max_batch_tokens: positive_u32("max_batch_tokens", max_batch_tokens)?,
             prefill_chunk_size: positive_u32("prefill_chunk_size", prefill_chunk_size)?,
             continuation_prefill,
-            cache_write_lookahead_tokens,
-            cache_write_reservation_tokens,
+            max_accepted_per_step,
             cache_layout,
         })
     }
@@ -111,13 +109,8 @@ impl RunnerConfig {
     }
 
     #[getter]
-    fn cache_write_lookahead_tokens(&self) -> u32 {
-        self.cache_write_lookahead_tokens
-    }
-
-    #[getter]
-    fn cache_write_reservation_tokens(&self) -> u32 {
-        self.cache_write_reservation_tokens
+    fn max_accepted_per_step(&self) -> u32 {
+        self.max_accepted_per_step
     }
 
     #[getter]
@@ -129,12 +122,11 @@ impl RunnerConfig {
 
     fn __repr__(&self) -> String {
         format!(
-            "RunnerConfig(max_batch_tokens={:?}, prefill_chunk_size={:?}, continuation_prefill={}, cache_write_lookahead_tokens={}, cache_write_reservation_tokens={}, cache={})",
+            "RunnerConfig(max_batch_tokens={:?}, prefill_chunk_size={:?}, continuation_prefill={}, max_accepted_per_step={}, cache={})",
             self.max_batch_tokens(),
             self.prefill_chunk_size(),
             self.continuation_prefill,
-            self.cache_write_lookahead_tokens,
-            self.cache_write_reservation_tokens,
+            self.max_accepted_per_step,
             self.cache_layout.is_some(),
         )
     }

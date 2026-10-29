@@ -259,6 +259,8 @@ class TestEngine:
 
     def test_decode_runner_can_commit_a_verified_token_block(self) -> None:
         class BlockRunner:
+            runner_config = RunnerConfig(max_accepted_per_step=3)
+
             def __init__(self) -> None:
                 self.plans: list[BatchPlan] = []
 
@@ -296,7 +298,7 @@ class TestEngine:
         class BlockRunner:
             runner_config = RunnerConfig(
                 cache_layout=layout,
-                cache_write_lookahead_tokens=2,
+                max_accepted_per_step=3,
             )
 
             def __init__(self) -> None:
@@ -313,7 +315,7 @@ class TestEngine:
                 )
 
         runner = BlockRunner()
-        assert runner.runner_config.cache_write_lookahead_tokens == 2
+        assert runner.runner_config.max_accepted_per_step == 3
         engine = Engine(runner)
         request = engine.submit(
             [1], sampling_params=SamplingParams(max_output_tokens=4)
@@ -332,6 +334,8 @@ class TestEngine:
         self,
     ) -> None:
         class BlockRunner:
+            runner_config = RunnerConfig(max_accepted_per_step=3)
+
             @staticmethod
             def forward(plan: BatchPlan):
                 if plan.phase == BatchPhase.PREFILL:
@@ -423,7 +427,7 @@ class TestEngine:
             ),
         )
         engine.step()
-        with pytest.raises(RuntimeError, match="leased cache space for at most 1"):
+        with pytest.raises(RuntimeError, match="declared output maximum is 1"):
             engine.step()
         assert engine.poisoned
         assert not request.done

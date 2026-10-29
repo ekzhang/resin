@@ -52,6 +52,7 @@ def _runner_signature(config: RunnerConfig):
         else (
             layout.parent_capacity,
             layout.replay_suffix_tokens,
+            layout.decode_write_extra_tokens,
             tuple(
                 (
                     group.block_tokens,
@@ -69,8 +70,7 @@ def _runner_signature(config: RunnerConfig):
         config.max_batch_tokens,
         config.prefill_chunk_size,
         config.continuation_prefill,
-        config.cache_write_lookahead_tokens,
-        config.cache_write_reservation_tokens,
+        config.max_accepted_per_step,
         geometry,
     )
 
@@ -138,7 +138,7 @@ class DistributedWorker:
         self._wire = CommandTransport(
             groups.distributed, groups.replica.handle, source=groups.replica.source
         )
-        lookahead = None
+        max_accepted = None
         error = None
         try:
             self._forward = getattr(runner, "forward_distributed", None)
@@ -161,22 +161,22 @@ class DistributedWorker:
                     "CP, EP, and attention DP require forward_distributed(plan_or_none, context)"
                 )
             signature = _runner_signature(self.runner_config)
-            lookahead = self.runner_config.cache_write_lookahead_tokens
+            max_accepted = self.runner_config.max_accepted_per_step
         except BaseException as exc:
             signature, error = None, _message(exc)
         configs = self._gather(groups.replica, (signature, error))
         error = next((item[1] for item in configs if item[1]), error)
         if any(item[0] != configs[0][0] for item in configs):
             error = "runner configurations must agree within each attention replica"
-        # Replicas own independent caches and limits, but the lookahead fixes
+        # Replicas own independent caches and limits, but the output bound fixes
         # the distributed decode protocol and captured token capacities.
-        contracts = self._gather(groups.domain, (lookahead, error))
+        contracts = self._gather(groups.domain, (max_accepted, error))
         failure = _first_error(groups.domain, [item[1] for item in contracts])
         if failure:
             raise DistributedExecutionError(failure)
         if any(item[0] != contracts[0][0] for item in contracts):
             raise DistributedExecutionError(
-                "cache write lookahead must agree across the expert communication domain"
+                "max_accepted_per_step must agree across the expert communication domain"
             )
 
     def _gather(self, group: RankGroup, value):

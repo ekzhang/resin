@@ -6,7 +6,9 @@ use pyo3::prelude::*;
 use resin_core::logprobs::{LogprobView, TopLogprobView};
 use resin_core::output::TokenRows;
 
+use crate::cache::StateCheckpoint;
 use crate::core_error;
+use resin_core::resources::kv::StateCheckpoint as CoreStateCheckpoint;
 
 /// Borrowed NumPy SoA output, valid until the synchronous step returns.
 ///
@@ -49,6 +51,7 @@ pub struct ForwardOutput {
     top_token_ids: Option<Py<PyArray1<u32>>>,
     #[pyo3(get)]
     top_logprobs: Option<Py<PyArray1<f32>>>,
+    state_checkpoints: Vec<CoreStateCheckpoint>,
 }
 
 #[pymethods]
@@ -70,7 +73,8 @@ impl ForwardOutput {
         prompt_top_logprobs: "npt.NDArray[np.float32] | None" = None,
         prompt_target_indptr: "npt.NDArray[np.uint32] | None" = None,
         prompt_target_token_ids: "npt.NDArray[np.uint32] | None" = None,
-        prompt_target_logprobs: "npt.NDArray[np.float32] | None" = None
+        prompt_target_logprobs: "npt.NDArray[np.float32] | None" = None,
+        state_checkpoints = Vec::new()
     ))]
     #[allow(clippy::too_many_arguments)]
     fn new(
@@ -90,6 +94,7 @@ impl ForwardOutput {
         prompt_target_indptr: Option<Py<PyArray1<u32>>>,
         prompt_target_token_ids: Option<Py<PyArray1<u32>>>,
         prompt_target_logprobs: Option<Py<PyArray1<f32>>>,
+        state_checkpoints: Vec<Py<StateCheckpoint>>,
     ) -> PyResult<Self> {
         if prompt_logprobs.is_some() != prompt_logprob_indptr.is_some() {
             return Err(PyValueError::new_err(
@@ -153,7 +158,73 @@ impl ForwardOutput {
             top_indptr,
             top_token_ids,
             top_logprobs,
+            state_checkpoints: state_checkpoints
+                .iter()
+                .map(|record| record.borrow(py).inner())
+                .collect(),
         })
+    }
+    #[getter]
+    fn state_checkpoints(&self, py: Python<'_>) -> PyResult<Py<pyo3::types::PyTuple>> {
+        let values = self
+            .state_checkpoints
+            .iter()
+            .copied()
+            .map(StateCheckpoint::from)
+            .map(|record| Py::new(py, record))
+            .collect::<PyResult<Vec<_>>>()?;
+        Ok(pyo3::types::PyTuple::new(py, values)?.unbind())
+    }
+
+    fn with_state_checkpoints(&self, py: Python<'_>, records: Vec<Py<StateCheckpoint>>) -> Self {
+        Self {
+            token_ids: self.token_ids.clone_ref(py),
+            token_indptr: self.token_indptr.clone_ref(py),
+            prompt_top_indptr: self
+                .prompt_top_indptr
+                .as_ref()
+                .map(|value| value.clone_ref(py)),
+            prompt_top_token_ids: self
+                .prompt_top_token_ids
+                .as_ref()
+                .map(|value| value.clone_ref(py)),
+            prompt_top_logprobs: self
+                .prompt_top_logprobs
+                .as_ref()
+                .map(|value| value.clone_ref(py)),
+            prompt_target_indptr: self
+                .prompt_target_indptr
+                .as_ref()
+                .map(|value| value.clone_ref(py)),
+            prompt_target_token_ids: self
+                .prompt_target_token_ids
+                .as_ref()
+                .map(|value| value.clone_ref(py)),
+            prompt_target_logprobs: self
+                .prompt_target_logprobs
+                .as_ref()
+                .map(|value| value.clone_ref(py)),
+            prompt_logprobs: self
+                .prompt_logprobs
+                .as_ref()
+                .map(|value| value.clone_ref(py)),
+            prompt_logprob_indptr: self
+                .prompt_logprob_indptr
+                .as_ref()
+                .map(|value| value.clone_ref(py)),
+            logprobs: self.logprobs.as_ref().map(|value| value.clone_ref(py)),
+            logprob_indptr: self
+                .logprob_indptr
+                .as_ref()
+                .map(|value| value.clone_ref(py)),
+            top_indptr: self.top_indptr.as_ref().map(|value| value.clone_ref(py)),
+            top_token_ids: self.top_token_ids.as_ref().map(|value| value.clone_ref(py)),
+            top_logprobs: self.top_logprobs.as_ref().map(|value| value.clone_ref(py)),
+            state_checkpoints: records
+                .iter()
+                .map(|record| record.borrow(py).inner())
+                .collect(),
+        }
     }
 }
 
@@ -218,6 +289,7 @@ pub struct BorrowedOutput<'py> {
     pub tokens: BorrowedTokens<'py>,
     pub logprobs: Option<BorrowedLogprobs<'py>>,
     pub prompt_logprobs: Option<BorrowedLogprobs<'py>>,
+    pub state_checkpoints: Vec<CoreStateCheckpoint>,
 }
 
 pub struct BorrowedTokens<'py> {
@@ -297,6 +369,7 @@ impl ForwardOutput {
             tokens,
             logprobs,
             prompt_logprobs,
+            state_checkpoints: self.state_checkpoints.clone(),
         })
     }
 }

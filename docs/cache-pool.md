@@ -5,9 +5,9 @@ ordered `CacheLayout`; every `CacheGroupLayout` explains how one model state is
 packed into those slabs:
 
 - `family=HISTORY` stores token-addressed attention or rolling history.
-- `family=STATE` stores recurrent checkpoints.
-- `retention=HISTORY` keeps the full logical history. State groups retain only
-  their current and preceding checkpoints.
+- `family=STATE` stores one private live recurrent state per request.
+- `retention=HISTORY` keeps full logical token history for History groups.
+  For State groups, `block_tokens` specifies prefix checkpoint alignment.
 - `retention=WINDOW` keeps a bounded chronological suffix.
 - `window_tokens` is that suffix's physical retention budget;
   `read_window_tokens` is the logical window including the current token.
@@ -52,18 +52,21 @@ reserved for inactive/null rows; live slab IDs are one-based. Keeping the
 address structured prevents runners from assuming a different packing than the
 allocator.
 
-For overlapped decode, `cache_write_reservation_tokens` can reserve a wider
-immutable write span before dispatch. The runner must derive readable page
+For overlapped decode, the Engine derives a wider immutable write span from the
+maximum per-step advance and cache geometry. It bounds that span by window,
+context, output, and capacity limits, falling back to a single step when needed.
+The plan's page tables describe the actual lease. The runner must derive readable page
 counts, indices, and lengths from accepted GPU positions inside that span;
 reserved tail pages are not yet readable history. Native ownership and page
 addresses stay fixed until outstanding completions have been harvested.
 
-Hybrid models can reserve across attention pages while retaining ordinary
-recurrent-checkpoint boundaries. A wider span is granted only when it remains
-inside every State group's current block. Otherwise the batch uses its ordinary
-decode lease, and continuation drains before crossing a State boundary. This
-preserves checkpoint publication and copy-on-write semantics. Qwen uses this
-policy with 128-token attention pages and 4096-token State blocks.
+For hybrid models the STATE address remains fixed across checkpoint boundaries,
+so a wider attention lease can cross those boundaries without a recurrent-state
+drain. The state descriptor supplies one-time initialization or restore copies
+and optional snapshot destinations. The runner commits its accepted live state,
+then copies it into a snapshot only when the accepted cache-valid prefix equals
+that destination's reserved prefix. The shared CUDA `execute_state` wrapper
+performs these transfers outside model graphs and attaches completion receipts.
 
 ## Prefix caching
 
@@ -81,15 +84,17 @@ generated inputs when reconstructing a retracted request. Scored prompts still
 take the full prefill path.
 
 Live requests have priority over cached entries. When allocation needs more
-slabs, the least-recently-used prefix is evicted. Advancing a shared Window or
-State ring uses copy-on-write so one request cannot overwrite another request's
-prefix.
+slabs, the least-recently-used prefix is evicted. Shared token history uses
+copy-on-write before mutation. A State prefix hit keeps its immutable snapshot
+pinned while copying it once into a fresh private live slot.
 
-State groups use two checkpoint pages per live sequence. At a restored boundary,
-the cached input page remains read-only and the next checkpoint page is private
-and writable. Within a checkpoint interval, decode updates the private page in
-place. This keeps recurrent state prefix-compatible without a second slot
-allocator.
+Live state and optional snapshots use the same native pool. Snapshot allocation
+may fail without delaying decode. A speculative step that crosses a checkpoint
+without materializing that exact intermediate state skips it. Reports identify
+reserved snapshot destinations; the Engine validates ownership and exact prefix
+length, requires all State groups, and publishes only after outstanding consumers
+have drained. Terminal output truncation never relabels later state as an earlier
+prefix. Cancellation retains physical resources until all queued work finishes.
 
 ## Physical sizing
 

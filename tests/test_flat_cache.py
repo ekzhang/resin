@@ -139,10 +139,10 @@ class TestFlatCacheApi:
         )
         assert layout.estimated_parent_count([]) == 0
         assert layout.estimated_parent_count([0, 0]) == 0
-        assert layout.estimated_parent_count([0, 1, 4, 5, 17]) == 10
-        assert layout.estimated_parent_count((0, 1, 4, 5, 17)) == 10
+        assert layout.estimated_parent_count([0, 1, 4, 5, 17]) == 9
+        assert layout.estimated_parent_count((0, 1, 4, 5, 17)) == 9
         assert (
-            layout.estimated_parent_count([24, 24, 24], shared_prefix_tokens=16) == 10
+            layout.estimated_parent_count([24, 24, 24], shared_prefix_tokens=16) == 9
         )
         with pytest.raises(ValueError, match="align"):
             layout.estimated_parent_count([24, 24], shared_prefix_tokens=15)

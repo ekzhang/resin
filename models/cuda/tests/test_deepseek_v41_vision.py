@@ -10,6 +10,7 @@ from test_deepseek_v41_model import implementation as implementation
 from torch import nn
 
 from resin import BatchPhase, BatchPlan
+from resin.backend.cuda.completion import CudaContinuation
 from resin.backend.cuda.vision_cache import VisionFeatureCache
 from resin.recipe import (
     DeepSeekV41Image,
@@ -76,6 +77,7 @@ def media_fixture():
 
 def runner_fixture():
     runner = object.__new__(DeepSeekV41CudaRunner)
+    runner._continuation = CudaContinuation()
     runner._media_features = {}
     runner._vision_feature_cache = VisionFeatureCache()
     runner.device = torch.device("cpu")

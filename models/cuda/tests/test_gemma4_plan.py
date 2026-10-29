@@ -220,8 +220,7 @@ def test_explicit_none_feedback_drains_without_a_continuation_or_batch_id_gap():
     class Runner:
         runner_config = RunnerConfig(
             cache_layout=CacheLayout(parent_capacity=16, groups=[CacheGroupLayout(64)]),
-            cache_write_lookahead_tokens=3,
-            cache_write_reservation_tokens=8,
+            max_accepted_per_step=4,
         )
 
         def __init__(self):
@@ -337,15 +336,11 @@ def _reserved_plan(initial_positions, *, advance=0, reservation=8):
 
 
 def test_reserved_envelopes_crop_unwritten_future_pages_and_keep_owner_tables():
-    import pytest
-
     for initial in (58, 63, 64, 65, 511, 512, 513, 8191, 8192, 8193, 8703, 8704, 8705):
         for advance in (0, 1, 4):
             native, layout = _reserved_plan([initial], advance=advance)
-            # The exact-active validator intentionally continues to reject a
-            # wide table when it contains a future page or retained prefix.
             batch = edge_plan.build_gemma4_batch_plan(
-                native, layout, decode_lookahead=3, reservation_tokens=8
+                native, layout, decode_lookahead=3
             )
             assert (
                 batch.global_envelope is not None and batch.local_envelope is not None
@@ -376,24 +371,17 @@ def test_reserved_envelopes_crop_unwritten_future_pages_and_keep_owner_tables():
             assert verify.global_.append_slots.tolist() == [
                 int(pages[p // 64]) * 64 + p % 64 for p in range(anchor, anchor + 4)
             ]
-        if initial == 58:
-            native, layout = _reserved_plan([initial])
-            with pytest.raises(ValueError, match="exact active range"):
-                edge_plan.build_gemma4_batch_plan(native, layout, decode_lookahead=3)
 
 
 def test_reservation_validator_rejects_insufficient_span():
     import pytest
 
     native, layout = _reserved_plan([58], advance=69)
-    with pytest.raises(ValueError, match="does not cover"):
-        edge_plan.build_gemma4_batch_plan(
-            native, layout, decode_lookahead=3, reservation_tokens=8
-        )
+    with pytest.raises(ValueError, match="invalid active range"):
+        edge_plan.build_gemma4_batch_plan(native, layout, decode_lookahead=3)
 
 
-@pytest.mark.parametrize("reservation", [0, 8, 72])
-def test_native_reservation_preserves_exact_capacity_final_short_output(reservation):
+def test_native_reservation_preserves_exact_capacity_final_short_output():
     """Optional pipeline room cannot make an ordinary final step fail to fit."""
     from resin import (
         BatchPhase,
@@ -408,8 +396,7 @@ def test_native_reservation_preserves_exact_capacity_final_short_output(reservat
     class Runner:
         runner_config = RunnerConfig(
             cache_layout=CacheLayout(parent_capacity=16, groups=[CacheGroupLayout(4)]),
-            cache_write_lookahead_tokens=3,
-            cache_write_reservation_tokens=reservation,
+            max_accepted_per_step=4,
         )
 
         def bind_resources(self, binding):
@@ -438,9 +425,7 @@ def test_native_reservation_preserves_exact_capacity_final_short_output(reservat
 def test_large_reservation_keeps_unwritten_tail_out_of_readable_attention():
 
     native, layout = _reserved_plan([58], reservation=72)
-    batch = edge_plan.build_gemma4_batch_plan(
-        native, layout, decode_lookahead=3, reservation_tokens=72
-    )
+    batch = edge_plan.build_gemma4_batch_plan(native, layout, decode_lookahead=3)
     assert batch.global_envelope is not None
     assert batch.global_envelope.kv_indptr.tolist() == [0, 3]
     assert batch.global_.kv_indptr.tolist() == [0, 1]
@@ -448,8 +433,7 @@ def test_large_reservation_keeps_unwritten_tail_out_of_readable_attention():
     assert batch.global_.last_page_lengths.tolist() == [62]
 
 
-@pytest.mark.parametrize("reservation", [8, 72])
-def test_small_write_guard_allows_unused_page_padding(reservation):
+def test_small_write_guard_allows_unused_page_padding():
     from resin import (
         BatchPhase,
         CacheGroupLayout,
@@ -465,8 +449,7 @@ def test_small_write_guard_allows_unused_page_padding(reservation):
         runner_config = RunnerConfig(
             prefill_chunk_size=72,
             continuation_prefill=True,
-            cache_write_lookahead_tokens=3,
-            cache_write_reservation_tokens=reservation,
+            max_accepted_per_step=4,
             cache_layout=CacheLayout(
                 parent_capacity=256,
                 groups=[
@@ -490,7 +473,6 @@ def test_small_write_guard_allows_unused_page_padding(reservation):
                 self.runner_config.cache_layout,
                 decode_lookahead=3 if plan.phase == BatchPhase.DECODE else 0,
                 prefill_chunk_size=72,
-                reservation_tokens=reservation,
             )
             return ForwardOutput(
                 token_ids=np.asarray([2], dtype=np.uint32),
@@ -525,12 +507,8 @@ def test_small_write_guard_rejects_actual_verification_overrun():
             ),
         ],
     )
-    with pytest.raises(
-        ValueError, match="verification exceeds simultaneous write capacity"
-    ):
-        edge_plan.build_gemma4_batch_plan(
-            native, layout, decode_lookahead=3, reservation_tokens=8
-        )
+    with pytest.raises(ValueError, match="Window read/write capacity"):
+        edge_plan.build_gemma4_batch_plan(native, layout, decode_lookahead=3)
 
 
 def _assistant_window_batch(module, positions):

@@ -71,6 +71,7 @@ def test_byte_fallback_scores_preserve_raw_bytes_and_literal_metaspace(metaspace
             return Parser()
 
     class Runner:
+        runner_config = RunnerConfig(max_accepted_per_step=4)
         offset = 0
 
         def forward(self, _plan):
@@ -249,6 +250,7 @@ def scored_exchange(
     recipe, ids, alternative, *, api, block, controls=None, partial_tokens=False
 ):
     class Runner:
+        runner_config = RunnerConfig(max_accepted_per_step=max(1, len(ids)))
         offset = 0
 
         def forward(self, plan):

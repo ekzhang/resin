@@ -31,7 +31,7 @@ class CpuCompletion:
 class ParallelRunner:
     runner_config = RunnerConfig(
         cache_layout=CacheLayout(parent_capacity=32, groups=[CacheGroupLayout(128)]),
-        cache_write_lookahead_tokens=2,
+        max_accepted_per_step=3,
     )
     parallelism_capabilities = ParallelismCapabilities(
         cp=True, ep=True, expert_tp=True, attn_dp=True

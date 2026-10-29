@@ -21,6 +21,7 @@ class DevicePageGroup:
     slab_ids: Any
     slotnums: Any
     first_blocks: Any
+    live_state: bool = False
 
     parent_ids = property(lambda self: self.slab_ids)
     child_slots = property(lambda self: self.slotnums)
@@ -32,6 +33,7 @@ def slice_page_groups(groups: Sequence[DevicePageGroup], row: int):
             group.slab_ids[row : row + 1],
             group.slotnums[row : row + 1],
             group.first_blocks[row : row + 1],
+            group.live_state,
         )
         for group in groups
     )
@@ -41,16 +43,21 @@ def slab_locations(groups, group_index, positions, block_tokens):
     group = groups[group_index]
     logical = positions.div(block_tokens, rounding_mode="floor")
     first = group.first_blocks.view((-1,) + (1,) * (positions.ndim - 1))
-    columns = logical - first
+    columns = torch.zeros_like(positions) if group.live_state else logical - first
     width = group.slab_ids.shape[1]
     gather = columns.flatten(1).clamp(0, width - 1).long()
     slabs = torch.gather(group.slab_ids, 1, gather).view_as(columns)
     slots = torch.gather(group.slotnums, 1, gather).view_as(columns)
-    valid = (columns >= 0) & (columns < width)
+    valid = (columns >= 0) & (columns < width) & (positions >= 0)
+    offsets = (
+        torch.zeros_like(positions)
+        if group.live_state
+        else positions.remainder(block_tokens)
+    )
     return (
         torch.where(valid, slabs, 0),
         torch.where(valid, slots, 0),
-        torch.where(valid, positions.remainder(block_tokens), 0),
+        torch.where(valid, offsets, 0),
     )
 
 
@@ -118,6 +125,7 @@ def stage_page_groups(
                     source.block_table_start_indices,
                     torch.int32,
                 ),
+                source.state is not None,
             )
         )
     return tuple(groups)
@@ -132,7 +140,7 @@ def graph_page_widths(layout, sequence_capacity: int) -> tuple[int, ...]:
         if group.retention is CacheRetention.WINDOW:
             blocks = min(blocks, group.window_resident_block_count)
         elif group.family is CacheGroupFamily.STATE:
-            blocks = min(blocks, 2)
+            blocks = 1
         widths.append(max(blocks, 1))
     return tuple(widths)
 
@@ -246,11 +254,24 @@ class GraphPageTableArena:
     def _graph_widths(self, sequence_capacity: int) -> tuple[int, ...]:
         return graph_page_widths(self.layout, sequence_capacity)
 
+    def graph_can_fit_plan(self, plan, shape) -> bool:
+        """Fit the complete native lease, including currently unreadable tail pages."""
+        return plan.rows <= shape[0] and all(
+            int(np.diff(group.block_indptr).max()) <= width
+            for group, width in zip(
+                plan.groups, self._graph_widths(shape[1]), strict=True
+            )
+        )
+
     def graph_cache(self, batch_size: int, sequence_capacity: int):
         groups = empty_page_groups(
             self.device,
             batch_size,
             self._graph_widths(sequence_capacity),
+        )
+        groups = tuple(
+            replace(group, live_state=layout.family is CacheGroupFamily.STATE)
+            for group, layout in zip(groups, self.layout.groups, strict=True)
         )
         return self._make_graph_cache(groups)
 

@@ -31,6 +31,7 @@ from resin.backend.cuda.sampling import (
     SAMPLING_OFFSET_STRIDE,
 )
 from resin.backend.cuda.staging import TensorStager
+from resin.backend.cuda.state import execute_state
 from resin.backend.cuda.vision_cache import VisionFeatureCache
 from resin.backend.plans import PagedCachePlan
 from resin.backend.sampling import (
@@ -70,7 +71,7 @@ if TYPE_CHECKING:
 class InklingCudaRunner(CudaRunner):
     """Inkling-Small NVFP4 runner with image input and DSpark speculation."""
 
-    speculative_tokens = DSparkDraft.gamma
+    speculative_draft_tokens = DSparkDraft.gamma
 
     def __init__(
         self,
@@ -128,10 +129,10 @@ class InklingCudaRunner(CudaRunner):
         self.max_seq_len = max_seq_len
         self.max_batch_size = max_batch_size
         self.prefill_chunk_size = prefill_chunk_size
-        self.physical_seq_len = max_seq_len + self.speculative_tokens
+        self.physical_seq_len = max_seq_len + self.speculative_draft_tokens
         self.vocab_size = self.config.unpadded_vocab_size
         self.eos_token_id = self.config.eos_token_id
-        self._speculation = SpeculativeStats(self.speculative_tokens)
+        self._speculation = SpeculativeStats(self.speculative_draft_tokens)
         self._graph_device_caches: dict[GraphShape, DeviceCache] = {}
         self._media_features: dict[int, tuple[InklingMedia, torch.Tensor]] = {}
         self._vision_feature_cache = VisionFeatureCache()
@@ -190,7 +191,8 @@ class InklingCudaRunner(CudaRunner):
         if any(shape[1] > self.physical_seq_len for shape in decode_graph_shapes):
             raise ValueError("CUDA graph sequence capacity exceeds max_seq_len")
         if any(
-            shape[1] <= self.speculative_tokens + 1 for shape in decode_graph_shapes
+            shape[1] <= self.speculative_draft_tokens + 1
+            for shape in decode_graph_shapes
         ):
             raise ValueError("Inkling CUDA graph sequence capacity is too small")
         self._configure_cuda_graphs(
@@ -205,7 +207,7 @@ class InklingCudaRunner(CudaRunner):
         self._graph_state_inputs = torch.empty(
             (
                 max_batch_size,
-                self.speculative_tokens + 1,
+                self.speculative_draft_tokens + 1,
                 self.config.num_hidden_layers,
                 STATE_WIDTH_PER_LAYER,
             ),
@@ -216,7 +218,7 @@ class InklingCudaRunner(CudaRunner):
             max_batch_tokens=self.prefill_chunk_size,
             prefill_chunk_size=self.prefill_chunk_size,
             continuation_prefill=True,
-            cache_write_lookahead_tokens=self.speculative_tokens,
+            max_accepted_per_step=self.speculative_draft_tokens + 1,
             cache_layout=self.cache_layout,
         )
         layers = cast(Sequence[DecoderLayer], self._model.target.layers)
@@ -257,7 +259,7 @@ class InklingCudaRunner(CudaRunner):
         token_ids = torch.empty(batch_size, dtype=torch.long, device=self.device)
         positions = torch.empty(batch_size, dtype=torch.long, device=self.device)
         sampling = self._sampler.empty(batch_size, self.device)
-        output_width = 2 * self.speculative_tokens + 1
+        output_width = 2 * self.speculative_draft_tokens + 1
         output_ids = torch.empty(
             (batch_size, output_width), dtype=torch.long, device=self.device
         )
@@ -282,14 +284,16 @@ class InklingCudaRunner(CudaRunner):
                 if phase_timing is not None:
                     phase_timing.mark(1)
                 verify_ids = torch.cat((token_ids[:, None], drafts), dim=1)
-                offsets = torch.arange(self.speculative_tokens + 1, device=self.device)
+                offsets = torch.arange(
+                    self.speculative_draft_tokens + 1, device=self.device
+                )
                 verify_positions = positions[:, None] + offsets
                 logits, taps, final_state, _ = self._model.target(
                     verify_ids,
                     verify_positions,
                     cache,
                     initial_state,
-                    positions + self.speculative_tokens + 1,
+                    positions + self.speculative_draft_tokens + 1,
                     graph_seq_len,
                     full_logits=True,
                     state_inputs_out=state_inputs,
@@ -297,7 +301,7 @@ class InklingCudaRunner(CudaRunner):
                 if phase_timing is not None:
                     phase_timing.mark(2)
                 targets = graph_sample_block(self._sampler, logits, sampling)
-                matches = drafts == targets[:, : self.speculative_tokens]
+                matches = drafts == targets[:, : self.speculative_draft_tokens]
                 accepted = torch.cumprod(matches.to(torch.int32), dim=1).sum(1)
                 processed = accepted.to(torch.long) + 1
                 select_convolution_state(
@@ -308,8 +312,8 @@ class InklingCudaRunner(CudaRunner):
                 )
                 self._store_state(cache, positions + processed - 1, final_state)
                 self._draft.inject_target(taps, verify_positions, cache)
-                output_ids[:, : self.speculative_tokens].copy_(drafts)
-                output_ids[:, self.speculative_tokens :].copy_(targets)
+                output_ids[:, : self.speculative_draft_tokens].copy_(drafts)
+                output_ids[:, self.speculative_draft_tokens :].copy_(targets)
 
                 if phase_timing is not None:
                     phase_timing.mark(3)
@@ -330,7 +334,9 @@ class InklingCudaRunner(CudaRunner):
             self._cuda_graph_fallback("decode", "logprobs")
             return None
         batch_size = plan.num_sequences
-        required_length = int(np.max(plan.positions)) + self.speculative_tokens + 1
+        required_length = (
+            int(np.max(plan.positions)) + self.speculative_draft_tokens + 1
+        )
         shape = self._select_cuda_graph(
             "decode",
             match=lambda candidate: (
@@ -353,7 +359,7 @@ class InklingCudaRunner(CudaRunner):
         output = (
             self._run_cuda_graph("decode", shape, inputs)[:batch_size].cpu().tolist()
         )
-        width = self.speculative_tokens
+        width = self.speculative_draft_tokens
         accepted = self._speculation.accept(
             [row[:width] for row in output],
             [row[width:] for row in output],
@@ -519,14 +525,14 @@ class InklingCudaRunner(CudaRunner):
             anchors,
             positions,
             cache,
-            int(positions.max().item()) + self.speculative_tokens,
+            int(positions.max().item()) + self.speculative_draft_tokens,
             lambda logits, step: self._sample(logits, plan, step),
         )
         if phase_timing is not None:
             phase_timing.mark(1)
         verify_ids = torch.cat((anchors[:, None], drafts), dim=1)
         verify_positions = positions[:, None] + torch.arange(
-            self.speculative_tokens + 1, device=self.device
+            self.speculative_draft_tokens + 1, device=self.device
         )
         contexts = torch.as_tensor(
             plan.context_lengths, dtype=torch.long, device=self.device
@@ -535,7 +541,7 @@ class InklingCudaRunner(CudaRunner):
         state_inputs = torch.empty(
             (
                 anchors.shape[0],
-                self.speculative_tokens + 1,
+                self.speculative_draft_tokens + 1,
                 self.config.num_hidden_layers,
                 STATE_WIDTH_PER_LAYER,
             ),
@@ -547,8 +553,8 @@ class InklingCudaRunner(CudaRunner):
             verify_positions,
             cache,
             initial_state,
-            positions + self.speculative_tokens + 1,
-            int(positions.max().item()) + self.speculative_tokens + 1,
+            positions + self.speculative_draft_tokens + 1,
+            int(positions.max().item()) + self.speculative_draft_tokens + 1,
             full_logits=True,
             state_inputs_out=state_inputs,
         )
@@ -574,6 +580,7 @@ class InklingCudaRunner(CudaRunner):
         return format_output(logits, acceptance.token_rows, plan)
 
     @observe_execution
+    @execute_state
     def forward(self, plan: BatchPlan) -> ForwardOutput:
         self._check_cuda_graphs(plan.phase)
         rows = self._validate_plan(plan)
@@ -581,7 +588,7 @@ class InklingCudaRunner(CudaRunner):
             plan,
             self.cache_layout,
             decode_lookahead=(
-                self.speculative_tokens if plan.phase == BatchPhase.DECODE else 0
+                self.speculative_draft_tokens if plan.phase == BatchPhase.DECODE else 0
             ),
         )
         with self._cuda_failure:

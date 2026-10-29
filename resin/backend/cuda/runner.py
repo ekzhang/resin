@@ -182,8 +182,8 @@ class CudaRunner(Runner):
             type(self).__qualname__,
             self.cuda_graph_prefill,
             self.cuda_graph_decode,
-            self.runner_config.cache_write_lookahead_tokens,
-            self.runner_config.cache_write_reservation_tokens,
+            self.runner_config.max_accepted_per_step,
+            getattr(self.runner_config.cache_layout, "decode_write_extra_tokens", 0),
             request,
             catalog,
         )

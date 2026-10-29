@@ -165,7 +165,7 @@ def test_cache_preflight_credits_only_the_configured_shared_history():
         )
 
 
-@pytest.mark.parametrize("drafts,lookahead,output_budget", [(0, 0, 22), (3, 4, 84)])
+@pytest.mark.parametrize("drafts,lookahead,output_budget", [(0, 0, 22), (3, 4, 82)])
 def test_trace_cache_preflight_covers_actual_continuation_reservation(
     capsys, drafts, lookahead, output_budget
 ):
@@ -183,18 +183,22 @@ def test_trace_cache_preflight_covers_actual_continuation_reservation(
     context = 60
     peak_context = context + output_budget + lookahead
     required = (peak_context + 15) // 16
-    layout = CacheLayout(parent_capacity=required - 1, groups=[CacheGroupLayout(16)])
+    layout = CacheLayout(
+        parent_capacity=required - 1,
+        groups=[CacheGroupLayout(16)],
+        decode_write_extra_tokens=lookahead - drafts,
+    )
     raw = SimpleNamespace(
         cache_layout=layout,
         cache_capacity_plan=plan_cache_capacity(100, 100, 0.5, 10),
         runner_config=RunnerConfig(
-            cache_write_lookahead_tokens=lookahead, cache_layout=layout
+            max_accepted_per_step=drafts + 1, cache_layout=layout
         ),
         enqueue=lambda plan: None,
     )
     case = BenchCase(phase="decode", context_length=context, batch_size=1)
-    # Explicit independent budgets include the strict two-write-step guard:
-    # K0: 19 generated +3; K3: 73 generated +11 (lookahead4).
+    # Explicit independent budgets include the strict two-output-step guard:
+    # K0: 19 generated +3; K3: 73 generated +9 (maximum output4).
     assert bench._decode_budget(options, raw) == output_budget
     assert bench._context_capacity([case], options) == context + output_budget
     with pytest.raises(ValueError, match=f"needs {required} cache parents"):

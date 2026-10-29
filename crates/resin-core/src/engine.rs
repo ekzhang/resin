@@ -7,7 +7,7 @@ pub use crate::logprobs::{LogprobView, TokenLogprobs};
 use crate::metrics::{EngineMetricsSnapshot, EngineMetricsState, RequestMetricsState};
 pub use crate::output::{OwnedTokenRows, TokenRows};
 use crate::resources::RequestResourceRef;
-use crate::resources::kv::{KvGroupPlan, KvLayout};
+use crate::resources::kv::{KvGroupPlan, KvLayout, StateCheckpoint};
 use crate::resources::paged::{CachePoolError, RequestPages, WriterAccessLease};
 use crate::resources::paged_kv::{CacheMetrics, PagedKvBatchView, PagedKvError, PagedKvResources};
 use crate::{
@@ -145,39 +145,43 @@ impl SchedulerConfig {
     }
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug)]
 pub struct RunnerConfig {
     pub max_batch_tokens: Option<NonZeroU32>,
     pub prefill_chunk_size: Option<NonZeroU32>,
     pub continuation_prefill: bool,
-    /// Maximum additional committed outputs from one decode invocation.
-    pub cache_write_lookahead_tokens: u32,
-    /// Preferred decode write span reserved before dispatch, including the input
-    /// token. Zero retains the single-step reservation and same-page overlap
-    /// contract. A nonzero span opts into immutable, cross-page continuation
-    /// tables; the runner must resolve actual GPU positions within those tables.
-    /// Cohorts too close to an output/context limit or recurrent checkpoint
-    /// boundary reserve one step instead.
-    pub cache_write_reservation_tokens: u32,
+    /// Maximum accepted tokens from one decode invocation, before frontend
+    /// stop and length filtering. This is 1 for non-speculative runners and
+    /// N+1 when drafting N tokens with MTP.
+    pub max_accepted_per_step: u32,
     pub cache_layout: Option<KvLayout>,
 }
 
+impl Default for RunnerConfig {
+    fn default() -> Self {
+        Self {
+            max_batch_tokens: None,
+            prefill_chunk_size: None,
+            continuation_prefill: false,
+            max_accepted_per_step: 1,
+            cache_layout: None,
+        }
+    }
+}
+
 impl RunnerConfig {
-    fn decode_reservation_lookahead(&self) -> u32 {
-        self.cache_write_reservation_tokens
-            .checked_sub(1)
-            .unwrap_or(self.cache_write_lookahead_tokens)
+    fn decode_write_tokens(&self) -> Option<u32> {
+        self.max_accepted_per_step.checked_add(
+            self.cache_layout
+                .as_ref()
+                .map_or(0, KvLayout::decode_write_extra_tokens),
+        )
     }
 
-    fn decode_reservation_fits_state(&self, start: u32) -> bool {
-        let first = u64::from(start);
-        let last = first + u64::from(self.decode_reservation_lookahead());
-        self.cache_layout.as_ref().is_none_or(|layout| {
-            layout.groups().iter().all(|group| {
-                let block = u64::from(group.block_tokens().get());
-                !group.is_recurrent() || first / block == last / block
-            })
-        })
+    fn decode_write_lookahead(&self) -> u32 {
+        self.decode_write_tokens()
+            .expect("validated decode write footprint")
+            - 1
     }
 }
 
@@ -351,6 +355,9 @@ pub trait Runner<P> {
     }
     fn prompt_logprobs(&self) -> Option<LogprobView<'_>> {
         None
+    }
+    fn state_checkpoints(&self) -> &[StateCheckpoint] {
+        &[]
     }
     fn release(&mut self, _request_ids: &[u64]) -> Result<()> {
         Ok(())
@@ -560,25 +567,12 @@ impl<P: Clone> EngineCore<P> {
                 "schedule_conservativeness must be finite and non-negative",
             ));
         }
-        if runner_config.cache_write_lookahead_tokens > 0 && runner_config.cache_layout.is_none() {
-            return Err(Error::invalid(
-                "cache_write_lookahead_tokens requires cache_layout",
-            ));
+        if runner_config.max_accepted_per_step == 0 {
+            return Err(Error::invalid("max_accepted_per_step must be positive"));
         }
-        if runner_config.cache_write_reservation_tokens > 0 {
-            if runner_config.cache_layout.is_none() {
-                return Err(Error::invalid(
-                    "cache_write_reservation_tokens requires cache_layout",
-                ));
-            }
-            if u64::from(runner_config.cache_write_reservation_tokens)
-                < 2 * (u64::from(runner_config.cache_write_lookahead_tokens) + 1)
-            {
-                return Err(Error::invalid(
-                    "cache_write_reservation_tokens must cover two maximum decode steps",
-                ));
-            }
-        }
+        let write_tokens = runner_config
+            .decode_write_tokens()
+            .ok_or_else(|| Error::invalid("decode cache write footprint overflows u32"))?;
         let kv_resources = runner_config
             .cache_layout
             .as_ref()
@@ -593,10 +587,10 @@ impl<P: Clone> EngineCore<P> {
         if let Some(limit) = kv_resources
             .as_ref()
             .and_then(PagedKvResources::max_write_tokens)
-            && u64::from(runner_config.decode_reservation_lookahead()) + 1 > u64::from(limit.get())
+            && write_tokens > limit.get()
         {
             return Err(Error::invalid(
-                "decode cache write reservation exceeds the Window read/write capacity",
+                "decode cache write footprint exceeds the Window read/write capacity",
             ));
         }
         let new_token_ratio = scheduler_config.initial_new_token_ratio();
@@ -987,9 +981,28 @@ impl<P: Clone> EngineCore<P> {
         runner: &mut impl Runner<P>,
         phase: Option<Phase>,
     ) -> Result<Option<ExecutionPlan<P>>> {
+        self.prepare_dispatch(runner, phase, false)
+    }
+
+    /// Prepare asynchronous decode admission with an optional engine-sized
+    /// multi-step lease. Resource pressure or limits retain ordinary writes.
+    pub fn prepare_overlap_step(
+        &mut self,
+        runner: &mut impl Runner<P>,
+        phase: Option<Phase>,
+    ) -> Result<Option<ExecutionPlan<P>>> {
+        self.prepare_dispatch(runner, phase, true)
+    }
+
+    fn prepare_dispatch(
+        &mut self,
+        runner: &mut impl Runner<P>,
+        phase: Option<Phase>,
+        overlap: bool,
+    ) -> Result<Option<ExecutionPlan<P>>> {
         self.raise_if_open()?;
         self.require_completed_step()?;
-        let Some((batch, plan)) = self.prepare_batch(runner, phase)? else {
+        let Some((batch, plan)) = self.prepare_batch(runner, phase, overlap)? else {
             return Ok(None);
         };
         self.in_flight = Some(batch);
@@ -1041,7 +1054,13 @@ impl<P: Clone> EngineCore<P> {
     /// complete logically while physical retirement waits for the next step.
     /// The caller separately checks that its device runtime supports feedback.
     pub fn retain_continuation(&mut self, plan: &ExecutionPlan<P>) -> bool {
-        let maximum = u64::from(self.runner_config.cache_write_lookahead_tokens) + 1;
+        let maximum = u64::from(self.runner_config.max_accepted_per_step);
+        let two_step_writes = maximum
+            + u64::from(
+                self.runner_config
+                    .decode_write_tokens()
+                    .expect("validated decode write footprint"),
+            );
         let Some(batch) = &self.in_flight else {
             return false;
         };
@@ -1055,7 +1074,7 @@ impl<P: Clone> EngineCore<P> {
                         .max_output_tokens
                         .saturating_sub(row.request.generated.len()) as u64
                         > 2 * maximum
-                    && u64::from(row.scheduled.token_start()) + 2 * maximum
+                    && u64::from(row.scheduled.token_start()) + two_step_writes
                         <= u64::from(self.context_length.get())
             })
             && self
@@ -1069,14 +1088,11 @@ impl<P: Clone> EngineCore<P> {
                             .enumerate()
                             .all(|(row, &start)| {
                                 let block = u64::from(group.block_tokens().get());
-                                if self.runner_config.cache_write_reservation_tokens == 0
-                                    || group.is_recurrent()
-                                {
-                                    // State checkpoints keep their ordinary ring
-                                    // ownership: no continuation may cross a
-                                    // checkpoint boundary, even with wider KV leases.
-                                    u64::from(start) / block
-                                        == (u64::from(start) + 2 * maximum - 1) / block
+                                if group.is_recurrent() {
+                                    // Live recurrent state has no token-page
+                                    // boundary. Its one private slot is pinned
+                                    // for the entire continuation chain.
+                                    plan.cache_groups[index].state.is_some()
                                 } else {
                                     // The page table is the frozen lease envelope,
                                     // not a promise that new pages may be allocated.
@@ -1092,7 +1108,7 @@ impl<P: Clone> EngineCore<P> {
                                         .map_or(0, |window| start.saturating_sub(window.get() - 1));
                                     let lease_end = (first + count) * block;
                                     u64::from(earliest_read) / block >= first
-                                        && u64::from(start) + 2 * maximum <= lease_end
+                                        && u64::from(start) + two_step_writes <= lease_end
                                         && group.max_write_tokens().is_none_or(|limit| {
                                             lease_end - u64::from(start) <= u64::from(limit.get())
                                         })
@@ -1120,7 +1136,7 @@ impl<P: Clone> EngineCore<P> {
             .next_batch_id
             .checked_add(1)
             .ok_or_else(|| Error::internal("batch id space is exhausted"))?;
-        let maximum = self.runner_config.cache_write_lookahead_tokens + 1;
+        let maximum = self.runner_config.max_accepted_per_step;
         for context in &mut plan.context_lengths {
             *context += maximum;
         }
@@ -1132,19 +1148,26 @@ impl<P: Clone> EngineCore<P> {
                 .groups(),
         ) {
             for (row, &position) in plan.context_lengths.iter().enumerate() {
-                group.append_block_offsets[row] = position % layout.block_tokens().get();
-                if self.runner_config.cache_write_reservation_tokens > 0 {
-                    let logical = position / layout.block_tokens().get();
-                    let relative = logical
-                        .checked_sub(group.block_table_start_indices[row])
-                        .ok_or_else(|| Error::internal("continuation precedes its KV lease"))?;
-                    let address = group.block_indptr[row] + relative;
-                    if address >= group.block_indptr[row + 1] {
-                        return Err(Error::internal("continuation exceeds its KV lease"));
-                    }
-                    group.append_slab_ids[row] = group.block_slab_ids[address as usize];
-                    group.append_slotnums[row] = group.block_slotnums[address as usize];
+                if layout.is_recurrent() {
+                    group.append_block_offsets[row] = 0;
+                    continue;
                 }
+                group.append_block_offsets[row] = position % layout.block_tokens().get();
+                let logical = position / layout.block_tokens().get();
+                let relative = logical
+                    .checked_sub(group.block_table_start_indices[row])
+                    .ok_or_else(|| Error::internal("continuation precedes its KV lease"))?;
+                let address = group.block_indptr[row] + relative;
+                if address >= group.block_indptr[row + 1] {
+                    return Err(Error::internal("continuation exceeds its KV lease"));
+                }
+                group.append_slab_ids[row] = group.block_slab_ids[address as usize];
+                group.append_slotnums[row] = group.block_slotnums[address as usize];
+            }
+            if let Some(state) = &mut group.state {
+                // Restoring the initial checkpoint is ordered before the
+                // first launch and must never overwrite a later live state.
+                state.restore_copies.clear();
             }
         }
         Ok(Some(plan))
@@ -1207,6 +1230,7 @@ impl<P: Clone> EngineCore<P> {
         &mut self,
         runner: &mut impl Runner<P>,
         phase: Option<Phase>,
+        overlap: bool,
     ) -> Result<Option<(Batch<P>, ExecutionPlan<P>)>> {
         self.raise_if_open()?;
         if self.scheduler.is_empty() {
@@ -1243,8 +1267,9 @@ impl<P: Clone> EngineCore<P> {
                 ));
             }
             selection.truncate(scheduled_rows.len());
-            let maximum = u64::from(self.runner_config.cache_write_lookahead_tokens) + 1;
-            let reserve_continuation = self.runner_config.cache_write_reservation_tokens > 0
+            let maximum = u64::from(self.runner_config.max_accepted_per_step);
+            let reserve_continuation = overlap
+                && self.runner_config.cache_layout.is_some()
                 && scheduled_rows
                     .iter()
                     .zip(&selected_requests)
@@ -1255,21 +1280,54 @@ impl<P: Clone> EngineCore<P> {
                                 .saturating_sub(request.generated.len())
                                 as u64
                                 > 2 * maximum
-                            && u64::from(row.token_start())
-                                + u64::from(self.runner_config.cache_write_reservation_tokens)
-                                <= u64::from(self.context_length.get())
-                            // Within one checkpoint block, the wider context
-                            // has exactly the ordinary state-ring active range.
-                            // Otherwise fall back for the whole cohort before
-                            // growth, COW, or writer-lease acquisition.
-                            && self
-                                .runner_config
-                                .decode_reservation_fits_state(row.token_start())
                     });
             let lookahead = if reserve_continuation {
-                self.runner_config.decode_reservation_lookahead()
+                let layout = self.runner_config.cache_layout.as_ref().unwrap();
+                let writes = u64::from(self.runner_config.decode_write_tokens().unwrap());
+                let page = layout
+                    .groups()
+                    .iter()
+                    .filter(|group| !group.is_recurrent())
+                    .map(|group| u64::from(group.block_tokens().get()))
+                    .max()
+                    .unwrap_or(0);
+                // Reserve one history page of progress plus the two-step
+                // physical write envelope. The plan's actual CSR, rather than
+                // a second runner setting, authenticates the resulting lease.
+                let mut span = page + maximum + writes;
+                for group in layout.groups() {
+                    if let Some(limit) = group.max_write_tokens() {
+                        span = span.min(u64::from(limit.get()));
+                    }
+                }
+                for (row, request) in scheduled_rows.iter().zip(&selected_requests) {
+                    let remaining = request
+                        .max_output_tokens
+                        .saturating_sub(request.generated.len())
+                        as u64;
+                    span = span
+                        .min(u64::from(
+                            self.context_length.get().saturating_sub(row.token_start()),
+                        ))
+                        .min(remaining - 1 + writes);
+                    for group in layout.groups() {
+                        if let Some(limit) = group.max_write_tokens() {
+                            let start = u64::from(row.token_start());
+                            let block = u64::from(group.block_tokens().get());
+                            // Every advertised page is pinned in full. Keep
+                            // its rounded tail inside the WINDOW write guard.
+                            let end = (start + u64::from(limit.get())) / block * block;
+                            span = span.min(end.saturating_sub(start));
+                        }
+                    }
+                }
+                if span >= maximum + writes {
+                    (span - 1) as u32
+                } else {
+                    self.runner_config.decode_write_lookahead()
+                }
             } else {
-                self.runner_config.cache_write_lookahead_tokens
+                self.runner_config.decode_write_lookahead()
             };
             (scheduled_rows, selection, lookahead)
         };
@@ -1289,7 +1347,7 @@ impl<P: Clone> EngineCore<P> {
         }
         let mut scheduled = self.scheduler.take_selected(selection);
 
-        if decode_reservation_lookahead > self.runner_config.cache_write_lookahead_tokens {
+        if decode_reservation_lookahead > self.runner_config.decode_write_lookahead() {
             let resources = self.kv_resources.as_ref().expect("reservation has a cache");
             let requests = scheduled
                 .iter()
@@ -1309,7 +1367,7 @@ impl<P: Clone> EngineCore<P> {
             match resources.can_ensure_contexts(&requests) {
                 Ok(true) => {}
                 Ok(false) => {
-                    decode_reservation_lookahead = self.runner_config.cache_write_lookahead_tokens
+                    decode_reservation_lookahead = self.runner_config.decode_write_lookahead()
                 }
                 Err(error) => {
                     self.scheduler.restore_rejected(scheduled);
@@ -1347,7 +1405,7 @@ impl<P: Clone> EngineCore<P> {
             if matches!(error, CachePoolError::InsufficientCapacity { .. })
                 && self.retract_one(runner)?
             {
-                return self.prepare_batch(runner, phase);
+                return self.prepare_batch(runner, phase, overlap);
             }
             return Err(Error::from(error));
         }
@@ -1576,6 +1634,53 @@ impl<P: Clone> EngineCore<P> {
                 }
             };
 
+        if let Some(resources) = &mut self.kv_resources {
+            let progress = batch
+                .rows
+                .iter()
+                .zip(&prepared_progress)
+                .zip(output_token_ids.iter())
+                .map(|((row, visible), physical)| {
+                    let physical_prefix = if row.terminal {
+                        0
+                    } else {
+                        row.scheduled
+                            .token_end()
+                            .expect("validated scheduled range")
+                            + if row.scheduled.phase == Phase::Decode {
+                                physical.len() as u32 - 1
+                            } else {
+                                0
+                            }
+                    };
+                    (
+                        row.request.id,
+                        physical_prefix,
+                        visible.resident_tokens,
+                        row.terminal,
+                    )
+                })
+                .collect::<Vec<_>>();
+            if let Err(error) =
+                resources.accept_state_checkpoints(&progress, runner.state_checkpoints())
+            {
+                return self.quarantine(
+                    batch,
+                    "invalid state checkpoint receipt",
+                    Error::from(error),
+                );
+            }
+            resources.finish_state_initialization(
+                &progress.iter().map(|item| item.0).collect::<Vec<_>>(),
+            );
+        } else if !runner.state_checkpoints().is_empty() {
+            return self.quarantine(
+                batch,
+                "unexpected state checkpoint receipt",
+                Error::invalid("state checkpoints require managed cache resources"),
+            );
+        }
+
         // Validate every physical retirement and reserve all destination
         // storage before asking the runner or any allocator to release state.
         for (row, retire) in batch.rows.iter().zip(&retired) {
@@ -1786,7 +1891,7 @@ impl<P: Clone> EngineCore<P> {
         &mut self,
         batch: &mut Batch<P>,
         progress: &[PreparedProgress],
-        physical_output: TokenRows<'_>,
+        _physical_output: TokenRows<'_>,
     ) -> Result<()> {
         let Some(alignment) = self.prefix_alignment() else {
             return Ok(());
@@ -1796,31 +1901,27 @@ impl<P: Clone> EngineCore<P> {
             .cache_layout
             .as_ref()
             .is_some_and(|layout| layout.groups().iter().any(|group| group.is_recurrent()));
-        for ((row, progress), physical_tokens) in batch
-            .rows
-            .iter_mut()
-            .zip(progress)
-            .zip(physical_output.iter())
-        {
-            if row.terminal
-                || !row.request.cacheable
-                || progress.resident_tokens == 0
-                || progress.resident_tokens % alignment != 0
-            {
+        for (row, progress) in batch.rows.iter_mut().zip(progress) {
+            if row.terminal || !row.request.cacheable || progress.resident_tokens == 0 {
                 continue;
             }
-            // EOS/output limits can shorten a speculative result after the
-            // runner committed the whole accepted block. STATE groups need
-            // only store its final checkpoint, so the shortened aligned
-            // history has no guaranteed matching recurrent state. History-only
-            // caches still contain valid token-addressed entries for it.
-            if has_recurrent_state
-                && row.scheduled.phase == Phase::Decode
-                && progress.sampled_tokens.len() < physical_tokens.len()
-            {
+            let checkpoints = if has_recurrent_state {
+                self.kv_resources
+                    .as_ref()
+                    .expect("managed cache resources")
+                    .ready_state_checkpoints(row.request.id)
+                    .into_iter()
+                    .filter(|(_, length)| *length <= progress.resident_tokens)
+                    .collect::<Vec<_>>()
+            } else {
+                if progress.resident_tokens % alignment != 0 {
+                    continue;
+                }
+                vec![(0, progress.resident_tokens)]
+            };
+            if checkpoints.is_empty() {
                 continue;
             }
-            let resident = progress.resident_tokens as usize;
             let mut tokens = Vec::new();
             tokens
                 .try_reserve_exact(
@@ -1839,24 +1940,31 @@ impl<P: Clone> EngineCore<P> {
             );
             tokens.extend_from_slice(&row.request.generated);
             tokens.extend_from_slice(&progress.sampled_tokens);
-            if resident > tokens.len() {
-                return Err(Error::internal(
-                    "resident KV progress exceeds the request token history",
-                ));
+            for (reservation_id, length) in checkpoints {
+                if length as usize > tokens.len() {
+                    return Err(Error::internal(
+                        "resident KV progress exceeds the request token history",
+                    ));
+                }
+                let resources = self
+                    .kv_resources
+                    .as_mut()
+                    .expect("prefix alignment requires managed resources");
+                let pages = row
+                    .request
+                    .cache
+                    .as_mut()
+                    .expect("prefix-enabled requests own managed pages");
+                if has_recurrent_state {
+                    resources
+                        .publish_state_prefix(pages, reservation_id, &tokens[..length as usize])
+                        .map_err(Error::from)?;
+                } else {
+                    resources
+                        .publish_prefix(pages, &tokens[..length as usize], length)
+                        .map_err(Error::from)?;
+                }
             }
-            tokens.truncate(resident);
-            let resources = self
-                .kv_resources
-                .as_mut()
-                .expect("prefix alignment requires managed cache resources");
-            let pages = row
-                .request
-                .cache
-                .as_mut()
-                .expect("prefix-enabled requests own managed cache pages");
-            resources
-                .publish_prefix(pages, &tokens, progress.resident_tokens)
-                .map_err(Error::from)?;
         }
         Ok(())
     }
@@ -2204,15 +2312,10 @@ impl<P: Clone> EngineCore<P> {
                     "speculative token rows are only supported during decode",
                 ));
             }
-            let maximum = u64::from(self.runner_config.cache_write_lookahead_tokens) + 1;
-            if row.request.cache.is_some() && tokens.len() as u64 > maximum {
-                let limit = if self.runner_config.cache_write_reservation_tokens > 0 {
-                    format!("declared output maximum is {maximum}")
-                } else {
-                    format!("leased cache space for at most {maximum}")
-                };
+            let maximum = u64::from(self.runner_config.max_accepted_per_step);
+            if tokens.len() as u64 > maximum {
                 return Err(Error::internal(format!(
-                    "runner returned {} decode tokens but {limit}",
+                    "runner returned {} decode tokens but declared output maximum is {maximum}",
                     tokens.len(),
                 )));
             }

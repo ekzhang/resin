@@ -218,8 +218,12 @@ def test_batch_cache_owns_initial_states_and_preserves_published_prefix(device):
 
 
 @CUDA
-def test_batch_cache_graph_pool_lifetime_and_changed_page_metadata():
+@pytest.mark.parametrize("live_state", [False, True])
+def test_batch_cache_graph_pool_lifetime_and_changed_page_metadata(live_state):
     arena, cache = _fixture("cuda", 4, first=7)
+    cache = replace(
+        cache, groups=(cache.groups[0], replace(cache.groups[1], live_state=live_state))
+    )
     contexts = torch.tensor([0, 449, 512, 448], device="cuda", dtype=torch.int64)
     # A zero-token row exercises scatter position -1 and null storage. Others
     # have disjoint destinations; conflicting null writers are not a valid lease.

@@ -62,6 +62,9 @@ class Recipe:
 
 class Runner:
     def __init__(self, script):
+        self.runner_config = resin.RunnerConfig(
+            max_accepted_per_step=max(map(len, script))
+        )
         self.script = script
         self.steps, self.positions = {}, {}
         self.released = []

@@ -65,15 +65,15 @@ def decode_output_budget(
     draft_tokens: int,
     overlap: bool,
     trace_passes: int = 0,
-    cache_write_lookahead_tokens: int | None = None,
+    max_accepted_per_step: int | None = None,
 ) -> int:
     """Reserve output tokens without making a trace drain the decode pipeline.
 
-    The Engine retains a continuation only with more than two maximum write
+    The Engine retains a continuation only with more than two maximum output
     steps remaining. Traces need that reservation *after* their last completion,
     in addition to the worst-case accepted output count. Before constructing a
-    runner, the default lookahead conservatively covers the extra speculative
-    cache row used by GLM and Qwen; callers with a runner use its actual config.
+    runner, the default is the draft count plus one; callers with a runner use
+    its declared output bound. Physical cache writes do not consume output budget.
     Untraced requests keep their existing budget.
     """
     for name, value, minimum in (
@@ -84,19 +84,16 @@ def decode_output_budget(
     ):
         if type(value) is not int or value < minimum:
             raise ValueError(f"{name} must be an integer >= {minimum}")
-    if cache_write_lookahead_tokens is None:
-        cache_write_lookahead_tokens = draft_tokens + 1 if draft_tokens else 0
-    if (
-        type(cache_write_lookahead_tokens) is not int
-        or cache_write_lookahead_tokens < 0
-    ):
-        raise ValueError("cache_write_lookahead_tokens must be an integer >= 0")
+    if max_accepted_per_step is None:
+        max_accepted_per_step = draft_tokens + 1
+    if type(max_accepted_per_step) is not int or max_accepted_per_step < 1:
+        raise ValueError("max_accepted_per_step must be an integer >= 1")
     if not trace_passes:
         return 1 + (warmup_steps + measure_steps + 1 + int(overlap)) * (
             draft_tokens + 1
         )
     generated = 1 + (warmup_steps + measure_steps + trace_passes) * (draft_tokens + 1)
-    reservation = 2 * (cache_write_lookahead_tokens + 1) + 1 if overlap else 0
+    reservation = 2 * max_accepted_per_step + 1 if overlap else 0
     return generated + reservation
 
 
@@ -213,7 +210,7 @@ class BenchmarkRunner:
         self, runner, *, accepted_drafts: int | None = None, balanced_experts=False
     ):
         self.runner = runner
-        self.draft_tokens = int(getattr(runner, "speculative_tokens", 0))
+        self.draft_tokens = int(getattr(runner, "speculative_draft_tokens", 0))
         if accepted_drafts is not None:
             if (
                 type(accepted_drafts) is not int
@@ -741,10 +738,10 @@ def run_sweep(
                     draft_tokens=runner.draft_tokens,
                     overlap=overlap,
                     trace_passes=trace_passes,
-                    cache_write_lookahead_tokens=getattr(
+                    max_accepted_per_step=getattr(
                         getattr(runner, "runner_config", None),
-                        "cache_write_lookahead_tokens",
-                        0,
+                        "max_accepted_per_step",
+                        None,
                     ),
                 )
                 if case.context_length + maximum > local.context_length:

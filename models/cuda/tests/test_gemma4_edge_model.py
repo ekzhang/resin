@@ -235,13 +235,13 @@ def test_edge_default_mtp_uses_matching_assistant_and_supported_bf16_cache(monke
         "__init__",
         lambda self, model, **kwargs: received.update(kwargs),
     )
-    Gemma4EdgeCudaRunner(device="cuda", speculative_tokens=3)
+    Gemma4EdgeCudaRunner(device="cuda", speculative_draft_tokens=3)
     assert received["assistant_model"] == DEFAULT_ASSISTANT
     assert received["assistant_revision"] == DEFAULT_ASSISTANT_REVISION
     assert resolve_kv_cache_dtype(received["kv_cache_dtype"]) == torch.bfloat16
     with pytest.raises(ValueError, match="explicit assistant_model"):
         Gemma4EdgeCudaRunner(
-            "/local/custom-edge-target", device="cuda", speculative_tokens=3
+            "/local/custom-edge-target", device="cuda", speculative_draft_tokens=3
         )
 
 

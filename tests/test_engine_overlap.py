@@ -41,7 +41,7 @@ class Completion:
 class AsyncRunner:
     runner_config = RunnerConfig(
         cache_layout=CacheLayout(parent_capacity=16, groups=[CacheGroupLayout(128)]),
-        cache_write_lookahead_tokens=2,
+        max_accepted_per_step=3,
     )
 
     def __init__(self):

@@ -2,11 +2,15 @@
 
 from __future__ import annotations
 
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
+from types import MappingProxyType
+from typing import Any
 
 import numpy as np
 import torch
 
+from resin.backend.cuda.failures import GraphInputError
 from resin.backend.cuda.staging import TensorStager
 from resin.backend.sampling import SAMPLING_OFFSET_STRIDE, token_output
 
@@ -33,26 +37,142 @@ class DeviceFeedback:
         }
 
 
-def accepted_block(output, positions, draft_tokens, *, fixed_acceptance=None):
-    """Apply the shared prefix-acceptance rule entirely on the device."""
+@dataclass(frozen=True, slots=True)
+class DeviceAcceptance:
+    """One GPU decision shared by state commit, output, feedback and statistics.
 
-    if draft_tokens:
-        drafts, targets = output[:, :draft_tokens], output[:, draft_tokens:]
-        if fixed_acceptance is None:
-            accepted = (drafts == targets[:, :draft_tokens]).int().cumprod(1).sum(1)
-        else:
-            accepted = torch.full_like(positions, fixed_acceptance)
-        bonus = targets.gather(1, accepted[:, None]).squeeze(1)
-        columns = torch.arange(draft_tokens + 1, device=output.device)[None, :]
-        tokens = torch.where(
-            columns < accepted[:, None], output[:, : draft_tokens + 1], bonus[:, None]
+    Captured tensors belong to the graph and change on replay. Consume state
+    selections and create the completion before another replay overwrites them.
+    """
+
+    tokens: torch.Tensor
+    accepted_drafts: torch.Tensor
+    counts: torch.Tensor
+    positions: torch.Tensor
+    draft_tokens: int
+
+    @classmethod
+    def from_samples(cls, drafts, targets, positions, *, fixed_acceptance=None):
+        if drafts.ndim != 2 or targets.shape != (len(drafts), drafts.shape[1] + 1):
+            raise ValueError(
+                "target samples must contain one bonus after the draft block"
+            )
+        draft_tokens = drafts.shape[1]
+        dynamic_fixed = isinstance(fixed_acceptance, torch.Tensor)
+        if dynamic_fixed and (
+            fixed_acceptance.ndim != 0
+            or fixed_acceptance.dtype not in (torch.int32, torch.int64)
+        ):
+            raise ValueError(
+                "runtime fixed acceptance must be an integer scalar tensor"
+            )
+        if (
+            fixed_acceptance is not None
+            and not dynamic_fixed
+            and (
+                type(fixed_acceptance) is not int
+                or not 0 <= fixed_acceptance <= draft_tokens
+            )
+        ):
+            raise ValueError("fixed acceptance must fit the verified draft block")
+        accepted = (
+            (drafts == targets[:, :draft_tokens]).int().cumprod(1).sum(1)
+            if fixed_acceptance is None or dynamic_fixed
+            else torch.full_like(positions, fixed_acceptance)
         )
-        counts = accepted + 1
-    else:
-        tokens = output.reshape(-1, 1)
-        counts = torch.ones_like(positions)
-        bonus = tokens[:, 0]
-    return tokens, counts.int(), DeviceFeedback(bonus.clone(), positions + counts)
+        if dynamic_fixed:
+            accepted = torch.where(fixed_acceptance >= 0, fixed_acceptance, accepted)
+        bonus = targets.gather(1, accepted[:, None]).squeeze(1)
+        columns = torch.arange(draft_tokens + 1, device=targets.device)[None, :]
+        candidate = torch.cat((drafts, targets[:, -1:]), dim=1)
+        tokens = torch.where(columns < accepted[:, None], candidate, bonus[:, None])
+        return cls.from_accepted(tokens, accepted, positions, draft_tokens=draft_tokens)
+
+    @classmethod
+    def from_accepted(cls, tokens, accepted_drafts, positions, *, draft_tokens):
+        if (
+            type(draft_tokens) is not int
+            or draft_tokens < 0
+            or positions.ndim != 1
+            or tokens.shape != (len(positions), draft_tokens + 1)
+            or accepted_drafts.shape != positions.shape
+        ):
+            raise ValueError("accepted GPU block does not match its draft/row geometry")
+        accepted_drafts = accepted_drafts.long()
+        return cls(
+            tokens,
+            accepted_drafts,
+            (accepted_drafts + 1).int(),
+            positions,
+            draft_tokens,
+        )
+
+    def feedback(self):
+        bonus = self.tokens.gather(1, self.accepted_drafts[:, None]).squeeze(1)
+        return DeviceFeedback(bonus.clone(), self.positions + self.counts)
+
+
+def accepted_block(output, positions, draft_tokens, *, fixed_acceptance=None):
+    """Compatibility wrapper for runners adopting DeviceAcceptance separately."""
+    if not draft_tokens:
+        output = output.reshape(-1, 1)
+    accepted = DeviceAcceptance.from_samples(
+        output[:, :draft_tokens],
+        output[:, draft_tokens:],
+        positions,
+        fixed_acceptance=fixed_acceptance,
+    )
+    return accepted.tokens, accepted.counts, accepted.feedback()
+
+
+@dataclass(frozen=True, slots=True)
+class ContinuationState:
+    """An admission generation owning one row order, graph bucket and lease view."""
+
+    sequence_ids: tuple[int, ...]
+    shape: tuple[int, ...]
+    inputs: Mapping[str, torch.Tensor]
+
+
+@dataclass(frozen=True, slots=True)
+class GraphDeviceFeedback(DeviceFeedback):
+    """Shared feedback for graphs with no additional model-specific payload."""
+
+    continuation: ContinuationState
+
+
+class CudaContinuation:
+    """Validate retained graph ownership independently of model feedback payloads."""
+
+    def __init__(self):
+        self._active: ContinuationState | None = None
+
+    def begin(self, sequence_ids: Iterable[int], shape, inputs) -> ContinuationState:
+        ids = tuple(map(int, sequence_ids))
+        if len(set(ids)) != len(ids) or not shape or shape[0] < len(ids):
+            raise GraphInputError("continuation rows do not fit their graph bucket")
+        if not all(isinstance(value, torch.Tensor) for value in inputs.values()):
+            raise GraphInputError("continuations require graph-owned tensor inputs")
+        state = ContinuationState(ids, tuple(shape), MappingProxyType(dict(inputs)))
+        self._active = state
+        return state
+
+    def resume(
+        self, sequence_ids: Iterable[int], state: ContinuationState, *, shape=None
+    ):
+        if not isinstance(state, ContinuationState) or state is not self._active:
+            raise GraphInputError(
+                "continuation no longer owns its admitted cache lease"
+            )
+        if tuple(map(int, sequence_ids)) != state.sequence_ids:
+            raise GraphInputError("continuation changed its row ownership")
+        if shape is not None and tuple(shape) != state.shape:
+            raise GraphInputError("continuation changed its graph bucket")
+        return dict(state.inputs)
+
+    def drain(self, state: ContinuationState | None = None):
+        if state is None or self._active is state:
+            self._active = None
 
 
 class DeviceCompletion:
@@ -61,6 +181,21 @@ class DeviceCompletion:
     Copies are queued before another replay may reuse graph buffers. The Engine
     retains the native writer lease until ``result`` has established completion.
     """
+
+    @classmethod
+    def from_acceptance(cls, acceptance: DeviceAcceptance, *, feedback=None, **kwargs):
+        stats = kwargs.get("stats")
+        if stats is not None and stats.draft_tokens != acceptance.draft_tokens:
+            raise ValueError(
+                "completion statistics do not match the accepted draft block"
+            )
+        return cls(
+            acceptance.tokens,
+            acceptance.counts,
+            acceptance.feedback() if feedback is None else feedback,
+            accepted_end_positions=acceptance.positions + acceptance.counts,
+            **kwargs,
+        )
 
     def __init__(
         self,
@@ -73,7 +208,14 @@ class DeviceCompletion:
         device=None,
         plan=None,
         logits=None,
+        accepted_end_positions=None,
+        state_checkpoints=None,
     ):
+        self.accepted_end_positions = (
+            feedback.positions
+            if accepted_end_positions is None
+            else accepted_end_positions
+        )
         self.feedback = feedback.restrict(rows)
         self._rows, self._stats = rows, stats
         self._staging = TensorStager(device or tokens.device)
@@ -84,9 +226,36 @@ class DeviceCompletion:
         self._top_ids = self._top_logprobs = None
         if plan is not None and plan.needs_logprobs:
             self._stage_scores(tokens, plan, logits)
-        self._event = torch.cuda.Event()
-        self._event.record(torch.cuda.current_stream(tokens.device))
+        self._device = tokens.device
+        self._event = None
         self._result = None
+        self._state_checkpoints = None
+        self._prepared_state_checkpoints = state_checkpoints
+        if state_checkpoints is not None:
+            self._state_checkpoints = state_checkpoints.stage(self._staging)
+        self._record_event()
+
+    def _record_event(self):
+        event = torch.cuda.Event()
+        event.record(torch.cuda.current_stream(self._device))
+        self._event = event
+
+    def attach_state_checkpoints(self, prepared_report):
+        """Queue a report before exposing this completion to the Engine.
+
+        Snapshot copies must already follow model state commit on the same
+        stream. Republishing the event includes their report readback; failure
+        leaves this completion quarantined instead of exposing an older fence.
+        """
+        if self._result is not None:
+            raise RuntimeError("cannot attach state checkpoints after result harvest")
+        if self._state_checkpoints is not None:
+            raise RuntimeError("completion already has a state checkpoint report")
+        self._event = None
+        self._prepared_state_checkpoints = prepared_report
+        self._state_checkpoints = prepared_report.stage(self._staging)
+        self._record_event()
+        return self
 
     def _stage_scores(self, tokens, plan, logits):
         if logits is None:
@@ -140,7 +309,7 @@ class DeviceCompletion:
         scored_counts = counts.astype(np.uint32) * self._requested
         kept_counts = counts[self._score_rows].astype(np.uint32)
         keep = np.arange(width)[None, :] < kept_counts[:, None]
-        columns = {}
+        columns: dict[str, Any] = {}
         if self._top_ids is not None:
             assert self._top_logprobs is not None
             top_counts = np.repeat(self._top_counts, kept_counts)
@@ -172,11 +341,17 @@ class DeviceCompletion:
 
     def result(self):
         if self._result is None:
+            if self._event is None:
+                raise RuntimeError(
+                    "completion has an unfinished state checkpoint report"
+                )
             self._event.synchronize()
             counts = self._counts[: self._rows].numpy()
             output = token_output(self._tokens[: self._rows].numpy(), counts=counts)
             if self._logprobs is not None:
                 output = self._scored_output(output, counts)
+            if self._state_checkpoints is not None:
+                output = self._state_checkpoints.attach(output)
             self._result = output
             if self._stats is not None:
                 self._stats.blocks += self._rows

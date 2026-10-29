@@ -114,7 +114,8 @@ def test_conv_decode_matches_torch_and_shifts_window(channels):
     torch.testing.assert_close(conv_states[:, :layer], untouched_layers, atol=0, rtol=0)
 
 
-def test_two_token_verify_and_commit_match_sequential_recurrence():
+@pytest.mark.parametrize("tokens", [2, 4])
+def test_verified_prefix_commit_matches_sequential_recurrence(tokens):
     from fla.ops.gated_delta_rule import fused_recurrent_gated_delta_rule
 
     from resin_models_cuda.qwen3_5.gdn_decode import (
@@ -124,9 +125,9 @@ def test_two_token_verify_and_commit_match_sequential_recurrence():
     )
 
     torch.manual_seed(4)
-    B, H, HV, K, V, L, T = 4, 16, 32, 128, 128, 2, 2
+    B, H, HV, K, V, L, T = 4, 16, 32, 128, 128, 2, tokens
     state_elems = L * HV * K * V
-    for accepted_value in (0, 1):
+    for accepted_value in range(T):
         arena = torch.randn(8, state_elems, device="cuda", dtype=torch.float32) * 0.1
         states = arena.view(8, L, HV, K, V)
         source = torch.tensor([0, 1, 2, 3], device="cuda")
@@ -201,7 +202,22 @@ def test_two_token_verify_and_commit_match_sequential_recurrence():
             key_dim=K,
             value_dim=V,
         )
-        expected = ref_state if accepted_value else first_state
+        if accepted_value == T - 1:
+            expected = ref_state
+        elif accepted_value == 0:
+            expected = first_state
+        else:
+            kept = accepted_value + 1
+            _, expected = fused_recurrent_gated_delta_rule(
+                q[:, :kept].reshape(B, kept, H, K),
+                k[:, :kept].reshape(B, kept, H, K),
+                v[:, :kept].reshape(B, kept, HV, V),
+                g=g[:, :kept],
+                beta=b[:, :kept].sigmoid(),
+                initial_state=initial,
+                output_final_state=True,
+                use_qk_l2norm_in_kernel=True,
+            )
         torch.testing.assert_close(
             states[committed, layer], expected, atol=1e-4, rtol=1e-4
         )
@@ -242,8 +258,21 @@ def _tiny_runner_config():
     torch.cuda.is_available() and torch.cuda.get_device_capability()[0] < 9,
     reason="the real Qwen runner requires Hopper or newer",
 )
-@pytest.mark.parametrize("draft_tokens,forced", [(0, None), (1, None), (1, 0), (1, 1)])
-def test_tiny_runner_overlap_matches_sync(monkeypatch, tmp_path, draft_tokens, forced):
+@pytest.mark.parametrize(
+    "draft_tokens,forced,temperature",
+    [
+        (0, None, 0.0),
+        (1, None, 0.0),
+        (1, 1, 0.0),
+        (3, None, 0.0),
+        (3, 0, 0.0),
+        (3, 3, 0.0),
+        (3, None, 1.0),
+    ],
+)
+def test_tiny_runner_overlap_matches_sync(
+    monkeypatch, tmp_path, draft_tokens, forced, temperature
+):
     """Compare real decode paths using a small model and a padded graph batch."""
     import gc
 
@@ -266,21 +295,30 @@ def test_tiny_runner_overlap_matches_sync(monkeypatch, tmp_path, draft_tokens, f
 
     monkeypatch.setattr(runtime, "resolve_model_path", lambda *args: tmp_path)
     monkeypatch.setattr(runtime, "load_model", load_random_model)
-    modes = ((False, 0), (True, 136))
-    outputs, statistics = [], []
-    for overlap, reservation in modes:
+    modes = [
+        ("disabled", False, draft_tokens, False),
+        ("full", False, draft_tokens, False),
+        ("full", True, draft_tokens, False),
+    ]
+    if forced is None and draft_tokens and temperature == 0.0:
+        modes.append(("full", False, 0, False))
+    if forced is None and draft_tokens in (0, 3):
+        modes.append(("full", True, draft_tokens, True))
+    outputs, statistics, cached_outputs = [], [], None
+    for graph_mode, overlap, mode_drafts, prefix_cache in modes:
         runner = runtime.Qwen3_5CudaRunner(
             tmp_path,
             device="cuda",
-            speculative_tokens=draft_tokens,
+            speculative_draft_tokens=mode_drafts,
             max_seq_len=config.max_position_embeddings,
             max_batch_size=4,
             cache_slab_capacity=1024,
             kv_cache_dtype="bfloat16",
             cuda_graph_prefill="disabled",
-            cuda_graph_decode="full",
-            cuda_graph_decode_shapes=[(4, config.max_position_embeddings)],
-            cache_write_reservation_tokens=reservation,
+            cuda_graph_decode=graph_mode,
+            cuda_graph_decode_shapes=(
+                [(4, config.max_position_embeddings)] if graph_mode == "full" else []
+            ),
         )
         runner._speculation.benchmark_accepted_drafts = forced
         runner.capture_cuda_graphs()
@@ -289,23 +327,27 @@ def test_tiny_runner_overlap_matches_sync(monkeypatch, tmp_path, draft_tokens, f
             max_running_requests=3,
             context_length=config.max_position_embeddings,
             scheduler_config=SchedulerConfig(prefill_chunk_size=4096),
-            prefix_cache=False,
+            prefix_cache=prefix_cache,
             enable_overlap=overlap,
         )
         mode_outputs, mode_statistics = [], []
+
+        def prompt(length, row):
+            return [1] + [
+                2 + (index * 17 + row * 11) % 62 for index in range(length - 1)
+            ]
+
         try:
-            for length in (125, 4093, 8192):
-                leases = [
+            if prefix_cache:
+                warmup = [
                     engine.submit(
-                        [1]
-                        + [
-                            2 + (index * 17 + row * 11) % 62
-                            for index in range(length - 1)
-                        ],
+                        prompt(4096, row),
                         sampling_params=SamplingParams(
-                            max_output_tokens=160,
+                            max_output_tokens=1,
                             stop_token_ids=[],
-                            temperature=0.0,
+                            temperature=temperature,
+                            top_p=0.95,
+                            top_k=64,
                             seed=41,
                         ),
                     )
@@ -313,19 +355,175 @@ def test_tiny_runner_overlap_matches_sync(monkeypatch, tmp_path, draft_tokens, f
                 ]
                 while engine.has_work():
                     engine.step()
+                assert all(len(lease.take_result()) == 1 for lease in warmup)
+            for length in (4097,) if prefix_cache else (125, 4093, 4097):
+                leases = [
+                    engine.submit(
+                        prompt(length, row),
+                        sampling_params=SamplingParams(
+                            max_output_tokens=40,
+                            stop_token_ids=[],
+                            temperature=temperature,
+                            top_p=0.95,
+                            top_k=64,
+                            seed=41,
+                        ),
+                    )
+                    for row in range(3)
+                ]
+                while engine.has_work():
+                    engine.step()
+                if prefix_cache:
+                    assert all(lease.cached_tokens >= 4096 for lease in leases)
                 values = [lease.take_result() for lease in leases]
-                assert all(len(value) == 160 for value in values)
+                assert all(len(value) == 40 for value in values)
                 mode_outputs.append(values)
-                mode_statistics.append(dict(runner.speculative_stats))
+                stats = dict(runner.speculative_stats)
+                assert stats["drafts"] == mode_drafts * stats["blocks"]
+                assert stats["emitted"] == stats["blocks"] + stats["accepted"]
+                assert 0 <= stats["accepted"] <= stats["drafts"]
+                if forced is not None:
+                    assert stats["accepted"] == forced * stats["blocks"]
+                if mode_drafts:
+                    # Each final raw block can exceed the requested output by
+                    # at most K tokens; prefill contributed one token per row.
+                    emitted = len(mode_outputs) * 3 * 39
+                    assert (
+                        emitted
+                        <= stats["emitted"]
+                        <= emitted + len(mode_outputs) * 3 * mode_drafts
+                    )
+                mode_statistics.append(stats)
             if overlap:
                 assert engine.overlap_stats[1] > 0
-            outputs.append(mode_outputs)
-            statistics.append(mode_statistics)
+            if prefix_cache:
+                cached_outputs = mode_outputs[0]
+            else:
+                outputs.append(mode_outputs)
+                statistics.append(mode_statistics)
         finally:
             engine.close()
             runner.close_cuda_graphs()
             del engine, runner
             gc.collect()
             torch.cuda.empty_cache()
-    assert outputs[0] == outputs[1]
-    assert statistics[0] == statistics[1]
+    assert outputs[1] == outputs[2]
+    if temperature == 0.0 and forced in (None, 0):
+        assert all(output == outputs[0] for output in outputs[1:])
+    # Identical physical graph geometry must make exactly the same decisions.
+    # The smaller eager batch can round an assistant logit tie differently;
+    # Greedy verified output remains equal to the target-only sequence above.
+    # Shared sampling tests cover the probability and RNG contract. BF16
+    # target-logit or nucleus-cutoff ties can change seeded categorical draws
+    # between eager/graph shapes or single-token/block verification.
+    assert statistics[1] == statistics[2]
+    if forced is not None:
+        assert statistics[0] == statistics[1]
+    if cached_outputs is not None:
+        assert cached_outputs == outputs[1][-1]
+
+
+@pytest.mark.parametrize(
+    "tokens,kv_dtype",
+    [(1, torch.bfloat16), (4, torch.bfloat16), (1, torch.float8_e4m3fn)],
+)
+def test_shifted_mtp_attention_masks_origin_and_replays_pages(tokens, kv_dtype):
+    """Compare the real shifted-page kernel with an independent causal oracle."""
+    from resin_models_cuda.qwen3_5.attention import (
+        GraphAttentionSpec,
+        GraphPagedAttentionRuntime,
+    )
+    from resin_models_cuda.qwen3_5.cache import CacheArena, CacheGeometry
+
+    torch.manual_seed(17)
+    config = _tiny_runner_config()
+    geometry = CacheGeometry.from_config(
+        config, include_mtp=True, kv_element_bytes=kv_dtype.itemsize
+    )
+    arena = CacheArena("cuda", geometry.layout(4), geometry, kv_dtype=kv_dtype)
+    cache = arena.graph_cache(2, 512)
+    for group in cache.groups:
+        group.slab_ids.fill_(1)
+        group.slotnums.copy_(torch.arange(group.slotnums.shape[1], device="cuda")[None])
+        group.first_blocks.zero_()
+    cache.groups[2].slab_ids[1].fill_(2)
+    arena.keys.copy_(torch.randn_like(arena.keys, dtype=torch.bfloat16).to(kv_dtype))
+    arena.values.copy_(
+        torch.randn_like(arena.values, dtype=torch.bfloat16).to(kv_dtype)
+    )
+    # The unused origin would strongly alter the answer if it were attended.
+    for row in range(2):
+        physical = cache.row(row).rows(
+            2, 0, 1, torch.zeros(1, 1, device="cuda", dtype=torch.long)
+        )
+        arena.values[
+            physical.div(128, rounding_mode="floor"), physical.remainder(128)
+        ] = 128
+    queries = torch.randn(
+        2,
+        tokens,
+        config.num_attention_heads,
+        config.head_dim,
+        device="cuda",
+        dtype=torch.bfloat16,
+    )
+    positions = torch.tensor([125, 127], device="cuda")
+    runtime = GraphPagedAttentionRuntime(
+        torch.device("cuda"),
+        cache,
+        (GraphAttentionSpec(2, 1, tokens, tokens, 1),),
+        num_attention_heads=config.num_attention_heads,
+        num_key_value_heads=config.num_key_value_heads,
+        head_dim=config.head_dim,
+        workspace=torch.empty(64 * 1024**2, device="cuda", dtype=torch.uint8),
+    )
+
+    def run():
+        runtime.reset()
+        runtime.refresh(positions)
+        prepared = runtime.prepare(
+            cache,
+            group_index=2,
+            layer_count=1,
+            sequence_lengths=positions + tokens + 1,
+            tokens=tokens,
+            softmax_scale=config.head_dim**-0.5,
+        )
+        return prepared.run(queries, 0)
+
+    run()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        actual = run()
+    for starts in ((125, 127), (127, 129), (255, 256)):
+        positions.copy_(torch.tensor(starts, device="cuda"))
+        queries.normal_()
+        graph.replay()
+        for row, start in enumerate(starts):
+            length = start + tokens
+            physical = cache.row(row).rows(
+                2,
+                0,
+                1,
+                torch.arange(1, length + 1, device="cuda")[None],
+            )[0]
+            key = (
+                arena.keys.flatten(0, 1)[physical]
+                .to(queries.dtype)
+                .repeat_interleave(2, dim=1)
+            )
+            value = (
+                arena.values.flatten(0, 1)[physical]
+                .to(queries.dtype)
+                .repeat_interleave(2, dim=1)
+            )
+            mask = torch.arange(length, device="cuda")[None] <= (
+                torch.arange(tokens, device="cuda")[:, None] + length - tokens
+            )
+            expected = F.scaled_dot_product_attention(
+                queries[row].transpose(0, 1)[None],
+                key.transpose(0, 1)[None],
+                value.transpose(0, 1)[None],
+                attn_mask=mask,
+            )[0].transpose(0, 1)
+            torch.testing.assert_close(actual[row], expected, atol=2e-2, rtol=2e-2)

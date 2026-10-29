@@ -7,6 +7,7 @@ use numpy::{PyArray1, PyArrayLike1};
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use pyo3::types::PyTuple;
+use resin_core::resources::kv as core_kv;
 use resin_core::resources::kv::{
     KvGroupFamily, KvGroupLayout, KvGroupPlan, KvLayout, KvLayoutError, KvPlanError, KvRetention,
 };
@@ -23,7 +24,7 @@ fn plan_error(error: KvPlanError) -> PyErr {
 ///
 /// For history groups, `HISTORY` retains every logical block and `WINDOW`
 /// retains the suffix selected by `CacheGroupLayout.window_tokens`. Recurrent
-/// state groups use `HISTORY` and retain their two-page checkpoint ring.
+/// state groups use `HISTORY` with one private live slot per request.
 #[pyclass(
     frozen,
     eq,
@@ -38,7 +39,7 @@ pub(crate) enum CacheRetention {
     Window,
 }
 
-/// Whether a group stores token history or recurrent checkpoints.
+/// Whether a group stores token history or private live recurrent state.
 #[pyclass(
     frozen,
     eq,
@@ -277,8 +278,12 @@ impl CacheLayout {
             0 => String::new(),
             tokens => format!(", replay_suffix_tokens={tokens}"),
         };
+        let writes = match self.inner.decode_write_extra_tokens() {
+            0 => String::new(),
+            tokens => format!(", decode_write_extra_tokens={tokens}"),
+        };
         format!(
-            "CacheLayout(parent_capacity={}, groups=[{groups}]{replay})",
+            "CacheLayout(parent_capacity={}, groups=[{groups}]{replay}{writes})",
             self.inner.parent_capacity()
         )
     }
@@ -287,16 +292,20 @@ impl CacheLayout {
 #[pymethods]
 impl CacheLayout {
     #[new]
-    #[pyo3(signature = (*, parent_capacity, groups, replay_suffix_tokens=0))]
+    #[pyo3(signature = (*, parent_capacity, groups, replay_suffix_tokens=0, decode_write_extra_tokens=0))]
     fn new(
         py: Python<'_>,
         parent_capacity: u32,
         groups: Vec<Py<CacheGroupLayout>>,
         replay_suffix_tokens: u32,
+        decode_write_extra_tokens: u32,
     ) -> PyResult<Self> {
         let groups = groups.into_iter().map(|group| *group.borrow(py)).collect();
         let mut layout = Self::from_groups(parent_capacity, groups)?;
-        layout.inner = layout.inner.with_replay_suffix_tokens(replay_suffix_tokens);
+        layout.inner = layout
+            .inner
+            .with_replay_suffix_tokens(replay_suffix_tokens)
+            .with_decode_write_extra_tokens(decode_write_extra_tokens);
         Ok(layout)
     }
 
@@ -304,6 +313,12 @@ impl CacheLayout {
     #[getter]
     fn replay_suffix_tokens(&self) -> u32 {
         self.inner.replay_suffix_tokens()
+    }
+
+    /// Additional persistent writes from the resolved decode operation.
+    #[getter]
+    fn decode_write_extra_tokens(&self) -> u32 {
+        self.inner.decode_write_extra_tokens()
     }
 
     /// Number of fungible physical slabs in the pool.
@@ -363,6 +378,219 @@ impl CacheLayout {
     }
 }
 
+#[pyclass(frozen, get_all, module = "resin._resin", skip_from_py_object)]
+#[derive(Clone)]
+pub(crate) struct StateCopy {
+    row: u32,
+    source_slab_id: u32,
+    source_slotnum: u32,
+    destination_slab_id: u32,
+    destination_slotnum: u32,
+}
+
+impl From<&core_kv::StateCopy> for StateCopy {
+    fn from(copy: &core_kv::StateCopy) -> Self {
+        Self {
+            row: copy.row,
+            source_slab_id: copy.source_slab_id,
+            source_slotnum: copy.source_slotnum,
+            destination_slab_id: copy.destination_slab_id,
+            destination_slotnum: copy.destination_slotnum,
+        }
+    }
+}
+
+impl StateCopy {
+    fn inner(&self) -> core_kv::StateCopy {
+        core_kv::StateCopy {
+            row: self.row,
+            source_slab_id: self.source_slab_id,
+            source_slotnum: self.source_slotnum,
+            destination_slab_id: self.destination_slab_id,
+            destination_slotnum: self.destination_slotnum,
+        }
+    }
+}
+
+#[pymethods]
+impl StateCopy {
+    #[new]
+    #[pyo3(signature = (*, row, source_slab_id, source_slotnum, destination_slab_id, destination_slotnum))]
+    fn new(
+        row: u32,
+        source_slab_id: u32,
+        source_slotnum: u32,
+        destination_slab_id: u32,
+        destination_slotnum: u32,
+    ) -> Self {
+        Self {
+            row,
+            source_slab_id,
+            source_slotnum,
+            destination_slab_id,
+            destination_slotnum,
+        }
+    }
+}
+
+#[pyclass(frozen, get_all, module = "resin._resin", skip_from_py_object)]
+#[derive(Clone)]
+pub(crate) struct StateCheckpointSlot {
+    reservation_id: u64,
+    row: u32,
+    prefix_length: u32,
+    destination_slab_id: u32,
+    destination_slotnum: u32,
+}
+
+impl From<&core_kv::StateCheckpointSlot> for StateCheckpointSlot {
+    fn from(slot: &core_kv::StateCheckpointSlot) -> Self {
+        Self {
+            reservation_id: slot.reservation_id,
+            row: slot.row,
+            prefix_length: slot.prefix_length,
+            destination_slab_id: slot.destination_slab_id,
+            destination_slotnum: slot.destination_slotnum,
+        }
+    }
+}
+
+impl StateCheckpointSlot {
+    fn inner(&self) -> core_kv::StateCheckpointSlot {
+        core_kv::StateCheckpointSlot {
+            reservation_id: self.reservation_id,
+            row: self.row,
+            prefix_length: self.prefix_length,
+            destination_slab_id: self.destination_slab_id,
+            destination_slotnum: self.destination_slotnum,
+        }
+    }
+}
+
+#[pymethods]
+impl StateCheckpointSlot {
+    #[new]
+    #[pyo3(signature = (*, reservation_id, row, prefix_length, destination_slab_id, destination_slotnum))]
+    fn new(
+        reservation_id: u64,
+        row: u32,
+        prefix_length: u32,
+        destination_slab_id: u32,
+        destination_slotnum: u32,
+    ) -> Self {
+        Self {
+            reservation_id,
+            row,
+            prefix_length,
+            destination_slab_id,
+            destination_slotnum,
+        }
+    }
+}
+
+#[pyclass(frozen, get_all, module = "resin._resin", skip_from_py_object)]
+#[derive(Clone, Copy)]
+pub(crate) struct StateCheckpoint {
+    reservation_id: u64,
+    prefix_length: u32,
+}
+
+impl StateCheckpoint {
+    pub(crate) fn inner(&self) -> core_kv::StateCheckpoint {
+        core_kv::StateCheckpoint {
+            reservation_id: self.reservation_id,
+            prefix_length: self.prefix_length,
+        }
+    }
+}
+
+impl From<core_kv::StateCheckpoint> for StateCheckpoint {
+    fn from(checkpoint: core_kv::StateCheckpoint) -> Self {
+        Self {
+            reservation_id: checkpoint.reservation_id,
+            prefix_length: checkpoint.prefix_length,
+        }
+    }
+}
+
+#[pymethods]
+impl StateCheckpoint {
+    #[new]
+    fn new(reservation_id: u64, prefix_length: u32) -> Self {
+        Self {
+            reservation_id,
+            prefix_length,
+        }
+    }
+}
+
+#[pyclass(frozen, module = "resin._resin", skip_from_py_object)]
+pub(crate) struct CacheStatePlan {
+    inner: core_kv::StatePlan,
+}
+
+#[pymethods]
+impl CacheStatePlan {
+    #[new]
+    #[pyo3(signature = (*, live_slab_ids, live_slotnums, restore_copies=Vec::new(), checkpoint_slots=Vec::new()))]
+    fn new(
+        py: Python<'_>,
+        live_slab_ids: PyArrayLike1<'_, u32>,
+        live_slotnums: PyArrayLike1<'_, u32>,
+        restore_copies: Vec<Py<StateCopy>>,
+        checkpoint_slots: Vec<Py<StateCheckpointSlot>>,
+    ) -> Self {
+        Self {
+            inner: core_kv::StatePlan {
+                live_slab_ids: crate::arrays::owned_vec(live_slab_ids),
+                live_slotnums: crate::arrays::owned_vec(live_slotnums),
+                restore_copies: restore_copies
+                    .iter()
+                    .map(|copy| copy.borrow(py).inner())
+                    .collect(),
+                checkpoint_slots: checkpoint_slots
+                    .iter()
+                    .map(|slot| slot.borrow(py).inner())
+                    .collect(),
+            },
+        }
+    }
+
+    #[getter]
+    fn live_slab_ids<'py>(this: Bound<'py, Self>) -> Bound<'py, PyArray1<u32>> {
+        crate::arrays::readonly_view(this.clone().into_any(), &this.get().inner.live_slab_ids)
+    }
+
+    #[getter]
+    fn live_slotnums<'py>(this: Bound<'py, Self>) -> Bound<'py, PyArray1<u32>> {
+        crate::arrays::readonly_view(this.clone().into_any(), &this.get().inner.live_slotnums)
+    }
+
+    #[getter]
+    fn restore_copies(&self, py: Python<'_>) -> PyResult<Py<PyTuple>> {
+        let records = self
+            .inner
+            .restore_copies
+            .iter()
+            .map(StateCopy::from)
+            .map(|record| Py::new(py, record))
+            .collect::<PyResult<Vec<_>>>()?;
+        Ok(PyTuple::new(py, records)?.unbind())
+    }
+
+    #[getter]
+    fn checkpoint_slots(&self, py: Python<'_>) -> PyResult<Py<PyTuple>> {
+        let records = self
+            .inner
+            .checkpoint_slots
+            .iter()
+            .map(StateCheckpointSlot::from)
+            .map(|record| Py::new(py, record))
+            .collect::<PyResult<Vec<_>>>()?;
+        Ok(PyTuple::new(py, records)?.unbind())
+    }
+}
+
 /// Plan for one type of cache in a BatchPlan.
 ///
 /// Each `CacheGroupLayout` describes full-attention history, sliding-window
@@ -376,7 +604,7 @@ impl CacheLayout {
 /// - `block_slab_ids`: One-based slab IDs for the flattened block table.
 /// - `block_slotnums`: Zero-based block slots within those slabs.
 /// - `block_table_start_indices`: Logical index of each row's first block;
-///   zero for full history, advancing for window and recurrent rings. Block
+///   zero for full history and private live state, advancing for window rows. Block
 ///   `b` starts at token position `b * CacheGroupLayout.block_tokens`.
 /// - `append_slab_ids`: Destination slab for each flattened `BatchPlan` token.
 /// - `append_slotnums`: Destination block slot for each token.
@@ -459,10 +687,12 @@ impl CacheGroupPlan {
         append_slab_ids: "Sequence[int] | npt.NDArray[np.uint32]",
         append_slotnums: "Sequence[int] | npt.NDArray[np.uint32]",
         append_block_offsets: "Sequence[int] | npt.NDArray[np.uint32]",
-        blocks_per_slab = 1
+        blocks_per_slab = 1,
+        state = None
     ))]
     #[allow(clippy::too_many_arguments)]
     fn new(
+        py: Python<'_>,
         group_index: u32,
         block_indptr: PyArrayLike1<'_, u32>,
         block_slab_ids: PyArrayLike1<'_, u32>,
@@ -472,8 +702,9 @@ impl CacheGroupPlan {
         append_slotnums: PyArrayLike1<'_, u32>,
         append_block_offsets: PyArrayLike1<'_, u32>,
         blocks_per_slab: u32,
+        state: Option<Py<CacheStatePlan>>,
     ) -> PyResult<Self> {
-        Self::from_parts(
+        let mut plan = Self::from_parts(
             group_index,
             crate::arrays::owned_vec(block_indptr),
             crate::arrays::owned_vec(block_slab_ids),
@@ -483,7 +714,11 @@ impl CacheGroupPlan {
             crate::arrays::owned_vec(append_slotnums),
             crate::arrays::owned_vec(append_block_offsets),
             blocks_per_slab,
-        )
+        )?;
+        Arc::make_mut(&mut plan.inner).state =
+            state.as_ref().map(|state| state.borrow(py).inner.clone());
+        plan.validate_local()?;
+        Ok(plan)
     }
 
     /// Zero-based index of this plan's matching CacheGroupLayout. BatchPlan
@@ -498,6 +733,22 @@ impl CacheGroupPlan {
     #[getter]
     fn blocks_per_slab(&self) -> u32 {
         self.inner.blocks_per_slab
+    }
+
+    #[getter]
+    fn state(&self, py: Python<'_>) -> PyResult<Option<Py<CacheStatePlan>>> {
+        self.inner
+            .state
+            .as_ref()
+            .map(|state| {
+                Py::new(
+                    py,
+                    CacheStatePlan {
+                        inner: state.clone(),
+                    },
+                )
+            })
+            .transpose()
     }
 
     /// CSR row pointer into the block-address arrays. Its length is one more
@@ -523,7 +774,7 @@ impl CacheGroupPlan {
 
     /// Absolute logical-block index at which each sequence's table row starts.
     /// This is zero for full-attention history and advances for sliding-window
-    /// and recurrent rings. It has one entry per sequence and is unrelated to
+    /// rows. Private live state always uses zero. It has one entry per sequence and is unrelated to
     /// the physical slab ID.
     #[getter]
     fn block_table_start_indices<'py>(this: Bound<'py, Self>) -> Bound<'py, PyArray1<u32>> {
@@ -584,7 +835,7 @@ mod tests {
         Python::initialize();
         Python::attach(|py| {
             let group = Py::new(py, history(16, 2)).unwrap();
-            let layout = CacheLayout::new(py, 4, vec![group], 0).unwrap();
+            let layout = CacheLayout::new(py, 4, vec![group], 0, 0).unwrap();
             assert_eq!(layout.groups_native(), &[history(16, 2).inner()]);
             assert_eq!(layout.groups(py).unwrap().bind(py).len(), 1);
             assert_eq!(layout.group_kernel_page_capacity(0).unwrap(), 8);

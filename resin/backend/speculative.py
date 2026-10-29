@@ -40,10 +40,7 @@ class SpeculativeStats:
         draft_rows: Sequence[Sequence[int]],
         target_rows: Sequence[Sequence[int]],
     ) -> SpeculativeAcceptance:
-        fixed = self.benchmark_accepted_drafts
-        if fixed is not None:
-            if type(fixed) is not int or not 0 <= fixed <= self.draft_tokens:
-                raise ValueError("benchmark accepted drafts must fit the draft block")
+        fixed = self.validated_benchmark_accepted_drafts
         acceptance = accept_speculative_tokens(
             draft_rows, target_rows, benchmark_accepted_drafts=fixed
         )
@@ -52,6 +49,15 @@ class SpeculativeStats:
         self.accepted += sum(acceptance.accepted_counts)
         self.emitted += sum(map(len, acceptance.token_rows))
         return acceptance
+
+    @property
+    def validated_benchmark_accepted_drafts(self) -> int | None:
+        fixed = self.benchmark_accepted_drafts
+        if fixed is not None and (
+            type(fixed) is not int or not 0 <= fixed <= self.draft_tokens
+        ):
+            raise ValueError("benchmark accepted drafts must fit the draft block")
+        return fixed
 
     def snapshot(self, *, include_draft_tokens: bool = False) -> dict[str, int | float]:
         values: dict[str, int | float] = {

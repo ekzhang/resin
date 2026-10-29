@@ -16,6 +16,7 @@ from typing import Any
 import torch
 from torch import Tensor
 
+from resin.backend.cuda.completion import DeviceAcceptance
 from resin_models_cuda.glm5_3_flash import kernels
 from resin_models_cuda.glm5_3_flash.attention import rms_norm
 
@@ -313,7 +314,7 @@ def speculative_step(
     ``fixed_acceptance`` is an optional scalar tensor: -1 selects natural
     acceptance; [0,draft_tokens] selects a synthetic benchmark depth. It is
     runtime data so changing the depth does not capture or compile a new graph.
-    Returns [drafts, target samples] in ``accepted_block`` format and target logits.
+    Returns the shared accepted block and target logits.
     """
     if not 1 <= draft_tokens <= 7:
         raise ValueError("native MTP currently supports 1–7 draft tokens")
@@ -372,10 +373,10 @@ def speculative_step(
     if phase_timing is not None:
         phase_timing.mark(2)
     targets = sample(logits)
-    accepted = (drafts == targets[:, :-1]).int().cumprod(1).sum(1)
-    if fixed_acceptance is not None:
-        accepted = torch.where(fixed_acceptance >= 0, fixed_acceptance, accepted)
-    counts = accepted + 1
+    acceptance = DeviceAcceptance.from_samples(
+        drafts, targets, positions, fixed_acceptance=fixed_acceptance
+    )
+    accepted, counts = acceptance.accepted_drafts, acceptance.counts
     selected_hidden = tape.commit(counts, verified_hidden)
     # Rebuild the native MTP cache using verified target states, replacing the
     # approximate recursively generated draft states. Only accepted positions
@@ -400,4 +401,4 @@ def speculative_step(
     batch.store(selected_hidden)
     if phase_timing is not None:
         phase_timing.mark(3)
-    return torch.cat((drafts, targets), dim=1), logits
+    return acceptance, logits

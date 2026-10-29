@@ -6,6 +6,7 @@ from resin import (
     CacheGroupFamily,
     CacheGroupPlan,
     CacheRetention,
+    CacheStatePlan,
 )
 from resin.backend.plans import PagedCachePlan
 from resin_models_cuda.inkling.cache import (
@@ -36,8 +37,13 @@ def _group(
         block_table_start_indices=[0],
         append_slab_ids=[parent for parent, _ in append],
         append_slotnums=[slot for _, slot in append],
-        append_block_offsets=offsets,
+        append_block_offsets=[0] * len(offsets) if index == 3 else offsets,
         blocks_per_slab=packing,
+        state=(
+            CacheStatePlan(live_slab_ids=[pages[0][0]], live_slotnums=[pages[0][1]])
+            if index == 3
+            else None
+        ),
     )
 
 

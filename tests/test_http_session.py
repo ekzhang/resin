@@ -16,6 +16,8 @@ def test_session_overflow_terminates_client_and_keeps_other_requests_usable(
     stream_interval,
 ):
     class Runner:
+        runner_config = resin.RunnerConfig(max_accepted_per_step=40)
+
         def forward(self, plan):
             return forward_output(
                 [1] if plan.phase == BatchPhase.PREFILL else [[2] * 40]

@@ -15,12 +15,14 @@ class ImmediateDeviceRunner:
     vocab_size = 1024
 
     def __init__(self, drafts, extra_write_row):
-        self.speculative_tokens = drafts
+        self.speculative_draft_tokens = drafts
         self.runner_config = RunnerConfig(
             cache_layout=CacheLayout(
-                parent_capacity=16, groups=[CacheGroupLayout(4096)]
+                parent_capacity=16,
+                groups=[CacheGroupLayout(4096)],
+                decode_write_extra_tokens=extra_write_row,
             ),
-            cache_write_lookahead_tokens=drafts + extra_write_row,
+            max_accepted_per_step=drafts + 1,
         )
         self.synchronous_decodes = 0
         self.enqueued = 0
@@ -34,7 +36,7 @@ class ImmediateDeviceRunner:
             plan.context_lengths.tolist() if feedback is None else feedback.positions
         )
         rows = [
-            [token + index + 1 for index in range(self.speculative_tokens + 1)]
+            [token + index + 1 for index in range(self.speculative_draft_tokens + 1)]
             for token in tokens
         ]
         return forward_output(rows), SimpleNamespace(
@@ -65,7 +67,7 @@ def exercise(*, drafts, extra_write_row, warmup, passes, declared=True):
         draft_tokens=drafts,
         overlap=True,
         trace_passes=passes,
-        cache_write_lookahead_tokens=raw.runner_config.cache_write_lookahead_tokens,
+        max_accepted_per_step=raw.runner_config.max_accepted_per_step,
     )
     engine = Engine(observed, context_length=64 + budget, max_running_requests=2)
     trace_stats = []

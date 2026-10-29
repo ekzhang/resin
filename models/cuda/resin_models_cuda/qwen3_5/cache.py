@@ -177,7 +177,11 @@ class CacheGeometry:
             groups.append(
                 CacheGroupLayout(PAGE_TOKENS, blocks_per_slab=self.mtp_blocks_per_slab)
             )
-        return CacheLayout(parent_capacity=slab_capacity, groups=groups)
+        return CacheLayout(
+            parent_capacity=slab_capacity,
+            groups=groups,
+            decode_write_extra_tokens=int(self.include_mtp),
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -202,6 +206,12 @@ class DeviceCache(SlabDeviceCache):
             self.convolution_states[indices],
             self.target_hidden_states[indices],
         )
+
+    def hidden_at(self, positions: Tensor) -> Tensor:
+        slabs, slots, _ = self.locations(
+            STATE_GROUP, positions[:, None], block_tokens=PREFILL_CHUNK_SIZE
+        )
+        return self.target_hidden_states[slabs[:, 0].long(), slots[:, 0].long()]
 
     def state_offsets(self, positions: Tensor) -> Tensor:
         """Element offsets of each row's layer-zero recurrent state slot."""
@@ -305,6 +315,15 @@ class CacheArena(GraphPageTableArena):
         self.storage = torch.zeros(
             (physical, geometry.slab_bytes), dtype=torch.uint8, device=device
         )
+        # The shared restore/checkpoint helper copies the complete state atom:
+        # FP32 recurrence, BF16 convolution windows and the preceding hidden.
+        self.state_blocks = {
+            STATE_GROUP: torch.as_strided(
+                self.storage,
+                (physical, geometry.state_blocks_per_slab, geometry.state_bytes),
+                (geometry.slab_bytes, geometry.state_bytes, 1),
+            )
+        }
 
         kv = self.storage.view(kv_dtype)
         bf16 = self.storage.view(torch.bfloat16)

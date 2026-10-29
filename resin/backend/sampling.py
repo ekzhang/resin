@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import TypedDict
+from typing import Any, TypedDict
 
 import numpy as np
 import numpy.typing as npt
@@ -249,7 +249,7 @@ def format_output(logits, token_ids, plan, *, prompt_logprobs=None):
 
     ids, offsets = _token_columns(token_ids)
     lengths = np.diff(offsets)
-    prompt_columns = {}
+    prompt_columns: dict[str, Any] = {}
     if plan.needs_prompt_logprobs:
         if prompt_logprobs is None:
             raise ValueError("prefill did not provide requested prompt scores")

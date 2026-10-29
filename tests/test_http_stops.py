@@ -35,6 +35,9 @@ class TextRecipe:
 
 class PiecesRunner:
     def __init__(self, pieces, *, block=False):
+        self.runner_config = resin.RunnerConfig(
+            max_accepted_per_step=max(1, len(pieces))
+        )
         self.pieces = pieces
         self.block = block
         self.position = 0

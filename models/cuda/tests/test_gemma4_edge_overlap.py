@@ -33,7 +33,7 @@ class _Event:
 
 
 def test_hidden_feedback_pool_respects_owner_and_consumer_event(runtime, monkeypatch):
-    from resin.backend.cuda.completion import DeviceFeedback
+    from resin.backend.cuda.completion import CudaContinuation, DeviceFeedback
 
     monkeypatch.setattr(torch.cuda, "Event", _Event)
     monkeypatch.setattr(torch.cuda, "current_stream", lambda _device: None)
@@ -45,8 +45,7 @@ def test_hidden_feedback_pool_respects_owner_and_consumer_event(runtime, monkeyp
     feedback = runtime._EdgeDeviceFeedback(
         DeviceFeedback(torch.tensor([3, 4, 5, 6]), torch.tensor([65, 66, 67, 68])),
         lease,
-        (10, 11, 12),
-        (4, 160),
+        CudaContinuation().begin((10, 11, 12), (4, 160), {}),
     ).restrict(3)
     del lease
     gc.collect()
@@ -143,7 +142,7 @@ def test_graph_metadata_uses_exact_device_positions(runtime, monkeypatch):
     )
     runner = object.__new__(runtime.Gemma4EdgeCudaRunner)
     runner.device = torch.device("cpu")
-    runner.speculative_tokens = 3
+    runner.speculative_draft_tokens = 3
     step = runner._new_speculative_graph_step((4, 160))
     for positions in ([511, 512, 8703, 1], [513, 515, 8705, 1]):
         inputs["positions"].copy_(torch.tensor(positions))
@@ -215,7 +214,7 @@ def real_runner(runtime):
         Path(os.environ["RESIN_TEST_CHECKPOINT"]),
         device="cuda",
         assistant_model=os.environ["RESIN_TEST_ASSISTANT_CHECKPOINT"],
-        speculative_tokens=3,
+        speculative_draft_tokens=3,
         cache_parent_capacity=1024,
         cuda_graph_prefill="breakable",
         cuda_graph_decode="full",
@@ -413,11 +412,8 @@ def test_real_overlap_stop_cancel_and_rebatch_preserve_survivor_and_hidden_slots
 
 @cuda
 @weights
-@pytest.mark.parametrize("reservation", [8, 72])
 @torch.inference_mode()
-def test_real_reserved_overlap_crosses_pages_with_unequal_rows_padding_and_rebatch(
-    reservation,
-):
+def test_real_reserved_overlap_crosses_pages_with_unequal_rows_padding_and_rebatch():
     from resin import SamplingParams
     from resin_models_cuda.gemma4.edge_cuda import Gemma4EdgeCudaRunner
 
@@ -425,14 +421,12 @@ def test_real_reserved_overlap_crosses_pages_with_unequal_rows_padding_and_rebat
         Path(os.environ["RESIN_TEST_CHECKPOINT"]),
         device="cuda",
         assistant_model=os.environ["RESIN_TEST_ASSISTANT_CHECKPOINT"],
-        speculative_tokens=3,
+        speculative_draft_tokens=3,
         cache_parent_capacity=8192,
         cuda_graph_prefill="breakable",
         cuda_graph_decode="full",
         cuda_graph_decode_shapes=[(32, 160)],
-        cache_write_reservation_tokens=reservation,
     )
-    assert runner.runner_config.cache_write_reservation_tokens == reservation
     runner.capture_cuda_graphs()
 
     facade = _ModeRunner(runner)
@@ -471,8 +465,7 @@ def test_real_reserved_overlap_crosses_pages_with_unequal_rows_padding_and_rebat
                     assert engine.overlap_stats[1] > before
                     assert facade.crossed
                     assert facade.renewals > 0
-                    if reservation == 72:
-                        assert facade.longest_chain >= 16
+                    assert facade.longest_chain >= 16
                     assert runner._edge_hidden_pool.allocations <= 4
             assert outputs[0] == outputs[1]
         # Reordered and newly admitted rows must gather owned bank state rather

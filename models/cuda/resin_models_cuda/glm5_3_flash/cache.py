@@ -132,6 +132,7 @@ class CacheGeometry:
     def layout(self, parent_capacity):
         return CacheLayout(
             parent_capacity=parent_capacity,
+            decode_write_extra_tokens=int(self.include_mtp),
             groups=[
                 CacheGroupLayout(PAGE_TOKENS, blocks_per_slab=self.packings[0]),
                 CacheGroupLayout(
@@ -409,6 +410,12 @@ class CacheArena(GraphPageTableArena):
             geometry.conv_history,
         )
         state_slots = geometry.packings[1]
+        self.state_blocks = {
+            STATE_GROUP: self.storage.as_strided(
+                (physical, state_slots, geometry.state_bytes),
+                (geometry.slab_bytes, geometry.state_bytes, 1),
+            )
+        }
         self.recurrent_states = fp32.as_strided(
             (physical, state_slots, n, h, d, d),
             (
@@ -473,7 +480,7 @@ class CacheArena(GraphPageTableArena):
     def _graph_widths(self, sequence_capacity: int) -> tuple[int, ...]:
         widths = super()._graph_widths(sequence_capacity)
         # MTP repair's final physical row is one past its logical position.
-        # The Engine already leases it via cache_write_lookahead_tokens.
+        # The cache layout declares this shifted physical write to the Engine.
         return (
             math.ceil(
                 (sequence_capacity + int(self.geometry.include_mtp)) / PAGE_TOKENS

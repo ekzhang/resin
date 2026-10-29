@@ -114,9 +114,9 @@ to whichever group needs it. There is no fixed VRAM percentage for recurrent
 state versus attention history.
 
 `CacheGroupFamily.HISTORY` covers full and sliding token history.
-`CacheGroupFamily.STATE` covers recurrent checkpoints and retains a two-page
-ring per live sequence. A Window group declares both physical `window_tokens`
-and logical `read_window_tokens`. A step may write at most
+`CacheGroupFamily.STATE` keeps one private live state per sequence and separate
+optional immutable prefix snapshots in the same pool. A Window group declares
+both physical `window_tokens` and logical `read_window_tokens`. A step may write at most
 `window_tokens - read_window_tokens + 1` tokens so its earliest query can still
 read the preceding window. The Engine caps prefill and checks speculative
 lookahead against this bound. See [unified paged cache](cache-pool.md).
@@ -135,16 +135,24 @@ so a hit restores attention, sliding-window, and recurrent state at the same
 token boundary. Cached pages consume the same fungible pool and are evicted LRU
 when live allocation needs capacity. Successive History snapshots share immutable
 page-table segments instead of copying every ancestor's references. Window and
-State snapshots remain bounded. Trie nodes carry direct LRU links, so eviction
-does not scan all cached entries.
+State snapshots remain bounded. Each request owns a private live STATE slot;
+immutable prefix snapshots use separate slots in the same pool. A prefix hit
+copies its snapshot into the new live slot once. Only an exactly materialized
+accepted prefix can become a snapshot; a verification step that crosses an
+alignment without producing that intermediate state skips the checkpoint.
+Snapshot allocation is optional and cannot block decode. Trie nodes carry direct
+LRU links, so eviction does not scan all cached entries.
 
 ## Speculative decoding
 
 The generic Engine schedules one decode anchor per sequence. A runner such as
 DeepSeek-V4.1 may draft and verify several tokens, then return the accepted token
-row. `cache_write_lookahead_tokens` reserves enough destinations for the maximum
-verified block. DSpark state updates and target verification remain inside the
-model runner and its fused kernels.
+row. The runner option `speculative_draft_tokens` defaults to zero and sets
+`RunnerConfig.max_accepted_per_step` to the draft count plus one. This output
+bound includes the correction or bonus token. Model-specific shifted writes are
+declared by `CacheLayout.decode_write_extra_tokens`; the Engine leases both
+without treating physical writes as output progress. DSpark state updates and
+target verification remain inside the model runner and its fused kernels.
 
 ## Failure boundary
 

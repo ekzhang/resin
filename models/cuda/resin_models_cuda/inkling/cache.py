@@ -167,6 +167,7 @@ class CacheArena(GraphPageTableArena):
                 1,
             ),
         )
+        self.state_blocks = {STATE_GROUP: self.states.flatten(2)}
 
     @staticmethod
     def unit_page(slab_id: int, slotnum: int, layers: int, layer: int) -> int:

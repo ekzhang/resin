@@ -100,10 +100,12 @@ and its borrowed `TokenRows` view.
 Prefill runners return one token for each sequence, including a placeholder ID
 for unsampled continuation or replay rows. A decode runner may
 return multiple tokens for each sequence; this is how speculative decoding
-commits an accepted block. The runner declares its maximum additional cache writes through
-`RunnerConfig.cache_write_lookahead_tokens`, so the Engine reserves those pages
-before execution. DSpark and other speculative algorithms remain model-runner
-details rather than fields in the generic plan. The Engine validates raw output
+commits an accepted block. `RunnerConfig.max_accepted_per_step` is the total
+output bound, normally `speculative_draft_tokens + 1`. Cache geometry declares
+any additional shifted writes with `CacheLayout.decode_write_extra_tokens`.
+The Engine reserves the combined physical write span before execution. DSpark and
+other speculative algorithms remain model-runner details rather than fields in
+the generic plan. The Engine validates raw output
 rows before applying stop tokens and length limits, so truncation cannot hide
 an oversized verified block.
 

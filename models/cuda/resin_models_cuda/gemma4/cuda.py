@@ -19,6 +19,7 @@ from resin import (
     RunnerConfig,
 )
 from resin.backend.capacity import CacheCapacityPlan, plan_cache_capacity
+from resin.backend.cuda.completion import DeviceAcceptance, DeviceCompletion
 from resin.backend.cuda.failures import GraphInputError
 from resin.backend.cuda.graphs import (
     DEFAULT_MAX_NUM_SEQS,
@@ -204,7 +205,7 @@ class Gemma4CudaRunner(CudaRunner):
         revision: str | None = None,
         assistant_model: str | Path | None = None,
         assistant_revision: str | None = None,
-        speculative_tokens: int = 0,
+        speculative_draft_tokens: int = 0,
         prefill_chunk_size: int = PREFILL_CHUNK_SIZE,
         device: str | torch.device,
         nvfp4_backend: str = "auto",
@@ -236,11 +237,11 @@ class Gemma4CudaRunner(CudaRunner):
         ):
             raise ValueError("cache_parent_capacity must be a positive integer")
         if (
-            isinstance(speculative_tokens, bool)
-            or not isinstance(speculative_tokens, int)
-            or speculative_tokens < 0
+            isinstance(speculative_draft_tokens, bool)
+            or not isinstance(speculative_draft_tokens, int)
+            or speculative_draft_tokens < 0
         ):
-            raise ValueError("speculative_tokens must be a non-negative integer")
+            raise ValueError("speculative_draft_tokens must be a non-negative integer")
         super().__init__(
             device=device,
             label="Gemma 4",
@@ -269,10 +270,10 @@ class Gemma4CudaRunner(CudaRunner):
         )
         self._configure_parallel_graphs(self._model, parallel_groups)
         self.nvfp4_backend = nvfp4_backend
-        self.speculative_tokens = speculative_tokens
+        self.speculative_draft_tokens = speculative_draft_tokens
         self._assistant = None
         self.assistant_path: Path | None = None
-        if speculative_tokens:
+        if speculative_draft_tokens:
             selected_assistant = assistant_model or DEFAULT_ASSISTANT
             self.assistant_path = resolve_assistant_path(
                 selected_assistant, assistant_revision
@@ -292,10 +293,11 @@ class Gemma4CudaRunner(CudaRunner):
             for field in self.assistant_geometry_fields:
                 if getattr(assistant_config, field) != getattr(self.config, field):
                     raise ValueError(f"assistant {field} does not match Gemma 4 target")
-        self._speculation = SpeculativeStats(speculative_tokens)
+        self._speculation = SpeculativeStats(speculative_draft_tokens)
         self._graph_attention: dict[GraphShape, tuple[Any, Any]] = {}
         self._graph_spec_attention: dict[GraphShape, tuple[Any, Any, Any, Any]] = {}
         self._graph_verify_hidden: dict[GraphShape, Tensor] = {}
+        self._graph_acceptance: dict[GraphShape, DeviceAcceptance] = {}
         torch.cuda.synchronize(self.device)
         free_memory, total_memory = torch.cuda.mem_get_info(self.device)
         capacity_plan = plan_gemma4_kv_capacity(
@@ -336,7 +338,7 @@ class Gemma4CudaRunner(CudaRunner):
                 maximum_history_pages,
                 self.cache_parent_capacity * self.config.history_blocks_per_parent,
             ),
-            speculative=bool(speculative_tokens),
+            speculative=bool(speculative_draft_tokens),
             max_batch_size=self.max_num_seqs,
         )
         if any(batch > self.max_num_seqs for batch, _ in decode_graph_shapes):
@@ -376,10 +378,7 @@ class Gemma4CudaRunner(CudaRunner):
             max_batch_tokens=self.prefill_chunk_size,
             prefill_chunk_size=self.prefill_chunk_size,
             continuation_prefill=True,
-            cache_write_lookahead_tokens=speculative_tokens,
-            cache_write_reservation_tokens=getattr(
-                self, "_cache_write_reservation_tokens", 0
-            ),
+            max_accepted_per_step=speculative_draft_tokens + 1,
             cache_layout=self.cache_layout,
         )
         self._configure_cache_binding(
@@ -796,17 +795,18 @@ class Gemma4CudaRunner(CudaRunner):
         batch_size, history_width = shape
         rows = tuple(range(batch_size))
         zeros = (0,) * batch_size
-        token_ids = (2,) * batch_size if self.speculative_tokens else zeros
-        positions = (1,) * batch_size if self.speculative_tokens else zeros
+        token_ids = (2,) * batch_size if self.speculative_draft_tokens else zeros
+        positions = (1,) * batch_size if self.speculative_draft_tokens else zeros
         inputs: dict[str, object] = {
             "token_ids": token_ids,
             "positions": positions,
             **capture_sampling_inputs(batch_size, vocab_size),
         }
-        if self.speculative_tokens:
-            width = self.speculative_tokens + 1
+        if self.speculative_draft_tokens:
+            width = self.speculative_draft_tokens + 1
             inputs.update(
                 {
+                    "fixed_acceptance": -1,
                     "target_hidden": torch.linspace(
                         -1.0,
                         1.0,
@@ -846,7 +846,7 @@ class Gemma4CudaRunner(CudaRunner):
         return inputs
 
     def _before_cuda_graph_capture(self) -> None:
-        if self.speculative_tokens:
+        if self.speculative_draft_tokens:
             self._cache.storage[0].fill_(0.125)
 
     def _after_cuda_graph_capture(self) -> None:
@@ -900,7 +900,7 @@ class Gemma4CudaRunner(CudaRunner):
         )
 
     def _new_decode_graph_step(self, shape: GraphShape) -> CudaGraphStep:
-        if self.speculative_tokens:
+        if self.speculative_draft_tokens:
             return self._new_speculative_graph_step(shape)
         from flashinfer import BatchDecodeWithPagedKVCacheWrapper
 
@@ -1002,12 +1002,14 @@ class Gemma4CudaRunner(CudaRunner):
         return BatchPrefillWithPagedKVCacheWrapper(*args, **kwargs)
 
     def _new_speculative_graph_step(self, shape: GraphShape) -> CudaGraphStep:
+        if not hasattr(self, "_graph_acceptance"):
+            self._graph_acceptance = {}
 
         assistant = self._assistant
         if assistant is None:
             raise RuntimeError("speculative graph requires the Gemma 4 assistant")
         batch_size, history_width = shape
-        width = self.speculative_tokens + 1
+        width = self.speculative_draft_tokens + 1
 
         def empty(dtype, *dimensions):
             return torch.empty(dimensions, dtype=dtype, device=self.device)
@@ -1119,7 +1121,10 @@ class Gemma4CudaRunner(CudaRunner):
         token_ids = empty(torch.int64, batch_size)
         positions = empty(torch.int64, batch_size)
         target_hidden = empty(torch.bfloat16, batch_size, self.config.hidden_size)
-        output_ids = empty(torch.int64, batch_size, 2 * self.speculative_tokens + 1)
+        output_ids = empty(
+            torch.int64, batch_size, 2 * self.speculative_draft_tokens + 1
+        )
+        fixed_acceptance = empty(torch.int64)
         verify_hidden_output = empty(
             torch.bfloat16, batch_size, width, self.config.hidden_size
         )
@@ -1136,7 +1141,7 @@ class Gemma4CudaRunner(CudaRunner):
             last_ids = token_ids
             last_hidden = target_hidden
             draft_columns = []
-            for _ in range(self.speculative_tokens):
+            for _ in range(self.speculative_draft_tokens):
                 token_embedding = self._model.embed_tokens(last_ids)
                 inputs_embeds = torch.cat((token_embedding, last_hidden), dim=-1)
                 draft_logits, last_hidden = assistant.forward_step(
@@ -1175,9 +1180,15 @@ class Gemma4CudaRunner(CudaRunner):
             )
             if phase_timing is not None:
                 phase_timing.mark(2)
-            output_ids[:, : self.speculative_tokens].copy_(drafts)
-            output_ids[:, self.speculative_tokens :].copy_(
+            output_ids[:, : self.speculative_draft_tokens].copy_(drafts)
+            output_ids[:, self.speculative_draft_tokens :].copy_(
                 graph_sample_block(self._sampler, verify_logits, sampling)
+            )
+            self._graph_acceptance[shape] = DeviceAcceptance.from_samples(
+                drafts,
+                output_ids[:, self.speculative_draft_tokens :],
+                positions,
+                fixed_acceptance=fixed_acceptance,
             )
 
             if phase_timing is not None:
@@ -1187,6 +1198,7 @@ class Gemma4CudaRunner(CudaRunner):
             "token_ids": token_ids,
             "positions": positions,
             "target_hidden": target_hidden,
+            "fixed_acceptance": fixed_acceptance,
             "assistant_local_kv_indptr": assistant_local.kv_indptr,
             "assistant_local_page_indices": assistant_local.page_indices,
             "assistant_local_last_page_lengths": assistant_local.last_page_lengths,
@@ -1221,7 +1233,7 @@ class Gemma4CudaRunner(CudaRunner):
     def _prepare_graph_attention(
         self, shape: GraphShape, inputs: dict[str, object]
     ) -> None:
-        if self.speculative_tokens:
+        if self.speculative_draft_tokens:
             wrappers = self._graph_spec_attention[shape]
             stages = (
                 ("assistant_", wrappers[:2], None),
@@ -1429,19 +1441,21 @@ class Gemma4CudaRunner(CudaRunner):
             return None
         graph_rows, graph_history_width = shape
         padding_rows = graph_rows - active_rows
-        width = self.speculative_tokens + 1
+        width = self.speculative_draft_tokens + 1
         assistant = gemma4_assistant_context(
             batch, local_window_tokens=self.sliding_window
         )
         verify = expand_gemma4_decode_batch(
             batch,
-            np.zeros((active_rows, self.speculative_tokens), dtype=np.int64),
+            np.zeros((active_rows, self.speculative_draft_tokens), dtype=np.int64),
         )
         hidden = self._gather_target_hidden(sequence_ids, graph_rows)
+        fixed = self._speculation.validated_benchmark_accepted_drafts
         inputs: dict[str, object] = {
             "token_ids": np.pad(batch.token_ids, (0, padding_rows)),
             "positions": np.pad(batch.positions, (0, padding_rows), constant_values=1),
             "target_hidden": hidden,
+            "fixed_acceptance": -1 if fixed is None else fixed,
             "verify_qo_indptr": np.arange(
                 0, (graph_rows + 1) * width, width, dtype=np.int32
             ),
@@ -1474,18 +1488,19 @@ class Gemma4CudaRunner(CudaRunner):
             )
         )
         self._prepare_graph_attention(shape, inputs)
-        output = (
-            self._run_cuda_graph("decode", shape, inputs)[:active_rows].cpu().tolist()
-        )
-        drafts = [row[: self.speculative_tokens] for row in output]
-        targets = [row[self.speculative_tokens :] for row in output]
-        accepted = self._accept_speculative(
+        self._run_cuda_graph("decode", shape, inputs)
+        accepted = self._graph_acceptance[shape]
+        self._store_accepted_hidden(
             sequence_ids,
-            drafts,
-            targets,
+            accepted.accepted_drafts[:active_rows],
             self._graph_verify_hidden[shape][:active_rows],
         )
-        return token_output(accepted)
+        return DeviceCompletion.from_acceptance(
+            accepted,
+            rows=active_rows,
+            stats=self._speculation,
+            device=self.device,
+        ).result()
 
     def _eager_transformer(self, native: BatchPlan, batch: Gemma4BatchPlan) -> Tensor:
         token_ids = torch.as_tensor(
@@ -1617,20 +1632,10 @@ class Gemma4CudaRunner(CudaRunner):
         logits = self._model.logits(hidden[target.last_token_indices])
         return format_output(logits, self._sample_target(logits, native, 0), native)
 
-    def _accept_speculative(
-        self,
-        sequence_ids: list[int],
-        draft_rows: list[list[int]],
-        target_rows: list[list[int]],
-        verify_hidden: Tensor,
-    ) -> list[list[int]]:
-        acceptance = self._speculation.accept(draft_rows, target_rows)
-        indices = torch.as_tensor(
-            acceptance.accepted_counts, dtype=torch.int64, device=self.device
-        )[:, None, None].expand(-1, 1, verify_hidden.shape[-1])
+    def _store_accepted_hidden(self, sequence_ids, accepted_drafts, verify_hidden):
+        indices = accepted_drafts[:, None, None].expand(-1, 1, verify_hidden.shape[-1])
         selected = verify_hidden.gather(1, indices).squeeze(1)
         self._set_target_hidden(sequence_ids, selected)
-        return acceptance.token_rows
 
     def _speculative_decode(
         self, native: BatchPlan, batch: Gemma4BatchPlan
@@ -1668,7 +1673,7 @@ class Gemma4CudaRunner(CudaRunner):
         draft_columns = []
         shared_local = (self._cache.local_keys[-1], self._cache.local_values[-1])
         shared_global = (self._cache.global_keys[-1], self._cache.global_values[-1])
-        for _ in range(self.speculative_tokens):
+        for _ in range(self.speculative_draft_tokens):
             token_embedding = self._model.embed_tokens(last_ids)
             inputs_embeds = torch.cat((token_embedding, last_hidden), dim=-1)
             draft_logits, last_hidden = assistant.forward_step(
@@ -1687,7 +1692,7 @@ class Gemma4CudaRunner(CudaRunner):
             phase_timing.mark(1)
         verify = expand_gemma4_decode_batch(batch, drafts.cpu().numpy())
         verify_hidden = self._eager_transformer(native, verify)
-        width = self.speculative_tokens + 1
+        width = self.speculative_draft_tokens + 1
         verify_hidden_rows = verify_hidden.view(
             native.num_sequences, width, self.config.hidden_size
         )
@@ -1697,25 +1702,34 @@ class Gemma4CudaRunner(CudaRunner):
         if phase_timing is not None:
             phase_timing.mark(2)
         targets = self._sampler(verify_logits, native)
-        accepted = self._accept_speculative(
-            sequence_ids,
-            drafts.tolist(),
-            targets.tolist(),
-            verify_hidden_rows,
+        accepted = DeviceAcceptance.from_samples(
+            drafts,
+            targets,
+            positions,
+            fixed_acceptance=self._speculation.validated_benchmark_accepted_drafts,
+        )
+        self._store_accepted_hidden(
+            sequence_ids, accepted.accepted_drafts, verify_hidden_rows
         )
         if phase_timing is not None:
             phase_timing.mark(3)
-        return format_output(verify_logits, accepted, native)
+        return DeviceCompletion.from_acceptance(
+            accepted,
+            rows=native.num_sequences,
+            stats=self._speculation,
+            device=self.device,
+            plan=native,
+            logits=verify_logits,
+        ).result()
 
     def _build_batch_plan(self, plan):
         return build_gemma4_batch_plan(
             plan,
             self.cache_layout,
             prefill_chunk_size=self.prefill_chunk_size,
-            decode_lookahead=self.speculative_tokens
+            decode_lookahead=self.speculative_draft_tokens
             if plan.phase == BatchPhase.DECODE
             else 0,
-            reservation_tokens=getattr(self, "_cache_write_reservation_tokens", 0),
         )
 
     @torch.inference_mode()
@@ -1725,7 +1739,7 @@ class Gemma4CudaRunner(CudaRunner):
         batch = self._build_batch_plan(plan)
         with self._cuda_failure:
             if batch.phase == BatchPhase.DECODE:
-                if self.speculative_tokens:
+                if self.speculative_draft_tokens:
                     graph_output = self._speculative_graph_forward(plan, batch)
                     if graph_output is not None:
                         return graph_output

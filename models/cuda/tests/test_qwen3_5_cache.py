@@ -39,7 +39,7 @@ def test_tp_cache_restores_local_recurrent_state_and_replicated_mtp_hidden(
         group.slab_ids.zero_()
         group.slotnums.zero_()
         group.first_blocks.zero_()
-    cache.groups[1].slab_ids.copy_(torch.tensor([[1, 2]], dtype=torch.int32))
+    cache.groups[1].slab_ids.fill_(1)
     assert arena.keys.shape[-2] == config.num_key_value_heads // size
     assert arena.values.shape == arena.keys.shape
     assert len(cache.groups) == 3  # Target KV, recurrent state, and MTP KV.
@@ -47,12 +47,12 @@ def test_tp_cache_restores_local_recurrent_state_and_replicated_mtp_hidden(
     pool = cache.recurrent_pool(torch.tensor([4095]), torch.tensor([4096]))
     assert pool.states is arena.recurrent_states
     assert pool.source.item() == arena.recurrent_states.stride(0)
-    assert pool.destination.item() == 2 * arena.recurrent_states.stride(0)
+    assert pool.destination.item() == arena.recurrent_states.stride(0)
     assert pool.layer_stride == arena.recurrent_states.stride(2)
     assert pool.convolution_source is not None
     assert pool.convolution_destination is not None
     assert pool.convolution_source.item() == arena.convolution_states.stride(0)
-    assert pool.convolution_destination.item() == 2 * arena.convolution_states.stride(0)
+    assert pool.convolution_destination.item() == arena.convolution_states.stride(0)
     assert pool.convolution_layer_stride == arena.convolution_states.stride(2)
 
     recurrent = torch.randn(
@@ -79,9 +79,9 @@ def test_tp_cache_restores_local_recurrent_state_and_replicated_mtp_hidden(
             convolution * multiplier,
             hidden * multiplier,
         )
-    # The two recurrent checkpoints occupy separate slots across a chunk
-    # boundary. TP partitions heads/channels but keeps the MTP hidden row whole.
-    for context, multiplier in ((4096, 1), (4097, 2), (0, 0)):
+    # The live state remains in one private slot across checkpoint boundaries.
+    # TP partitions heads/channels but keeps the MTP hidden row whole.
+    for context, multiplier in ((4096, 2), (4097, 2), (0, 0)):
         restored = runner._initial_state(cache, torch.tensor([context]))
         for actual, expected in zip(
             restored, (recurrent, convolution, hidden), strict=True
