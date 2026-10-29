@@ -329,39 +329,6 @@ impl WriterAccessLease {
     }
 }
 
-/// One immutable snapshot table in its original allocator order.
-#[derive(Debug)]
-pub struct CachedReadGroup {
-    group: GroupId,
-    pages: Vec<(u32, u32)>,
-}
-
-impl CachedReadGroup {
-    pub const fn group(&self) -> GroupId {
-        self.group
-    }
-
-    pub fn pages(&self) -> &[(u32, u32)] {
-        &self.pages
-    }
-}
-
-/// Owned read access for a cache export, independent of request or trie owners.
-/// Retain this token until every copy using its addresses has completed.
-#[derive(Debug)]
-#[must_use = "cached read access must be released or retained as quarantine"]
-pub struct CachedReadLease {
-    pool_id: u64,
-    claims: Vec<(PageHandle, u64)>,
-    groups: Vec<CachedReadGroup>,
-}
-
-impl CachedReadLease {
-    pub fn groups(&self) -> &[CachedReadGroup] {
-        &self.groups
-    }
-}
-
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum CachePoolError {
     InvalidParentCapacity,
@@ -382,10 +349,6 @@ pub enum CachePoolError {
     InvalidWriteSpan {
         requested: u32,
         maximum: u32,
-    },
-    InvalidPrefixLength {
-        requested: u32,
-        alignment: u32,
     },
     ParentGenerationExhausted {
         parent: u32,
@@ -442,13 +405,6 @@ impl fmt::Display for CachePoolError {
             Self::InvalidWriteSpan { requested, maximum } => write!(
                 formatter,
                 "cache write span {requested} exceeds window-safe maximum {maximum}"
-            ),
-            Self::InvalidPrefixLength {
-                requested,
-                alignment,
-            } => write!(
-                formatter,
-                "cache prefix length {requested} must be positive and aligned to {alignment} tokens"
             ),
             Self::ParentGenerationExhausted { parent } => {
                 write!(formatter, "cache parent {parent} generation is exhausted")
@@ -518,9 +474,6 @@ struct PageSlot {
     /// Several checkpoints can share one segment reference.
     cache_refs: u32,
     reader_leases: u32,
-    /// Snapshot exports can read immutable pages while live requests grow or
-    /// replace their tables; they do not borrow the request table itself.
-    cache_reader_leases: u32,
     writer_lease: bool,
     write_epoch: u64,
 }
@@ -531,7 +484,6 @@ impl PageSlot {
             || self.request_refs != 0
             || self.cache_refs != 0
             || self.reader_leases != 0
-            || self.cache_reader_leases != 0
             || self.writer_lease
     }
 
@@ -549,7 +501,6 @@ impl PageSlot {
         self.request_refs = 0;
         self.cache_refs = 0;
         self.reader_leases = 0;
-        self.cache_reader_leases = 0;
         self.writer_lease = false;
         self.write_epoch = 0;
     }
@@ -889,8 +840,7 @@ impl CachePool {
             let mut reclaimable = 0;
             for slot in &parent.slots {
                 metrics.cached_blocks += u64::from(slot.cache_refs != 0);
-                let pinned =
-                    slot.reader_leases != 0 || slot.cache_reader_leases != 0 || slot.writer_lease;
+                let pinned = slot.reader_leases != 0 || slot.writer_lease;
                 metrics.pinned_blocks += u64::from(pinned);
                 if slot.cache_refs != 0 && slot.request_refs == 0 && !pinned {
                     reclaimable += 1;
@@ -1378,103 +1328,6 @@ impl CachePool {
             }
         }
         Ok(history)
-    }
-
-    /// Pin every immutable page before exporting its bytes. Cache-only pages
-    /// need no temporary request, and eviction cannot invalidate these addresses.
-    pub fn pin_cached_prefix(
-        &mut self,
-        cached: &CachedPages,
-    ) -> Result<CachedReadLease, CachePoolError> {
-        if cached.pool_id != self.id {
-            return Err(CachePoolError::ForeignPool);
-        }
-        let count = cached.groups.iter().try_fold(0usize, |count, group| {
-            count
-                .checked_add(group.len())
-                .ok_or(CachePoolError::DemandOverflow)
-        })?;
-        let mut claims = Vec::new();
-        claims
-            .try_reserve_exact(count)
-            .map_err(|_| CachePoolError::MetadataAllocation)?;
-        let mut groups = Vec::new();
-        groups
-            .try_reserve_exact(cached.groups.len())
-            .map_err(|_| CachePoolError::MetadataAllocation)?;
-        for group in &cached.groups {
-            let mut pages = Vec::new();
-            pages
-                .try_reserve_exact(group.len())
-                .map_err(|_| CachePoolError::MetadataAllocation)?;
-            for page in group.pages_rev() {
-                if page.handle.group != group.group || page.writable {
-                    return Err(CachePoolError::StaleHandle);
-                }
-                let slot = self.validate_live_handle(page.handle)?;
-                if slot.mode != Some(PageMode::Shared) || slot.cache_refs == 0 {
-                    return Err(CachePoolError::StaleHandle);
-                }
-                if slot.writer_lease {
-                    return Err(CachePoolError::AccessConflict);
-                }
-                if slot.cache_reader_leases == u32::MAX {
-                    return Err(CachePoolError::DemandOverflow);
-                }
-                claims.push((page.handle, slot.write_epoch));
-                pages.push((page.handle.parent, page.handle.slot));
-            }
-            pages.reverse();
-            groups.push(CachedReadGroup {
-                group: group.group,
-                pages,
-            });
-        }
-        claims.sort_unstable_by_key(|&(handle, _)| handle);
-        if claims.windows(2).any(|pair| pair[0].0 == pair[1].0) {
-            return Err(CachePoolError::DuplicateHandle);
-        }
-        for &(handle, _) in &claims {
-            self.slot_mut(handle).cache_reader_leases += 1;
-        }
-        Ok(CachedReadLease {
-            pool_id: self.id,
-            claims,
-            groups,
-        })
-    }
-
-    pub fn validate_cached_read(&self, lease: &CachedReadLease) -> Result<(), CachePoolError> {
-        if lease.pool_id != self.id {
-            return Err(CachePoolError::ForeignAccess);
-        }
-        for &(handle, epoch) in &lease.claims {
-            let slot = self.validate_live_handle(handle)?;
-            if slot.mode != Some(PageMode::Shared)
-                || slot.cache_reader_leases == 0
-                || slot.writer_lease
-            {
-                return Err(CachePoolError::StaleHandle);
-            }
-            if slot.write_epoch != epoch {
-                return Err(CachePoolError::WriteEpochChanged {
-                    expected: epoch,
-                    actual: slot.write_epoch,
-                });
-            }
-        }
-        Ok(())
-    }
-
-    /// The caller has proved all device reads complete. This teardown allocates
-    /// nothing and may free pages whose request and trie owners already retired.
-    pub fn release_cached_read(&mut self, lease: CachedReadLease) {
-        self.validate_cached_read(&lease)
-            .expect("cached read access can only return to its live issuing pool");
-        for (handle, _) in lease.claims {
-            self.slot_mut(handle).cache_reader_leases -= 1;
-            self.retire_slot_if_unused(handle);
-        }
     }
 
     pub fn retire_cached_prefix(&mut self, cached: CachedPages) -> Result<(), CachePoolError> {
@@ -2020,9 +1873,7 @@ impl CachePool {
         if claim.write && slot.write_epoch == u64::MAX {
             return Err(CachePoolError::WriteEpochExhausted);
         }
-        if slot.writer_lease
-            || (claim.write && (slot.reader_leases != 0 || slot.cache_reader_leases != 0))
-        {
+        if slot.writer_lease || (claim.write && slot.reader_leases != 0) {
             return Err(CachePoolError::AccessConflict);
         }
         Ok(slot)
@@ -2077,7 +1928,6 @@ impl CachePool {
                 );
                 assert_eq!(slot.request_refs, 0);
                 assert_eq!(slot.reader_leases, 0);
-                assert_eq!(slot.cache_reader_leases, 0);
                 assert!(!slot.writer_lease);
                 assert_eq!(slot.write_epoch, 0);
             }
@@ -2177,42 +2027,6 @@ mod tests {
             .iter()
             .flat_map(|group| group.pages().iter().map(|page| request.access_claim(page)))
             .collect()
-    }
-
-    #[test]
-    fn cache_read_pins_validate_generations_and_acquire_atomically() {
-        let mut pool = CachePool::new(2, &[nz(1)]).unwrap();
-        let demands = [GroupDemand::new(GroupId::new(0), 2)];
-        let pending = pool.reserve_request(sequence(1), &demands).unwrap();
-        let mut request = pool.promote_request(pending);
-        let snapshot = pool.share_request_prefix(&mut request, &demands).unwrap();
-        let handles = request_handles(&request);
-        pool.retire_request(request).unwrap();
-        pool.slot_mut(handles[0]).cache_reader_leases = u32::MAX;
-        assert!(matches!(
-            pool.pin_cached_prefix(&snapshot),
-            Err(CachePoolError::DemandOverflow)
-        ));
-        assert_eq!(pool.slot_mut(handles[1]).cache_reader_leases, 0);
-        pool.slot_mut(handles[0]).cache_reader_leases = 0;
-        let mut lease = pool.pin_cached_prefix(&snapshot).unwrap();
-        let foreign = CachePool::new(2, &[nz(1)]).unwrap();
-        assert_eq!(
-            foreign.validate_cached_read(&lease),
-            Err(CachePoolError::ForeignAccess)
-        );
-        let original = lease.claims[0].0;
-        lease.claims[0].0.generation += 1;
-        assert_eq!(
-            pool.validate_cached_read(&lease),
-            Err(CachePoolError::StaleHandle)
-        );
-        lease.claims[0].0 = original;
-        pool.retire_cached_prefix(snapshot).unwrap();
-        assert_eq!(pool.free_parent_count(), 0);
-        pool.validate_cached_read(&lease).unwrap();
-        pool.release_cached_read(lease);
-        assert_eq!(pool.free_parent_count(), 2);
     }
 
     #[test]

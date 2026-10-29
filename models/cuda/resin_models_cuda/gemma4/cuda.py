@@ -137,8 +137,8 @@ class _Gemma4KvArena:
         self, device, config, parent_capacity: int, *, dtype, layout=None
     ) -> None:
         self.dtype = dtype
-        self.parent_capacity = parent_capacity
         self.layout = layout
+        self.parent_capacity = parent_capacity
         physical_parent_capacity = parent_capacity + 1
         local_shape = (
             physical_parent_capacity,
@@ -163,30 +163,17 @@ class _Gemma4KvArena:
         )
         global_view = self.storage.view(global_shape).permute(1, 2, 0, 3, 4, 5)
         self.global_keys, self.global_values = global_view[0], global_view[1]
-        parent_bytes = self.storage[0].numel() * self.storage.element_size()
-        self._storage_block_bytes = (parent_bytes // packing, parent_bytes)
-        self._storage_geometry = (str(dtype), local_shape[1:], global_shape[1:])
 
-    @property
-    def cache_storage_signature(self):
-        from resin.backend.cache_storage import cache_signature
-
-        if self.layout is None:
-            raise ValueError("cache storage requires the Engine's frozen cache layout")
-        return cache_signature(
-            "resin.gemma4-kv.v1",
-            self.layout,
-            self._storage_block_bytes,
-            self._storage_geometry,
-        )
-
-    def cache_storage_buffers(self, transfer):
+    def cache_storage_buffers(self, groups):
         from resin.backend.cache_storage import slab_buffers
 
-        if self.layout is None:
-            raise ValueError("cache storage requires the Engine's frozen cache layout")
+        assert self.layout is not None
+        size = self.storage[0].numel() * self.storage.element_size()
         return slab_buffers(
-            transfer, self.storage, self.layout, self._storage_block_bytes
+            groups,
+            self.storage,
+            self.layout,
+            (size // self.layout.groups[0].blocks_per_slab, size),
         )
 
 

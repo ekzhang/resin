@@ -297,15 +297,8 @@ class CacheArena(GraphPageTableArena):
     @property
     def cache_storage_block_bytes(self):
         geometry = self.geometry
-        groups = (
-            geometry.full_layers * geometry.unit_bytes,
-            geometry.state_bytes,
-        )
-        return groups + ((geometry.unit_bytes,) if geometry.include_mtp else ())
-
-    @property
-    def cache_storage_geometry(self):
-        return str(self.kv_dtype), repr(self.geometry)
+        sizes = (geometry.full_layers * geometry.unit_bytes, geometry.state_bytes)
+        return sizes + ((geometry.unit_bytes,) if geometry.include_mtp else ())
 
     def __init__(
         self,

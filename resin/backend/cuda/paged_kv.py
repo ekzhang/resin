@@ -114,25 +114,22 @@ class PagedKvArena:
         if any(page < 0 or page > self.capacity for page in page_ids):
             raise ValueError("BatchPlan cache block ID is outside the physical slab")
 
-    @property
-    def cache_storage_signature(self):
-        from resin.backend.cache_storage import cache_signature
-
-        return cache_signature(
-            "resin.paged-kv.v1",
-            self.binding.layout,
-            (self.storage[:, :, 0].numel() * self.storage.element_size(),)
-            * len(self.binding.layout.groups),
-            (
-                tuple(self.storage.shape[:2]) + tuple(self.storage.shape[3:]),
-                str(self.storage.dtype),
-            ),
-        )
-
-    def cache_storage_buffers(self, transfer):
-        from resin.backend.cache_storage import paged_kv_buffers
-
-        return paged_kv_buffers(transfer, self.storage, self.binding.layout)
+    def cache_storage_buffers(self, groups):
+        buffers = []
+        for _, addresses in groups:
+            for slab, slot in addresses:
+                if not 0 < slab <= self.capacity or slot:
+                    raise ValueError(
+                        "cache storage address is outside the managed arena"
+                    )
+                buffers.append(
+                    tuple(
+                        self.storage[kv, layer, slab].view(torch.uint8).reshape(-1)
+                        for kv in range(2)
+                        for layer in range(self.storage.shape[1])
+                    )
+                )
+        return tuple(buffers)
 
 
 @dataclass(frozen=True, slots=True)

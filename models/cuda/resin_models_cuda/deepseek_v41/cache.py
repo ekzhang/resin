@@ -309,18 +309,6 @@ class CacheArena(GraphPageTableArena):
             self.geometry.parent_bytes // packing for packing in self.geometry.packings
         )
 
-    @property
-    def cache_storage_geometry(self):
-        geometry = self.geometry
-        return (
-            geometry.attention_layers,
-            geometry.kv_sources,
-            geometry.ratios,
-            geometry.compressed_offsets,
-            geometry.index_offsets,
-            geometry.compressor_sources,
-        )
-
     def __init__(self, device, layout, geometry, *, dtype):
         self.device, self.layout, self.geometry = device, layout, geometry
         self.binding = CachePoolBinding(layout, resource="DeepSeek-V4.1 KV")

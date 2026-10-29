@@ -264,34 +264,18 @@ class GraphPageTableArena:
     layout: CacheLayout
     device: str | torch.device
     storage: torch.Tensor
-    geometry: Any
     graph_input_names = _SLAB_NAMES
     graph_label = "CUDA model"
 
     @property
-    def cache_storage_block_bytes(self):
-        raise NotImplementedError("this arena does not declare cache storage geometry")
+    def cache_storage_block_bytes(self) -> tuple[int, ...]:
+        raise NotImplementedError
 
-    @property
-    def cache_storage_signature(self):
-        from resin.backend.cache_storage import cache_signature
-
-        return cache_signature(
-            self.graph_label,
-            self.layout,
-            self.cache_storage_block_bytes,
-            self.cache_storage_geometry,
-        )
-
-    @property
-    def cache_storage_geometry(self):
-        return repr(self.geometry)
-
-    def cache_storage_buffers(self, transfer):
+    def cache_storage_buffers(self, groups):
         from resin.backend.cache_storage import slab_buffers
 
         return slab_buffers(
-            transfer, self.storage, self.layout, self.cache_storage_block_bytes
+            groups, self.storage, self.layout, self.cache_storage_block_bytes
         )
 
     def _make_graph_cache(self, groups):

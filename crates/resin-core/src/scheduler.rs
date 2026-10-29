@@ -17,9 +17,6 @@ pub trait Schedulable {
     fn batch_key(&self) -> Option<u64>;
     fn phase(&self) -> Phase;
     fn is_running(&self) -> bool;
-    fn is_ready(&self) -> bool {
-        true
-    }
     fn set_running(&mut self, running: bool);
     fn turn_ordinal(&self) -> u128;
     fn set_turn_ordinal(&mut self, turn: u128);
@@ -240,7 +237,6 @@ impl<T: Schedulable> Scheduler<T> {
             }
             let waiting = self.ready.iter().filter(|item| {
                 !item.is_running()
-                    && item.is_ready()
                     && item.batch_key() == anchor.batch_key()
                     && item.phase() == anchor.phase()
             });
@@ -254,7 +250,6 @@ impl<T: Schedulable> Scheduler<T> {
                     .enumerate()
                     .filter(|(_, item)| {
                         !item.is_running()
-                            && item.is_ready()
                             && item.priority() == max_priority
                             && item.batch_key() == anchor.batch_key()
                             && item.phase() == anchor.phase()
@@ -272,13 +267,12 @@ impl<T: Schedulable> Scheduler<T> {
             let running_key = self
                 .ready
                 .iter()
-                .find(|item| item.is_running() && item.is_ready())
+                .find(|item| item.is_running())
                 .and_then(Schedulable::batch_key);
             let waiting = self.ready.iter().filter(|item| {
                 !item.is_running()
-                    && item.is_ready()
                     && item.phase() == Phase::Prefill
-                    && (running.is_empty() || item.batch_key() == running_key)
+                    && (running_count == 0 || item.batch_key() == running_key)
             });
             if let Some(max_priority) = waiting.clone().map(Schedulable::priority).max() {
                 let anchor = waiting
@@ -291,7 +285,6 @@ impl<T: Schedulable> Scheduler<T> {
                     .enumerate()
                     .filter(|(_, item)| {
                         !item.is_running()
-                            && item.is_ready()
                             && item.priority() == max_priority
                             && item.batch_key() == anchor.batch_key()
                             && item.phase() == Phase::Prefill
@@ -308,10 +301,7 @@ impl<T: Schedulable> Scheduler<T> {
             return running;
         }
 
-        if running_count >= limit {
-            return Vec::new();
-        }
-        let waiting = self.ready.iter().filter(|item| item.is_ready());
+        let waiting = self.ready.iter();
         let Some(max_priority) = waiting.clone().map(Schedulable::priority).max() else {
             return Vec::new();
         };
@@ -323,12 +313,11 @@ impl<T: Schedulable> Scheduler<T> {
             .iter()
             .enumerate()
             .filter(|(_, item)| {
-                item.is_ready()
-                    && item.priority() == max_priority
+                item.priority() == max_priority
                     && item.batch_key() == anchor.batch_key()
                     && item.phase() == anchor.phase()
             })
-            .take(limit - running_count)
+            .take(limit)
             .map(|(index, item)| SelectedIdentity {
                 index,
                 turn: item.turn_ordinal(),
@@ -341,13 +330,9 @@ impl<T: Schedulable> Scheduler<T> {
         let Some(anchor) = self
             .ready
             .iter()
-            .filter(|item| item.is_running() && item.is_ready())
+            .filter(|item| item.is_running())
             .find(|item| item.phase() == Phase::Prefill)
-            .or_else(|| {
-                self.ready
-                    .iter()
-                    .find(|item| item.is_running() && item.is_ready())
-            })
+            .or_else(|| self.ready.iter().find(|item| item.is_running()))
         else {
             return Vec::new();
         };
@@ -357,10 +342,7 @@ impl<T: Schedulable> Scheduler<T> {
             .iter()
             .enumerate()
             .filter(|(_, item)| {
-                item.is_running()
-                    && item.is_ready()
-                    && item.batch_key() == anchor_key
-                    && item.phase() == anchor_phase
+                item.is_running() && item.batch_key() == anchor_key && item.phase() == anchor_phase
             })
             .take(limit)
             .map(|(index, item)| SelectedIdentity {

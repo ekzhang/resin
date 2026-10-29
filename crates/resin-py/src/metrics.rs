@@ -6,21 +6,19 @@ use crate::Engine;
 use pyo3::{exceptions::PyValueError, prelude::*, types::PyBytes};
 use pythonize::{depythonize, pythonize};
 use resin_core::{
-    metrics::{
-        CacheStorageMetricsSnapshot, EngineMetricsSnapshot, Histogram, RunnerMetricsSnapshot,
-    },
+    metrics::{EngineMetricsSnapshot, Histogram, RunnerMetricsSnapshot},
     resources::paged_kv,
 };
 use resin_http::MetricsEncoder;
 
-/// An immutable engine snapshot with request, cache, runner, and storage observations.
+/// An immutable engine snapshot with request, cache, and runner observations.
 /// Request and cache properties return independent dictionary views.
 #[pyclass(frozen, module = "resin._resin", skip_from_py_object)]
 pub(crate) struct EngineMetrics {
     requests: EngineMetricsSnapshot,
     cache: Option<paged_kv::CacheMetrics>,
     runner: Option<RunnerMetricsSnapshot>,
-    storage: Option<CacheStorageMetricsSnapshot>,
+    storage: Option<BTreeMap<String, u64>>,
 }
 
 #[pymethods]
@@ -41,8 +39,8 @@ impl EngineMetrics {
     }
 
     #[getter]
-    fn storage<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyAny>> {
-        Ok(pythonize(py, &self.storage)?)
+    fn storage(&self) -> Option<BTreeMap<String, u64>> {
+        self.storage.clone()
     }
 }
 
@@ -70,15 +68,15 @@ impl Engine {
         } else {
             None
         };
-        let storage = self.storage_metrics(py)?;
-        if let Some(storage) = &storage {
-            storage.validate().map_err(PyValueError::new_err)?;
-        }
         Ok(Some(EngineMetrics {
             requests,
             cache: self.core.cache_metrics(),
             runner,
-            storage,
+            storage: self
+                .prefix_storage
+                .as_ref()
+                .map(|runtime| runtime.bind(py).getattr("stats")?.extract())
+                .transpose()?,
         }))
     }
 }
@@ -100,9 +98,7 @@ impl EngineMetrics {
                 .map_err(|error| PyValueError::new_err(error.to_string()))?;
         }
         if let Some(storage) = &self.storage {
-            encoder
-                .storage(storage)
-                .map_err(|error| PyValueError::new_err(error.to_string()))?;
+            encoder.storage(storage);
         }
         Ok(resin_http::encode_metrics(&encoder.finish()))
     }

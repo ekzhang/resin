@@ -394,29 +394,20 @@ class CudaRunner(Runner):
             raise RuntimeError("CUDA cache binding is already configured")
         self._cache_binding = binding
 
+    def cache_storage_buffers(self, groups):
+        arena = getattr(self, "_cache", None)
+        if arena is None:
+            arena = getattr(self, "_kv", None)
+        if arena is None:
+            raise NotImplementedError("this runner does not expose a cache arena")
+        return arena.cache_storage_buffers(groups)
+
     def bind_resources(self, binding: ResourceBinding) -> None:
         """Bind the model cache to its Engine-owned physical allocation."""
 
         if self._cache_binding is None:
             raise RuntimeError("CUDA cache binding has not been configured")
         self._cache_binding.bind_resources(binding)
-
-    @property
-    def cache_storage_signature(self):
-        arena = getattr(self, "_cache", None)
-        if arena is None:
-            arena = getattr(self, "_kv", None)
-        if arena is None:
-            raise NotImplementedError("this runner does not expose a cache arena")
-        return arena.cache_storage_signature
-
-    def cache_storage_buffers(self, transfer):
-        arena = getattr(self, "_cache", None)
-        if arena is None:
-            arena = getattr(self, "_kv", None)
-        if arena is None:
-            raise NotImplementedError("this runner does not expose a cache arena")
-        return arena.cache_storage_buffers(transfer)
 
     def _configure_cuda_graphs(
         self,
