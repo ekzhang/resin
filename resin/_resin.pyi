@@ -504,6 +504,7 @@ class Engine:
         scheduler_config: SchedulerConfig | None = None,
         prefix_cache: bool = False,
         prefix_cache_storage: Any = None,
+        prefix_cache_namespace: str | bytes | None = None,
         enable_overlap: bool = True,
         enable_metrics: bool = True,
     ) -> Engine: ...

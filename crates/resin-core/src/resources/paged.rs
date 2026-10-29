@@ -178,7 +178,7 @@ impl CachedGroupTable {
             .map(|segment| (segment.start, segment.pages.as_slice()))
     }
 
-    fn pages_rev(&self) -> impl Iterator<Item = &PageRef> {
+    pub(crate) fn pages_rev(&self) -> impl Iterator<Item = &PageRef> {
         self.segments().flat_map(|(_, pages)| pages.iter().rev())
     }
 }

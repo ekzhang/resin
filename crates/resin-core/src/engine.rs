@@ -386,7 +386,6 @@ struct Request<P> {
     stop_token_ids: Vec<u32>,
     payload: P,
     cacheable: bool,
-    storage_pending: bool,
     cache: Option<RequestPages>,
 }
 
@@ -476,9 +475,6 @@ impl<P> Request<P> {
 }
 
 impl<P> Schedulable for Request<P> {
-    fn is_ready(&self) -> bool {
-        !self.storage_pending
-    }
     fn priority(&self) -> i32 {
         self.priority
     }
@@ -541,6 +537,7 @@ pub struct EngineCore<P> {
     quarantined: Option<Batch<P>>,
     runner_config: RunnerConfig,
     scheduler: Scheduler<Request<P>>,
+    storage_waiting: Vec<Request<P>>,
     scheduler_config: SchedulerConfig,
     new_token_ratio: f64,
     minimum_new_token_ratio: f64,
@@ -610,6 +607,7 @@ impl<P: Clone> EngineCore<P> {
             quarantined: None,
             runner_config,
             scheduler: Scheduler::new(max_running_requests),
+            storage_waiting: Vec::new(),
             scheduler_config,
             new_token_ratio,
             minimum_new_token_ratio,
@@ -636,24 +634,34 @@ impl<P: Clone> EngineCore<P> {
         Ok(())
     }
 
+    fn storage_pending(&self) -> bool {
+        self.kv_resources
+            .as_ref()
+            .is_some_and(|r| r.storage_pending())
+    }
+
     pub fn poll_storage(&mut self, wait: bool) -> Result<()> {
         self.raise_if_open()?;
         let Some(resources) = self.kv_resources.as_mut().filter(|r| r.storage_pending()) else {
             return Ok(());
         };
-        let ids = resources.poll_storage(wait)?;
-        for request in self.scheduler.iter_mut().filter(|r| ids.contains(&r.id)) {
-            request.storage_pending = false;
-            let count = resources.restore_prefix(
-                request.cache.as_mut().unwrap(),
-                request.cache_prompt.as_deref().unwrap_or(&request.prompt),
-            )?;
-            request.resident_tokens = count;
-            request.lease.lock().unwrap().cached_tokens = count;
-            if let (Some(metrics), Some(state)) = (&mut self.metrics, &mut request.metrics) {
-                metrics.restored(state, count);
+        resources.poll_storage(wait, |id, count, mut pages| {
+            if let Some(index) = self.storage_waiting.iter().position(|r| r.id == id) {
+                let mut request = self.storage_waiting.swap_remove(index);
+                if count != 0 {
+                    std::mem::swap(&mut request.cache, &mut pages);
+                    request.resident_tokens = count;
+                    request.lease.lock().unwrap().cached_tokens = count;
+                    if let Some((metrics, state)) =
+                        self.metrics.as_mut().zip(request.metrics.as_mut())
+                    {
+                        metrics.restored(state, count);
+                    }
+                }
+                self.scheduler.restore_rejected(vec![request]);
             }
-        }
+            pages
+        })?;
         Ok(())
     }
 
@@ -683,7 +691,8 @@ impl<P: Clone> EngineCore<P> {
             .scheduler
             .iter()
             .filter(|request| !request.running)
-            .count();
+            .count()
+            + self.storage_waiting.len();
         snapshot.running_requests = self
             .scheduler
             .iter()
@@ -711,22 +720,18 @@ impl<P: Clone> EngineCore<P> {
         self.context_length.get()
     }
     pub fn has_work(&self) -> bool {
-        self.in_flight.is_some()
-            || !self.scheduler.is_empty()
-            || self
-                .kv_resources
-                .as_ref()
-                .is_some_and(|r| r.storage_pending())
+        self.in_flight.is_some() || !self.scheduler.is_empty() || self.storage_pending()
     }
     pub fn active_request_count(&self) -> usize {
         self.scheduler.len()
+            + self.storage_waiting.len()
             + self.in_flight.as_ref().map_or(0, |batch| {
                 batch.rows.iter().filter(|row| !row.terminal).count()
             })
     }
 
     pub fn ready_request_count(&self) -> usize {
-        self.scheduler.len()
+        self.scheduler.len() + self.storage_waiting.len()
     }
     pub fn max_running_requests(&self) -> usize {
         self.scheduler.max_running_requests()
@@ -982,9 +987,12 @@ impl<P: Clone> EngineCore<P> {
             stop_token_ids,
             payload,
             cacheable,
-            storage_pending,
             cache: pages,
         });
+        if storage_pending {
+            let request = self.scheduler.remove(self.scheduler.len() - 1);
+            self.storage_waiting.push(request);
+        }
         Ok(lease)
     }
     pub fn step(&mut self, runner: &mut impl Runner<P>) -> Result<Vec<TokenEvent>> {
@@ -1060,11 +1068,8 @@ impl<P: Clone> EngineCore<P> {
         self.in_flight.is_some()
     }
 
-    fn queued_ready(&self) -> bool {
-        self.scheduler.iter().any(Schedulable::is_ready)
-    }
     pub fn has_continuation(&self) -> bool {
-        self.continuation.is_some() && !self.queued_ready()
+        self.continuation.is_some() && self.scheduler.is_empty()
     }
 
     /// Harvest an enqueued result using the same atomic commit as synchronous execution.
@@ -1114,7 +1119,7 @@ impl<P: Clone> EngineCore<P> {
         let Some(batch) = &self.in_flight else {
             return false;
         };
-        let allowed = !self.queued_ready()
+        let allowed = self.scheduler.is_empty()
             && plan.phase == Phase::Decode
             && batch.rows.len() == plan.sequence_ids.len()
             && batch.rows.iter().all(|row| {
@@ -1174,7 +1179,7 @@ impl<P: Clone> EngineCore<P> {
     /// the runtime substitutes exact GPU token/position feedback before launch.
     pub fn continuation_plan(&mut self) -> Result<Option<ExecutionPlan<P>>> {
         self.raise_if_open()?;
-        if self.queued_ready() {
+        if !self.scheduler.is_empty() {
             return Ok(None);
         }
         let Some(template) = &self.continuation else {
@@ -1454,10 +1459,7 @@ impl<P: Clone> EngineCore<P> {
         if let Some(error) = growth_error {
             self.scheduler.restore_rejected(scheduled);
             if matches!(error, CachePoolError::InsufficientCapacity { .. })
-                && self
-                    .kv_resources
-                    .as_ref()
-                    .is_some_and(|r| r.storage_pending())
+                && self.storage_pending()
             {
                 return Ok(None);
             }
@@ -1896,6 +1898,10 @@ impl<P: Clone> EngineCore<P> {
             return Err(Error::invalid("RequestLease belongs to a different Engine"));
         }
         let request_id = request.request_id;
+        if let Some(index) = self.storage_waiting.iter().position(|r| r.id == request_id) {
+            self.scheduler
+                .restore_rejected(vec![self.storage_waiting.swap_remove(index)]);
+        }
         if let Some(index) = self.scheduler.position(|request| request.id == request_id) {
             let mut request = self.scheduler.remove(index);
             if let Err(error) = self.validate_request_cache(&request) {
@@ -2211,6 +2217,8 @@ impl<P: Clone> EngineCore<P> {
             self.poison_message("storage could not retire");
             return Err(error);
         }
+        self.scheduler
+            .restore_rejected(std::mem::take(&mut self.storage_waiting));
         self.retire_ready(runner)?;
         if let Some(resources) = self.kv_resources.as_mut() {
             resources.clear_prefix_cache().map_err(Error::from)?;
@@ -2573,7 +2581,6 @@ mod tests {
             stop_token_ids: Vec::new(),
             payload: (),
             cacheable: true,
-            storage_pending: false,
             cache: pages,
         }
     }

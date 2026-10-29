@@ -13,9 +13,6 @@ pub enum Phase {
 /// billion new turns per second would take vastly longer than the lifetime of
 /// any process to exhaust it.
 pub trait Schedulable {
-    fn is_ready(&self) -> bool {
-        true
-    }
     fn priority(&self) -> i32;
     fn batch_key(&self) -> Option<u64>;
     fn phase(&self) -> Phase;
@@ -201,10 +198,6 @@ impl<T: Schedulable> Scheduler<T> {
         self.bump_epoch();
     }
 
-    pub(crate) fn iter_mut(&mut self) -> impl Iterator<Item = &mut T> {
-        self.ready.iter_mut()
-    }
-
     pub fn position(&self, mut predicate: impl FnMut(&T) -> bool) -> Option<usize> {
         self.ready.iter().position(&mut predicate)
     }
@@ -243,8 +236,7 @@ impl<T: Schedulable> Scheduler<T> {
                 return running;
             }
             let waiting = self.ready.iter().filter(|item| {
-                item.is_ready()
-                    && !item.is_running()
+                !item.is_running()
                     && item.batch_key() == anchor.batch_key()
                     && item.phase() == anchor.phase()
             });
@@ -257,8 +249,7 @@ impl<T: Schedulable> Scheduler<T> {
                     .iter()
                     .enumerate()
                     .filter(|(_, item)| {
-                        item.is_ready()
-                            && !item.is_running()
+                        !item.is_running()
                             && item.priority() == max_priority
                             && item.batch_key() == anchor.batch_key()
                             && item.phase() == anchor.phase()
@@ -279,8 +270,7 @@ impl<T: Schedulable> Scheduler<T> {
                 .find(|item| item.is_running())
                 .and_then(Schedulable::batch_key);
             let waiting = self.ready.iter().filter(|item| {
-                item.is_ready()
-                    && !item.is_running()
+                !item.is_running()
                     && item.phase() == Phase::Prefill
                     && (running_count == 0 || item.batch_key() == running_key)
             });
@@ -294,8 +284,7 @@ impl<T: Schedulable> Scheduler<T> {
                     .iter()
                     .enumerate()
                     .filter(|(_, item)| {
-                        item.is_ready()
-                            && !item.is_running()
+                        !item.is_running()
                             && item.priority() == max_priority
                             && item.batch_key() == anchor.batch_key()
                             && item.phase() == Phase::Prefill
@@ -312,7 +301,7 @@ impl<T: Schedulable> Scheduler<T> {
             return running;
         }
 
-        let waiting = self.ready.iter().filter(|item| item.is_ready());
+        let waiting = self.ready.iter();
         let Some(max_priority) = waiting.clone().map(Schedulable::priority).max() else {
             return Vec::new();
         };
@@ -324,8 +313,7 @@ impl<T: Schedulable> Scheduler<T> {
             .iter()
             .enumerate()
             .filter(|(_, item)| {
-                item.is_ready()
-                    && item.priority() == max_priority
+                item.priority() == max_priority
                     && item.batch_key() == anchor.batch_key()
                     && item.phase() == anchor.phase()
             })

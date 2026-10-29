@@ -31,6 +31,7 @@ from resin._resin import (
     TokenLogprobs,
     __version__,
 )
+from resin.cache_storage import MemoryCacheStorage
 from resin.protocols import (
     ManagedRunner,
     MediaInput,
@@ -51,6 +52,7 @@ __all__ = [
     "EngineMetrics",
     "ForwardOutput",
     "ManagedRunner",
+    "MemoryCacheStorage",
     "Parallelism",
     "MediaInput",
     "MediaTokenSpan",

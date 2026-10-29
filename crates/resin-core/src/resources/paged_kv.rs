@@ -194,14 +194,20 @@ impl PagedKvResources {
             .len()
             .saturating_sub(self.layout.replay_suffix_tokens().max(1) as usize);
         let alignment = self.prefix_cache.as_ref().unwrap().alignment();
+        if maximum < alignment as usize {
+            return false;
+        }
         let operation = storage.lookup(tokens, maximum as u32, alignment);
         self.jobs
             .push((operation, request, tokens[..maximum].to_vec(), None));
         true
     }
 
-    pub(crate) fn poll_storage(&mut self, wait: bool) -> Result<Vec<u64>, CachePoolError> {
-        let mut completed = Vec::new();
+    pub(crate) fn poll_storage(
+        &mut self,
+        wait: bool,
+        mut ready: impl FnMut(u64, u32, Option<RequestPages>) -> Option<RequestPages>,
+    ) -> Result<(), CachePoolError> {
         let mut index = 0;
         while index < self.jobs.len() {
             let Some(result) = self.jobs[index].0.poll(wait) else {
@@ -212,24 +218,13 @@ impl PagedKvResources {
                 continue;
             };
             let (operation, request, mut tokens, pages) = self.jobs.swap_remove(index);
-            if let Some(mut pages) = pages {
-                let published = (|| {
-                    if request != 0 && result != 0 {
-                        let demands = self.demands(tokens.len() as u32);
-                        let snapshot = self.pool.share_request_prefix(&mut pages, &demands)?;
-                        let cache = self.prefix_cache.as_mut().unwrap();
-                        if let Some(old) = cache.insert(&tokens, snapshot) {
-                            self.pool.retire_cached_prefix(old)?;
-                        }
-                    }
-                    Ok(())
-                })();
-                self.pool
-                    .retire_request(pages)
-                    .map_err(|failure| failure.error)?;
-                published?;
-                if request != 0 {
-                    completed.push(request);
+            if let Some(pages) = pages {
+                let count = u32::from(request != 0 && result != 0) * tokens.len() as u32;
+                if count != 0 {
+                    self.finish_state_initialization(&[request]);
+                }
+                if let Some(pages) = ready(request, count, Some(pages)) {
+                    self.pool.retire_request(pages).map_err(|f| f.error)?;
                 }
             } else {
                 if wait
@@ -237,7 +232,7 @@ impl PagedKvResources {
                     || result as usize > tokens.len()
                     || !result.is_multiple_of(self.prefix_alignment().unwrap())
                 {
-                    completed.push(request);
+                    let _ = ready(request, 0, None);
                     continue;
                 }
                 tokens.truncate(result as usize);
@@ -249,7 +244,7 @@ impl PagedKvResources {
                     if self.evict_one_prefix()? {
                         self.jobs.push((operation, request, tokens, None));
                     } else {
-                        completed.push(request);
+                        let _ = ready(request, 0, None);
                     }
                     continue;
                 };
@@ -265,7 +260,7 @@ impl PagedKvResources {
                 self.jobs.push((operation, request, tokens, Some(pages)));
             }
         }
-        Ok(completed)
+        Ok(())
     }
 
     fn store_prefix(&mut self, pages: &CachedPages, tokens: &[u32]) -> Result<(), CachePoolError> {
@@ -274,10 +269,7 @@ impl PagedKvResources {
                 .groups()
                 .iter()
                 .map(|group| {
-                    let mut table = group
-                        .segments()
-                        .flat_map(|(_, p)| p.iter().rev().map(|p| p.handle()))
-                        .collect::<Vec<_>>();
+                    let mut table = group.pages_rev().map(|p| p.handle()).collect::<Vec<_>>();
                     table.reverse();
                     table
                 })
@@ -301,20 +293,17 @@ impl PagedKvResources {
         length: u32,
         tables: Vec<Vec<PageHandle>>,
     ) -> Result<Vec<PrefixStorageGroup>, CachePoolError> {
-        self.layout
-            .groups()
-            .iter()
-            .zip(tables)
-            .map(|(group, table)| {
-                let (first, count) = group.active_blocks(length);
-                let mut addresses = table
-                    .into_iter()
-                    .map(|page| self.pool.physical_address(page))
-                    .collect::<Result<Vec<_>, _>>()?;
-                addresses.rotate_left(first as usize % count as usize);
-                Ok((first, addresses))
-            })
-            .collect()
+        let mut groups = Vec::new();
+        for (group, table) in self.layout.groups().iter().zip(tables) {
+            let (first, count) = group.active_blocks(length);
+            let mut addresses = table
+                .into_iter()
+                .map(|page| self.pool.physical_address(page))
+                .collect::<Result<Vec<_>, _>>()?;
+            addresses.rotate_left(first as usize % count as usize);
+            groups.push((first, addresses));
+        }
+        Ok(groups)
     }
 
     /// Collect a bounded-cadence snapshot, scanning physical block metadata.
