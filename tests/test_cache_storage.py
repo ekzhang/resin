@@ -43,7 +43,10 @@ def test_memory_bytes_capacity_and_scatter_gather():
         assert sum(store.lookup((b"a", b"b", b"c")).result()) <= 2
     assert not store.load((key,), ({"different": target},)).result()
     store.close()
-    store, other = MemoryCacheStorage(), MemoryCacheStorage()
+    store, other = (
+        MemoryCacheStorage(max_bytes=4096),
+        MemoryCacheStorage(max_bytes=4096),
+    )
     for provider, cached in ((store, 0), (store, 2), (other, 0)):
         engine, _, arena = make_engine(provider, 73 if not cached else 0)
         with engine:
@@ -61,7 +64,7 @@ def test_memory_bytes_capacity_and_scatter_gather():
 
 @pytest.mark.parametrize("limit", [1, 4])
 def test_storage_inflight_limit(limit):
-    store, pending = MemoryCacheStorage(), []
+    store, pending = MemoryCacheStorage(max_bytes=4096), []
 
     def unavailable(*args, **kwargs):
         raise NotImplementedError("cache_storage_buffers unavailable")
@@ -111,7 +114,7 @@ def test_storage_inflight_limit(limit):
 
 @pytest.mark.parametrize("delay", ["lookup", "load", "store"])
 def test_async_progress_cancellation_and_retirement(delay):
-    store, gate, pending = MemoryCacheStorage(), Event(), []
+    store, gate, pending = MemoryCacheStorage(max_bytes=4096), Event(), []
     params = SamplingParams(max_output_tokens=32)
     warm, _, _ = make_engine(store, 73)
     warm.submit([1, 2], sampling_params=params)

@@ -1,9 +1,9 @@
 # Async prefix storage
 
 Pass `Engine(runner, prefix_cache=True, prefix_cache_storage=provider)`.
-`MemoryCacheStorage(max_bytes=...)` provides an asynchronous, bounded CPU DRAM tier;
-its LRU budget counts key, region-name and payload bytes. The caller owns the provider
-and calls `provider.close()` after closing its engines.
+`MemoryCacheStorage(max_bytes=...)` provides an asynchronous, bounded CPU DRAM tier.
+The caller must set `max_bytes`; its LRU budget counts key, region-name and payload bytes.
+The caller owns the provider and calls `provider.close()` after closing its engines.
 
 Resin hashes token prefixes, selects published checkpoints, and maps cache groups to bytes.
 Full-history chunks are keyed per aligned span; providers skip copies while those objects

@@ -26,7 +26,7 @@ class CacheStorage(Protocol):
 
 
 class MemoryCacheStorage:
-    def __init__(self, max_bytes=1 << 30):
+    def __init__(self, max_bytes):
         if max_bytes < 0:
             raise ValueError("max_bytes must be nonnegative")
         self.max_bytes, self.nbytes = max_bytes, 0
