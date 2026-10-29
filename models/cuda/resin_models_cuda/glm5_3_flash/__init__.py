@@ -1,1 +1,1 @@
-"""GLM-5.3-Flash CUDA implementation; concrete imports initialize CUDA libraries."""
+"""GLM-5.3-Flash CUDA implementation (NVFP4, SM100/103)."""
