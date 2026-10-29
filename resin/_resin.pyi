@@ -13,7 +13,6 @@ from resin.protocols import (
     Runner,
     TokenSpan,
 )
-from resin.cache_storage import CacheStorage
 
 __version__: Final[str]
 
@@ -504,8 +503,7 @@ class Engine:
         context_length: int = 32768,
         scheduler_config: SchedulerConfig | None = None,
         prefix_cache: bool = False,
-        prefix_cache_storage: CacheStorage | None = None,
-        prefix_cache_namespace: str | bytes | None = None,
+        prefix_cache_storage: Any = None,
         enable_overlap: bool = True,
         enable_metrics: bool = True,
     ) -> Engine: ...
@@ -558,7 +556,7 @@ class Engine:
     def new_token_ratio(self, /) -> float: ...
     def next_phase(self, /) -> BatchPhase | None:
         """
-        Read-only admission-aware proposal; reserves no requests or resources.
+        Poll storage completions and propose the next runnable phase.
         """
     @property
     def overlap(self, /) -> bool: ...
@@ -612,8 +610,6 @@ class EngineMetrics:
     def requests(self, /) -> dict[str, Any]: ...
     @property
     def runner(self, /) -> RunnerMetrics | None: ...
-    @property
-    def storage(self, /) -> dict[str, int] | None: ...
 
 @final
 class ForwardOutput:

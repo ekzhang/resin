@@ -156,6 +156,11 @@ impl EngineMetricsState {
         }
     }
 
+    pub(crate) fn restored(&mut self, request: &mut RequestMetricsState, tokens: u32) {
+        request.cached_tokens += tokens;
+        self.values.prefill_cache_tokens += u64::from(tokens);
+    }
+
     pub(crate) fn commit(
         &mut self,
         request: &mut RequestMetricsState,

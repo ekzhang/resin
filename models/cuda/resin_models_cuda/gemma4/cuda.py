@@ -133,11 +133,8 @@ def plan_gemma4_kv_capacity(
 
 
 class _Gemma4KvArena:
-    def __init__(
-        self, device, config, parent_capacity: int, *, dtype, layout=None
-    ) -> None:
+    def __init__(self, device, config, parent_capacity: int, *, dtype) -> None:
         self.dtype = dtype
-        self.layout = layout
         self.parent_capacity = parent_capacity
         physical_parent_capacity = parent_capacity + 1
         local_shape = (
@@ -163,18 +160,8 @@ class _Gemma4KvArena:
         )
         global_view = self.storage.view(global_shape).permute(1, 2, 0, 3, 4, 5)
         self.global_keys, self.global_values = global_view[0], global_view[1]
-
-    def cache_storage_buffers(self, groups):
-        from resin.backend.cache_storage import slab_buffers
-
-        assert self.layout is not None
         size = self.storage[0].numel() * self.storage.element_size()
-        return slab_buffers(
-            groups,
-            self.storage,
-            self.layout,
-            (size // self.layout.groups[0].blocks_per_slab, size),
-        )
+        self.cache_storage_block_bytes = (size // packing, size)
 
 
 @dataclass(frozen=True, slots=True)
@@ -404,7 +391,6 @@ class Gemma4CudaRunner(CudaRunner):
             self.attention_config,
             self.cache_parent_capacity,
             dtype=cache_dtype,
-            layout=self.cache_layout,
         )
         self._graph_attention_workspaces = tuple(
             torch.zeros(_GRAPH_WORKSPACE_BYTES, dtype=torch.uint8, device=self.device)

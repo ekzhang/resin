@@ -133,14 +133,12 @@ class CacheArena(GraphPageTableArena):
 
     graph_label = "Inkling"
 
-    @property
-    def cache_storage_block_bytes(self):
-        return (
-            GLOBAL_LAYERS * UNIT_ELEMENTS * 2,
-            LOCAL_LAYERS * UNIT_ELEMENTS * 2,
-            DRAFT_LAYERS * UNIT_ELEMENTS * 2,
-            STATE_ELEMENTS * 2,
-        )
+    cache_storage_block_bytes = (
+        GLOBAL_LAYERS * UNIT_ELEMENTS * 2,
+        LOCAL_LAYERS * UNIT_ELEMENTS * 2,
+        DRAFT_LAYERS * UNIT_ELEMENTS * 2,
+        STATE_ELEMENTS * 2,
+    )
 
     def __init__(self, device: Any, layout: CacheLayout) -> None:
         self.device = device

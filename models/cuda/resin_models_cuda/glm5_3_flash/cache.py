@@ -371,13 +371,6 @@ class DeviceCache(SlabDeviceCache):
 class CacheArena(GraphPageTableArena):
     graph_label = "GLM-5.3-Flash"
 
-    @property
-    def cache_storage_block_bytes(self):
-        return (
-            len(self.geometry.full_layers) * self.geometry.unit_bytes,
-            self.geometry.state_bytes,
-        )
-
     def __init__(
         self,
         device: Any,
@@ -387,6 +380,10 @@ class CacheArena(GraphPageTableArena):
         max_batch_size: int,
     ):
         self.device, self.layout, self.geometry = device, layout, geometry
+        self.cache_storage_block_bytes = (
+            len(geometry.full_layers) * geometry.unit_bytes,
+            geometry.state_bytes,
+        )
         self.max_batch_size = max_batch_size
         self.binding = CachePoolBinding(layout, resource=self.graph_label)
         reserved = 1 + graph_scratch_parent_count(geometry.packings, max_batch_size)

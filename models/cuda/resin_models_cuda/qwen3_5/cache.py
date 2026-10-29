@@ -294,12 +294,6 @@ class CacheArena(GraphPageTableArena):
 
     graph_label = "Qwen3.5"
 
-    @property
-    def cache_storage_block_bytes(self):
-        geometry = self.geometry
-        sizes = (geometry.full_layers * geometry.unit_bytes, geometry.state_bytes)
-        return sizes + ((geometry.unit_bytes,) if geometry.include_mtp else ())
-
     def __init__(
         self,
         device: Any,
@@ -311,6 +305,10 @@ class CacheArena(GraphPageTableArena):
         self.device = device
         self.layout = layout
         self.geometry = geometry
+        sizes = (geometry.full_layers * geometry.unit_bytes, geometry.state_bytes)
+        self.cache_storage_block_bytes = sizes + (
+            (geometry.unit_bytes,) if geometry.include_mtp else ()
+        )
         if kv_dtype is None:
             kv_dtype = torch.bfloat16
         if kv_dtype.itemsize != geometry.kv_element_bytes:

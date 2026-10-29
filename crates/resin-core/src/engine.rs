@@ -386,6 +386,7 @@ struct Request<P> {
     stop_token_ids: Vec<u32>,
     payload: P,
     cacheable: bool,
+    storage_pending: bool,
     cache: Option<RequestPages>,
 }
 
@@ -475,6 +476,9 @@ impl<P> Request<P> {
 }
 
 impl<P> Schedulable for Request<P> {
+    fn is_ready(&self) -> bool {
+        !self.storage_pending
+    }
     fn priority(&self) -> i32 {
         self.priority
     }
@@ -625,13 +629,31 @@ impl<P: Clone> EngineCore<P> {
     }
 
     pub fn set_prefix_storage(&mut self, storage: Box<dyn PrefixStorage>) -> Result<()> {
-        self.raise_if_open()?;
         if self.prefix_alignment().is_none() {
-            return Err(Error::invalid(
-                "prefix storage requires the managed prefix cache",
-            ));
+            return Err(Error::invalid("storage requires prefix caching"));
         }
         self.kv_resources.as_mut().unwrap().storage = Some(storage);
+        Ok(())
+    }
+
+    pub fn poll_storage(&mut self, wait: bool) -> Result<()> {
+        self.raise_if_open()?;
+        let Some(resources) = self.kv_resources.as_mut().filter(|r| r.storage_pending()) else {
+            return Ok(());
+        };
+        let ids = resources.poll_storage(wait)?;
+        for request in self.scheduler.iter_mut().filter(|r| ids.contains(&r.id)) {
+            request.storage_pending = false;
+            let count = resources.restore_prefix(
+                request.cache.as_mut().unwrap(),
+                request.cache_prompt.as_deref().unwrap_or(&request.prompt),
+            )?;
+            request.resident_tokens = count;
+            request.lease.lock().unwrap().cached_tokens = count;
+            if let (Some(metrics), Some(state)) = (&mut self.metrics, &mut request.metrics) {
+                metrics.restored(state, count);
+            }
+        }
         Ok(())
     }
 
@@ -689,7 +711,12 @@ impl<P: Clone> EngineCore<P> {
         self.context_length.get()
     }
     pub fn has_work(&self) -> bool {
-        self.in_flight.is_some() || !self.scheduler.is_empty()
+        self.in_flight.is_some()
+            || !self.scheduler.is_empty()
+            || self
+                .kv_resources
+                .as_ref()
+                .is_some_and(|r| r.storage_pending())
     }
     pub fn active_request_count(&self) -> usize {
         self.scheduler.len()
@@ -917,6 +944,12 @@ impl<P: Clone> EngineCore<P> {
                 .map_err(Error::from)?,
             _ => 0,
         };
+        let storage_pending = resident_tokens == 0
+            && cache_identity.is_some_and(|identity| {
+                self.kv_resources
+                    .as_mut()
+                    .is_some_and(|r| r.start_storage(request_id, identity))
+            });
         lease_state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -949,6 +982,7 @@ impl<P: Clone> EngineCore<P> {
             stop_token_ids,
             payload,
             cacheable,
+            storage_pending,
             cache: pages,
         });
         Ok(lease)
@@ -1026,8 +1060,11 @@ impl<P: Clone> EngineCore<P> {
         self.in_flight.is_some()
     }
 
+    fn queued_ready(&self) -> bool {
+        self.scheduler.iter().any(Schedulable::is_ready)
+    }
     pub fn has_continuation(&self) -> bool {
-        self.continuation.is_some() && self.scheduler.is_empty()
+        self.continuation.is_some() && !self.queued_ready()
     }
 
     /// Harvest an enqueued result using the same atomic commit as synchronous execution.
@@ -1077,7 +1114,7 @@ impl<P: Clone> EngineCore<P> {
         let Some(batch) = &self.in_flight else {
             return false;
         };
-        let allowed = self.scheduler.is_empty()
+        let allowed = !self.queued_ready()
             && plan.phase == Phase::Decode
             && batch.rows.len() == plan.sequence_ids.len()
             && batch.rows.iter().all(|row| {
@@ -1137,7 +1174,7 @@ impl<P: Clone> EngineCore<P> {
     /// the runtime substitutes exact GPU token/position feedback before launch.
     pub fn continuation_plan(&mut self) -> Result<Option<ExecutionPlan<P>>> {
         self.raise_if_open()?;
-        if !self.scheduler.is_empty() {
+        if self.queued_ready() {
             return Ok(None);
         }
         let Some(template) = &self.continuation else {
@@ -1246,6 +1283,7 @@ impl<P: Clone> EngineCore<P> {
         overlap: bool,
     ) -> Result<Option<(Batch<P>, ExecutionPlan<P>)>> {
         self.raise_if_open()?;
+        self.poll_storage(false)?;
         if self.scheduler.is_empty() {
             return Ok(None);
         }
@@ -1415,6 +1453,14 @@ impl<P: Clone> EngineCore<P> {
         };
         if let Some(error) = growth_error {
             self.scheduler.restore_rejected(scheduled);
+            if matches!(error, CachePoolError::InsufficientCapacity { .. })
+                && self
+                    .kv_resources
+                    .as_ref()
+                    .is_some_and(|r| r.storage_pending())
+            {
+                return Ok(None);
+            }
             if matches!(error, CachePoolError::InsufficientCapacity { .. })
                 && self.retract_one(runner)?
             {
@@ -2161,6 +2207,10 @@ impl<P: Clone> EngineCore<P> {
     }
 
     fn close_healthy(&mut self, runner: &mut impl Runner<P>) -> Result<()> {
+        if let Err(error) = self.poll_storage(true) {
+            self.poison_message("storage could not retire");
+            return Err(error);
+        }
         self.retire_ready(runner)?;
         if let Some(resources) = self.kv_resources.as_mut() {
             resources.clear_prefix_cache().map_err(Error::from)?;
@@ -2523,6 +2573,7 @@ mod tests {
             stop_token_ids: Vec::new(),
             payload: (),
             cacheable: true,
+            storage_pending: false,
             cache: pages,
         }
     }

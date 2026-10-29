@@ -400,7 +400,11 @@ class CudaRunner(Runner):
             arena = getattr(self, "_kv", None)
         if arena is None:
             raise NotImplementedError("this runner does not expose a cache arena")
-        return arena.cache_storage_buffers(groups)
+        if hasattr(arena, "cache_storage_buffers"):
+            return arena.cache_storage_buffers(groups)
+        from resin.backend.cache_storage import slab_buffers
+
+        return slab_buffers(groups, arena.storage, arena.cache_storage_block_bytes)
 
     def bind_resources(self, binding: ResourceBinding) -> None:
         """Bind the model cache to its Engine-owned physical allocation."""

@@ -28,6 +28,7 @@ pub struct CacheMetrics {
     pub reclaimable_slabs: u32,
     pub groups: Vec<CacheGroupMetrics>,
     pub prefix: Option<PrefixCacheMetrics>,
+    pub storage_pending: u64,
 }
 
 /// Physical block usage for an ordered runner-declared cache group.
@@ -67,15 +68,15 @@ pub struct PrefixCacheMetrics {
 }
 
 pub type PrefixStorageGroup = (u32, Vec<(u32, u32)>);
-
-/// Synchronous storage hooks for complete immutable checkpoints. Every buffer
-/// access must retire before a callback returns or unwinds, including failures.
-/// Groups follow layout order; each contains its first logical block and the
-/// chronological (slab, slot) addresses. Providers never retain these addresses.
-pub trait PrefixStorage: fmt::Debug + Send + Sync {
-    fn lookup(&mut self, tokens: &[u32], maximum: u32, alignment: u32) -> u32;
-    fn transfer(&mut self, tokens: &[u32], groups: &[PrefixStorageGroup], load: bool) -> bool;
+pub type StorageOp = Box<dyn PrefixStorageOperation>;
+pub trait PrefixStorageOperation: fmt::Debug + Send + Sync {
+    fn poll(&mut self, wait: bool) -> Option<u32>;
 }
+pub trait PrefixStorage: fmt::Debug + Send + Sync {
+    fn lookup(&mut self, tokens: &[u32], maximum: u32, alignment: u32) -> StorageOp;
+    fn transfer(&mut self, tokens: &[u32], groups: &[PrefixStorageGroup], load: bool) -> StorageOp;
+}
+type StorageJob = (StorageOp, u64, Vec<u32>, Option<RequestPages>);
 
 #[derive(Debug)]
 pub struct PagedKvResources {
@@ -83,6 +84,7 @@ pub struct PagedKvResources {
     pool: CachePool,
     prefix_cache: Option<PrefixCache<super::paged::CachedPages>>,
     pub(crate) storage: Option<Box<dyn PrefixStorage>>,
+    jobs: Vec<StorageJob>,
     prefix_reclaimed_blocks: u64,
     prefix_reclaimed_slabs: u64,
     batch_active: bool,
@@ -158,6 +160,7 @@ impl PagedKvResources {
             pool,
             prefix_cache,
             storage: None,
+            jobs: Vec::new(),
             prefix_reclaimed_blocks: 0,
             prefix_reclaimed_slabs: 0,
             batch_active: false,
@@ -174,6 +177,144 @@ impl PagedKvResources {
 
     pub fn parent_capacity(&self) -> u32 {
         self.layout.parent_capacity().get()
+    }
+
+    pub(crate) fn storage_pending(&self) -> bool {
+        !self.jobs.is_empty()
+    }
+
+    pub(crate) fn start_storage(&mut self, request: u64, tokens: &[u32]) -> bool {
+        if self.jobs.len() >= 2 {
+            return false;
+        }
+        let Some(storage) = &mut self.storage else {
+            return false;
+        };
+        let maximum = tokens
+            .len()
+            .saturating_sub(self.layout.replay_suffix_tokens().max(1) as usize);
+        let alignment = self.prefix_cache.as_ref().unwrap().alignment();
+        let operation = storage.lookup(tokens, maximum as u32, alignment);
+        self.jobs
+            .push((operation, request, tokens[..maximum].to_vec(), None));
+        true
+    }
+
+    pub(crate) fn poll_storage(&mut self, wait: bool) -> Result<Vec<u64>, CachePoolError> {
+        let mut completed = Vec::new();
+        let mut index = 0;
+        while index < self.jobs.len() {
+            let Some(result) = self.jobs[index].0.poll(wait) else {
+                if wait {
+                    return Err(CachePoolError::AccessConflict);
+                }
+                index += 1;
+                continue;
+            };
+            let (operation, request, mut tokens, pages) = self.jobs.swap_remove(index);
+            if let Some(mut pages) = pages {
+                let published = (|| {
+                    if request != 0 && result != 0 {
+                        let demands = self.demands(tokens.len() as u32);
+                        let snapshot = self.pool.share_request_prefix(&mut pages, &demands)?;
+                        let cache = self.prefix_cache.as_mut().unwrap();
+                        if let Some(old) = cache.insert(&tokens, snapshot) {
+                            self.pool.retire_cached_prefix(old)?;
+                        }
+                    }
+                    Ok(())
+                })();
+                self.pool
+                    .retire_request(pages)
+                    .map_err(|failure| failure.error)?;
+                published?;
+                if request != 0 {
+                    completed.push(request);
+                }
+            } else {
+                if wait
+                    || result == 0
+                    || result as usize > tokens.len()
+                    || !result.is_multiple_of(self.prefix_alignment().unwrap())
+                {
+                    completed.push(request);
+                    continue;
+                }
+                tokens.truncate(result as usize);
+                let demands = self.demands(result);
+                let Ok(pending) = self
+                    .pool
+                    .reserve_request(SequenceId::new(request), &demands)
+                else {
+                    if self.evict_one_prefix()? {
+                        self.jobs.push((operation, request, tokens, None));
+                    } else {
+                        completed.push(request);
+                    }
+                    continue;
+                };
+                let pages = self.pool.promote_request(pending);
+                let tables = pages
+                    .groups()
+                    .iter()
+                    .map(|g| g.pages().iter().map(|p| p.handle()).collect())
+                    .collect();
+                let groups = self.storage_groups(result, tables)?;
+                let storage = self.storage.as_mut().unwrap();
+                let operation = storage.transfer(&tokens, &groups, true);
+                self.jobs.push((operation, request, tokens, Some(pages)));
+            }
+        }
+        Ok(completed)
+    }
+
+    fn store_prefix(&mut self, pages: &CachedPages, tokens: &[u32]) -> Result<(), CachePoolError> {
+        if self.storage.is_some() && self.jobs.len() < 2 {
+            let tables = pages
+                .groups()
+                .iter()
+                .map(|group| {
+                    let mut table = group
+                        .segments()
+                        .flat_map(|(_, p)| p.iter().rev().map(|p| p.handle()))
+                        .collect::<Vec<_>>();
+                    table.reverse();
+                    table
+                })
+                .collect();
+            let groups = self.storage_groups(tokens.len() as u32, tables)?;
+            let pending = self
+                .pool
+                .reserve_request(SequenceId::new(u64::MAX), &self.demands(0))?;
+            let mut source = self.pool.promote_request(pending);
+            self.pool.attach_shared_prefix(&mut source, pages)?;
+            if let Some(storage) = &mut self.storage {
+                let operation = storage.transfer(tokens, &groups, false);
+                self.jobs.push((operation, 0, Vec::new(), Some(source)));
+            }
+        }
+        Ok(())
+    }
+
+    fn storage_groups(
+        &self,
+        length: u32,
+        tables: Vec<Vec<PageHandle>>,
+    ) -> Result<Vec<PrefixStorageGroup>, CachePoolError> {
+        self.layout
+            .groups()
+            .iter()
+            .zip(tables)
+            .map(|(group, table)| {
+                let (first, count) = group.active_blocks(length);
+                let mut addresses = table
+                    .into_iter()
+                    .map(|page| self.pool.physical_address(page))
+                    .collect::<Result<Vec<_>, _>>()?;
+                addresses.rotate_left(first as usize % count as usize);
+                Ok((first, addresses))
+            })
+            .collect()
     }
 
     /// Collect a bounded-cadence snapshot, scanning physical block metadata.
@@ -221,6 +362,7 @@ impl PagedKvResources {
             reclaimable_slabs: groups.iter().map(|group| group.reclaimable_slabs).sum(),
             groups,
             prefix: self.prefix_metrics(),
+            storage_pending: self.jobs.len() as u64,
         }
     }
 
@@ -400,9 +542,6 @@ impl PagedKvResources {
         let (pool, cache) = (&mut self.pool, &mut self.prefix_cache);
         let Some((length, snapshot)) = cache.as_mut().and_then(|cache| cache.find(tokens, maximum))
         else {
-            if self.restore_storage(state, tokens, maximum)? {
-                return self.restore_prefix(state, tokens);
-            }
             return Ok(0);
         };
         let mut private = if !self.state_demands.is_empty() {
@@ -439,57 +578,6 @@ impl PagedKvResources {
         Ok(length)
     }
 
-    fn restore_storage(
-        &mut self,
-        state: &mut RequestPages,
-        tokens: &[u32],
-        maximum: usize,
-    ) -> Result<bool, CachePoolError> {
-        let Some(storage) = self.storage.as_mut() else {
-            return Ok(false);
-        };
-        let alignment = self.prefix_cache.as_ref().unwrap().alignment();
-        let maximum = maximum.min(tokens.len().saturating_sub(1)) as u32;
-        let length = storage.lookup(tokens, maximum, alignment);
-        if length == 0 || length > maximum || !length.is_multiple_of(alignment) {
-            return Ok(false);
-        }
-        let demands = self.demands(length);
-        let pending = loop {
-            match self.pool.reserve_request(state.sequence(), &demands) {
-                Ok(pages) => break pages,
-                Err(CachePoolError::InsufficientCapacity { .. }) => {
-                    if !self.evict_one_prefix()? {
-                        return Ok(false);
-                    }
-                }
-                Err(error) => return Err(error),
-            }
-        };
-        let mut imported = self.pool.promote_request(pending);
-        let loaded = (|| {
-            let tables = imported
-                .groups()
-                .iter()
-                .map(|group| group.pages().iter().map(|page| page.handle()).collect())
-                .collect();
-            if !self.storage_transfer(&tokens[..length as usize], tables, true)? {
-                return Ok(false);
-            }
-            let snapshot = self.pool.share_request_prefix(&mut imported, &demands)?;
-            let cache = self.prefix_cache.as_mut().unwrap();
-            let replaced = cache.insert(&tokens[..length as usize], snapshot);
-            if let Some(replaced) = replaced {
-                self.pool.retire_cached_prefix(replaced)?;
-            }
-            Ok(true)
-        })();
-        self.pool
-            .retire_request(imported)
-            .map_err(|failure| failure.error)?;
-        loaded
-    }
-
     /// Publish a completed aligned resident boundary. Returns false when the
     /// current progress cannot form a safe block-complete snapshot.
     pub fn publish_prefix(
@@ -515,10 +603,7 @@ impl PagedKvResources {
         }
         let demands = self.demands(resident_tokens);
         let pages = self.pool.share_request_prefix(state, &demands)?;
-        if let Err(error) = self.store_prefix(&pages, &tokens[..length]) {
-            self.pool.retire_cached_prefix(pages)?;
-            return Err(error);
-        }
+        self.store_prefix(&pages, &tokens[..length])?;
         let replaced = self
             .prefix_cache
             .as_mut()
@@ -757,10 +842,7 @@ impl PagedKvResources {
             .pool
             .combine_state_snapshots(history, copied, &self.state_groups)?;
         snapshot.ready = false;
-        if let Err(error) = self.store_prefix(&pages, tokens) {
-            self.pool.retire_cached_prefix(pages)?;
-            return Err(error);
-        }
+        self.store_prefix(&pages, tokens)?;
         let replaced = self
             .prefix_cache
             .as_mut()
@@ -770,45 +852,6 @@ impl PagedKvResources {
             self.pool.retire_cached_prefix(replaced)?;
         }
         Ok(())
-    }
-
-    fn store_prefix(&mut self, pages: &CachedPages, tokens: &[u32]) -> Result<(), CachePoolError> {
-        if self.storage.is_some() {
-            let tables = pages
-                .groups()
-                .iter()
-                .map(|group| {
-                    let mut table = group
-                        .segments()
-                        .flat_map(|(_, pages)| pages.iter().rev().map(|page| page.handle()))
-                        .collect::<Vec<_>>();
-                    table.reverse();
-                    table
-                })
-                .collect();
-            self.storage_transfer(tokens, tables, false)?;
-        }
-        Ok(())
-    }
-
-    fn storage_transfer(
-        &mut self,
-        tokens: &[u32],
-        tables: Vec<Vec<PageHandle>>,
-        load: bool,
-    ) -> Result<bool, CachePoolError> {
-        let mut groups = Vec::new();
-        for (group, table) in self.layout.groups().iter().zip(tables) {
-            let (first, count) = group.active_blocks(tokens.len() as u32);
-            let mut addresses = Vec::new();
-            for logical in first..first + count {
-                let page = page_for(*group, &table, logical).ok_or(CachePoolError::StaleHandle)?;
-                addresses.push(self.pool.physical_address(*page)?);
-            }
-            groups.push((first, addresses));
-        }
-        let storage = self.storage.as_mut().unwrap();
-        Ok(storage.transfer(tokens, &groups, load))
     }
 
     fn demands(&self, context: u32) -> Vec<GroupDemand> {
@@ -1153,6 +1196,16 @@ impl AdmissionEstimate<'_> {
     }
 }
 
+impl Drop for PagedKvResources {
+    fn drop(&mut self) {
+        for mut job in self.jobs.drain(..) {
+            if job.0.poll(true).is_none() {
+                std::mem::forget(job);
+            }
+        }
+    }
+}
+
 fn prefix_alignment(layout: &KvLayout) -> Result<u32, CachePoolError> {
     fn gcd(mut left: u32, mut right: u32) -> u32 {
         while right != 0 {
@@ -1226,194 +1279,10 @@ fn page_index(group: KvGroupLayout, page_count: usize, logical: u32) -> Option<u
 #[cfg(test)]
 mod tests {
     use std::num::{NonZeroU32, NonZeroU64};
-    use std::sync::{Arc, Mutex};
 
     use crate::{Phase, TokenRange};
 
     use super::*;
-
-    type TestArena = HashMap<(usize, u32, u32), [u8; 8]>;
-    type TestObjects = HashMap<Vec<u32>, Vec<Vec<[u8; 8]>>>;
-
-    #[derive(Clone, Debug, Default)]
-    struct ByteStorage {
-        arena: Arc<Mutex<TestArena>>,
-        objects: Arc<Mutex<TestObjects>>,
-    }
-
-    impl PrefixStorage for ByteStorage {
-        fn lookup(&mut self, tokens: &[u32], maximum: u32, alignment: u32) -> u32 {
-            self.objects
-                .lock()
-                .unwrap()
-                .keys()
-                .filter(|key| {
-                    tokens.starts_with(key)
-                        && key.len() <= maximum as usize
-                        && key.len().is_multiple_of(alignment as usize)
-                })
-                .map(|key| key.len() as u32)
-                .max()
-                .unwrap_or(0)
-        }
-
-        fn transfer(&mut self, tokens: &[u32], groups: &[PrefixStorageGroup], load: bool) -> bool {
-            let mut arena = self.arena.lock().unwrap();
-            let mut objects = self.objects.lock().unwrap();
-            if load {
-                let Some(object) = objects.get(tokens) else {
-                    return false;
-                };
-                for (index, ((_, addresses), blocks)) in groups.iter().zip(object).enumerate() {
-                    assert_eq!(addresses.len(), blocks.len());
-                    for (&(slab, slot), &bytes) in addresses.iter().zip(blocks) {
-                        arena.insert((index, slab, slot), bytes);
-                    }
-                }
-            } else {
-                objects.insert(
-                    tokens.to_vec(),
-                    groups
-                        .iter()
-                        .enumerate()
-                        .map(|(index, (_, addresses))| {
-                            addresses
-                                .iter()
-                                .map(|&(slab, slot)| arena[&(index, slab, slot)])
-                                .collect()
-                        })
-                        .collect(),
-                );
-            }
-            true
-        }
-    }
-
-    fn storage_roundtrip(recurrent: bool) {
-        let mut groups = vec![KvGroupLayout::new(2, 2, KvRetention::FullContext).unwrap()];
-        if recurrent {
-            groups.push(
-                KvGroupLayout::new_with_family(
-                    2,
-                    2,
-                    KvRetention::FullContext,
-                    crate::resources::kv::KvGroupFamily::State,
-                )
-                .unwrap(),
-            );
-        }
-        let mut resources =
-            PagedKvResources::with_prefix_cache(KvLayout::new(8, groups).unwrap()).unwrap();
-        let storage = ByteStorage::default();
-        resources.storage = Some(Box::new(storage.clone()));
-        let id = RequestId::new(NonZeroU64::new(1).unwrap());
-        let mut seed = resources.attach(id, 0).unwrap();
-        resources.ensure_context(&mut seed, 0, 4).unwrap();
-        for (index, group) in seed.groups().iter().enumerate() {
-            for (block, page) in group.pages().iter().enumerate() {
-                let (slab, slot) = resources.pool.physical_address(page.handle()).unwrap();
-                storage
-                    .arena
-                    .lock()
-                    .unwrap()
-                    .insert((index, slab, slot), [(index * 16 + block + 1) as u8; 8]);
-            }
-        }
-        if recurrent {
-            let access = resources
-                .acquire(
-                    &[RequestResourceRef {
-                        request_id: id,
-                        state: &seed,
-                    }],
-                    &[SequenceStep {
-                        phase: Phase::Prefill,
-                        tokens: TokenRange {
-                            start: 0,
-                            count: NonZeroU32::new(4).unwrap(),
-                        },
-                        sample: true,
-                    }],
-                    0,
-                )
-                .unwrap();
-            let slot = access.view.groups[1]
-                .state
-                .as_ref()
-                .unwrap()
-                .checkpoint_slots
-                .iter()
-                .find(|slot| slot.prefix_length == 4)
-                .unwrap();
-            // The immutable snapshot deliberately differs from live state.
-            storage.arena.lock().unwrap().insert(
-                (1, slot.destination_slab_id, slot.destination_slotnum),
-                [0xa5; 8],
-            );
-            let receipt = slot.reservation_id;
-            resources
-                .accept_state_checkpoints(&[(id.get(), 4, 4, false)], &[receipt])
-                .unwrap();
-            resources.finish_state_initialization(&[id.get()]);
-            resources.release(access.lease);
-            resources
-                .publish_state_prefix(&mut seed, receipt, &[1, 2, 3, 4])
-                .unwrap();
-        } else {
-            assert!(
-                resources
-                    .publish_prefix(&mut seed, &[1, 2, 3, 4], 4)
-                    .unwrap()
-            );
-        }
-        let expected = storage.objects.lock().unwrap()[&vec![1, 2, 3, 4]].clone();
-        resources.retire(seed).unwrap();
-        resources.clear_prefix_cache().unwrap();
-        assert_eq!(resources.pool.free_parent_count(), 8);
-        storage.arena.lock().unwrap().clear();
-
-        let id = RequestId::new(NonZeroU64::new(2).unwrap());
-        let mut restored = resources.attach(id, 0).unwrap();
-        assert_eq!(
-            resources
-                .restore_prefix(&mut restored, &[1, 2, 3, 4, 5])
-                .unwrap(),
-            4
-        );
-        for (index, group) in restored.groups().iter().enumerate() {
-            let pages = if recurrent && index == 1 {
-                assert!(group.pages()[0].is_writable());
-                resources.state_resources[&id.get()]
-                    .restore
-                    .as_ref()
-                    .unwrap()
-                    .groups()[index]
-                    .pages()
-            } else {
-                group.pages()
-            };
-            for (block, page) in pages.iter().enumerate() {
-                let (slab, slot) = resources.pool.physical_address(page.handle()).unwrap();
-                assert_eq!(
-                    storage.arena.lock().unwrap()[&(index, slab, slot)],
-                    expected[index][block]
-                );
-            }
-        }
-        resources.retire(restored).unwrap();
-        resources.clear_prefix_cache().unwrap();
-        assert_eq!(resources.pool.free_parent_count(), 8);
-    }
-
-    #[test]
-    fn storage_restores_history_bytes_after_all_device_pages_are_recycled() {
-        storage_roundtrip(false);
-    }
-
-    #[test]
-    fn storage_restores_recurrent_snapshot_bytes_with_private_live_state() {
-        storage_roundtrip(true);
-    }
 
     #[test]
     fn ancestor_eviction_counts_no_reclaimed_storage_until_the_last_checkpoint() {

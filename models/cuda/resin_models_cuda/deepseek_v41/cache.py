@@ -303,14 +303,11 @@ class CacheArena(GraphPageTableArena):
     graph_input_names = PARENT_PAGE_NAMES
     graph_label = "DeepSeek-V4.1"
 
-    @property
-    def cache_storage_block_bytes(self):
-        return tuple(
-            self.geometry.parent_bytes // packing for packing in self.geometry.packings
-        )
-
     def __init__(self, device, layout, geometry, *, dtype):
         self.device, self.layout, self.geometry = device, layout, geometry
+        self.cache_storage_block_bytes = tuple(
+            geometry.parent_bytes // p for p in geometry.packings
+        )
         self.binding = CachePoolBinding(layout, resource="DeepSeek-V4.1 KV")
         self.storage = torch.empty(
             (

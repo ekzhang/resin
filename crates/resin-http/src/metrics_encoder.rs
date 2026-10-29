@@ -39,18 +39,6 @@ impl MetricsEncoder {
             families: BTreeMap::new(),
         }
     }
-    /// Object-level cumulative observations from the optional prefix store.
-    pub fn storage(&mut self, observations: &BTreeMap<String, u64>) {
-        for (name, value) in observations {
-            self.counter(
-                &format!("cache_storage_{name}_total"),
-                "Prefix storage objects, successful payload bytes, or failures.",
-                *value as f64,
-                &[],
-            );
-        }
-    }
-
     /// Map logical-engine observations to the public Resin metric schema.
     pub fn engine(
         &mut self,
@@ -271,6 +259,12 @@ impl MetricsEncoder {
         Ok(())
     }
     fn cache(&mut self, c: &CacheMetrics) {
+        self.gauge(
+            "cache_storage_pending",
+            "Outstanding prefix storage operations.",
+            c.storage_pending as f64,
+            &[],
+        );
         for (state, value) in [
             ("capacity", c.capacity_slabs),
             ("free", c.free_slabs),

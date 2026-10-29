@@ -1242,7 +1242,6 @@ struct Engine {
     overlap_enqueues: u64,
     overlap_continuations: u64,
     runner_metrics: Option<Py<PyAny>>,
-    prefix_storage: Option<Py<PyAny>>,
 }
 
 struct PendingExecution {
@@ -1258,6 +1257,7 @@ impl Engine {
         allow_overlap: bool,
     ) -> PyResult<Vec<Py<TokenEvent>>> {
         self.core.raise_if_open().map_err(core_error)?;
+        self.core.poll_storage(false).map_err(core_error)?;
         let mut events = Vec::new();
         if self.pending.is_some() {
             let feedback = if self.overlap
@@ -1539,7 +1539,7 @@ impl Engine {
 #[pymethods]
 impl Engine {
     #[new]
-    #[pyo3(signature = (runner: "Runner", *, max_running_requests = 32, context_length = 32768, scheduler_config = None, prefix_cache = false, prefix_cache_storage = None, prefix_cache_namespace = None, enable_overlap = true, enable_metrics = true))]
+    #[pyo3(signature = (runner: "Runner", *, max_running_requests = 32, context_length = 32768, scheduler_config = None, prefix_cache = false, prefix_cache_storage = None, enable_overlap = true, enable_metrics = true))]
     #[allow(
         clippy::too_many_arguments,
         reason = "Python constructor exposes keyword configuration"
@@ -1552,7 +1552,6 @@ impl Engine {
         scheduler_config: Option<Py<SchedulerConfig>>,
         prefix_cache: bool,
         prefix_cache_storage: Option<Py<PyAny>>,
-        prefix_cache_namespace: Option<Py<PyAny>>,
         enable_overlap: bool,
         enable_metrics: bool,
     ) -> PyResult<Self> {
@@ -1560,11 +1559,6 @@ impl Engine {
         let (runner_forward, runner_release) = resolve_runner_contract(py, runner.bind(py))?;
         let resolved = resolve_runner_config(py, runner.bind(py))?;
         let config = &resolved.config;
-        if prefix_cache_storage.is_some() && (!prefix_cache || config.cache_layout.is_none()) {
-            return Err(PyValueError::new_err(
-                "prefix storage requires the managed prefix cache",
-            ));
-        }
         let scheduler = scheduler_config
             .as_ref()
             .map(|config| *config.borrow(py))
@@ -1604,29 +1598,13 @@ impl Engine {
         } else {
             None
         };
-        let prefix_storage = if let Some(provider) = prefix_cache_storage {
-            let runtime = PyModule::import(py, "resin._cache_storage")?
-                .getattr("_PrefixStorage")?
-                .call1((
-                    provider,
-                    runner,
-                    &config.cache_layout,
-                    prefix_cache_namespace,
-                ))?
-                .unbind();
+        if let Some(provider) = prefix_cache_storage {
+            let buffers = runner.bind(py).getattr("cache_storage_buffers")?.unbind();
             core.set_prefix_storage(Box::new(cache_storage::PythonPrefixStorage(
-                runtime.clone_ref(py),
+                provider, buffers,
             )))
             .map_err(core_error)?;
-            Some(runtime)
-        } else {
-            if prefix_cache_namespace.is_some() {
-                return Err(PyValueError::new_err(
-                    "prefix_cache_namespace requires prefix_cache_storage",
-                ));
-            }
-            None
-        };
+        }
         let runner_config = bind_runner_resources(py, resolved, core.cache_pool_id())?;
         Ok(Self {
             core,
@@ -1641,7 +1619,6 @@ impl Engine {
             overlap_enqueues: 0,
             overlap_continuations: 0,
             runner_metrics,
-            prefix_storage,
         })
     }
     #[pyo3(signature = (
@@ -1815,8 +1792,9 @@ impl Engine {
         (self.overlap_enqueues, self.overlap_continuations)
     }
 
-    /// Read-only admission-aware proposal; reserves no requests or resources.
-    fn next_phase(&self) -> PyResult<Option<BatchPhase>> {
+    /// Poll storage completions before proposing the next runnable phase.
+    fn next_phase(&mut self) -> PyResult<Option<BatchPhase>> {
+        self.core.poll_storage(false).map_err(core_error)?;
         self.core
             .next_phase()
             .map(|phase| {

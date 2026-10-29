@@ -31,7 +31,6 @@ from resin._resin import (
     TokenLogprobs,
     __version__,
 )
-from resin.cache_storage import CacheStorage, MemoryCacheStorage
 from resin.protocols import (
     ManagedRunner,
     MediaInput,
@@ -48,8 +47,6 @@ __all__ = [
     "CacheLayout",
     "CacheRetention",
     "CacheStatePlan",
-    "CacheStorage",
-    "MemoryCacheStorage",
     "Engine",
     "EngineMetrics",
     "ForwardOutput",

@@ -18,7 +18,6 @@ pub(crate) struct EngineMetrics {
     requests: EngineMetricsSnapshot,
     cache: Option<paged_kv::CacheMetrics>,
     runner: Option<RunnerMetricsSnapshot>,
-    storage: Option<BTreeMap<String, u64>>,
 }
 
 #[pymethods]
@@ -36,11 +35,6 @@ impl EngineMetrics {
     #[getter]
     fn runner(&self) -> Option<RunnerMetrics> {
         self.runner.clone().map(RunnerMetrics)
-    }
-
-    #[getter]
-    fn storage(&self) -> Option<BTreeMap<String, u64>> {
-        self.storage.clone()
     }
 }
 
@@ -72,11 +66,6 @@ impl Engine {
             requests,
             cache: self.core.cache_metrics(),
             runner,
-            storage: self
-                .prefix_storage
-                .as_ref()
-                .map(|runtime| runtime.bind(py).getattr("stats")?.extract())
-                .transpose()?,
         }))
     }
 }
@@ -96,9 +85,6 @@ impl EngineMetrics {
             encoder
                 .runner(runner)
                 .map_err(|error| PyValueError::new_err(error.to_string()))?;
-        }
-        if let Some(storage) = &self.storage {
-            encoder.storage(storage);
         }
         Ok(resin_http::encode_metrics(&encoder.finish()))
     }
