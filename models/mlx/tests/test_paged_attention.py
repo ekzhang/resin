@@ -41,6 +41,9 @@ def _reference(queries, keys, values, history, scale):
         [0],
         [1, 127, 128, 129],
         [PARTITION_TOKENS - 1, PARTITION_TOKENS, PARTITION_TOKENS + 1],
+        # Fewer than four rows use half-size partitions.
+        [PARTITION_TOKENS // 2 - 1, PARTITION_TOKENS // 2, PARTITION_TOKENS // 2 + 1],
+        [PARTITION_TOKENS * 4 + 3],
         [3000, 17, 0, 2049],
     ],
 )

@@ -15,15 +15,43 @@ size are runtime data; only the model geometry selects a compiled kernel.
 
 from __future__ import annotations
 
-from functools import cache
+from functools import cache, partial
 
 import mlx.core as mx
 
 PARTITION_TOKENS = 512
+# Below this many rows, half-size partitions keep more GPU cores busy.
+SMALL_BATCH_ROWS = 4
 SIMDGROUPS = 4
+PREFETCH = 4
 _HEADS_PER_THREADGROUP = 4
 # Metal guarantees 32 KiB of threadgroup memory.
 _THREADGROUP_BYTES = 32 * 1024
+
+_HEADER = """
+template <int GROUP, int LANE_DIMS>
+inline void attend(
+    thread const float (&q)[GROUP][LANE_DIMS],
+    thread const float (&k)[LANE_DIMS],
+    thread const float (&v)[LANE_DIMS],
+    thread float (&m)[GROUP],
+    thread float (&l)[GROUP],
+    thread float (&acc)[GROUP][LANE_DIMS]) {
+    for (int h = 0; h < GROUP; ++h) {
+        float dot = 0.0f;
+        for (int i = 0; i < LANE_DIMS; ++i) dot += q[h][i] * k[i];
+        const float score = simd_sum(dot);
+        const float peak = max(m[h], score);
+        const float correction = fast::exp(m[h] - peak);
+        const float weight = fast::exp(score - peak);
+        l[h] = l[h] * correction + weight;
+        for (int i = 0; i < LANE_DIMS; ++i) {
+            acc[h][i] = acc[h][i] * correction + weight * v[i];
+        }
+        m[h] = peak;
+    }
+}
+"""
 
 _SOURCE = """
     constexpr int LANE_DIMS = D / 32;
@@ -63,39 +91,55 @@ _SOURCE = """
         for (int i = 0; i < LANE_DIMS; ++i) acc[h][i] = 0.0f;
     }
 
+    // Each simdgroup walks its own contiguous run of positions, page by page,
+    // loading PREFETCH positions ahead so their memory latency overlaps.
     const int width = KV_HEADS * D;
-    for (int p = start + int(group); p < stop; p += SIMDGROUPS) {
+    const int run = PART / SIMDGROUPS;
+    const int first = start + int(group) * run;
+    const int last = min(first + run, stop);
+    const int cached = min(last, history);
+    int p = first;
+    while (p < cached) {
+        const int page_end = min(cached, (p / PAGE + 1) * PAGE);
+        const long unit = long(pages[row * PAGES + p / PAGE]) + layer;
+        const device T* key = units + (unit * 2 * PAGE + p % PAGE) * width
+                              + kv_head * D + lane * LANE_DIMS;
+        const device T* value = key + long(PAGE) * width;
+        for (; p + PREFETCH <= page_end; p += PREFETCH) {
+            float k[PREFETCH][LANE_DIMS];
+            float v[PREFETCH][LANE_DIMS];
+            for (int t = 0; t < PREFETCH; ++t) {
+                for (int i = 0; i < LANE_DIMS; ++i) k[t][i] = float(key[t * width + i]);
+            }
+            for (int t = 0; t < PREFETCH; ++t) {
+                for (int i = 0; i < LANE_DIMS; ++i) v[t][i] = float(value[t * width + i]);
+            }
+            for (int t = 0; t < PREFETCH; ++t) attend(q, k[t], v[t], m, l, acc);
+            key += PREFETCH * width;
+            value += PREFETCH * width;
+        }
+        for (; p < page_end; ++p) {
+            float k[LANE_DIMS];
+            float v[LANE_DIMS];
+            for (int i = 0; i < LANE_DIMS; ++i) {
+                k[i] = float(key[i]);
+                v[i] = float(value[i]);
+            }
+            attend(q, k, v, m, l, acc);
+            key += width;
+            value += width;
+        }
+    }
+    // The step's own key and value follow the history.
+    if (first <= history && history < last) {
+        const int base = (row * KV_HEADS + kv_head) * D + lane * LANE_DIMS;
         float k[LANE_DIMS];
         float v[LANE_DIMS];
-        if (p < history) {
-            const long unit = long(pages[row * PAGES + p / PAGE]) + layer;
-            const long base = (unit * 2 * PAGE + (p % PAGE)) * width
-                              + kv_head * D + lane * LANE_DIMS;
-            const long value = base + long(PAGE) * width;
-            for (int i = 0; i < LANE_DIMS; ++i) {
-                k[i] = float(units[base + i]);
-                v[i] = float(units[value + i]);
-            }
-        } else {
-            const int base = (row * KV_HEADS + kv_head) * D + lane * LANE_DIMS;
-            for (int i = 0; i < LANE_DIMS; ++i) {
-                k[i] = float(current_keys[base + i]);
-                v[i] = float(current_values[base + i]);
-            }
+        for (int i = 0; i < LANE_DIMS; ++i) {
+            k[i] = float(current_keys[base + i]);
+            v[i] = float(current_values[base + i]);
         }
-        for (int h = 0; h < GROUP; ++h) {
-            float dot = 0.0f;
-            for (int i = 0; i < LANE_DIMS; ++i) dot += q[h][i] * k[i];
-            const float score = simd_sum(dot);
-            const float peak = max(m[h], score);
-            const float correction = fast::exp(m[h] - peak);
-            const float weight = fast::exp(score - peak);
-            l[h] = l[h] * correction + weight;
-            for (int i = 0; i < LANE_DIMS; ++i) {
-                acc[h][i] = acc[h][i] * correction + weight * v[i];
-            }
-            m[h] = peak;
-        }
+        attend(q, k, v, m, l, acc);
     }
 
     threadgroup float shared_m[SIMDGROUPS][GROUP];
@@ -152,6 +196,7 @@ def _kernel():
         ],
         output_names=["partial", "maxima", "sums"],
         source=_SOURCE,
+        header=_HEADER,
     )
 
 
@@ -194,8 +239,9 @@ def paged_decode_attention(
     group = max(fits)
     head_groups = shared // group
     longest = pages.shape[1] * page + 1
-    partitions = -(-longest // PARTITION_TOKENS)
-    partial, maxima, sums = _kernel()(
+    part = PARTITION_TOKENS // (2 if rows < SMALL_BATCH_ROWS else 1)
+    partitions = -(-longest // part)
+    outputs, maxima, sums = _kernel()(
         inputs=[
             queries,
             current_keys,
@@ -213,8 +259,10 @@ def paged_decode_attention(
             ("GROUP", group),
             ("HEAD_GROUPS", head_groups),
             ("PAGE", page),
-            ("PART", PARTITION_TOKENS),
+            ("PART", part),
             ("SIMDGROUPS", SIMDGROUPS),
+            ("PREFETCH", PREFETCH),
+            ("T", units.dtype),
         ],
         grid=(32 * SIMDGROUPS, 1, rows * kv_heads * head_groups * partitions),
         threadgroup=(32 * SIMDGROUPS, 1, 1),
@@ -225,11 +273,18 @@ def paged_decode_attention(
         ],
         output_dtypes=[mx.float32, mx.float32, mx.float32],
     )
+    return _merge(outputs, maxima, sums).astype(queries.dtype)
+
+
+@partial(mx.compile, shapeless=True)
+def _merge(outputs: mx.array, maxima: mx.array, sums: mx.array) -> mx.array:
+    """Combine partitions by their log-sum-exp; empty partitions weigh zero."""
+
     peak = maxima.max(axis=-1, keepdims=True)
     weights = mx.where(maxima == -mx.inf, 0.0, mx.exp(maxima - peak))
-    numerator = (partial * weights[..., None]).sum(axis=2)
+    numerator = (outputs * weights[..., None]).sum(axis=2)
     denominator = (sums * weights).sum(axis=-1)[..., None]
-    return (numerator / denominator).astype(queries.dtype)
+    return numerator / denominator
 
 
 __all__ = ["PARTITION_TOKENS", "paged_decode_attention"]
