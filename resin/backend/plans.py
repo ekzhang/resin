@@ -188,13 +188,21 @@ class PagedCachePlan:
         layout: CacheLayout,
         *,
         decode_lookahead: int = 0,
+        decode_reservation_tokens: int = 0,
     ) -> PagedCachePlan:
-        """Validate group order, physical bounds, extents, and append ownership."""
+        """Validate group order, physical bounds, extents, and append ownership.
+
+        Decode reservations admit bounded, frozen full-history tables. Recurrent
+        checkpoints retain their exact active range, and window layouts retain
+        the ordinary strict contract until a runner supplies window-aware views.
+        """
 
         from resin._resin import CacheGroupFamily
 
         if decode_lookahead < 0:
             raise ValueError("decode_lookahead cannot be negative")
+        if type(decode_reservation_tokens) is not int or decode_reservation_tokens < 0:
+            raise ValueError("decode_reservation_tokens must be a nonnegative integer")
         if not isinstance(layout, CacheLayout):
             raise TypeError("paged cache plans require a native CacheLayout")
         batch = BatchView.from_plan(plan)
@@ -205,16 +213,23 @@ class PagedCachePlan:
         row_ids = np.repeat(np.arange(batch.num_sequences), query_lengths)
         positions = batch.positions.astype(np.int64)
         lookahead = decode_lookahead if batch.phase == BatchPhase.DECODE else 0
+        reservation = (
+            decode_reservation_tokens if batch.phase == BatchPhase.DECODE else 0
+        )
         # Native fields are u32, but a leased decode span can extend beyond u32.
         # Keep even oversized caller-supplied lookahead from wrapping arithmetic.
         post_lengths = batch.context_lengths.astype(np.int64) + query_lengths
         arithmetic = (
             object
-            if lookahead > np.iinfo(np.int64).max - int(post_lengths.max())
+            if max(lookahead, reservation)
+            > np.iinfo(np.int64).max - int(post_lengths.max())
             else np.int64
         )
         write_tokens = query_lengths.astype(arithmetic) + lookahead
         leased = batch.context_lengths.astype(arithmetic) + write_tokens
+        reserved = np.maximum(
+            leased, batch.context_lengths.astype(arithmetic) + reservation
+        )
 
         groups = []
         for index, descriptor in enumerate(layout.groups):
@@ -244,6 +259,21 @@ class PagedCachePlan:
             invalid_range = (group.block_table_start_indices != expected_first) | (
                 np.diff(group.block_indptr) != last_blocks - expected_first + 1
             )
+            if reservation and descriptor.family != CacheGroupFamily.STATE:
+                if window_blocks is not None:
+                    raise ValueError(
+                        "decode reservations require full-history token groups"
+                    )
+                # A continuation's conservative host position may advance while
+                # this page envelope stays fixed. Every required write must fit,
+                # but unused, already leased tail pages remain valid.
+                count = np.diff(group.block_indptr)
+                maximum_count = (reserved - 1) // block_tokens + 1
+                invalid_range = (
+                    (group.block_table_start_indices != 0)
+                    | (count < last_blocks + 1)
+                    | (count > maximum_count)
+                )
 
             logical_blocks = positions // block_tokens
             # Layout-inconsistent extents must be rejected before indexing.

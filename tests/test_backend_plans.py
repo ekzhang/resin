@@ -284,6 +284,82 @@ def test_paged_cache_plan_accepts_the_two_checkpoint_state_ring() -> None:
     assert cache.groups[0].address(0, 2) == (2, 0)
 
 
+@pytest.mark.parametrize(
+    "context,history_pages", [(125, 3), (128, 3), (381, 3), (4094, 33)]
+)
+def test_reserved_history_keeps_exact_recurrent_checkpoints(context, history_pages):
+    layout = CacheLayout(
+        parent_capacity=40,
+        groups=[
+            CacheGroupLayout(128),
+            CacheGroupLayout(4096, family=CacheGroupFamily.STATE),
+        ],
+    )
+    state_last = (context + 2) // 4096
+    state_first = max(0, state_last - 1)
+    state_pages = state_last - state_first + 1
+    plan = BatchPlan(
+        sequence_ids=[10],
+        context_lengths=[context],
+        token_ids=[7],
+        token_indptr=[0, 1],
+        phase=BatchPhase.DECODE,
+        cache_groups=[
+            CacheGroupPlan(
+                group_index=0,
+                block_indptr=[0, history_pages],
+                block_slab_ids=list(range(1, history_pages + 1)),
+                block_slotnums=[0] * history_pages,
+                block_table_start_indices=[0],
+                append_slab_ids=[context // 128 + 1],
+                append_slotnums=[0],
+                append_block_offsets=[context % 128],
+            ),
+            CacheGroupPlan(
+                group_index=1,
+                block_indptr=[0, state_pages],
+                block_slab_ids=list(range(39, 39 + state_pages)),
+                block_slotnums=[0] * state_pages,
+                block_table_start_indices=[state_first],
+                append_slab_ids=[39 + context // 4096 - state_first],
+                append_slotnums=[0],
+                append_block_offsets=[context % 4096],
+            ),
+        ],
+    )
+    options = dict(decode_lookahead=2, decode_reservation_tokens=136)
+    cache = PagedCachePlan.from_plan(plan, layout, **options)
+    assert len(cache.groups[0].block_slabs(0)) == history_pages
+    assert len(cache.groups[1].block_slabs(0)) == state_pages
+    if context == 125:
+        with pytest.raises(ValueError, match="exact active range"):
+            PagedCachePlan.from_plan(plan, layout, decode_lookahead=2)
+        for group, pages, slabs in ((0, 4, [1, 2, 3, 4]), (1, 2, [39, 40])):
+            invalid = _replace_plan_group(
+                plan,
+                group,
+                block_indptr=[0, pages],
+                block_slab_ids=slabs,
+                block_slotnums=[0] * pages,
+            )
+            with pytest.raises(ValueError, match="exact active range"):
+                PagedCachePlan.from_plan(invalid, layout, **options)
+    if context == 128:
+        short = _replace_plan_group(
+            plan,
+            0,
+            block_indptr=[0, 1],
+            block_slab_ids=[2],
+            block_slotnums=[0],
+            block_table_start_indices=[1],
+        )
+        with pytest.raises(ValueError, match="exact active range"):
+            PagedCachePlan.from_plan(short, layout, **options)
+        wrong_append = _replace_plan_group(plan, 0, append_slab_ids=[1])
+        with pytest.raises(ValueError, match="append target"):
+            PagedCachePlan.from_plan(wrong_append, layout, **options)
+
+
 @pytest.mark.parametrize("decode", [False, True])
 def test_source_free_window_plan_rejects_writes_that_discard_read_history(
     decode: bool,

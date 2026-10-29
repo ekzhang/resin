@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Sequence
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import TYPE_CHECKING, cast
 
@@ -12,6 +12,11 @@ import torch
 
 from resin import BatchPhase, RunnerConfig
 from resin.backend.capacity import plan_cache_capacity
+from resin.backend.cuda.completion import (
+    DeviceCompletion,
+    DeviceFeedback,
+    accepted_block,
+)
 from resin.backend.cuda.graphs import (
     CudaGraphMode,
     CudaGraphStep,
@@ -54,6 +59,7 @@ from resin_models_cuda.qwen3_5.attention import (
     PagedAttentionRuntime,
 )
 from resin_models_cuda.qwen3_5.cache import (
+    PAGE_TOKENS,
     PREFILL_CHUNK_SIZE,
     CacheArena,
     CacheGeometry,
@@ -96,6 +102,62 @@ def _one_draft_verification(drafts, targets, *, accepted_drafts=None):
     return accepted, mtp_inputs
 
 
+@dataclass(frozen=True, slots=True)
+class _Feedback(DeviceFeedback):
+    """Device continuation inputs; the one-draft MTP path also carries drafts."""
+
+    sequence_ids: tuple[int, ...]
+    shape: GraphShape
+    draft_ids: torch.Tensor | None = None
+
+    def restrict(self, rows):
+        DeviceFeedback.restrict(self, rows)
+        if self.draft_ids is not None:
+            self.draft_ids[rows:].zero_()
+        return self
+
+    def inputs(self):
+        inputs = {
+            "token_ids": self.token_ids,
+            "positions": self.positions,
+            "sampling_offsets": (self.positions + 1) * SAMPLING_OFFSET_STRIDE,
+        }
+        if self.draft_ids is not None:
+            inputs["draft_ids"] = self.draft_ids
+        return inputs
+
+
+class _Completion(DeviceCompletion):
+    """Shared device completion that also harvests the next MTP drafts on the host."""
+
+    def __init__(self, runner, sequence_ids, next_drafts, *args, **kwargs):
+        # Queue the draft copy before the base class records its completion event.
+        self._draft_stager = TensorStager(runner.device)
+        self._next_drafts = (
+            None
+            if next_drafts is None
+            else self._draft_stager.output("next_drafts", next_drafts)
+        )
+        self._runner = runner
+        self._sequence_ids = sequence_ids
+        super().__init__(*args, **kwargs)
+
+    def result(self):
+        fresh = self._result is None
+        output = super().result()
+        if not fresh:
+            return output
+        runner = self._runner
+        if self._next_drafts is not None:
+            for sequence, draft in zip(
+                self._sequence_ids,
+                self._next_drafts[: self._rows].tolist(),
+                strict=True,
+            ):
+                runner._drafts[sequence] = int(draft)
+        return output
+
+
 class Qwen3_5CudaRunner(CudaRunner):
     """Dense Qwen3.5/Qwen3.8 text runner over paged FA4 and DeltaNet state."""
 
@@ -119,6 +181,7 @@ class Qwen3_5CudaRunner(CudaRunner):
         cuda_graph_prefill: str = "breakable",
         cuda_graph_decode: str = "full",
         cuda_graph_decode_shapes: object | None = None,
+        cache_write_reservation_tokens: int = 136,
         parallel_groups: ParallelGroups | None = None,
     ) -> None:
         if parallel_groups is not None:
@@ -314,6 +377,9 @@ class Qwen3_5CudaRunner(CudaRunner):
             prefill_chunk_size=PREFILL_CHUNK_SIZE,
             continuation_prefill=True,
             cache_write_lookahead_tokens=lookahead,
+            cache_write_reservation_tokens=(
+                cache_write_reservation_tokens if speculative_tokens in (0, 1) else 0
+            ),
             cache_layout=self.cache_layout,
         )
         layers = tuple(
@@ -332,6 +398,14 @@ class Qwen3_5CudaRunner(CudaRunner):
     @property
     def speculative_stats(self) -> dict[str, int | float]:
         return self._speculation.snapshot(include_draft_tokens=True)
+
+    @property
+    def benchmark_counters(self) -> dict[str, int]:
+        return {
+            "async.enqueues": getattr(self, "_async_enqueues", 0),
+            "async.continuations": getattr(self, "_async_continuations", 0),
+            "host.attention_plans": getattr(self, "_host_attention_plans", 0),
+        }
 
     @staticmethod
     def _media_at(plan: BatchPlan, row: int) -> Qwen35Media | None:
@@ -454,10 +528,6 @@ class Qwen3_5CudaRunner(CudaRunner):
         if not self._fast_speculation:
             del inputs["draft_ids"]
         inputs.update(self._cache.graph_shape_capture_inputs(*shape))
-        for index, call in enumerate(self._graph_attention_for(shape).calls):
-            inputs[f"attention.{index}.base_pages"] = (0,) * len(
-                call.prepared.base_pages
-            )
         return inputs
 
     @property
@@ -501,6 +571,10 @@ class Qwen3_5CudaRunner(CudaRunner):
             self._graph_attention[shape] = runtime
         return runtime
 
+    def _refresh_graph_attention(self, attention, positions: torch.Tensor) -> None:
+        """Resolve exact readable pages from GPU positions and the frozen lease."""
+        attention.refresh(positions)
+
     def _new_decode_graph_step(self, shape: GraphShape) -> CudaGraphStep:
         batch_size, graph_seq_len = shape
         attention = self._graph_attention_for(shape)
@@ -526,6 +600,7 @@ class Qwen3_5CudaRunner(CudaRunner):
 
         def ordinary_launch() -> None:
             attention.reset()
+            self._refresh_graph_attention(attention, positions)
             # GDN recurrent and convolution state update in place in the arena.
             previous = (positions - 1).clamp_min(0)
             hidden, _, _ = self._target_forward(
@@ -552,6 +627,7 @@ class Qwen3_5CudaRunner(CudaRunner):
             if phase_timing is not None:
                 phase_timing.mark(0)
             attention.reset()
+            self._refresh_graph_attention(attention, positions)
             recurrent, convolution, _ = self._initial_state(cache, positions)
             anchor_hidden, recurrent, convolution = self._target_forward(
                 cache,
@@ -687,6 +763,7 @@ class Qwen3_5CudaRunner(CudaRunner):
             if phase_timing is not None:
                 phase_timing.mark(0)
             attention.reset()
+            self._refresh_graph_attention(attention, positions)
             config = self.attention_config
             previous = (positions - 1).clamp_min(0)
             pool = replace(
@@ -773,6 +850,9 @@ class Qwen3_5CudaRunner(CudaRunner):
         inputs.update(self._cache.graph_device_inputs(cache))
         inputs.update(attention.graph_inputs())
         inputs.update(self._sampler.graph_inputs(sampling))
+        if not hasattr(self, "_feedback_graph_inputs"):
+            self._feedback_graph_inputs = {}
+        self._feedback_graph_inputs[shape] = inputs
 
         def prepare() -> None:
             attention.reset()
@@ -787,19 +867,31 @@ class Qwen3_5CudaRunner(CudaRunner):
         )
 
     def _graph_forward(
-        self, plan: BatchPlan, cache_plan: PagedCachePlan
-    ) -> ForwardOutput | None:
+        self,
+        plan: BatchPlan,
+        cache_plan: PagedCachePlan,
+        *,
+        enqueue: bool = False,
+        feedback=None,
+    ):
         if plan.needs_logprobs:
             self._cuda_graph_fallback("decode", "logprobs")
             return None
         batch_size = plan.num_sequences
+        history_pages = max(
+            int(np.diff(cache_plan.groups[index].block_indptr).max())
+            for index in (0, 2)
+            if index < len(cache_plan.groups)
+        )
         required_length = int(np.max(plan.positions)) + self.speculative_tokens + 2
         if not self.speculative_tokens:
             required_length = int(np.max(plan.positions)) + 1
         shape = self._select_cuda_graph(
             "decode",
             match=lambda candidate: (
-                candidate[0] >= batch_size and candidate[1] >= required_length
+                candidate[0] >= batch_size
+                and candidate[1] >= required_length
+                and (candidate[1] + PAGE_TOKENS - 1) // PAGE_TOKENS >= history_pages
             ),
         )
         if shape is None:
@@ -816,6 +908,7 @@ class Qwen3_5CudaRunner(CudaRunner):
         inputs.update(
             self._graph_attention[shape].plan(cache_plan, np.asarray(plan.positions))
         )
+        self._host_attention_plans = getattr(self, "_host_attention_plans", 0) + 1
         inputs.update(
             pad_sampling_inputs(self._sampler, plan, self.vocab_size, padding)
         )
@@ -835,6 +928,8 @@ class Qwen3_5CudaRunner(CudaRunner):
                 ),
                 (0, padding),
             )
+        if enqueue:
+            return self._enqueue_graph_output(plan, shape, inputs, feedback=feedback)
         output = self._run_cuda_graph("decode", shape, inputs)[:batch_size]
         if not self.speculative_tokens:
             return token_output(output[:, 0])
@@ -858,6 +953,48 @@ class Qwen3_5CudaRunner(CudaRunner):
         for sequence, row in zip(sequence_ids, rows, strict=True):
             self._drafts[sequence] = row[3]
         return token_output(acceptance.token_rows)
+
+    def _enqueue_graph_output(self, plan, shape, inputs, *, feedback=None):
+        sequence_ids = tuple(map(int, plan.sequence_ids))
+        if feedback is not None:
+            inputs.update(feedback.inputs())
+            positions = feedback.positions
+        else:
+            positions = torch.as_tensor(
+                inputs["positions"], device=self.device, dtype=torch.long
+            )
+        output = self._run_cuda_graph("decode", shape, inputs)
+        draft_width = 1 if self._fast_speculation else 0
+        stats = self._speculation if draft_width else None
+        tokens, counts, base = accepted_block(
+            output[:, : 2 * draft_width + 1],
+            positions,
+            draft_width,
+            fixed_acceptance=None if stats is None else stats.benchmark_accepted_drafts,
+        )
+        next_drafts = output[:, 3].clone() if draft_width else None
+        completion = _Completion(
+            self,
+            sequence_ids,
+            next_drafts,
+            tokens,
+            counts,
+            _Feedback(base.token_ids, base.positions, sequence_ids, shape, next_drafts),
+            rows=plan.num_sequences,
+            device=self.device,
+            stats=stats,
+        )
+        # A later conservative plan can advance by the Engine's maximum output
+        # width. Drain before it could exceed this graph's token capacity;
+        # the next normal batch may select a different graph bucket or go eager.
+        maximum = self.runner_config.cache_write_lookahead_tokens + 1
+        if np.any(np.asarray(plan.positions, dtype=np.int64) + 2 * maximum > shape[1]):
+            completion.feedback = None
+        self._async_enqueues = getattr(self, "_async_enqueues", 0) + 1
+        self._async_continuations = getattr(self, "_async_continuations", 0) + int(
+            feedback is not None
+        )
+        return completion
 
     def _validate_plan(self, plan: BatchPlan) -> tuple[tuple[int, int], ...]:
         return validate_hybrid_plan(
@@ -1262,7 +1399,10 @@ class Qwen3_5CudaRunner(CudaRunner):
             else 0
         )
         cache_plan = PagedCachePlan.from_plan(
-            plan, self.cache_layout, decode_lookahead=lookahead
+            plan,
+            self.cache_layout,
+            decode_lookahead=lookahead,
+            decode_reservation_tokens=self.runner_config.cache_write_reservation_tokens,
         )
         with self._cuda_failure:
             if plan.phase == BatchPhase.DECODE:
@@ -1284,6 +1424,51 @@ class Qwen3_5CudaRunner(CudaRunner):
                 if self.speculative_tokens:
                     return self._speculative_decode(plan, cache, token_ids, positions)
                 return self._ordinary_decode(plan, cache, token_ids, positions)
+
+    @observe_execution
+    def enqueue(self, plan: BatchPlan, *, feedback=None):
+        """Device-feedback decode for plain and one-draft MTP graphs; else forward()."""
+        if (
+            plan.phase != BatchPhase.DECODE
+            or plan.needs_logprobs
+            or plan.needs_prompt_logprobs
+            or self.speculative_tokens not in (0, 1)
+        ):
+            if feedback is not None:
+                raise RuntimeError(
+                    "a device continuation requires unscored captured decode"
+                )
+            return self.forward(plan)
+        self._check_cuda_graphs(plan.phase)
+        if feedback is not None:
+            if not isinstance(feedback, _Feedback):
+                raise ValueError("Qwen continuation requires owned device feedback")
+            if feedback.sequence_ids != tuple(map(int, plan.sequence_ids)):
+                raise ValueError("Qwen continuation changed its row ownership")
+            shape = feedback.shape
+            with self._cuda_failure, torch.inference_mode():
+                # The Engine retains the same lease and row order. All dense
+                # tables, policies and rotary deltas already occupy graph-owned
+                # buffers; stage only owned token/position/draft feedback.
+                inputs = dict(self._feedback_graph_inputs[shape])
+                return self._enqueue_graph_output(
+                    plan, shape, inputs, feedback=feedback
+                )
+        self._validate_plan(plan)
+        lookahead = self.speculative_tokens + 1 if self.speculative_tokens else 0
+        cache_plan = PagedCachePlan.from_plan(
+            plan,
+            self.cache_layout,
+            decode_lookahead=lookahead,
+            decode_reservation_tokens=self.runner_config.cache_write_reservation_tokens,
+        )
+        with self._cuda_failure, torch.inference_mode():
+            result = self._graph_forward(
+                plan, cache_plan, enqueue=True, feedback=feedback
+            )
+        if result is None and feedback is not None:
+            raise RuntimeError("a device continuation requires a captured graph")
+        return self.forward(plan) if result is None else result
 
     def release(self, sequence_ids: list[int]) -> None:
         """Release request-local image embeddings after Engine retirement."""

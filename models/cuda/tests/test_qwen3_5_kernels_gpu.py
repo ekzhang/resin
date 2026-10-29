@@ -12,14 +12,16 @@ import torch
 from torch.nn import functional as F
 
 from resin.backend.cuda.paged_kv import SlabPagedKvCache
+from resin.backend.cuda.slab import DevicePageGroup
 from resin.models.qwen3_5.config import Qwen35Config
 from resin_models_cuda.qwen3_5 import model as qwen
-from resin_models_cuda.qwen3_5.attention import PreparedPagedAttention
-
-pytestmark = pytest.mark.skipif(
-    not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] < 9,
-    reason="requires Hopper or newer CUDA",
+from resin_models_cuda.qwen3_5.attention import (
+    GraphAttentionSpec,
+    GraphPagedAttentionRuntime,
+    PreparedPagedAttention,
 )
+
+pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 
 
 def _norm(hidden, weight, eps, gate=None):
@@ -285,7 +287,173 @@ def _paged_attention():
 
 
 @pytest.mark.parametrize("check", [_norms, _delta, _paged_attention])
+@pytest.mark.skipif(
+    torch.cuda.is_available() and torch.cuda.get_device_capability()[0] < 9,
+    reason="model normalization kernels require Hopper or newer CUDA",
+)
 @torch.inference_mode()
 def test_qwen_native_kernels(check):
     torch.manual_seed(93)
     check()
+
+
+def _dense_graph_attention(query, cache, call, lengths):
+    """Independent FP32 causal reference from the exact dense lease prefix."""
+    spec = call.spec
+    outputs = []
+    group = cache.groups[spec.group_index]
+    for row in range(len(query)):
+        if group.slab_ids[row, 0].item() == 0:
+            outputs.append(torch.zeros_like(query[row]))
+            continue
+        length = int(lengths[row].item())
+        physical = (
+            group.slab_ids[row] * cache.slab_units
+            + group.slotnums[row] * spec.layer_count
+            + spec.layer_count
+            - 1
+        ).long()
+        key = cache.keys[physical].flatten(0, 1)[:length].repeat_interleave(2, 1)
+        value = cache.values[physical].flatten(0, 1)[:length].repeat_interleave(2, 1)
+        causal = torch.arange(length, device="cuda")[None] <= (
+            length - spec.tokens + torch.arange(spec.tokens, device="cuda")[:, None]
+        )
+        outputs.append(
+            F.scaled_dot_product_attention(
+                query[row].transpose(0, 1).float(),
+                key.transpose(0, 1).float(),
+                value.transpose(0, 1).float(),
+                attn_mask=causal,
+            )
+            .transpose(0, 1)
+            .bfloat16()
+        )
+    return torch.stack(outputs)
+
+
+@pytest.mark.parametrize(
+    "rows,tokens",
+    [(rows, tokens) for rows in (4, 32) for tokens in (1, 2, 4)] + [(4, 129)],
+)
+@torch.inference_mode()
+def test_graph_attention_refreshes_exact_csr_across_reserved_pages(tokens, rows):
+    torch.manual_seed(391 + rows + tokens)
+    width, page, heads, kv_heads, dimension, slab_units = 8, 128, 4, 2, 256, 6
+    first = torch.zeros(rows, dtype=torch.int32, device="cuda")
+    first[1::3] = 2
+    slabs = (
+        torch.arange(rows * width, device="cuda", dtype=torch.int32).view(rows, width)
+        // 2
+        + 1
+    )
+    slots = (
+        torch.arange(rows * width, device="cuda", dtype=torch.int32).view(rows, width)
+        % 2
+    )
+    slabs[-1].zero_()
+    slots[-1].zero_()
+    groups = tuple(
+        DevicePageGroup(slabs.clone(), slots.clone(), first.clone()) for _ in range(3)
+    )
+    keys = (
+        torch.randn(
+            (rows * width // 2 + 2) * slab_units,
+            page,
+            kv_heads,
+            dimension,
+            device="cuda",
+            dtype=torch.bfloat16,
+        )
+        * 0.2
+    )
+    values = torch.randn_like(keys)
+    keys[:slab_units].zero_()
+    values[:slab_units].zero_()
+    cache = cast(
+        SlabPagedKvCache,
+        SimpleNamespace(
+            keys=keys,
+            values=values,
+            groups=groups,
+            page_tokens=page,
+            slab_units=slab_units,
+        ),
+    )
+    runtime = GraphPagedAttentionRuntime(
+        torch.device("cuda"),
+        cache,
+        (
+            GraphAttentionSpec(0, 3, tokens, tokens),
+            GraphAttentionSpec(2, 1, tokens, tokens + 1),
+        ),
+        num_attention_heads=heads,
+        num_key_value_heads=kv_heads,
+        head_dim=dimension,
+        workspace=torch.empty(64 * 1024**2, dtype=torch.uint8, device="cuda"),
+    )
+    queries = (
+        torch.randn(rows, tokens, heads, dimension, device="cuda", dtype=torch.bfloat16)
+        * 0.2
+    )
+    positions = first.long() * page + 125
+
+    def run():
+        runtime.refresh(positions)
+        return tuple(
+            call.prepared.run(queries, call.spec.layer_count - 1)
+            for call in runtime.calls
+        )
+
+    graph, output = _capture(run)
+    pointers = [
+        (
+            call.kv_indptr.data_ptr(),
+            call.prepared.base_pages.data_ptr(),
+            call.last_page_lengths.data_ptr(),
+        )
+        for call in runtime.calls
+    ]
+    for iteration, position in enumerate(
+        (125, 126, 127, 128, 129, 255, 256, 257, 511, 512, 513)
+    ):
+        positions.copy_(
+            first.long() * page + position + torch.arange(rows, device="cuda") % 3
+        )
+        positions[-1] = 100000  # A padded row must never expose a future page.
+        if iteration == 5:
+            for group in groups:
+                group.slab_ids[:-1].copy_(group.slab_ids[:-1].flip(1))
+                group.slotnums[:-1].copy_(group.slotnums[:-1].flip(1))
+        queries.normal_(std=0.2)
+        graph.replay()
+        for index, call in enumerate(runtime.calls):
+            expected_lengths = positions + call.spec.sequence_offset - first * page
+            expected_lengths[-1] = tokens
+            counts = (expected_lengths + page - 1) // page
+            expected_ptr = torch.zeros(rows + 1, device="cuda", dtype=torch.int32)
+            expected_ptr[1:] = counts.cumsum(0)
+            torch.testing.assert_close(call.kv_indptr, expected_ptr, rtol=0, atol=0)
+            torch.testing.assert_close(
+                call.last_page_lengths,
+                ((expected_lengths - 1) % page + 1).int(),
+                rtol=0,
+                atol=0,
+            )
+            for row in range(rows):
+                start, end = expected_ptr[row : row + 2].cpu().tolist()
+                expected_pages = (
+                    groups[call.spec.group_index].slab_ids[row, : end - start]
+                    * slab_units
+                    + groups[call.spec.group_index].slotnums[row, : end - start]
+                    * call.spec.layer_count
+                )
+                torch.testing.assert_close(
+                    call.prepared.base_pages[start:end], expected_pages, rtol=0, atol=0
+                )
+            expected = _dense_graph_attention(queries, cache, call, expected_lengths)
+            torch.testing.assert_close(output[index], expected, rtol=0.015, atol=0.003)
+            assert pointers[index] == (
+                call.kv_indptr.data_ptr(),
+                call.prepared.base_pages.data_ptr(),
+                call.last_page_lengths.data_ptr(),
+            )

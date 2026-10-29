@@ -156,7 +156,8 @@ pub struct RunnerConfig {
     /// token. Zero retains the single-step reservation and same-page overlap
     /// contract. A nonzero span opts into immutable, cross-page continuation
     /// tables; the runner must resolve actual GPU positions within those tables.
-    /// Cohorts too close to an output/context limit reserve one step instead.
+    /// Cohorts too close to an output/context limit or recurrent checkpoint
+    /// boundary reserve one step instead.
     pub cache_write_reservation_tokens: u32,
     pub cache_layout: Option<KvLayout>,
 }
@@ -166,6 +167,17 @@ impl RunnerConfig {
         self.cache_write_reservation_tokens
             .checked_sub(1)
             .unwrap_or(self.cache_write_lookahead_tokens)
+    }
+
+    fn decode_reservation_fits_state(&self, start: u32) -> bool {
+        let first = u64::from(start);
+        let last = first + u64::from(self.decode_reservation_lookahead());
+        self.cache_layout.as_ref().is_none_or(|layout| {
+            layout.groups().iter().all(|group| {
+                let block = u64::from(group.block_tokens().get());
+                !group.is_recurrent() || first / block == last / block
+            })
+        })
     }
 }
 
@@ -564,18 +576,6 @@ impl<P: Clone> EngineCore<P> {
             {
                 return Err(Error::invalid(
                     "cache_write_reservation_tokens must cover two maximum decode steps",
-                ));
-            }
-            if runner_config
-                .cache_layout
-                .as_ref()
-                .expect("reservation has a layout")
-                .groups()
-                .iter()
-                .any(|group| group.is_recurrent())
-            {
-                return Err(Error::invalid(
-                    "cross-page decode reservations require token-addressed cache groups",
                 ));
             }
         }
@@ -1069,7 +1069,12 @@ impl<P: Clone> EngineCore<P> {
                             .enumerate()
                             .all(|(row, &start)| {
                                 let block = u64::from(group.block_tokens().get());
-                                if self.runner_config.cache_write_reservation_tokens == 0 {
+                                if self.runner_config.cache_write_reservation_tokens == 0
+                                    || group.is_recurrent()
+                                {
+                                    // State checkpoints keep their ordinary ring
+                                    // ownership: no continuation may cross a
+                                    // checkpoint boundary, even with wider KV leases.
                                     u64::from(start) / block
                                         == (u64::from(start) + 2 * maximum - 1) / block
                                 } else {
@@ -1086,8 +1091,7 @@ impl<P: Clone> EngineCore<P> {
                                         .read_window_tokens()
                                         .map_or(0, |window| start.saturating_sub(window.get() - 1));
                                     let lease_end = (first + count) * block;
-                                    !group.is_recurrent()
-                                        && u64::from(earliest_read) / block >= first
+                                    u64::from(earliest_read) / block >= first
                                         && u64::from(start) + 2 * maximum <= lease_end
                                         && group.max_write_tokens().is_none_or(|limit| {
                                             lease_end - u64::from(start) <= u64::from(limit.get())
@@ -1254,6 +1258,13 @@ impl<P: Clone> EngineCore<P> {
                             && u64::from(row.token_start())
                                 + u64::from(self.runner_config.cache_write_reservation_tokens)
                                 <= u64::from(self.context_length.get())
+                            // Within one checkpoint block, the wider context
+                            // has exactly the ordinary state-ring active range.
+                            // Otherwise fall back for the whole cohort before
+                            // growth, COW, or writer-lease acquisition.
+                            && self
+                                .runner_config
+                                .decode_reservation_fits_state(row.token_start())
                     });
             let lookahead = if reserve_continuation {
                 self.runner_config.decode_reservation_lookahead()

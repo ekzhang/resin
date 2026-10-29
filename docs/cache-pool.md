@@ -52,6 +52,19 @@ reserved for inactive/null rows; live slab IDs are one-based. Keeping the
 address structured prevents runners from assuming a different packing than the
 allocator.
 
+For overlapped decode, `cache_write_reservation_tokens` can reserve a wider
+immutable write span before dispatch. The runner must derive readable page
+counts, indices, and lengths from accepted GPU positions inside that span;
+reserved tail pages are not yet readable history. Native ownership and page
+addresses stay fixed until outstanding completions have been harvested.
+
+Hybrid models can reserve across attention pages while retaining ordinary
+recurrent-checkpoint boundaries. A wider span is granted only when it remains
+inside every State group's current block. Otherwise the batch uses its ordinary
+decode lease, and continuation drains before crossing a State boundary. This
+preserves checkpoint publication and copy-on-write semantics. Qwen uses this
+policy with 128-token attention pages and 4096-token State blocks.
+
 ## Prefix caching
 
 `Engine(..., prefix_cache=True)` enables an exact-token block trie with LRU

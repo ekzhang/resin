@@ -211,10 +211,24 @@ class GraphPagedAttentionRuntime:
         self.softmax_scale = head_dim**-0.5
         self.workspace = workspace
         self._cursor = 0
+        if not specs:
+            raise ValueError("Qwen3.5 graph attention requires at least one call")
         calls = []
         batch_size = cache.groups[0].slab_ids.shape[0]
         for spec in specs:
+            if (
+                spec.tokens <= 0
+                or spec.sequence_offset < spec.tokens
+                or spec.layer_count <= 0
+                or cache.slab_units % spec.layer_count
+            ):
+                raise ValueError("invalid Qwen3.5 graph attention geometry")
             group = cache.groups[spec.group_index]
+            initial_pages = (spec.tokens + cache.page_tokens - 1) // cache.page_tokens
+            if initial_pages > group.slab_ids.shape[1]:
+                raise ValueError(
+                    "Qwen3.5 graph attention queries exceed its page capacity"
+                )
             page_capacity = batch_size * group.slab_ids.shape[1]
             base_pages = torch.empty(page_capacity, dtype=torch.int32, device=device)
             physical_pages = torch.empty_like(base_pages)
@@ -229,11 +243,19 @@ class GraphPagedAttentionRuntime:
                 "disable_split_kv": True,
                 "non_blocking": False,
             }
-            initial_indptr = torch.arange(
-                batch_size + 1, dtype=torch.int32, device=device
+            initial_indptr = (
+                torch.arange(batch_size + 1, dtype=torch.int32, device=device)
+                * initial_pages
             )
-            initial_indices = torch.zeros(batch_size, dtype=torch.int32, device=device)
-            initial_last = torch.ones(batch_size, dtype=torch.int32, device=device)
+            initial_indices = torch.zeros(
+                batch_size * initial_pages, dtype=torch.int32, device=device
+            )
+            initial_last = torch.full(
+                (batch_size,),
+                (spec.tokens - 1) % cache.page_tokens + 1,
+                dtype=torch.int32,
+                device=device,
+            )
             if spec.tokens == 1:
                 wrapper = BatchDecodeWithPagedKVCacheWrapper(
                     self.workspace,
@@ -257,7 +279,7 @@ class GraphPagedAttentionRuntime:
                     paged_kv_indptr_buf=kv_indptr,
                     paged_kv_indices_buf=physical_pages,
                     paged_kv_last_page_len_buf=last,
-                    backend="auto",
+                    backend="fa2",
                 )
             _plan_wrapper(
                 wrapper,
@@ -289,6 +311,35 @@ class GraphPagedAttentionRuntime:
             )
         self.calls = tuple(calls)
 
+    def refresh(self, positions: Tensor) -> None:
+        """Pack the exact readable prefix of each frozen lease on the GPU.
+
+        FA2's no-split schedule depends on the fixed batch/query geometry, not
+        KV lengths. The wrappers are planned once; replay updates all of their
+        mutable CSR buffers before any layer reads them. Future reserved pages
+        stay hidden, including when rows accept different numbers of drafts.
+        """
+        from resin_models_cuda.qwen3_5.attention_triton import refresh
+
+        if positions.ndim != 1 or len(positions) != len(
+            self.calls[0].last_page_lengths
+        ):
+            raise ValueError("Qwen3.5 graph positions do not match its physical rows")
+        for call in self.calls:
+            spec = call.spec
+            refresh(
+                positions,
+                self.cache.groups[spec.group_index],
+                call.kv_indptr,
+                call.last_page_lengths,
+                call.prepared.base_pages,
+                page=self.cache.page_tokens,
+                tokens=spec.tokens,
+                offset=spec.sequence_offset,
+                slab_units=self.cache.slab_units,
+                layers=spec.layer_count,
+            )
+
     def reset(self) -> None:
         self._cursor = 0
 
@@ -318,109 +369,42 @@ class GraphPagedAttentionRuntime:
         return call.prepared
 
     def graph_inputs(self) -> dict[str, Tensor]:
-        return {
-            f"attention.{index}.base_pages": call.prepared.base_pages
-            for index, call in enumerate(self.calls)
-        }
-
-    @staticmethod
-    def _host_pages(
-        group: Any,
-        *,
-        rows: int,
-        graph_rows: int,
-        graph_width: int,
-        sequence_lengths: Any,
-        layer_count: int,
-        slab_units: int,
-        page_tokens: int,
-    ) -> tuple[Any, Any, Any]:
-        """Vectorized CSR page tables; padding rows get one null page."""
-        import numpy as np
-
-        logical = np.zeros(graph_rows * graph_width, dtype=np.int32)
-        last = np.ones(graph_rows, dtype=np.int32)
-        pages_per_slab = slab_units // layer_count
-        retained = group.block_table_start_indices[:rows].astype(np.int64) * page_tokens
-        used = np.asarray(sequence_lengths[:rows], dtype=np.int64) - retained
-        if np.any(used <= 0):
-            raise ValueError("Qwen3.5 graph attention requires retained context")
-        count = (used + page_tokens - 1) // page_tokens
-        table = group.block_indptr.astype(np.int64)
-        if np.any(count > table[1 : rows + 1] - table[:rows]) or np.any(
-            count > graph_width
-        ):
-            raise ValueError("Qwen3.5 graph attention exceeds its cache lease")
-        total = int(count.sum())
-        starts = np.cumsum(count) - count
-        source = np.repeat(table[:rows] - starts, count) + np.arange(total)
-        logical[:total] = group.block_slab_ids[source].astype(
-            np.int64
-        ) * pages_per_slab + group.block_slotnums[source].astype(np.int64)
-        last[:rows] = (used - 1) % page_tokens + 1
-        counts = np.ones(graph_rows, dtype=np.int64)
-        counts[:rows] = count
-        indptr = np.zeros(graph_rows + 1, dtype=np.int32)
-        indptr[1:] = np.cumsum(counts)
-        return logical, indptr, last
+        # CSR and base pages are graph outputs of refresh(), not staged inputs.
+        return {}
 
     def plan(self, cache_plan: Any, positions: Any) -> dict[str, object]:
-        """Plan every wrapper for current host rows before graph replay."""
+        """Validate a newly acquired lease; retain the fixed no-split plans.
+
+        Continuations use the already validated immutable tables and bypass
+        this host method. Exact accepted positions never need a host readback.
+        """
 
         import numpy as np
 
         positions = np.asarray(positions, dtype=np.int64)
         rows = cache_plan.rows
         graph_rows = self.cache.groups[0].slab_ids.shape[0]
-        inputs: dict[str, object] = {}
-        for index, call in enumerate(self.calls):
+        if positions.shape != (rows,) or rows > graph_rows:
+            raise ValueError("Qwen3.5 graph attention rows do not match its cache plan")
+        for call in self.calls:
             spec = call.spec
             group = cache_plan.groups[spec.group_index]
             graph_width = self.cache.groups[spec.group_index].slab_ids.shape[1]
             lengths = positions + spec.sequence_offset
-            logical, indptr, last = self._host_pages(
-                group,
-                rows=rows,
-                graph_rows=graph_rows,
-                graph_width=graph_width,
-                sequence_lengths=lengths,
-                layer_count=spec.layer_count,
-                slab_units=self.cache.slab_units,
-                page_tokens=self.cache.page_tokens,
+            used = (
+                lengths
+                - group.block_table_start_indices.astype(np.int64)
+                * self.cache.page_tokens
             )
-            physical = logical * spec.layer_count
-            common = {
-                "pos_encoding_mode": "NONE",
-                "q_data_type": torch.bfloat16,
-                "kv_data_type": self.cache.keys.dtype,
-                "o_data_type": torch.bfloat16,
-                "sm_scale": self.softmax_scale,
-                "disable_split_kv": True,
-                "non_blocking": False,
-            }
-            page_count = int(indptr[-1])
-            device_indptr = torch.as_tensor(
-                indptr, dtype=torch.int32, device=self.device
-            )
-            device_pages = torch.as_tensor(
-                physical[:page_count], dtype=torch.int32, device=self.device
-            )
-            device_last = torch.as_tensor(last, dtype=torch.int32, device=self.device)
-            _plan_wrapper(
-                call.prepared.wrapper,
-                spec.tokens,
-                device_indptr,
-                device_pages,
-                device_last,
-                num_attention_heads=self.num_attention_heads,
-                num_key_value_heads=self.num_key_value_heads,
-                head_dim=self.head_dim,
-                page_tokens=self.cache.page_tokens,
-                common=common,
-            )
-            inputs[f"attention.{index}.base_pages"] = physical
+            count = (used + self.cache.page_tokens - 1) // self.cache.page_tokens
+            if np.any(used < spec.tokens):
+                raise ValueError("Qwen3.5 graph attention requires retained queries")
+            if np.any(count > np.diff(group.block_indptr)) or np.any(
+                count > graph_width
+            ):
+                raise ValueError("Qwen3.5 graph attention exceeds its cache lease")
         self.reset()
-        return inputs
+        return {}
 
 
 __all__ = [
