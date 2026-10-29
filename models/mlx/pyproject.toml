@@ -1,0 +1,22 @@
+[build-system]
+requires = ["uv_build>=0.9.2,<0.10"]
+build-backend = "uv_build"
+
+[project]
+name = "resin-models-mlx"
+version = "0.1.0"
+description = "Apple Silicon (MLX) model runners for Resin"
+requires-python = ">=3.11"
+license = "Apache-2.0"
+dependencies = [
+  "resin==0.1.0",
+  "mlx>=0.32.4; sys_platform == 'darwin'",
+  "mlx-lm>=0.32.2; sys_platform == 'darwin'",
+  "huggingface-hub>=0.35",
+]
+
+[tool.uv.sources]
+resin = { workspace = true }
+
+[tool.uv.build-backend]
+module-root = ""

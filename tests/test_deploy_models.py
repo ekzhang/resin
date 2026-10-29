@@ -3,6 +3,7 @@
 import importlib
 from dataclasses import replace
 from types import SimpleNamespace
+from typing import Any
 
 import pytest
 
@@ -14,6 +15,55 @@ from deploy.models import (
     require_checkpoint,
     validate_gpu,
 )
+
+
+def test_mlx_factory_constructs_single_device_runner(monkeypatch, tmp_path):
+    pytest.importorskip("mlx.core")
+    spec = get_model("ornith-1.0-35b")
+    module = importlib.import_module("resin_models_mlx.qwen3_5_moe")
+    calls = []
+    monkeypatch.setattr(
+        module,
+        "Qwen3_5MoeMlxRunner",
+        lambda *args, **kwargs: calls.append((args, kwargs)),
+    )
+
+    def create(**overrides):
+        options: dict[str, Any] = dict(
+            device="mps",
+            context_length=8192,
+            max_batch_size=8,
+            prefill_chunk_size=4096,
+            draft_tokens=0,
+        )
+        return create_runner(spec, checkpoint, **(options | overrides))
+
+    checkpoint = tmp_path / "ornith"
+    create()
+    assert calls == [
+        (
+            (checkpoint,),
+            {"memory_utilization": 0.7, "max_seq_len": 8192, "max_batch_size": 8},
+        )
+    ]
+    with pytest.raises(ValueError, match="no MTP"):
+        create(draft_tokens=2)
+    with pytest.raises(ValueError, match="one Apple Silicon device"):
+        create(groups=object())
+    with pytest.raises(ValueError, match="4096-token chunks"):
+        create(prefill_chunk_size=8192)
+    with pytest.raises(ValueError, match="mlx-gather-qmm experts"):
+        create(expert_backend="flashinfer")
+    # MLX presets have no managed volume; their checkpoint is always explicit.
+    with pytest.raises(ValueError, match="no managed checkpoint volume"):
+        create_runner(
+            spec,
+            device="mps",
+            context_length=8192,
+            max_batch_size=8,
+            prefill_chunk_size=4096,
+            draft_tokens=0,
+        )
 
 
 def make_checkpoint(path, required_files):
@@ -246,3 +296,15 @@ def test_glm_serving_checkpoints_allow_real_engine_prefix_reuse(
         assert runner.plans[0].context_lengths.tolist() == [expected]
         assert sum(plan.num_tokens for plan in runner.plans) == len(prompt) - expected
         assert second.take_result() == [len(prompt)]
+
+
+def test_local_presets_require_an_explicit_checkpoint(tmp_path):
+    spec = get_model("ornith-1.0-35b")
+    with pytest.raises(ValueError, match="runs locally"):
+        require_checkpoint(spec)
+    with pytest.raises(ValueError, match="no managed volume"):
+        download_checkpoint(spec, metadata_only=True)
+    make_checkpoint(tmp_path / "ornith", spec.checkpoint.required_files)
+    assert (
+        require_checkpoint(spec, checkpoint=tmp_path / "ornith") == tmp_path / "ornith"
+    )

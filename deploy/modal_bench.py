@@ -26,11 +26,13 @@ def _write_source(path: Path, source: str | bytes) -> None:
 TRACE_VOLUME = modal.Volume.from_name(
     "resin-benchmark-traces-v1", create_if_missing=True
 )
+# Local-only presets (for example MLX) have no Modal volume.
 MODEL_VOLUMES = {
     spec.model_mount: modal.Volume.from_name(
         spec.model_volume, version=spec.model_volume_version, create_if_missing=True
     )
     for spec in MODEL_SPECS.values()
+    if spec.model_mount is not None and spec.model_volume is not None
 }
 KERNEL_VOLUMES = {
     spec.kernel_mount: modal.Volume.from_name(
@@ -71,7 +73,7 @@ def download(model: str, metadata_only: bool = False) -> dict:
     from deploy.models import download_checkpoint
 
     spec = get_model(model)
-    volume = MODEL_VOLUMES[spec.model_mount]
+    volume = MODEL_VOLUMES[str(spec.mount)]
     volume.reload()
     result = download_checkpoint(spec, metadata_only=metadata_only)
     volume.commit()
@@ -137,7 +139,7 @@ def _run_sweep(
     from resin import Parallelism
     from scripts.bench import run_benchmark
 
-    MODEL_VOLUMES[spec.model_mount].reload()
+    MODEL_VOLUMES[str(spec.mount)].reload()
     kernel_volume = KERNEL_VOLUMES.get(spec.kernel_mount)
     if kernel_volume is not None:
         kernel_volume.reload()
@@ -271,7 +273,7 @@ def _run_qualification(
 
     spec = get_model(model)
     os.environ.update(image_environment(spec))
-    MODEL_VOLUMES[spec.model_mount].reload()
+    MODEL_VOLUMES[str(spec.mount)].reload()
     kernel_volume = KERNEL_VOLUMES.get(spec.kernel_mount)
     if kernel_volume is not None:
         kernel_volume.reload()

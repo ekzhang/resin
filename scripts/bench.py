@@ -84,6 +84,11 @@ def _runner(model, checkpoint, *, device, groups, cases, options, context_capaci
     )
 
 
+def _apple_silicon(spec) -> bool:
+    """Whether this preset runs one MLX process instead of CUDA ranks."""
+    return spec.backend == "mlx"
+
+
 def _result_callback(report_path):
     """Keep a valid snapshot of completed cases and print untimed progress."""
     records = []
@@ -246,7 +251,17 @@ def _rank(
         # the user's ordinary FlashInfer cache unless that mount is configured.
         if os.environ.get("CUDA_CACHE_PATH", "").startswith(KERNEL_CACHE_MOUNT + "/"):
             install_flashinfer_hash_cache()
-    torch.cuda.set_device(rank)
+    spec = get_model(model)
+    apple = _apple_silicon(spec)
+    if apple:
+        import mlx.core as mx
+
+        synchronize = mx.synchronize
+        hardware = mx.device_info()["device_name"]
+    else:
+        torch.cuda.set_device(rank)
+        synchronize = torch.cuda.synchronize
+        hardware = torch.cuda.get_device_name(rank)
     groups = None
     if topology.world_size > 1:
         dist.init_process_group(
@@ -285,7 +300,8 @@ def _rank(
     # lengths on the charts remain the prompt lengths recorded by the harness.
     capacity = _context_capacity(cases, options)
     if rank == 0:
-        print(f"[bench] loading {model} over {topology.world_size} GPUs", flush=True)
+        devices = hardware if apple else f"{topology.world_size} GPUs"
+        print(f"[bench] loading {model} over {devices}", flush=True)
     started = time.perf_counter()
     raw = _runner(
         model,
@@ -305,18 +321,20 @@ def _rank(
         accepted_drafts=options["accepted_drafts"],
         balanced_experts=options["balanced_experts"],
     )
-    torch.cuda.synchronize()
+    synchronize()
     loaded_seconds = time.perf_counter() - started
     if rank == 0:
         print(
-            f"[bench] weights ready in {loaded_seconds:.1f}s; capturing graphs",
+            f"[bench] weights ready in {loaded_seconds:.1f}s"
+            + ("" if apple else "; capturing graphs"),
             flush=True,
         )
     started = time.perf_counter()
-    raw.capture_cuda_graphs()
-    torch.cuda.synchronize()
+    if not apple:
+        raw.capture_cuda_graphs()
+    synchronize()
     capture_seconds = time.perf_counter() - started
-    if rank == 0:
+    if rank == 0 and not apple:
         print(f"[bench] graphs ready in {capture_seconds:.1f}s", flush=True)
     overlap = options.get("overlap", True) and callable(getattr(raw, "enqueue", None))
     metadata = {
@@ -325,7 +343,7 @@ def _rank(
         "implementation": "resin",
         "implementation_version": resin.__version__,
         "checkpoint": str(checkpoint),
-        "hardware": torch.cuda.get_device_name(rank),
+        "hardware": hardware,
         "parallelism": {
             axis: getattr(topology, axis)
             for axis in ("world_size", "attn_dp", "attn_tp", "cp", "ep")
@@ -336,6 +354,9 @@ def _rank(
         },
         "quant": "checkpoint",
         "expert_backend": options["expert_backend"],
+        # Runners that choose their own execution (for example MLX, which
+        # quantizes at load and has no CUDA graphs) describe it themselves.
+        **getattr(raw, "benchmark_metadata", {}),
         "load_seconds": loaded_seconds,
         "capture_seconds": capture_seconds,
         "profile_graph_phases": options.get("profile_graph_phases", False),
@@ -398,7 +419,7 @@ def _rank(
             prefill_measure_cohorts=options.get("prefill_measure_cohorts", 3),
             gpu_count=topology.world_size,
             attn_dp=topology.attn_dp,
-            synchronize=torch.cuda.synchronize,
+            synchronize=synchronize,
             reduce_step=None if groups is None else distributed_reducer(groups),
             metadata=metadata,
             on_result=_result_callback(report_path) if rank == 0 else None,
@@ -406,7 +427,12 @@ def _rank(
                 None
                 if options.get("trace_dir") is None
                 else perfetto_trace(
-                    options["trace_dir"], rank, metadata, decode_passes=2 + int(overlap)
+                    options["trace_dir"],
+                    rank,
+                    metadata,
+                    decode_passes=2 + int(overlap),
+                    synchronize=synchronize,
+                    cuda=not apple,
                 )
             ),
         )
@@ -498,7 +524,12 @@ def _validate_configuration(model, cases, topology, options):
             raise ValueError("GLM native MTP supports at most seven draft tokens")
     if numa not in ("auto", "off", "required"):
         raise ValueError("numa must be 'auto', 'off', or 'required'")
-    if expert_backend not in ("flashinfer", "deepgemm"):
+    if _apple_silicon(spec):
+        if expert_backend != spec.expert_backend:
+            raise ValueError(f"{model} uses {spec.expert_backend} experts")
+        if prefill_chunk_size != 4096:
+            raise ValueError(f"{model} prefills in 4096-token chunks")
+    elif expert_backend not in ("flashinfer", "deepgemm"):
         raise ValueError(f"unknown expert backend: {expert_backend}")
     if expert_backend == "deepgemm":
         if model != "deepseek-v41":
@@ -628,7 +659,12 @@ def run_benchmark(
         },
     )
     _validate_configuration(model, cases, topology, options)
-    if torch.cuda.device_count() < topology.world_size:
+    apple = _apple_silicon(spec)
+    if apple and topology.world_size != 1:
+        raise ValueError(f"{model} runs on one Apple Silicon device")
+    # Host NUMA placement applies to CUDA ranks only.
+    numa = "off" if apple else numa
+    if not apple and torch.cuda.device_count() < topology.world_size:
         raise ValueError(f"the sweep requires {topology.world_size} visible GPUs")
     with tempfile.TemporaryDirectory(prefix="resin-bench-") as directory:
         output = (
@@ -648,7 +684,11 @@ def run_benchmark(
         processes = resin.process.spawn(
             _rank,
             args=(port, output, model, checkpoint, cases, topology, options),
-            devices=[f"cuda:{rank}" for rank in range(topology.world_size)],
+            devices=(
+                ["mps"]
+                if apple
+                else [f"cuda:{rank}" for rank in range(topology.world_size)]
+            ),
             numa=numa,
         )
         records = json.loads(output.read_text())
@@ -867,6 +907,8 @@ def _configuration(args):
 
     spec = get_model(args.model)
     if args.backend == "modal":
+        if _apple_silicon(spec):
+            raise ValueError(f"{spec.name} runs locally; use --backend local")
         validate_gpu(spec, args.gpu)
     world = spec.world_size if args.world_size is None else args.world_size
     topology = dict(world_size=world, cp=1 if args.cp is None else args.cp)
@@ -970,9 +1012,7 @@ def main(argv=None) -> None:
     if args.backend == "local" and (args.download_only or args.publish_only):
         parser.error("--download-only/--publish-only require --backend modal")
     if args.backend == "local" and args.gpu is not None:
-        parser.error(
-            "--gpu selects Modal hardware; local runs use visible CUDA devices"
-        )
+        parser.error("--gpu selects Modal hardware; local runs use the visible devices")
     if args.backend == "local" and args.checkpoint is None:
         parser.error("--checkpoint is required for local benchmarks")
     if args.backend == "modal" and (
@@ -981,6 +1021,10 @@ def main(argv=None) -> None:
         parser.error(
             "Modal uses the pinned model registry; local checkpoint paths require --backend local"
         )
+    if (args.download_only or args.publish_only) and _apple_silicon(
+        get_model(args.model)
+    ):
+        parser.error(f"{args.model} runs locally; pass its checkpoint directory")
     if args.download_only or args.publish_only:
         import modal
 
@@ -1068,6 +1112,13 @@ def main(argv=None) -> None:
         options.update(
             trace_dir=None if local_trace_dir is None else str(local_trace_dir),
             assistant_checkpoint=args.assistant_checkpoint,
+        )
+        # A local directory is only known to be the pinned revision when it is
+        # the registry's own checkpoint path.
+        options["metadata"]["checkpoint_revision"] = (
+            spec.revision
+            if spec.model_mount is not None and Path(checkpoint) == spec.path
+            else "local"
         )
         records = run_benchmark(
             spec.name, checkpoint, cases, parallelism=topology, **options

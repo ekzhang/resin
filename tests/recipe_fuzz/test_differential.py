@@ -26,7 +26,7 @@ from recipe_fuzz.harness import (
 )
 from recipe_fuzz.inputs import native_inputs
 from recipe_fuzz.lfm2 import Lfm2Adapter
-from recipe_fuzz.qwen import QwenAdapter
+from recipe_fuzz.qwen import OrnithAdapter, QwenAdapter
 from resin.recipe import InklingResponseParser, Tokenizer, get_native_recipe
 
 MARKERS = (
@@ -235,6 +235,7 @@ ADAPTERS = {
     "gpt_oss": GptOssAdapter,
     "deepseek_v41": DeepSeekV41Adapter,
     "qwen3_5": QwenAdapter,
+    "ornith": OrnithAdapter,
     "lfm2": Lfm2Adapter,
     "gemma4": GemmaAdapter,
 }

@@ -17,6 +17,7 @@ configuration belongs in `deploy/models.py`.
 | [bench_startup.py](../scripts/bench_startup.py) | Measure cold `resin` and Torch backend imports in separate fresh processes. This measures Python startup, not model loading or inference. |
 | [lfm2_chat.py](../scripts/lfm2_chat.py) | Minimal CPU example: render a fixed LFM2 conversation with the native recipe and stream one Engine completion. |
 | [lfm2_serve.py](../scripts/lfm2_serve.py) | Minimal CPU example: serve the Torch LFM2 runner through the native HTTP server on localhost. |
+| [serve.py](../scripts/serve.py) | Serve a local registered preset (currently the Apple Silicon MLX presets) through the native HTTP server with the prefix cache enabled. |
 | [rust_build_and_types.py](../scripts/rust_build_and_types.py) | Development build: sync type-library sources, build the Rust extension with generated stubs, normalize stubs and format them. |
 | [sync_type_libraries.py](../scripts/sync_type_libraries.py) | Make locked Linux dependency sources available to `ty` on the development host without importing those libraries or running their installation hooks. |
 | [normalize_stubs.py](../scripts/normalize_stubs.py) | Add property types, protocol bases and imports missing from generated native bindings. Called by the build script. |

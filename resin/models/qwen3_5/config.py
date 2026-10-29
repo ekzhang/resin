@@ -8,7 +8,11 @@ from typing import Any, Self, cast
 
 @dataclass(frozen=True, slots=True)
 class Qwen35Config:
-    """Dense hybrid-attention geometry used by Qwen3.5 and Qwen3.8."""
+    """Hybrid-attention geometry used by Qwen3.5, Qwen3.8 and Qwen3.5-MoE.
+
+    Dense checkpoints set ``intermediate_size``. Mixture-of-experts checkpoints
+    set the expert fields instead and leave ``intermediate_size`` at zero.
+    """
 
     vocab_size: int
     hidden_size: int
@@ -40,6 +44,12 @@ class Qwen35Config:
     attn_output_gate: bool = True
     output_gate_type: str = "swish"
     tie_word_embeddings: bool = False
+    is_moe: bool = False
+    num_experts: int = 0
+    num_experts_per_tok: int = 0
+    moe_intermediate_size: int = 0
+    shared_expert_intermediate_size: int = 0
+    norm_topk_prob: bool = True
 
     @classmethod
     def from_hugging_face(cls, values: dict[str, Any]) -> Self:
@@ -47,15 +57,18 @@ class Qwen35Config:
 
         root_type = values.get("model_type")
         if "text_config" in values:
-            if root_type != "qwen3_5":
+            if root_type not in _TEXT_TYPES:
                 raise ValueError(
                     f"expected a Qwen3.5-family checkpoint, got {root_type!r}"
                 )
             text = values["text_config"]
+            expected = (_TEXT_TYPES[root_type],)
         else:
             text = values
-        if not isinstance(text, dict) or text.get("model_type") != "qwen3_5_text":
+            expected = tuple(_TEXT_TYPES.values())
+        if not isinstance(text, dict) or text.get("model_type") not in expected:
             raise ValueError("Qwen3.5 checkpoint is missing qwen3_5_text config")
+        moe = text["model_type"] == _TEXT_TYPES["qwen3_5_moe"]
 
         rope = text.get("rope_parameters") or {}
         if not isinstance(rope, dict):
@@ -63,7 +76,7 @@ class Qwen35Config:
         config = cls(
             vocab_size=int(text["vocab_size"]),
             hidden_size=int(text["hidden_size"]),
-            intermediate_size=int(text["intermediate_size"]),
+            intermediate_size=0 if moe else int(text["intermediate_size"]),
             num_hidden_layers=int(text["num_hidden_layers"]),
             num_attention_heads=int(text["num_attention_heads"]),
             num_key_value_heads=int(text["num_key_value_heads"]),
@@ -105,6 +118,14 @@ class Qwen35Config:
             attn_output_gate=bool(text.get("attn_output_gate", True)),
             output_gate_type=str(text.get("output_gate_type", "swish")),
             tie_word_embeddings=bool(text.get("tie_word_embeddings", False)),
+            num_experts=int(text["num_experts"]) if moe else 0,
+            num_experts_per_tok=int(text["num_experts_per_tok"]) if moe else 0,
+            moe_intermediate_size=int(text["moe_intermediate_size"]) if moe else 0,
+            shared_expert_intermediate_size=(
+                int(text["shared_expert_intermediate_size"]) if moe else 0
+            ),
+            norm_topk_prob=bool(text.get("norm_topk_prob", True)),
+            is_moe=moe,
         )
         config.validate()
         return config
@@ -113,7 +134,6 @@ class Qwen35Config:
         dimensions = {
             "vocab_size": self.vocab_size,
             "hidden_size": self.hidden_size,
-            "intermediate_size": self.intermediate_size,
             "num_hidden_layers": self.num_hidden_layers,
             "num_attention_heads": self.num_attention_heads,
             "num_key_value_heads": self.num_key_value_heads,
@@ -125,6 +145,15 @@ class Qwen35Config:
             "linear_conv_kernel_dim": self.linear_conv_kernel_dim,
             "max_position_embeddings": self.max_position_embeddings,
         }
+        if self.is_moe:
+            dimensions |= {
+                "num_experts": self.num_experts,
+                "num_experts_per_tok": self.num_experts_per_tok,
+                "moe_intermediate_size": self.moe_intermediate_size,
+                "shared_expert_intermediate_size": self.shared_expert_intermediate_size,
+            }
+        else:
+            dimensions["intermediate_size"] = self.intermediate_size
         if invalid := [name for name, value in dimensions.items() if value <= 0]:
             raise ValueError(f"Qwen3.5 dimensions must be positive: {invalid}")
         if len(self.layer_types) != self.num_hidden_layers:
@@ -143,6 +172,8 @@ class Qwen35Config:
             raise ValueError("Qwen3.5 runner requires full-attention layers")
         if self.num_attention_heads % self.num_key_value_heads:
             raise ValueError("attention heads must be divisible by KV heads")
+        if self.num_experts_per_tok > self.num_experts:
+            raise ValueError("experts per token cannot exceed the expert count")
         if self.linear_num_value_heads % self.linear_num_key_heads:
             raise ValueError("linear value heads must be divisible by key heads")
         rotary_dim = self.rotary_dim
@@ -177,6 +208,10 @@ class Qwen35Config:
             raise ValueError("Qwen3.5 runner supports at most one bundled MTP layer")
         if self.mtp_use_dedicated_embeddings:
             raise ValueError("dedicated Qwen3.5 MTP embeddings are not supported")
+
+    def require_dense(self) -> None:
+        if self.is_moe:
+            raise ValueError("this runner does not support Qwen3.5-MoE checkpoints")
 
     def require_mtp(self) -> None:
         if self.mtp_num_hidden_layers != 1:
@@ -221,6 +256,10 @@ class Qwen35Config:
     @property
     def linear_conv_dim(self) -> int:
         return 2 * self.linear_key_dim + self.linear_value_dim
+
+
+# Root multimodal model types and their text sub-config types.
+_TEXT_TYPES = {"qwen3_5": "qwen3_5_text", "qwen3_5_moe": "qwen3_5_moe_text"}
 
 
 __all__ = ["Qwen35Config"]

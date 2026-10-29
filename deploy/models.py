@@ -41,10 +41,13 @@ class ModelSpec:
     name: str
     family: str
     checkpoint: Checkpoint
-    model_mount: str
-    model_volume: str
     gpu: str
     label: str
+    # "cuda" presets run on Modal or local NVIDIA GPUs; "mlx" presets run
+    # locally on Apple Silicon from an explicit checkpoint directory.
+    backend: str = "cuda"
+    model_mount: str | None = None
+    model_volume: str | None = None
     app_name: str | None = None
     model_volume_version: int = 1
     kernel_mount: str | None = None
@@ -64,6 +67,7 @@ class ModelSpec:
     memory: int = 256 * 1024
     enable_anthropic: bool = True
     image_warmup: bool = False
+    recipe: str | None = None
 
     @property
     def repo_id(self) -> str:
@@ -74,16 +78,20 @@ class ModelSpec:
         return self.checkpoint.revision
 
     @property
+    def mount(self) -> Path:
+        if self.model_mount is None:
+            raise ValueError(f"{self.name} has no managed checkpoint volume")
+        return Path(self.model_mount)
+
+    @property
     def path(self) -> Path:
-        return Path(self.model_mount) / self.checkpoint.directory / self.revision
+        return self.mount / self.checkpoint.directory / self.revision
 
     @property
     def assistant_path(self) -> Path | None:
         if self.assistant is None:
             return None
-        return (
-            Path(self.model_mount) / self.assistant.directory / self.assistant.revision
-        )
+        return self.mount / self.assistant.directory / self.assistant.revision
 
 
 MODEL_SPECS = {
@@ -278,6 +286,32 @@ MODEL_SPECS.update(
             memory=128 * 1024,
             image_warmup=True,
         ),
+        "ornith-1.0-35b": ModelSpec(
+            name="ornith-1.0-35b",
+            family="qwen3_5_moe",
+            checkpoint=Checkpoint(
+                repo_id="ornith-ai/Ornith-1.0-35B",
+                revision="5df2ed3f675c7beaa490328cc70bb573b65fb660",
+                directory="",
+                required_files=(
+                    "config.json",
+                    "chat_template.jinja",
+                    "tokenizer.json",
+                    "tokenizer_config.json",
+                    "preprocessor_config.json",
+                ),
+            ),
+            # Apple Silicon (MLX) runner: BF16 weights quantized to 8-bit at load.
+            backend="mlx",
+            gpu="M4-Max",
+            label="ornith-1.0-35b-mlx",
+            expert_backend="mlx-gather-qmm",
+            context_length=32_768,
+            max_batch_size=32,
+            # Unified memory is shared with the OS and other applications.
+            gpu_memory_utilization=0.70,
+            recipe="ornith",
+        ),
         "inkling": ModelSpec(
             name="inkling",
             family="inkling",
@@ -335,9 +369,11 @@ def validate_gpu(model: str | ModelSpec, gpu: str | None = None) -> str:
 
 
 def checkpoint_parts(spec: ModelSpec):
-    yield spec.checkpoint, spec.path
+    """Yield each checkpoint with its managed path, or None for local presets."""
+    managed = spec.model_mount is not None
+    yield spec.checkpoint, spec.path if managed else None
     if spec.assistant is not None:
-        yield spec.assistant, spec.assistant_path
+        yield spec.assistant, spec.assistant_path if managed else None
 
 
 def download_checkpoint(model: str | ModelSpec, *, metadata_only: bool = False) -> dict:
@@ -349,6 +385,8 @@ def download_checkpoint(model: str | ModelSpec, *, metadata_only: bool = False) 
     spec = get_model(model)
     started, inventory, cache_hit = time.perf_counter(), {}, True
     for checkpoint, path in checkpoint_parts(spec):
+        if path is None:
+            raise ValueError(f"{spec.name} runs locally and has no managed volume")
         try:
             checkpoint_inventory(path, required_files=checkpoint.required_files)
         except RuntimeError:
@@ -372,7 +410,7 @@ def download_checkpoint(model: str | ModelSpec, *, metadata_only: bool = False) 
         )
         inventory.update(
             {
-                str(path.relative_to(spec.model_mount) / name): size
+                str(path.relative_to(spec.mount) / name): size
                 for name, size in files.items()
             }
         )
@@ -404,6 +442,8 @@ def require_checkpoint(
         override = assistant_checkpoint if part is spec.assistant else checkpoint
         if override is not None:
             checkpoint_inventory(Path(override), required_files=part.required_files)
+        elif path is None:
+            raise ValueError(f"{spec.name} runs locally; pass its checkpoint directory")
         elif not checkpoint_is_complete(
             path, part.repo_id, part.revision, required_files=part.required_files
         ):
@@ -412,7 +452,7 @@ def require_checkpoint(
             )
     os.environ["HF_HUB_OFFLINE"] = "1"
     os.environ["TRANSFORMERS_OFFLINE"] = "1"
-    return spec.path if checkpoint is None else Path(checkpoint)
+    return Path(checkpoint) if checkpoint is not None else spec.path
 
 
 def image_environment(model: str | ModelSpec) -> dict[str, str]:
@@ -519,6 +559,30 @@ def create_runner(
         if gpu_memory_utilization is None
         else gpu_memory_utilization
     )
+    if spec.backend == "mlx":
+        from resin_models_mlx.qwen3_5_moe import Qwen3_5MoeMlxRunner
+        from resin_models_mlx.qwen3_5_moe.cache import PREFILL_CHUNK_SIZE
+
+        if draft_tokens:
+            raise ValueError(
+                "Ornith checkpoints ship no MTP weights; use draft_tokens=0"
+            )
+        if groups is not None:
+            raise ValueError("the MLX runner executes on one Apple Silicon device")
+        if prefill_chunk_size != PREFILL_CHUNK_SIZE:
+            raise ValueError(
+                f"the MLX Qwen3.5-MoE runner uses {PREFILL_CHUNK_SIZE}-token chunks"
+            )
+        if expert_backend not in (None, spec.expert_backend):
+            raise ValueError(f"{spec.name} uses {spec.expert_backend} experts")
+        # MLX has no CUDA graphs or graph batch catalog; graph options and
+        # decode_batch_sizes do not apply. The batch limit sizes live state.
+        return Qwen3_5MoeMlxRunner(
+            checkpoint,
+            memory_utilization=memory,
+            max_seq_len=context_length,
+            max_batch_size=max_batch_size,
+        )
     common: dict[str, Any] = dict(
         device=device, cuda_graph_prefill=prefill_graph, cuda_graph_decode=decode_graph
     )
@@ -688,6 +752,8 @@ def create_recipe(
         if spec.family == "gemma4" and runner is not None
         else {}
     )
-    return get_native_recipe(
-        "qwen3_8" if spec.family == "qwen3_5" else spec.family, processor, **options
-    )
+    if spec.backend == "mlx":
+        # MLX runners serve the language model only.
+        options["text_only"] = True
+    name = spec.recipe or ("qwen3_8" if spec.family == "qwen3_5" else spec.family)
+    return get_native_recipe(name, processor, **options)

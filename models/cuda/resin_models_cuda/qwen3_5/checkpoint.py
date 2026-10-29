@@ -70,7 +70,9 @@ def resolve_model_path(model: str | Path, revision: str | None = None) -> Path:
 
 def load_config(model_path: str | Path) -> tuple[Qwen35Config, dict]:
     raw_config = read_config(Path(model_path))
-    return Qwen35Config.from_hugging_face(raw_config), raw_config
+    config = Qwen35Config.from_hugging_face(raw_config)
+    config.require_dense()
+    return config, raw_config
 
 
 def is_modelopt_nvfp4(raw_config: dict[str, Any]) -> bool:
@@ -97,6 +99,7 @@ def build_meta_model(
     raw_config: dict[str, Any], *, include_mtp: bool, include_vision: bool = False
 ) -> tuple[Qwen3_5ForConditionalGeneration, Qwen35Config]:
     config = Qwen35Config.from_hugging_face(raw_config)
+    config.require_dense()
     if include_mtp:
         config.require_mtp()
     quantized = is_modelopt_nvfp4(raw_config)
