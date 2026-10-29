@@ -576,9 +576,12 @@ def create_runner(
         if expert_backend not in (None, spec.expert_backend):
             raise ValueError(f"{spec.name} uses {spec.expert_backend} experts")
         # MLX has no CUDA graphs or graph batch catalog; graph options and
-        # decode_batch_sizes do not apply. The Engine owns batch limits.
+        # decode_batch_sizes do not apply. The batch limit sizes live state.
         return Qwen3_5MoeMlxRunner(
-            checkpoint, memory_utilization=memory, max_seq_len=context_length
+            checkpoint,
+            memory_utilization=memory,
+            max_seq_len=context_length,
+            max_batch_size=max_batch_size,
         )
     common: dict[str, Any] = dict(
         device=device, cuda_graph_prefill=prefill_graph, cuda_graph_decode=decode_graph

@@ -40,7 +40,12 @@ def test_mlx_factory_constructs_single_device_runner(monkeypatch, tmp_path):
 
     checkpoint = tmp_path / "ornith"
     create()
-    assert calls == [((checkpoint,), {"memory_utilization": 0.7, "max_seq_len": 8192})]
+    assert calls == [
+        (
+            (checkpoint,),
+            {"memory_utilization": 0.7, "max_seq_len": 8192, "max_batch_size": 8},
+        )
+    ]
     with pytest.raises(ValueError, match="no MTP"):
         create(draft_tokens=2)
     with pytest.raises(ValueError, match="one Apple Silicon device"):

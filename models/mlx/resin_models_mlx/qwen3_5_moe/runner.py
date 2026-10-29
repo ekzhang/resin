@@ -23,6 +23,7 @@ from resin_models_mlx.qwen3_5_moe.cache import (
 )
 from resin_models_mlx.qwen3_5_moe.checkpoint import load_model
 from resin_models_mlx.qwen3_5_moe.model import Qwen35MoeModel, StepOutput
+from resin_models_mlx.qwen3_5_moe.state import LiveStates
 from resin_models_mlx.sampling import MlxSampler
 
 if TYPE_CHECKING:
@@ -51,6 +52,7 @@ class Qwen3_5MoeMlxRunner:
         memory_utilization: float = 0.85,
         cache_slab_capacity: int | None = None,
         max_seq_len: int | None = None,
+        max_batch_size: int = 16,
     ) -> None:
         if isinstance(model, Qwen35MoeModel):
             self._model = model
@@ -90,7 +92,10 @@ class Qwen3_5MoeMlxRunner:
             max(1, limit - mx.get_active_memory()),
             memory_utilization,
             self.cache_geometry.slab_bytes,
-            overhead_bytes=_WORKSPACE_BYTES,
+            # Live DeltaNet state is held for every running request, and a
+            # step's output exists beside its input.
+            overhead_bytes=_WORKSPACE_BYTES
+            + 2 * max_batch_size * self.cache_geometry.state_bytes,
         )
         # The arena is one Metal buffer, including the reserved null slab.
         buffer_slabs = (
@@ -108,13 +113,13 @@ class Qwen3_5MoeMlxRunner:
             cache_layout=self.cache_layout,
         )
         self._sampler = MlxSampler()
+        self._states = LiveStates(self._cache, self._model)
 
     def bind_resources(self, resources: ResourceBinding) -> None:
         self._cache.binding.bind_resources(resources)
 
     def release(self, sequence_ids: list[int]) -> None:
-        # All request state lives in Engine-owned slabs.
-        del sequence_ids
+        self._states.release(sequence_ids)
 
     def _project(self, hidden: torch.Tensor) -> torch.Tensor:
         logits = self._model.logits(mx.array(hidden.numpy()).astype(mx.bfloat16))
@@ -125,10 +130,11 @@ class Qwen3_5MoeMlxRunner:
         plan: PagedCachePlan,
         rows: np.ndarray,
         tokens: np.ndarray,
-    ) -> tuple[StepOutput, mx.array]:
+    ) -> tuple[StepOutput, mx.array, tuple[int, ...]]:
         """Run ``tokens``, flattened plan indices shaped ``[len(rows), width]``.
 
         Decode passes one token per row; prefill passes one row's chunk.
+        Returns the output, last-token logits and written snapshot receipts.
         """
 
         batch = plan.batch
@@ -145,7 +151,7 @@ class Qwen3_5MoeMlxRunner:
             output = self._model(
                 mx.array(token_ids.astype(np.int32)),
                 mx.array(contexts.astype(np.int32)),
-                self._cache.state(plan, rows, contexts),
+                self._states.gather(plan, rows),
                 history,
             )
             last = self._model.logits(output.hidden[:, -1])
@@ -169,12 +175,14 @@ class Qwen3_5MoeMlxRunner:
                 tuple(value.reshape(-1, *value.shape[2:]) for value in output.values),
                 tokens.reshape(-1),
             )
-            self._cache.write_state(plan, tokens[:, -1], output.state)
+            receipts = self._states.commit(
+                plan, rows, contexts + tokens.shape[1], output.state
+            )
             # Reads of this step are complete, so the writes can update the arena
             # in place while the host samples and commits. The next step's reads
             # depend on the written arena and therefore run after them.
             mx.async_eval(self._cache.storage)
-        return output, last
+        return output, last, receipts
 
     def _output(
         self, plan: BatchPlan, logits: mx.array, prompt_logprobs=None
@@ -189,14 +197,16 @@ class Qwen3_5MoeMlxRunner:
         batch = cache_plan.batch
         logits = []
         prompt_rows = []
+        receipts: list[int] = []
         for row in range(batch.num_sequences):
             selected = batch.token_slice(row)
-            output, last = self._step(
+            output, last, written = self._step(
                 cache_plan,
                 np.array([row]),
                 np.arange(selected.start, selected.stop)[None],
             )
             logits.append(last)
+            receipts += written
             if plan.needs_prompt_logprobs:
                 prompt_rows.append(
                     prompt_scores(
@@ -210,13 +220,13 @@ class Qwen3_5MoeMlxRunner:
             plan,
             mx.concatenate(logits),
             prompt_logprobs=PromptScores.concat(prompt_rows),
-        )
+        ).with_state_checkpoints(receipts)
 
     def _decode(self, plan: BatchPlan, cache_plan: PagedCachePlan) -> ForwardOutput:
         batch = cache_plan.batch
         rows = np.arange(batch.num_sequences)
-        _, last = self._step(cache_plan, rows, rows[:, None])
-        return self._output(plan, last)
+        _, last, receipts = self._step(cache_plan, rows, rows[:, None])
+        return self._output(plan, last).with_state_checkpoints(receipts)
 
     def forward(self, plan: BatchPlan) -> ForwardOutput:
         cache_plan = PagedCachePlan.from_plan(plan, self.cache_layout)

@@ -7,10 +7,11 @@ units of a slab. A DeltaNet checkpoint is packed into whole units: each linear
 layer's FP32 recurrent state fills whole units, followed by the BF16
 convolution tails of every layer.
 
-Reads gather with ``take``. Keys and values scatter single rows; checkpoints
-are written as contiguous slice updates, which MLX performs far faster than
-large-payload scatters. Every write happens after the step's reads are
-evaluated, so MLX updates the arena in place instead of copying it.
+Reads gather with ``take``. Keys and values scatter single rows; DeltaNet
+snapshots are written as contiguous slice updates, which MLX performs far
+faster than large-payload scatters. Every write happens after the step's reads
+are evaluated, so MLX updates the arena in place instead of copying it. Live
+DeltaNet state stays outside the arena between steps (see ``state.py``).
 """
 
 from __future__ import annotations
@@ -18,13 +19,12 @@ from __future__ import annotations
 import math
 from collections.abc import Sequence
 from dataclasses import dataclass
-from typing import Any, cast
 
 import mlx.core as mx
 import numpy as np
 
 from resin import CacheGroupFamily, CacheGroupLayout, CacheLayout
-from resin.backend.plans import CacheGroupView, PagedCachePlan
+from resin.backend.plans import PagedCachePlan
 from resin.backend.resources import CachePoolBinding
 from resin.models.qwen3_5.config import Qwen35Config
 from resin_models_mlx.qwen3_5_moe.model import (
@@ -108,6 +108,12 @@ class CacheGeometry:
         return self.slab_units * self.unit_elements * BF16_BYTES
 
     @property
+    def state_bytes(self) -> int:
+        """Bytes of one DeltaNet STATE block."""
+
+        return self.state_units * self.unit_elements * BF16_BYTES
+
+    @property
     def kv_blocks_per_slab(self) -> int:
         return self.slab_units // self.full_layers
 
@@ -150,25 +156,6 @@ class CacheGeometry:
                 ),
             ],
         )
-
-
-def _mask(values: np.ndarray) -> mx.array:
-    # MLX accepts NumPy arrays through the buffer protocol at runtime.
-    return mx.array(cast(Any, values))
-
-
-def _locate(
-    group: CacheGroupView, rows: np.ndarray, positions: np.ndarray, block_tokens: int
-) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Map row-relative absolute positions to ``(slab, slot, offset)``."""
-
-    columns = positions // block_tokens - group.block_table_start_indices[rows]
-    addresses = group.block_indptr[rows] + columns
-    return (
-        group.block_slab_ids[addresses].astype(np.int32),
-        group.block_slotnums[addresses].astype(np.int32),
-        (positions % block_tokens).astype(np.int32),
-    )
 
 
 class CacheArena:
@@ -231,15 +218,10 @@ class CacheArena:
             mx.array(lengths.astype(np.int32)),
         )
 
-    def _state_units(
-        self, plan: PagedCachePlan, rows: np.ndarray, positions: np.ndarray
-    ) -> np.ndarray:
-        """First unit of each row's checkpoint containing ``positions``."""
+    def state_start(self, slab: int, slot: int) -> int:
+        """First unit of the STATE block at ``(slab, slot)``."""
 
-        slab, slot, _ = _locate(
-            plan.groups[STATE_GROUP], rows, positions, PREFILL_CHUNK_SIZE
-        )
-        return self._unit(slab, slot * self.geometry.state_units)
+        return slab * self.geometry.slab_units + slot * self.geometry.state_units
 
     @property
     def _recurrent_units(self) -> int:
@@ -252,20 +234,11 @@ class CacheArena:
             // geometry.unit_elements
         )
 
-    def state(
-        self, plan: PagedCachePlan, rows: np.ndarray, contexts: np.ndarray
-    ) -> LinearState:
-        """Read each row's checkpoint after ``contexts[i] - 1``; zero if new."""
+    def read_states(self, starts: np.ndarray) -> LinearState:
+        """Copy the STATE blocks starting at units ``starts``, one row each."""
 
         geometry = self.geometry
-        count = len(rows)
-        live = contexts > 0
-        starts = np.zeros(count, dtype=np.int64)
-        if live.any():
-            indices = np.flatnonzero(live)
-            starts[indices] = self._state_units(
-                plan, rows[indices], contexts[indices].astype(np.int64) - 1
-            )
+        count = len(starts)
         layers = geometry.linear_layers
         per_layer = self._recurrent_units
         recurrent_shape = (count, *geometry.recurrent_shape[1:])
@@ -284,10 +257,6 @@ class CacheArena:
         tails = tails.reshape(count, -1)[:, : geometry.convolution_elements]
         tails = tails.reshape(count, layers, *geometry.convolution_shape[1:])
         convolution = [tails[:, layer] for layer in range(layers)]
-        if not live.all():
-            keep = _mask(live)
-            recurrent = [mx.where(keep[:, None, None, None], r, 0) for r in recurrent]
-            convolution = [mx.where(keep[:, None, None], c, 0) for c in convolution]
         return LinearState(tuple(recurrent), tuple(convolution))
 
     # Writes --------------------------------------------------------------
@@ -328,25 +297,18 @@ class CacheArena:
             mx.array(np.broadcast_to(rows, shape).reshape(-1).astype(np.int32)),
         ] = update.reshape(-1, self.geometry.kv_width)
 
-    def write_state(
-        self, plan: PagedCachePlan, last_tokens: np.ndarray, state: LinearState
-    ) -> None:
-        """Store each row's checkpoint after its flattened ``last_tokens`` entry.
+    def write_states(self, starts: Sequence[int], state: LinearState) -> None:
+        """Store row ``i`` of ``state`` in the STATE block starting at ``starts[i]``.
 
-        Targets are the plan's validated STATE append addresses. Writes are
-        contiguous slice updates per row and layer: on an M4 Max at batch 16 this
-        moves 1 GB in 12 ms, against 13 ms when rows are first concatenated
-        into one update each and 57 ms as one indexed scatter per layer.
+        Writes are contiguous slice updates per row and layer: on an M4 Max at
+        batch 16 this moves 1 GB in 12 ms, against 13 ms when rows are first
+        concatenated into one update each and 57 ms as one indexed scatter per
+        layer.
         """
 
         geometry = self.geometry
-        group = plan.groups[STATE_GROUP]
-        count = len(last_tokens)
+        count = len(starts)
         unit_shape = (2 * PAGE_TOKENS, geometry.kv_width)
-        slots = group.append_slotnums[last_tokens].astype(np.int64)
-        starts = self._unit(
-            group.append_slab_ids[last_tokens], slots * geometry.state_units
-        ).tolist()
         per_layer = self._recurrent_units
         for layer, value in enumerate(state.recurrent):
             units = value.astype(mx.float32).view(mx.bfloat16)

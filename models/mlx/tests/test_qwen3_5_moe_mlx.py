@@ -12,7 +12,7 @@ mx = pytest.importorskip("mlx.core")
 
 from mlx.utils import tree_flatten  # noqa: E402
 
-from resin import Engine, SamplingParams  # noqa: E402
+from resin import Engine, SamplingParams, SchedulerConfig  # noqa: E402
 from resin.models.qwen3_5.config import Qwen35Config  # noqa: E402
 from resin_models_mlx.qwen3_5_moe.cache import (  # noqa: E402
     PAGE_TOKENS,
@@ -247,6 +247,91 @@ def test_batched_decode_matches_individual_requests() -> None:
     with Engine(_runner(model), context_length=8192) as engine:
         together = _generate(engine, prompts, 8)
     assert together == alone
+
+
+def test_live_state_follows_changing_batches() -> None:
+    model = _model()
+    prompts = [_prompt(length, seed=20 + length) for length in (4, 33, 90, 150)]
+    counts = [3, 9, 5, 12]
+
+    def run(staggered: bool):
+        runner = _runner(model)
+        with Engine(runner, context_length=8192) as engine:
+            leases = []
+            for prompt, count in zip(prompts, counts, strict=True):
+                params = SamplingParams(max_output_tokens=count, temperature=0.0)
+                leases.append(engine.submit(prompt, sampling_params=params))
+                # Later requests join a decode batch already in flight.
+                for _ in range(2 if staggered else 0):
+                    engine.step()
+            while engine.has_work():
+                engine.step()
+            # Finished requests release their live state.
+            assert len(runner._states) == 0
+            return [lease.take_result() for lease in leases]
+
+    assert run(staggered=True) == run(staggered=False)
+
+
+def test_cancel_releases_live_state_and_others_continue() -> None:
+    model = _model()
+    prompts = [_prompt(length, seed=30 + length) for length in (20, 50, 70)]
+    with Engine(_runner(model), context_length=8192) as engine:
+        expected = _generate(engine, [prompts[0], prompts[2]], 10)
+    runner = _runner(model)
+    with Engine(runner, context_length=8192) as engine:
+        params = SamplingParams(max_output_tokens=10, temperature=0.0)
+        leases = [engine.submit(p, sampling_params=params) for p in prompts]
+        for _ in range(4):
+            engine.step()
+        engine.cancel(leases[1])
+        assert len(runner._states) == 2
+        while engine.has_work():
+            engine.step()
+        assert [leases[0].take_result(), leases[2].take_result()] == expected
+        assert len(runner._states) == 0
+
+
+def test_retracted_requests_replay_from_fresh_state() -> None:
+    model = _model(all_experts=True)
+    prompts = [_prompt(500, seed=40), _prompt(500, seed=41)]
+    runner = _runner(model, slabs=4)
+    released = []
+    release = runner.release
+
+    def recording(ids):
+        released.extend(int(i) for i in ids)
+        release(ids)
+
+    cast(Any, runner).release = recording
+    config = SchedulerConfig(schedule_conservativeness=0.0)
+    with Engine(runner, context_length=8192, scheduler_config=config) as engine:
+        results = _generate(engine, prompts, 40)
+    # Some request was released and resumed before it finished.
+    assert len(released) > len(set(released))
+    # Replay prefills generated tokens that were first decoded, so compare with
+    # the reference within BF16 tie tolerance rather than token for token.
+    for prompt, generated in zip(prompts, results, strict=True):
+        _assert_greedy(model, prompt, generated, 40)
+
+
+def test_snapshot_written_during_decode_serves_the_next_turn() -> None:
+    model = _model(all_experts=True)
+    prompt = _prompt(PREFILL_CHUNK_SIZE - 3, seed=8)
+    with Engine(_runner(model), context_length=16384, prefix_cache=True) as engine:
+        # Decode crosses the 4096-token checkpoint and publishes it.
+        (first,) = _generate(engine, [prompt], 8)
+        turn = prompt + first[:3] + _prompt(5, seed=9)
+        request = engine.submit(
+            turn, sampling_params=SamplingParams(max_output_tokens=4, temperature=0.0)
+        )
+        while engine.has_work():
+            engine.step()
+        assert request.cached_tokens == PREFILL_CHUNK_SIZE
+        cached = request.take_result()
+    with Engine(_runner(model), context_length=16384) as engine:
+        (fresh,) = _generate(engine, [turn], 4)
+    assert cached == fresh
 
 
 def test_chunked_prefill_crosses_state_checkpoint() -> None:
