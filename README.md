@@ -74,14 +74,6 @@ packages. Then use the following skills:
 
 Importing `resin` does not import PyTorch or initialize CUDA.
 
-Model runners are not tied to CUDA. `resin_models_mlx` runs
-[Qwen3.5-MoE models such as Ornith](models/mlx/resin_models_mlx/qwen3_5_moe/README.md)
-on Apple Silicon with MLX, on the same Rust Engine:
-
-```bash
-uv run scripts/serve.py --model ornith-1.0-35b --checkpoint ~/models/Ornith-1.0-35B
-```
-
 ## Installation
 
 Install the core library directly from GitHub with Python 3.11+ and Rust installed:
@@ -208,35 +200,9 @@ Pass `prefix_cache=True` to reuse aligned prefixes across requests.
 ## Local HTTP server
 
 The built-in native server exposes one Engine through OpenAI Chat Completions and
-Responses, Anthropic Messages, and a small streaming chat page. Model-specific
+Responses, Anthropic Messages, and a small demo chat page. Model-specific
 prompt rendering and incremental response parsing live in the independent
-`resin-recipe` Rust crate. Native model recipes implement the same `Recipe`
-protocol as application-provided recipes. Stock image/video preprocessing also
-runs in Rust; the model runner performs the GPU vision encoder.
-
-Native recipes reuse preparation for repeated immutable encoded images, with an
-LRU limited to 8 image sets and 128 MiB per recipe. CUDA vision runners separately
-retain up to 64 encoded feature sets and 256 MiB per runner. Both caches use
-content identities; prompt positions are rebuilt for each request. Mutable image
-arrays and video inputs bypass the CPU preparation cache. Prepared native media
-exposes read-only snapshots, so pixels and geometry cannot diverge from their
-cache identity; render a new payload when changing an input image.
-
-The bridge bounds queued jobs with `HttpServer(request_queue_capacity=1024)`.
-This shared intake queue absorbs bursts while requests await engine admission;
-it does not reserve GPU cache or change the engine's active batch size.
-`max_active_requests` bounds admitted requests, including prompts being rendered,
-and defaults to `engine.max_running_requests + render_workers`. Set it explicitly
-to control how many additional requests can wait inside the Engine. Local prompt
-rendering defaults to the CPU parallelism reported by
-`std::thread::available_parallelism()` (falling back to one thread), capped at 16,
-or an explicit `render_workers` count. `admissions_per_step=32` limits admissions
-between inference steps. For distributed engines, the total active
-and admission limits scale with the number of attention-DP replicas; rendering
-runs on the replica drivers. Buffered events per client remain bounded at 64.
-A full intake queue returns HTTP 429; slow or disconnected clients are cancelled
-without blocking other requests. Actor failure stops the listener, and
-`HttpServer.shutdown()` requests shutdown after the current model step.
+`resin-recipe` Rust crate.
 
 ```bash
 # Run one LFM2 prompt in the terminal.
@@ -269,92 +235,17 @@ RESIN_MODEL=deepseek-v41 uv run modal deploy deploy/modal_serve.py
 Use `uv run scripts/bench.py --help` to see the current model keys accepted by
 `RESIN_MODEL` and the benchmark CLI. The shared
 [`MODEL_SPECS` registry](deploy/models.py) defines each selection's checkpoint,
-hardware, and serving limits. Add `--publish-only` to the download command to
-adopt complete files already in the checkpoint volume without downloading their
-contents. Serving and benchmarking use the same checkpoint inventory and
-completion marker.
+hardware, and serving limits.
 
-Multi-rank deployments use the shared distributed worker, Engine, and HTTP
-coordinator. For example, DeepSeek uses attention DP and expert parallelism,
-while GPT-OSS 120B uses attention and expert tensor parallelism. Requests are
-routed round-robin across attention-DP replicas unless `routed_dp_rank` in the
-JSON body or `resin-routed-dp-rank` in the header selects a replica. Single-rank
-deployments use a local Engine through the same HTTP frontend. The built-in chat
-page chooses one replica per page session and keeps later turns there so they can
-reuse its prefix and image caches. API clients can select a stable rank likewise.
+## MLX runner (Apple Silicon)
 
-Each deployed URL serves `/`, `/health`, `/v1/models`,
-`/v1/chat/completions`, and `/v1/responses`; model configuration controls
-`/v1/messages` support. The functions
-scale to zero after 15 idle minutes and are capped at one GPU container apiece.
-The chat demo renders Markdown and TeX math and requests up to 16,384 output
-tokens by default. Model loading, CUDA graph capture, and prompt warmup all
-complete before the endpoint starts accepting traffic. Models with image warmup
-enabled also warm the vision path on every attention replica.
-Because `requires_proxy_auth=False`, anyone with a URL can submit inference
-requests and incur GPU usage; remove the deployment when it is no longer
-needed.
+Model runners are not tied to CUDA. `resin_models_mlx` runs
+[Qwen3.5-MoE models such as Ornith](models/mlx/resin_models_mlx/qwen3_5_moe/README.md)
+on Apple Silicon with MLX, on the same core engine:
 
-Select a native recipe by name and supply its tokenizer or multimodal processor.
-Messages and content blocks are Rust-owned typed objects:
-
-```python
-import resin
-from resin.recipe import get_native_recipe
-from resin.server import HttpServer
-
-recipe = get_native_recipe("gpt_oss", tokenizer)
-prompt = recipe.render(
-    [
-        resin.recipe.Message(resin.recipe.Role.USER, [resin.recipe.Text("Hello!")]),
-    ]
-)
-parser = recipe.create_parser(prompt)
-
-HttpServer(engine, recipe=recipe, model="my-model", stream_interval=4).serve()
+```bash
+uv run scripts/mlx_serve.py --model ornith-1.0-35b --checkpoint ~/models/Ornith-1.0-35B
 ```
-
-## Current shape
-
-The native layer currently provides:
-
-- sticky continual batching with prefill priority and memory retraction;
-- phase-homogeneous prefill or decode batches, token budgets, and prefill chunks;
-- one flat physical cache pool shared by History, Window, and State groups;
-- sparse, chronological `CacheGroupPlan` rows and exact append destinations;
-- opt-in exact-token LRU prefix caching with immutable page sharing and
-  sliding-window and recurrent-state copy-on-write;
-- retryable pre-accept failure and fail-stop post-accept quarantine.
-
-`crates/resin-core` is Python-independent Rust containing request
-lifecycle, scheduling, token-range planning, grouped cache allocation, and
-execution transactions. It uses `rkyv` for the distributed
-plan wire format. `crates/resin-py` converts Python inputs and adapts runner
-callbacks, plans, errors, handles, and events to that core. `crates/resin-recipe`
-owns conversation formats and CPU media preparation; `crates/resin-http` owns
-the serving protocols and streaming responses.
-
-History cache grows on demand to each frozen plan. Window cache grows toward
-bounded cyclic storage whose plan row is projected into chronological order.
-With prefix caching enabled, a block trie indexes exact token prefixes, cached
-pages become immutable readers, and Window pages are copied on write when a
-request advances its ring. State groups retain a two-checkpoint ring. At an
-aligned prefix hit, the input checkpoint stays immutable while the next page is
-writable; the runner copies only when input and output pages differ. LRU entries
-use spare capacity in the same pool and are evicted when live requests need it.
-
-## Public surface
-
-The top-level `resin` package exposes the Engine, immutable plans and request
-policies, runner protocols, cache layouts, and metrics types. See
-[`resin/__init__.py`](resin/__init__.py) for the current exports and
-[`resin/protocols.py`](resin/protocols.py) for the runner contracts.
-
-Distributed coordination lives in `resin.backend.distributed`, with explicit
-process groups in `resin.backend.topology`. Concrete runners are imports from
-separately installed architecture submodules such as
-`resin_models_cuda.deepseek_v41`, `resin_models_cuda.gpt_oss`, and
-`resin_models_torch.lfm2`.
 
 ## Checks
 
@@ -377,29 +268,7 @@ Use the current report instead of a checked-in line-count snapshot.
 For resident prefill/decode sweeps, optional fixed speculative acceptance and
 balanced routing, Perfetto traces, and throughput/latency charts, see
 [benchmarking](docs/benchmarks.md).
-`Engine` collects native request/cache metrics and optional runner observations
-by default (`enable_metrics=True`). Use `enable_metrics=False` to opt out.
-The HTTP server publishes `/metrics`; see [metrics](docs/metrics.md)
-for Prometheus queries and forwarding through an OTLP Collector.
-
-## Repository map
-
-- `crates/resin-core/src/engine.rs` — request lifecycle and execution transactions
-- `crates/resin-py/src/lib.rs` — Python objects and the native Engine adapter
-- `crates/resin-py/src/planning.rs` — conversion from core batch/resource views to `BatchPlan`
-- `crates/resin-py/src/runner.rs` — execution discovery and one-time resource binding
-- `crates/resin-py/src/cache.rs` — Python adapters for core KV descriptors
-- `crates/resin-core/src/scheduler.rs` — cohort selection and queue-age policy
-- `crates/resin-core/src/planning.rs` — typed token-range planning
-- `crates/resin-core/src/resources/` — grouped cache allocation, prefix reuse, and leases
-- `crates/resin-recipe/` — native conversation formats, parsing, and CPU media preparation
-- `crates/resin-http/` — HTTP protocols, streaming, and serving lifecycle
-- `resin/backend/` — reusable execution and resource gadgets
-- `models/` — separately installable model definitions, loaders, and runners
-- `scripts/` — examples, benchmarks, and local maintenance tools
-- `deploy/` — shared model registry, checkpoint/cache helpers, and parameterized Modal serving/benchmark adapters
-- `tests/` — native and runner-contract coverage
 
 ## Acknowledgements
 
-Resin was based on and inspired by systems from SGLang, TokenSpeed, and DeepInfer.
+Resin was based on and inspired by systems from SGLang, vLLM, TokenSpeed, and DeepInfer.

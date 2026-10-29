@@ -1,6 +1,6 @@
 """Serve a local Apple Silicon (MLX) registry preset through Resin's HTTP APIs.
 
-uv run scripts/serve.py --model ornith-1.0-35b --checkpoint ~/models/Ornith-1.0-35B
+uv run scripts/mlx_serve.py --model ornith-1.0-35b --checkpoint ~/models/Ornith-1.0-35B
 
 CUDA presets need graph capture, warmup and runtime preparation; serve them with
 deploy/modal_serve.py.

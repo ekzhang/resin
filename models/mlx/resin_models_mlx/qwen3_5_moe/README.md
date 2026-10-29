@@ -9,36 +9,18 @@ to MLX 8-bit affine weights (group size 64). Text only: the vision tower and any
 MTP head are not loaded, and the preset's recipe rejects image and video input.
 
 ```bash
-uv run scripts/serve.py --model ornith-1.0-35b --checkpoint ~/models/Ornith-1.0-35B
+uv run scripts/mlx_serve.py --model ornith-1.0-35b --checkpoint ~/models/Ornith-1.0-35B
 uv run scripts/bench.py --model ornith-1.0-35b --backend local \
   --checkpoint ~/models/Ornith-1.0-35B --context-lengths 8192 \
   --decode-batch-sizes 1,2,4,8,16 --output artifacts/ornith.jsonl --plot
 ```
-
-## Boundaries
-
-| Component | Responsibility |
-| --- | --- |
-| `resin.models.qwen3_5.config` | Backend-neutral Qwen3.5 and Qwen3.5-MoE geometry. |
-| `checkpoint.py` | Map checkpoint names, stack or split experts, quantize layer by layer. |
-| `model.py` | Stateless forward: gated DeltaNet, gated attention, routed and shared experts. Qwen's `1 + w` RMSNorm scale and the DeltaNet decay are computed in FP32, as in the reference. |
-| `cache.py` | Slab geometry and typed reads and writes over the Engine-owned arena. |
-| `state.py` | Live DeltaNet state held on the GPU between steps, keyed by request. |
-| `../paged_attention.py` | Metal flash-decoding kernel that reads K/V directly from slabs. |
-| `../sampling.py` | Batched GPU sampling with `TorchSampler`'s filtering semantics. |
-| `runner.py` | `ManagedRunner` adapter: plans in, tokens and scores out. |
-| Shared Resin runtime | Scheduling, cache admission, prefix reuse, retraction, HTTP and metrics. |
-
-The model imports mlx-lm's gated delta-rule Metal kernel and switched-expert
-`gather_qmm` layers, as CUDA families import FlashInfer. Its composition follows
-the CUDA `qwen3_5` family and mlx-lm's `qwen3_5`/`qwen3_next` modules.
 
 ## Cache
 
 The Engine sees the same two groups as the CUDA Qwen family: 128-token
 full-attention pages (all ten attention layers per block) and a STATE group
 holding each request's live slot and its 4096-token prefix snapshots.
-Physically the arena is one BF16 MLX array of 256 KiB *units*; a unit is one
+Physically the arena is one BF16 MLX array of 256 KiB _units_; a unit is one
 layer's keys and values for one page. A slab is 250 units (65.5 MB) and holds 25
 KV blocks or one STATE block (240 units of FP32 recurrent state, then the
 convolution tails of all 30 layers).
@@ -116,17 +98,17 @@ the median of 20 synchronized steps after 5 warmup steps, with distinct tokens
 per row. Prefill runs in 4,096-token chunks for Resin and mlx-lm's default
 2,048 for mlx-lm.
 
-| Decode, 8K context | 1 | 2 | 4 | 8 | 16 |
-| --- | ---: | ---: | ---: | ---: | ---: |
-| Resin step (ms) | 14.9 | 18.7 | 25.4 | 35.9 | 55.3 |
-| mlx-lm step (ms) | 12.6 | 15.6 | 20.9 | 31.2 | 50.6 |
-| Resin / mlx-lm | 1.18 | 1.20 | 1.21 | 1.15 | 1.09 |
-| Resin output tokens/s | 67.2 | 106.8 | 157.5 | 223.2 | 289.2 |
+| Decode, 8K context     |    1 |     2 |     4 |     8 |    16 |
+| ---------------------- | ---: | ----: | ----: | ----: | ----: |
+| Resin step (ms)        | 14.9 |  18.7 |  25.4 |  35.9 |  55.3 |
+| mlx-lm step (ms)       | 12.6 |  15.6 |  20.9 |  31.2 |  50.6 |
+| Resin / mlx-lm         | 1.18 |  1.20 |  1.21 |  1.15 |  1.09 |
+| Resin output tokens/s  | 67.2 | 106.8 | 157.5 | 223.2 | 289.2 |
 | mlx-lm output tokens/s | 79.2 | 128.6 | 191.4 | 256.2 | 316.1 |
 
-| Prefill, one request | 4K | 8K | 16K | 32K |
-| --- | ---: | ---: | ---: | ---: |
-| Resin input tokens/s | 1,665 | 1,716 | 1,587 | 1,239 |
+| Prefill, one request  |    4K |    8K |   16K |   32K |
+| --------------------- | ----: | ----: | ----: | ----: |
+| Resin input tokens/s  | 1,665 | 1,716 | 1,587 | 1,239 |
 | mlx-lm input tokens/s | 2,017 | 1,929 | 1,662 | 1,321 |
 
 A second round of batches 2 and 4 gives 1.17 and 1.23. Before live state, the
@@ -174,6 +156,3 @@ snapshot, are cached.
 - Vision input, multiple devices and prompt-chunk sizes other than 4096.
 - The fused-expert and text-only loaders are tested against Transformers on a
   small configuration; only Ornith-1.0-35B has been run at full size.
-- `scripts/serve.py` serves MLX presets only; CUDA presets need the graph
-  capture and warmup in `deploy/modal_serve.py`. MLX presets have no Modal
-  volume and are rejected by the Modal launchers.

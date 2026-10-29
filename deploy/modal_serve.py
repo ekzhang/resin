@@ -30,7 +30,7 @@ from deploy.models import (
 ROOT = Path(__file__).resolve().parents[1]
 MODEL = get_model(os.environ.get("RESIN_MODEL", "gpt-oss-20b"))
 if MODEL.backend != "cuda" or MODEL.model_mount is None or MODEL.model_volume is None:
-    raise ValueError(f"{MODEL.name} runs locally; use scripts/serve.py")
+    raise ValueError(f"{MODEL.name} is not a CUDA model")
 model_volume = modal.Volume.from_name(
     MODEL.model_volume, version=MODEL.model_volume_version, create_if_missing=True
 )
