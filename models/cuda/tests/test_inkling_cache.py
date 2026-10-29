@@ -39,11 +39,7 @@ def _group(
         append_slotnums=[slot for _, slot in append],
         append_block_offsets=[0] * len(offsets) if index == 3 else offsets,
         blocks_per_slab=packing,
-        state=(
-            CacheStatePlan(live_slab_ids=[pages[0][0]], live_slotnums=[pages[0][1]])
-            if index == 3
-            else None
-        ),
+        state=(CacheStatePlan() if index == 3 else None),
     )
 
 

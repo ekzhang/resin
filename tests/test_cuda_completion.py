@@ -170,13 +170,13 @@ def test_state_report_extends_completion_fence_and_attaches_once(monkeypatch):
 
     class Report:
         def stage(self, staging):
-            self.records = staging.output("state_checkpoints", torch.tensor([[7, 129]]))
+            self.records = staging.output("state_checkpoints", torch.tensor([7]))
             return self
 
         def attach(self, output):
             operations.append("attach")
-            assert self.records.tolist() == [[7, 129]]
-            return output
+            assert self.records.tolist() == [7]
+            return output.with_state_checkpoints(tuple(self.records.tolist()))
 
     monkeypatch.setattr(runtime, "TensorStager", Stager)
     monkeypatch.setattr(runtime.torch.cuda, "Event", Event)
@@ -192,7 +192,9 @@ def test_state_report_extends_completion_fence_and_attaches_once(monkeypatch):
     old_event = pending._event
     assert pending.attach_state_checkpoints(Report()) is pending
     assert pending._event is not old_event
-    assert pending.result() is pending.result()
+    result = pending.result()
+    assert result is pending.result()
+    assert result.state_checkpoints == (7,)
     assert operations[-2:] == ["synchronize", "attach"]
     assert operations.count("record") == 2 and operations.count("attach") == 1
     with pytest.raises(RuntimeError, match="after result harvest"):

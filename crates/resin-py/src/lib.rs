@@ -35,8 +35,7 @@ mod recipe_types;
 mod runner;
 
 use cache::{
-    CacheGroupFamily, CacheGroupLayout, CacheGroupPlan, CacheLayout, CacheRetention,
-    CacheStatePlan, StateCheckpoint, StateCheckpointSlot, StateCopy,
+    CacheGroupFamily, CacheGroupLayout, CacheGroupPlan, CacheLayout, CacheRetention, CacheStatePlan,
 };
 use output::{BorrowedLogprobs, BorrowedOutput, ForwardOutput};
 use parallelism::Parallelism;
@@ -1163,7 +1162,7 @@ struct PythonRunner<'a, 'py> {
     error: Option<PyErr>,
     logprobs: Option<BorrowedLogprobs<'py>>,
     prompt_logprobs: Option<BorrowedLogprobs<'py>>,
-    state_checkpoints: Vec<resin_core::resources::kv::StateCheckpoint>,
+    state_checkpoints: Vec<u64>,
 }
 impl PythonRunner<'_, '_> {
     fn failed(&mut self, error: PyErr, accepted: bool) -> core::Error {
@@ -1214,7 +1213,7 @@ impl<'py> core::Runner<RequestPayload> for PythonRunner<'_, 'py> {
     fn prompt_logprobs(&self) -> Option<core::LogprobView<'_>> {
         self.prompt_logprobs.as_ref().map(BorrowedLogprobs::view)
     }
-    fn state_checkpoints(&self) -> &[resin_core::resources::kv::StateCheckpoint] {
+    fn state_checkpoints(&self) -> &[u64] {
         &self.state_checkpoints
     }
     fn release(&mut self, ids: &[u64]) -> core::Result<()> {
@@ -2067,8 +2066,7 @@ mod _resin {
     use super::{
         BatchPhase, BatchPlan, CacheGroupFamily, CacheGroupLayout, CacheGroupPlan, CacheLayout,
         CacheRetention, CacheStatePlan, Engine, ForwardOutput, Parallelism, RequestLease,
-        ResourceBinding, RunnerConfig, SamplingParams, SchedulerConfig, StateCheckpoint,
-        StateCheckpointSlot, StateCopy, TokenEvent, TokenLogprobs,
+        ResourceBinding, RunnerConfig, SamplingParams, SchedulerConfig, TokenEvent, TokenLogprobs,
     };
 
     #[pymodule_export]

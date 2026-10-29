@@ -251,16 +251,10 @@ class PagedCachePlan:
                     np.any(np.diff(group.block_indptr) != 1)
                     or np.any(group.block_table_start_indices != 0)
                     or not np.array_equal(
-                        group.block_slab_ids, group.state.live_slab_ids
+                        group.append_slab_ids, group.block_slab_ids[row_ids]
                     )
                     or not np.array_equal(
-                        group.block_slotnums, group.state.live_slotnums
-                    )
-                    or not np.array_equal(
-                        group.append_slab_ids, group.state.live_slab_ids[row_ids]
-                    )
-                    or not np.array_equal(
-                        group.append_slotnums, group.state.live_slotnums[row_ids]
+                        group.append_slotnums, group.block_slotnums[row_ids]
                     )
                 ):
                     raise ValueError(

@@ -12,8 +12,6 @@ from resin import (
     CacheGroupPlan,
     CacheStatePlan,
     SamplingParams,
-    StateCheckpointSlot,
-    StateCopy,
 )
 from resin.backend.plan_transport import PlanTransport, RequestRegistration
 from resin.recipe import InklingMedia
@@ -75,26 +73,8 @@ def rich_plan(batch_key):
                 append_slotnums=[1, 1, 0],
                 append_block_offsets=[0, 0, 0],
                 state=CacheStatePlan(
-                    live_slab_ids=[31, 32],
-                    live_slotnums=[1, 0],
-                    restore_copies=[
-                        StateCopy(
-                            row=0,
-                            source_slab_id=36,
-                            source_slotnum=0,
-                            destination_slab_id=31,
-                            destination_slotnum=1,
-                        )
-                    ],
-                    checkpoint_slots=[
-                        StateCheckpointSlot(
-                            reservation_id=2**63 + 7,
-                            row=0,
-                            prefix_length=8,
-                            destination_slab_id=41,
-                            destination_slotnum=1,
-                        )
-                    ],
+                    restore_copies=[(0, 36, 0)],
+                    checkpoint_slots=[(2**63 + 7, 0, 8, 41, 1)],
                 ),
             )
         ],
@@ -155,44 +135,16 @@ def test_packet_roundtrips_all_plan_fields_and_full_width_ids(batch_key):
                 getattr(actual, name), getattr(expected, name)
             )
             assert not np.shares_memory(getattr(actual, name), packet.data)
+            assert not getattr(actual, name).flags.writeable
         if expected.state is None:
             assert actual.state is None
         else:
             assert actual.state is not None
-            for name in ("live_slab_ids", "live_slotnums"):
+            for name in ("restore_copies", "checkpoint_slots"):
                 value = getattr(actual.state, name)
-                np.testing.assert_array_equal(value, getattr(expected.state, name))
-                assert not value.flags.writeable
-            for name, fields in (
-                (
-                    "restore_copies",
-                    (
-                        "row",
-                        "source_slab_id",
-                        "source_slotnum",
-                        "destination_slab_id",
-                        "destination_slotnum",
-                    ),
-                ),
-                (
-                    "checkpoint_slots",
-                    (
-                        "reservation_id",
-                        "row",
-                        "prefix_length",
-                        "destination_slab_id",
-                        "destination_slotnum",
-                    ),
-                ),
-            ):
-                for restored_item, original_item in zip(
-                    getattr(actual.state, name),
-                    getattr(expected.state, name),
-                    strict=True,
-                ):
-                    assert tuple(
-                        getattr(restored_item, field) for field in fields
-                    ) == tuple(getattr(original_item, field) for field in fields)
+                assert isinstance(value, tuple)
+                assert all(isinstance(item, tuple) for item in value)
+                assert value == getattr(expected.state, name)
     for actual, expected in zip(restored.sampling_params, original.sampling_params):
         for name in (
             "max_output_tokens",

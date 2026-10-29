@@ -8,7 +8,7 @@ from functools import wraps
 import numpy as np
 import torch
 
-from resin import BatchPhase, ForwardOutput, StateCheckpoint
+from resin import BatchPhase, ForwardOutput
 from resin.backend.cuda.completion import DeviceCompletion
 from resin.backend.cuda.failures import GraphInputError
 from resin.backend.cuda.staging import TensorStager
@@ -16,35 +16,24 @@ from resin.backend.cuda.staging import TensorStager
 
 @dataclass
 class _CheckpointReport:
-    records: tuple
+    reservation_ids: tuple[int, ...]
     flags: torch.Tensor
     owner: object
 
     def stage(self, staging):
-        return _StagedReport(
-            self.records, staging.output("state_checkpoints", self.flags), self
+        return _CheckpointReport(
+            self.reservation_ids, staging.output("state_checkpoints", self.flags), self
         )
-
-
-@dataclass
-class _StagedReport:
-    records: tuple
-    flags: torch.Tensor
-    owner: object
 
     def attach(self, output):
         # One native reservation covers every STATE group at a row/prefix.
         # A receipt certifies the complete snapshot, not an individual layer.
-        snapshots = {}
-        for record, materialized in zip(self.records, self.flags.tolist(), strict=True):
-            previous = snapshots.get(record.reservation_id)
-            snapshots[record.reservation_id] = (
-                record,
-                materialized and (previous is None or previous[1]),
-            )
-        records = tuple(
-            record for record, materialized in snapshots.values() if materialized
-        )
+        snapshots = dict.fromkeys(self.reservation_ids, True)
+        for reservation_id, materialized in zip(
+            self.reservation_ids, self.flags.tolist(), strict=True
+        ):
+            snapshots[reservation_id] &= materialized
+        records = tuple(key for key, ready in snapshots.items() if ready)
         return output.with_state_checkpoints((*output.state_checkpoints, *records))
 
 
@@ -69,30 +58,20 @@ class _StateExecution:
                         "state transfer address is outside its cache arena"
                     )
 
-            for copy in state.restore_copies:
-                if not 0 <= copy.row < plan.num_sequences:
+            for row, source_slab, source_slot in state.restore_copies:
+                if not 0 <= row < plan.num_sequences:
                     raise ValueError("state restore row is outside its batch")
-                address(copy.source_slab_id, copy.source_slotnum)
+                address(source_slab, source_slot)
                 address(
-                    copy.destination_slab_id, copy.destination_slotnum, destination=True
+                    group.block_slab_ids[row],
+                    group.block_slotnums[row],
+                    destination=True,
                 )
-                if (copy.destination_slab_id, copy.destination_slotnum) != (
-                    int(state.live_slab_ids[copy.row]),
-                    int(state.live_slotnums[copy.row]),
-                ):
-                    raise ValueError(
-                        "state restore destination is not its row's live slot"
-                    )
-            for slot in state.checkpoint_slots:
-                if not 0 <= slot.row < plan.num_sequences:
+            for _, row, _, slab, slot in state.checkpoint_slots:
+                if not 0 <= row < plan.num_sequences:
                     raise ValueError("state checkpoint row is outside its batch")
-                address(
-                    int(state.live_slab_ids[slot.row]),
-                    int(state.live_slotnums[slot.row]),
-                )
-                address(
-                    slot.destination_slab_id, slot.destination_slotnum, destination=True
-                )
+                address(group.block_slab_ids[row], group.block_slotnums[row])
+                address(slab, slot, destination=True)
 
     def restore(self):
         from resin.backend.cuda.state_triton import copy_state
@@ -105,12 +84,12 @@ class _StateExecution:
                 f"state.{group.group_index}.restore",
                 [
                     (
-                        copy.source_slab_id,
-                        copy.source_slotnum,
-                        copy.destination_slab_id,
-                        copy.destination_slotnum,
+                        slab,
+                        slot,
+                        group.block_slab_ids[row],
+                        group.block_slotnums[row],
                     )
-                    for copy in copies
+                    for row, slab, slot in copies
                 ],
                 torch.int64,
             )
@@ -146,18 +125,18 @@ class _StateExecution:
                 f"state.{group.group_index}.snapshots",
                 [
                     (
-                        int(state.live_slab_ids[slot.row]),
-                        int(state.live_slotnums[slot.row]),
-                        slot.destination_slab_id,
-                        slot.destination_slotnum,
+                        group.block_slab_ids[row],
+                        group.block_slotnums[row],
+                        slab,
+                        slot,
                     )
-                    for slot in slots
+                    for _, row, _, slab, slot in slots
                 ],
                 torch.int64,
             )
             candidates = self.staging.device(
                 f"state.{group.group_index}.candidates",
-                [(slot.row, slot.prefix_length) for slot in slots],
+                [(row, prefix) for _, row, prefix, _, _ in slots],
                 torch.int64,
             )
             flags.append(
@@ -168,12 +147,7 @@ class _StateExecution:
                     ends=ends,
                 )
             )
-            records.extend(
-                StateCheckpoint(
-                    reservation_id=slot.reservation_id, prefix_length=slot.prefix_length
-                )
-                for slot in slots
-            )
+            records.extend(reservation_id for reservation_id, *_ in slots)
         # Retain restore staging even when there was no optional snapshot space.
         materialized = (
             torch.cat(flags)

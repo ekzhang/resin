@@ -363,14 +363,12 @@ impl fmt::Display for KvLayoutError {
 
 impl std::error::Error for KvLayoutError {}
 
-/// Executor-facing block table and append locations for one cache group.
+/// Restore a private live row from an immutable snapshot, or zero it with source slab zero.
 #[derive(Clone, Debug, Eq, PartialEq, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
 pub struct StateCopy {
     pub row: u32,
     pub source_slab_id: u32,
     pub source_slotnum: u32,
-    pub destination_slab_id: u32,
-    pub destination_slotnum: u32,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
@@ -382,20 +380,14 @@ pub struct StateCheckpointSlot {
     pub destination_slotnum: u32,
 }
 
+/// Optional transfers; the enclosing group's one-slot CSR owns each live address.
 #[derive(Clone, Debug, Eq, PartialEq, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
 pub struct StatePlan {
-    pub live_slab_ids: Vec<u32>,
-    pub live_slotnums: Vec<u32>,
     pub restore_copies: Vec<StateCopy>,
     pub checkpoint_slots: Vec<StateCheckpointSlot>,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct StateCheckpoint {
-    pub reservation_id: u64,
-    pub prefix_length: u32,
-}
-
+/// Executor-facing block table and append locations for one cache group.
 #[derive(Clone, Debug, Eq, PartialEq, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
 pub struct KvGroupPlan {
     pub group_index: u32,
@@ -492,39 +484,25 @@ impl KvGroupPlan {
         }
         if let Some(state) = &self.state {
             let rows = self.block_table_start_indices.len();
-            if state.live_slab_ids.len() != rows || state.live_slotnums.len() != rows {
-                return Err(KvPlanError("live state addresses must cover every row"));
-            }
-            if state
-                .live_slab_ids
-                .iter()
-                .zip(&state.live_slotnums)
-                .any(|(&slab, &slot)| slab == 0 || slot >= self.blocks_per_slab)
-                || state.restore_copies.iter().any(|copy| {
-                    copy.row as usize >= rows
-                        || copy.source_slotnum >= self.blocks_per_slab
-                        || copy.destination_slab_id == 0
-                        || copy.destination_slotnum >= self.blocks_per_slab
-                })
-                || state.checkpoint_slots.iter().any(|slot| {
-                    slot.row as usize >= rows
-                        || slot.reservation_id == 0
-                        || slot.prefix_length == 0
-                        || slot.destination_slab_id == 0
-                        || slot.destination_slotnum >= self.blocks_per_slab
-                })
-            {
+            if state.restore_copies.iter().any(|copy| {
+                copy.row as usize >= rows || copy.source_slotnum >= self.blocks_per_slab
+            }) || state.checkpoint_slots.iter().any(|slot| {
+                slot.row as usize >= rows
+                    || slot.reservation_id == 0
+                    || slot.prefix_length == 0
+                    || slot.destination_slab_id == 0
+                    || slot.destination_slotnum >= self.blocks_per_slab
+            }) {
                 return Err(KvPlanError("state copy or checkpoint address is malformed"));
             }
-            let live: HashSet<_> = state
-                .live_slab_ids
+            // Each STATE row's one-slot CSR is its private live address.
+            let live: HashSet<_> = self
+                .block_slab_ids
                 .iter()
                 .copied()
-                .zip(state.live_slotnums.iter().copied())
+                .zip(self.block_slotnums.iter().copied())
                 .collect();
             if live.len() != rows
-                || self.block_slab_ids != state.live_slab_ids
-                || self.block_slotnums != state.live_slotnums
                 || self
                     .block_indptr
                     .iter()
@@ -549,15 +527,9 @@ impl KvGroupPlan {
             let mut restored = HashSet::new();
             for copy in &state.restore_copies {
                 let source = (copy.source_slab_id, copy.source_slotnum);
-                let destination = (copy.destination_slab_id, copy.destination_slotnum);
                 if !restored.insert(copy.row)
                     || (copy.source_slab_id == 0 && copy.source_slotnum != 0)
                     || live.contains(&source)
-                    || destination
-                        != (
-                            state.live_slab_ids[copy.row as usize],
-                            state.live_slotnums[copy.row as usize],
-                        )
                 {
                     return Err(KvPlanError(
                         "state restores must initialize each live row at most once",
@@ -799,14 +771,10 @@ mod tests {
         )
         .unwrap();
         plan.state = Some(StatePlan {
-            live_slab_ids: vec![7],
-            live_slotnums: vec![0],
             restore_copies: vec![StateCopy {
                 row: 0,
                 source_slab_id: 0,
                 source_slotnum: 0,
-                destination_slab_id: 7,
-                destination_slotnum: 0,
             }],
             checkpoint_slots: vec![StateCheckpointSlot {
                 reservation_id: 1,
@@ -821,8 +789,8 @@ mod tests {
             |plan| plan.append_slab_ids[0] = 8,
             |plan| plan.append_block_offsets[0] = 1,
             |plan| plan.block_table_start_indices[0] = 1,
-            |plan| plan.state.as_mut().unwrap().live_slab_ids[0] = 8,
-            |plan| plan.state.as_mut().unwrap().restore_copies[0].destination_slab_id = 8,
+            |plan| plan.state.as_mut().unwrap().restore_copies[0].row = 1,
+            |plan| plan.state.as_mut().unwrap().restore_copies[0].source_slotnum = 1,
             |plan| plan.state.as_mut().unwrap().restore_copies[0].source_slab_id = 7,
             |plan| {
                 let state = plan.state.as_mut().unwrap();

@@ -278,7 +278,7 @@ def test_paged_cache_plan_addresses_private_state_across_boundaries() -> None:
                 append_slab_ids=[2],
                 append_slotnums=[0],
                 append_block_offsets=[0],
-                state=CacheStatePlan(live_slab_ids=[2], live_slotnums=[0]),
+                state=CacheStatePlan(),
             )
         ],
     )
@@ -322,7 +322,7 @@ def test_reserved_history_keeps_private_live_recurrent_state(context, history_pa
                 block_slotnums=[0],
                 block_table_start_indices=[0],
                 append_slab_ids=[39],
-                state=CacheStatePlan(live_slab_ids=[39], live_slotnums=[0]),
+                state=CacheStatePlan(),
                 append_slotnums=[0],
                 append_block_offsets=[0],
             ),
@@ -482,7 +482,7 @@ def _mixed_cache_plan(*, decode: bool) -> tuple[BatchPlan, CacheLayout]:
                 append_block_offsets=offsets,
                 blocks_per_slab=descriptor.blocks_per_slab,
                 state=(
-                    CacheStatePlan(live_slab_ids=slabs, live_slotnums=slots)
+                    CacheStatePlan()
                     if descriptor.family == CacheGroupFamily.STATE
                     else None
                 ),

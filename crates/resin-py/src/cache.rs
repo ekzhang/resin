@@ -378,152 +378,8 @@ impl CacheLayout {
     }
 }
 
-#[pyclass(frozen, get_all, module = "resin._resin", skip_from_py_object)]
-#[derive(Clone)]
-pub(crate) struct StateCopy {
-    row: u32,
-    source_slab_id: u32,
-    source_slotnum: u32,
-    destination_slab_id: u32,
-    destination_slotnum: u32,
-}
-
-impl From<&core_kv::StateCopy> for StateCopy {
-    fn from(copy: &core_kv::StateCopy) -> Self {
-        Self {
-            row: copy.row,
-            source_slab_id: copy.source_slab_id,
-            source_slotnum: copy.source_slotnum,
-            destination_slab_id: copy.destination_slab_id,
-            destination_slotnum: copy.destination_slotnum,
-        }
-    }
-}
-
-impl StateCopy {
-    fn inner(&self) -> core_kv::StateCopy {
-        core_kv::StateCopy {
-            row: self.row,
-            source_slab_id: self.source_slab_id,
-            source_slotnum: self.source_slotnum,
-            destination_slab_id: self.destination_slab_id,
-            destination_slotnum: self.destination_slotnum,
-        }
-    }
-}
-
-#[pymethods]
-impl StateCopy {
-    #[new]
-    #[pyo3(signature = (*, row, source_slab_id, source_slotnum, destination_slab_id, destination_slotnum))]
-    fn new(
-        row: u32,
-        source_slab_id: u32,
-        source_slotnum: u32,
-        destination_slab_id: u32,
-        destination_slotnum: u32,
-    ) -> Self {
-        Self {
-            row,
-            source_slab_id,
-            source_slotnum,
-            destination_slab_id,
-            destination_slotnum,
-        }
-    }
-}
-
-#[pyclass(frozen, get_all, module = "resin._resin", skip_from_py_object)]
-#[derive(Clone)]
-pub(crate) struct StateCheckpointSlot {
-    reservation_id: u64,
-    row: u32,
-    prefix_length: u32,
-    destination_slab_id: u32,
-    destination_slotnum: u32,
-}
-
-impl From<&core_kv::StateCheckpointSlot> for StateCheckpointSlot {
-    fn from(slot: &core_kv::StateCheckpointSlot) -> Self {
-        Self {
-            reservation_id: slot.reservation_id,
-            row: slot.row,
-            prefix_length: slot.prefix_length,
-            destination_slab_id: slot.destination_slab_id,
-            destination_slotnum: slot.destination_slotnum,
-        }
-    }
-}
-
-impl StateCheckpointSlot {
-    fn inner(&self) -> core_kv::StateCheckpointSlot {
-        core_kv::StateCheckpointSlot {
-            reservation_id: self.reservation_id,
-            row: self.row,
-            prefix_length: self.prefix_length,
-            destination_slab_id: self.destination_slab_id,
-            destination_slotnum: self.destination_slotnum,
-        }
-    }
-}
-
-#[pymethods]
-impl StateCheckpointSlot {
-    #[new]
-    #[pyo3(signature = (*, reservation_id, row, prefix_length, destination_slab_id, destination_slotnum))]
-    fn new(
-        reservation_id: u64,
-        row: u32,
-        prefix_length: u32,
-        destination_slab_id: u32,
-        destination_slotnum: u32,
-    ) -> Self {
-        Self {
-            reservation_id,
-            row,
-            prefix_length,
-            destination_slab_id,
-            destination_slotnum,
-        }
-    }
-}
-
-#[pyclass(frozen, get_all, module = "resin._resin", skip_from_py_object)]
-#[derive(Clone, Copy)]
-pub(crate) struct StateCheckpoint {
-    reservation_id: u64,
-    prefix_length: u32,
-}
-
-impl StateCheckpoint {
-    pub(crate) fn inner(&self) -> core_kv::StateCheckpoint {
-        core_kv::StateCheckpoint {
-            reservation_id: self.reservation_id,
-            prefix_length: self.prefix_length,
-        }
-    }
-}
-
-impl From<core_kv::StateCheckpoint> for StateCheckpoint {
-    fn from(checkpoint: core_kv::StateCheckpoint) -> Self {
-        Self {
-            reservation_id: checkpoint.reservation_id,
-            prefix_length: checkpoint.prefix_length,
-        }
-    }
-}
-
-#[pymethods]
-impl StateCheckpoint {
-    #[new]
-    fn new(reservation_id: u64, prefix_length: u32) -> Self {
-        Self {
-            reservation_id,
-            prefix_length,
-        }
-    }
-}
-
+/// Optional restore sources and snapshot destinations for one STATE group.
+/// Its one-slot CSR owns the live destination for each row.
 #[pyclass(frozen, module = "resin._resin", skip_from_py_object)]
 pub(crate) struct CacheStatePlan {
     inner: core_kv::StatePlan,
@@ -532,62 +388,70 @@ pub(crate) struct CacheStatePlan {
 #[pymethods]
 impl CacheStatePlan {
     #[new]
-    #[pyo3(signature = (*, live_slab_ids, live_slotnums, restore_copies=Vec::new(), checkpoint_slots=Vec::new()))]
+    #[pyo3(signature = (*, restore_copies=Vec::new(), checkpoint_slots=Vec::new()))]
     fn new(
-        py: Python<'_>,
-        live_slab_ids: PyArrayLike1<'_, u32>,
-        live_slotnums: PyArrayLike1<'_, u32>,
-        restore_copies: Vec<Py<StateCopy>>,
-        checkpoint_slots: Vec<Py<StateCheckpointSlot>>,
+        restore_copies: Vec<(u32, u32, u32)>,
+        checkpoint_slots: Vec<(u64, u32, u32, u32, u32)>,
     ) -> Self {
         Self {
             inner: core_kv::StatePlan {
-                live_slab_ids: crate::arrays::owned_vec(live_slab_ids),
-                live_slotnums: crate::arrays::owned_vec(live_slotnums),
                 restore_copies: restore_copies
-                    .iter()
-                    .map(|copy| copy.borrow(py).inner())
+                    .into_iter()
+                    .map(|(row, source_slab_id, source_slotnum)| core_kv::StateCopy {
+                        row,
+                        source_slab_id,
+                        source_slotnum,
+                    })
                     .collect(),
                 checkpoint_slots: checkpoint_slots
-                    .iter()
-                    .map(|slot| slot.borrow(py).inner())
+                    .into_iter()
+                    .map(
+                        |(
+                            reservation_id,
+                            row,
+                            prefix_length,
+                            destination_slab_id,
+                            destination_slotnum,
+                        )| core_kv::StateCheckpointSlot {
+                            reservation_id,
+                            row,
+                            prefix_length,
+                            destination_slab_id,
+                            destination_slotnum,
+                        },
+                    )
                     .collect(),
             },
         }
     }
 
     #[getter]
-    fn live_slab_ids<'py>(this: Bound<'py, Self>) -> Bound<'py, PyArray1<u32>> {
-        crate::arrays::readonly_view(this.clone().into_any(), &this.get().inner.live_slab_ids)
-    }
-
-    #[getter]
-    fn live_slotnums<'py>(this: Bound<'py, Self>) -> Bound<'py, PyArray1<u32>> {
-        crate::arrays::readonly_view(this.clone().into_any(), &this.get().inner.live_slotnums)
-    }
-
-    #[getter]
     fn restore_copies(&self, py: Python<'_>) -> PyResult<Py<PyTuple>> {
-        let records = self
-            .inner
-            .restore_copies
-            .iter()
-            .map(StateCopy::from)
-            .map(|record| Py::new(py, record))
-            .collect::<PyResult<Vec<_>>>()?;
-        Ok(PyTuple::new(py, records)?.unbind())
+        Ok(PyTuple::new(
+            py,
+            self.inner
+                .restore_copies
+                .iter()
+                .map(|copy| (copy.row, copy.source_slab_id, copy.source_slotnum)),
+        )?
+        .unbind())
     }
 
     #[getter]
     fn checkpoint_slots(&self, py: Python<'_>) -> PyResult<Py<PyTuple>> {
-        let records = self
-            .inner
-            .checkpoint_slots
-            .iter()
-            .map(StateCheckpointSlot::from)
-            .map(|record| Py::new(py, record))
-            .collect::<PyResult<Vec<_>>>()?;
-        Ok(PyTuple::new(py, records)?.unbind())
+        Ok(PyTuple::new(
+            py,
+            self.inner.checkpoint_slots.iter().map(|slot| {
+                (
+                    slot.reservation_id,
+                    slot.row,
+                    slot.prefix_length,
+                    slot.destination_slab_id,
+                    slot.destination_slotnum,
+                )
+            }),
+        )?
+        .unbind())
     }
 }
 

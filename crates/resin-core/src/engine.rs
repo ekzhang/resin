@@ -7,7 +7,7 @@ pub use crate::logprobs::{LogprobView, TokenLogprobs};
 use crate::metrics::{EngineMetricsSnapshot, EngineMetricsState, RequestMetricsState};
 pub use crate::output::{OwnedTokenRows, TokenRows};
 use crate::resources::RequestResourceRef;
-use crate::resources::kv::{KvGroupPlan, KvLayout, StateCheckpoint};
+use crate::resources::kv::{KvGroupPlan, KvLayout};
 use crate::resources::paged::{CachePoolError, RequestPages, WriterAccessLease};
 use crate::resources::paged_kv::{CacheMetrics, PagedKvBatchView, PagedKvError, PagedKvResources};
 use crate::{
@@ -356,7 +356,7 @@ pub trait Runner<P> {
     fn prompt_logprobs(&self) -> Option<LogprobView<'_>> {
         None
     }
-    fn state_checkpoints(&self) -> &[StateCheckpoint] {
+    fn state_checkpoints(&self) -> &[u64] {
         &[]
     }
     fn release(&mut self, _request_ids: &[u64]) -> Result<()> {

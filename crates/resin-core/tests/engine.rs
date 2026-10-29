@@ -2,9 +2,7 @@ use resin_core::engine::{
     EngineCore, Error, ErrorKind, ExecutionPlan, OwnedTokenRows, Runner, RunnerConfig,
     SchedulerConfig, Submission, TokenRows,
 };
-use resin_core::resources::kv::{
-    KvGroupFamily, KvGroupLayout, KvLayout, KvRetention, StateCheckpoint,
-};
+use resin_core::resources::kv::{KvGroupFamily, KvGroupLayout, KvLayout, KvRetention};
 use std::collections::VecDeque;
 use std::num::NonZeroU32;
 
@@ -15,7 +13,7 @@ struct Model {
     released: Vec<u64>,
     release_fails: bool,
     report_checkpoints: bool,
-    checkpoints: Vec<StateCheckpoint>,
+    checkpoints: Vec<u64>,
 }
 impl Runner<&'static str> for Model {
     fn forward(&mut self, plan: ExecutionPlan<&'static str>) -> Result<OwnedTokenRows, Error> {
@@ -42,15 +40,9 @@ impl Runner<&'static str> for Model {
                                 0
                             };
                         if valid == slot.prefix_length
-                            && !self
-                                .checkpoints
-                                .iter()
-                                .any(|record| record.reservation_id == slot.reservation_id)
+                            && !self.checkpoints.contains(&slot.reservation_id)
                         {
-                            self.checkpoints.push(StateCheckpoint {
-                                reservation_id: slot.reservation_id,
-                                prefix_length: valid,
-                            });
+                            self.checkpoints.push(slot.reservation_id);
                         }
                     }
                 }
@@ -59,7 +51,7 @@ impl Runner<&'static str> for Model {
         self.plans.push(plan);
         output.map(owned_rows)
     }
-    fn state_checkpoints(&self) -> &[StateCheckpoint] {
+    fn state_checkpoints(&self) -> &[u64] {
         &self.checkpoints
     }
     fn release(&mut self, ids: &[u64]) -> Result<(), Error> {
@@ -243,7 +235,20 @@ fn check_stopped_speculative_prefix(stop_token: bool) {
                 // The GPU really materialized the reserved raw end6, even
                 // though EOS/output limits retain only the prefix through4.
                 assert_eq!(model.checkpoints.len(), 1);
-                assert_eq!(model.checkpoints[0].prefix_length, 6);
+                let state = model
+                    .plans
+                    .last()
+                    .unwrap()
+                    .cache_groups
+                    .iter()
+                    .find_map(|group| group.state.as_ref())
+                    .unwrap();
+                let slot = state
+                    .checkpoint_slots
+                    .iter()
+                    .find(|slot| slot.reservation_id == model.checkpoints[0])
+                    .unwrap();
+                assert_eq!(slot.prefix_length, 6);
             }
             assert_eq!(request.take_result().unwrap(), [13, 14]);
             assert!(!engine.has_work());

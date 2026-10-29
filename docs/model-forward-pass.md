@@ -134,13 +134,13 @@ IDs in `BatchPlan.cache_groups`; the model only maps those IDs to its device
 arena. Do not keep a second request-to-page allocator in Python.
 
 STATE groups use one private live slot per request, independent of token position.
-`CacheGroupPlan.state` identifies that slot, one-time zero/restore copies, and
-optional checkpoint destinations. Apply restores before model execution and
-copy live state into a checkpoint only when its reserved prefix length equals
-the actual accepted cache-valid length. Report the completed reservation through
-`ForwardOutput.state_checkpoints`. All STATE groups must materialize the same
-prefix before the Engine publishes it. Never relabel terminal state after EOS or
-output-length truncation as an earlier prefix. CUDA runners use the shared
+The ordinary block table identifies that slot; `CacheGroupPlan.state` carries
+one-time zero/restore copies and optional checkpoint destinations. Apply restores
+before model execution. Copy a checkpoint only at its exact accepted cache-valid
+prefix, and return its reservation ID in `ForwardOutput.state_checkpoints`.
+All STATE groups must materialize that prefix before the Engine publishes it.
+Never relabel terminal state after EOS or output-length truncation as an earlier
+prefix. CUDA runners use the shared
 `execute_state` wrapper; their arena exposes complete `[slab, slot, elements]`
 state views and their model commits only the accepted state before returning.
 Snapshots and restore sources remain pinned until queued consumers finish.

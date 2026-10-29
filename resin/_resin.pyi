@@ -255,80 +255,21 @@ class CacheGroupLayout:
         """
 
 @final
-class StateCopy:
-    def __new__(
-        cls,
-        /,
-        *,
-        row: int,
-        source_slab_id: int,
-        source_slotnum: int,
-        destination_slab_id: int,
-        destination_slotnum: int,
-    ) -> StateCopy: ...
-    @property
-    def row(self, /) -> int: ...
-    @property
-    def source_slab_id(self, /) -> int: ...
-    @property
-    def source_slotnum(self, /) -> int: ...
-    @property
-    def destination_slab_id(self, /) -> int: ...
-    @property
-    def destination_slotnum(self, /) -> int: ...
-
-@final
-class StateCheckpointSlot:
-    def __new__(
-        cls,
-        /,
-        *,
-        reservation_id: int,
-        row: int,
-        prefix_length: int,
-        destination_slab_id: int,
-        destination_slotnum: int,
-    ) -> StateCheckpointSlot: ...
-    @property
-    def reservation_id(self, /) -> int: ...
-    @property
-    def row(self, /) -> int: ...
-    @property
-    def prefix_length(self, /) -> int: ...
-    @property
-    def destination_slab_id(self, /) -> int: ...
-    @property
-    def destination_slotnum(self, /) -> int: ...
-
-@final
 class CacheStatePlan:
+    """Optional transfers for the private live slots in the group's block table."""
     def __new__(
         cls,
         /,
         *,
-        live_slab_ids: Sequence[int] | npt.NDArray[np.uint32],
-        live_slotnums: Sequence[int] | npt.NDArray[np.uint32],
-        restore_copies: Sequence[StateCopy] = (),
-        checkpoint_slots: Sequence[StateCheckpointSlot] = (),
+        restore_copies: Sequence[tuple[int, int, int]] = (),
+        checkpoint_slots: Sequence[tuple[int, int, int, int, int]] = (),
     ) -> CacheStatePlan: ...
     @property
-    def live_slab_ids(self, /) -> npt.NDArray[np.uint32]: ...
+    def restore_copies(self, /) -> tuple[tuple[int, int, int], ...]:
+        """(row, source slab, source slot); a zero source initializes the live slot."""
     @property
-    def live_slotnums(self, /) -> npt.NDArray[np.uint32]: ...
-    @property
-    def restore_copies(self, /) -> tuple[StateCopy, ...]: ...
-    @property
-    def checkpoint_slots(self, /) -> tuple[StateCheckpointSlot, ...]: ...
-
-@final
-class StateCheckpoint:
-    def __new__(
-        cls, /, *, reservation_id: int, prefix_length: int
-    ) -> StateCheckpoint: ...
-    @property
-    def reservation_id(self, /) -> int: ...
-    @property
-    def prefix_length(self, /) -> int: ...
+    def checkpoint_slots(self, /) -> tuple[tuple[int, int, int, int, int], ...]:
+        """(reservation ID, row, prefix length, destination slab, destination slot)."""
 
 @final
 class CacheGroupPlan:
@@ -703,12 +644,13 @@ class ForwardOutput:
         prompt_target_indptr: "npt.NDArray[np.uint32] | None" = None,
         prompt_target_token_ids: "npt.NDArray[np.uint32] | None" = None,
         prompt_target_logprobs: "npt.NDArray[np.float32] | None" = None,
-        state_checkpoints: Sequence[StateCheckpoint] = (),
+        state_checkpoints: Sequence[int] = (),
     ) -> ForwardOutput: ...
     @property
-    def state_checkpoints(self, /) -> tuple[StateCheckpoint, ...]: ...
+    def state_checkpoints(self, /) -> tuple[int, ...]:
+        """IDs of snapshot reservations materialized by every STATE group."""
     def with_state_checkpoints(
-        self, records: Sequence[StateCheckpoint], /
+        self, records: Sequence[int], /
     ) -> ForwardOutput: ...
     @property
     def logprob_indptr(self, /) -> npt.NDArray[np.uint32] | None: ...

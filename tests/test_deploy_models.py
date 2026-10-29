@@ -176,7 +176,6 @@ def test_glm_serving_checkpoints_allow_real_engine_prefix_reuse(
         RunnerConfig,
         SamplingParams,
         SchedulerConfig,
-        StateCheckpoint,
     )
     from resin.models.glm5_3_flash.config import Glm53Config
     from resin_models_cuda.glm5_3_flash.cache import CacheGeometry
@@ -213,17 +212,11 @@ def test_glm_serving_checkpoints_allow_real_engine_prefix_reuse(
             for group in plan.cache_groups:
                 if group.state is None:
                     continue
-                for slot in group.state.checkpoint_slots:
-                    start, end = plan.token_range(slot.row)
-                    if (
-                        int(plan.context_lengths[slot.row]) + end - start
-                        == slot.prefix_length
-                    ):
-                        receipts[slot.reservation_id] = StateCheckpoint(
-                            reservation_id=slot.reservation_id,
-                            prefix_length=slot.prefix_length,
-                        )
-            return output.with_state_checkpoints(tuple(receipts.values()))
+                for reservation_id, row, prefix, _, _ in group.state.checkpoint_slots:
+                    start, end = plan.token_range(row)
+                    if int(plan.context_lengths[row]) + end - start == prefix:
+                        receipts[reservation_id] = None
+            return output.with_state_checkpoints(tuple(receipts))
 
     runner = Runner()
     with Engine(
