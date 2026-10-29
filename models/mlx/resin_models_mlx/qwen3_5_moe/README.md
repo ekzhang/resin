@@ -96,6 +96,7 @@ about 3.5 GiB above the resident model from 32K to 98K tokens.
 - batched decode identical to each request alone, and unchanged when requests
   join and leave a running batch, are cancelled, or are retracted and replayed;
 - the paged kernel against gathered attention, including NaN-poisoned padding;
+- prompt logprobs of a multi-row prefill against the one-pass forward;
 - sampler filtering against `TorchSampler`, and row-stable seeded draws.
 
 ## Results on an M4 Max (128 GB)

@@ -207,15 +207,19 @@ class Qwen3_5MoeMlxRunner:
             )
             logits.append(last)
             receipts += written
-            if plan.needs_prompt_logprobs:
-                prompt_rows.append(
-                    prompt_scores(
+            if (
+                plan.needs_prompt_logprobs
+                and (
+                    scores := prompt_scores(
                         plan,
                         _to_torch(output.hidden[0]),
                         self._project,
                         token_start=selected.start,
                     )
                 )
+                is not None
+            ):
+                prompt_rows.append(scores)
         return self._output(
             plan,
             mx.concatenate(logits),

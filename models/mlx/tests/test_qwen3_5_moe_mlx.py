@@ -364,6 +364,26 @@ def test_prefix_cache_hit_matches_fresh_run() -> None:
     _assert_greedy(model, shared + suffix, fresh, 5)
 
 
+def test_prompt_logprobs_match_one_pass_forward() -> None:
+    model = _model()
+    prompts = [_prompt(37, seed=8), _prompt(21, seed=9)]
+    params = SamplingParams(max_output_tokens=1, prompt_logprobs=True, temperature=0)
+
+    with Engine(_runner(model), context_length=4096) as engine:
+        requests = [engine.submit(p, sampling_params=params) for p in prompts]
+        while engine.has_work():
+            engine.step()
+    for prompt, request in zip(prompts, requests):
+        scores = request.prompt_logprobs
+        assert scores is not None and scores[0] is None
+        logits = _full_logits(model, prompt)[:-1]
+        expected = (logits - mx.logsumexp(logits, axis=-1, keepdims=True))[
+            mx.arange(len(prompt) - 1), mx.array(prompt[1:])
+        ]
+        actual = [item.logprob for item in scores[1:] if item is not None]
+        assert actual == pytest.approx(expected.tolist(), abs=0.05)
+
+
 def test_decode_crosses_kv_page_boundary() -> None:
     model = _model(all_experts=True)
     prompt = _prompt(PAGE_TOKENS - 2, seed=7)
