@@ -273,7 +273,7 @@ def _run_qualification(
 
     spec = get_model(model)
     os.environ.update(image_environment(spec))
-    MODEL_VOLUMES[spec.model_mount].reload()
+    MODEL_VOLUMES[str(spec.mount)].reload()
     kernel_volume = KERNEL_VOLUMES.get(spec.kernel_mount)
     if kernel_volume is not None:
         kernel_volume.reload()
