@@ -186,7 +186,7 @@ class BatchPlan:
 @final
 class CacheGroupFamily:
     """
-    Whether a group stores token history or recurrent checkpoints.
+    Whether a group stores token history or private live recurrent state.
     """
 
     HISTORY: Final[CacheGroupFamily]
@@ -255,23 +255,6 @@ class CacheGroupLayout:
         """
 
 @final
-class CacheStatePlan:
-    """Optional transfers for the private live slots in the group's block table."""
-    def __new__(
-        cls,
-        /,
-        *,
-        restore_copies: Sequence[tuple[int, int, int]] = (),
-        checkpoint_slots: Sequence[tuple[int, int, int, int, int]] = (),
-    ) -> CacheStatePlan: ...
-    @property
-    def restore_copies(self, /) -> tuple[tuple[int, int, int], ...]:
-        """(row, source slab, source slot); a zero source initializes the live slot."""
-    @property
-    def checkpoint_slots(self, /) -> tuple[tuple[int, int, int, int, int], ...]:
-        """(reservation ID, row, prefix length, destination slab, destination slot)."""
-
-@final
 class CacheGroupPlan:
     """
     Plan for one type of cache in a BatchPlan.
@@ -308,8 +291,6 @@ class CacheGroupPlan:
         blocks_per_slab: int = 1,
         state: CacheStatePlan | None = None,
     ) -> CacheGroupPlan: ...
-    @property
-    def state(self, /) -> CacheStatePlan | None: ...
     def __repr__(self, /) -> str: ...
     @property
     def append_block_offsets(self, /) -> npt.NDArray[np.uint32]:
@@ -368,6 +349,8 @@ class CacheGroupPlan:
         Zero-based index of this plan's matching CacheGroupLayout. BatchPlan
         orders group plans by this index and rejects gaps or reordering.
         """
+    @property
+    def state(self, /) -> CacheStatePlan | None: ...
 
 @final
 class CacheLayout:
@@ -389,6 +372,11 @@ class CacheLayout:
         decode_write_extra_tokens: int = 0,
     ) -> CacheLayout: ...
     def __repr__(self, /) -> str: ...
+    @property
+    def decode_write_extra_tokens(self, /) -> int:
+        """
+        Additional persistent writes from the resolved decode operation.
+        """
     def estimated_parent_count(
         self, /, context_lengths: Sequence[int], *, shared_prefix_tokens: int = 0
     ) -> int:
@@ -401,14 +389,6 @@ class CacheLayout:
     def group_count(self, /) -> int:
         """
         Number of logical cache groups.
-        """
-    @property
-    def decode_write_extra_tokens(self, /) -> int:
-        """
-        Persistent decode writes beyond the maximum accepted output count.
-        Qwen3.5 and GLM-5.3-Flash repair their assistant caches after target
-        verification, preparing one extra assistant position for the next draft.
-        This extra storage does not increase the accepted output limit.
         """
     def group_kernel_page_capacity(self, /, group_index: int) -> int: ...
     def group_kernel_page_count(self, /, group_index: int) -> int: ...
@@ -445,6 +425,24 @@ class CacheRetention:
     def __int__(self, /) -> int: ...
     def __ne__(self, value: object, /) -> bool: ...
     def __repr__(self, /) -> str: ...
+
+@final
+class CacheStatePlan:
+    """
+    Optional restore sources and snapshot destinations for one STATE group.
+    Its one-slot CSR owns the live destination for each row.
+    """
+    def __new__(
+        cls,
+        /,
+        *,
+        restore_copies: Sequence[tuple[int, int, int]] = ...,
+        checkpoint_slots: Sequence[tuple[int, int, int, int, int]] = ...,
+    ) -> CacheStatePlan: ...
+    @property
+    def checkpoint_slots(self, /) -> tuple: ...
+    @property
+    def restore_copies(self, /) -> tuple: ...
 
 @final
 class DeepSeekV41Image:
@@ -644,13 +642,7 @@ class ForwardOutput:
         prompt_target_indptr: "npt.NDArray[np.uint32] | None" = None,
         prompt_target_token_ids: "npt.NDArray[np.uint32] | None" = None,
         prompt_target_logprobs: "npt.NDArray[np.float32] | None" = None,
-        state_checkpoints: Sequence[int] = (),
-    ) -> ForwardOutput: ...
-    @property
-    def state_checkpoints(self, /) -> tuple[int, ...]:
-        """IDs of snapshot reservations materialized by every STATE group."""
-    def with_state_checkpoints(
-        self, records: Sequence[int], /
+        state_checkpoints: Sequence[int] = ...,
     ) -> ForwardOutput: ...
     @property
     def logprob_indptr(self, /) -> npt.NDArray[np.uint32] | None: ...
@@ -673,6 +665,8 @@ class ForwardOutput:
     @property
     def prompt_top_token_ids(self, /) -> npt.NDArray[np.uint32] | None: ...
     @property
+    def state_checkpoints(self, /) -> tuple: ...
+    @property
     def token_ids(self, /) -> npt.NDArray[np.uint32]: ...
     @property
     def token_indptr(self, /) -> npt.NDArray[np.uint32]: ...
@@ -682,6 +676,7 @@ class ForwardOutput:
     def top_logprobs(self, /) -> npt.NDArray[np.float32] | None: ...
     @property
     def top_token_ids(self, /) -> npt.NDArray[np.uint32] | None: ...
+    def with_state_checkpoints(self, /, records: Sequence[int]) -> ForwardOutput: ...
 
 @final
 class Gemma4Media:
@@ -1169,9 +1164,9 @@ class RunnerConfig:
     @property
     def cache_layout(self, /) -> CacheLayout | None: ...
     @property
-    def max_accepted_per_step(self, /) -> int: ...
-    @property
     def continuation_prefill(self, /) -> bool: ...
+    @property
+    def max_accepted_per_step(self, /) -> int: ...
     @property
     def max_batch_tokens(self, /) -> int | None: ...
     @property
