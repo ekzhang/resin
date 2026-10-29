@@ -25,9 +25,9 @@
     #empty-state { margin:auto; display:grid; justify-items:center; gap:5px; color:var(--muted); font-size:13px; opacity:.72; user-select:none }
     #empty-state svg { width:140px; height:auto; transform:translateX(-5px); overflow:visible }
     #empty-state svg path { fill:currentColor }
-    .turn { min-width:0; border:1px solid var(--line); border-radius:15px; padding:14px 17px; overflow-wrap:anywhere }
-    .user { align-self:flex-end; width:min(88%,760px); background:var(--soft); white-space:pre-wrap }
-    .assistant { width:100%; padding:17px 19px }
+    .turn { min-width:0; border-radius:15px; padding:14px 17px; overflow-wrap:anywhere }
+    .user { align-self:flex-end; width:fit-content; max-width:min(65%,760px); background:var(--soft); white-space:pre-wrap }
+    .assistant { width:100%; padding:17px 0 }
     .markdown { min-width:0; max-width:100% }
     .markdown > :first-child { margin-top:0 } .markdown > :last-child { margin-bottom:0 }
     .markdown p { margin:.7em 0 } .markdown h1,.markdown h2,.markdown h3 { line-height:1.25; margin:1.15em 0 .45em }
@@ -43,7 +43,11 @@
     code { font:13px/1.5 ui-monospace,SFMono-Regular,Menlo,monospace; background:var(--soft); border-radius:5px; padding:.15em .35em }
     pre { max-width:100%; overflow:auto; margin:.9em 0; padding:13px 15px; border:1px solid var(--line); border-radius:10px; background:var(--soft) }
     pre code { background:none; padding:0 } a { color:var(--accent) }
-    details { min-width:0; color:var(--muted); margin:0 3px -5px } details summary { cursor:pointer; user-select:none; font-weight:600 }
+    details { min-width:0; color:var(--muted); margin:0 3px -5px }
+    details summary { display:flex; align-items:center; gap:8px; cursor:pointer; user-select:none; font-weight:400; list-style:none }
+    details summary::-webkit-details-marker { display:none }
+    details summary::before { content:""; flex:0 0 6px; width:6px; height:6px; border-right:1px solid currentColor; border-bottom:1px solid currentColor; transform:rotate(-45deg); transition:transform .15s }
+    details[open] > summary::before { transform:translateY(-2px) rotate(45deg) }
     details.pending summary { animation:pulse 1.4s ease-in-out infinite }
     details .markdown { padding:7px 3px 2px }
     .assistant:empty { display:none }
@@ -64,11 +68,16 @@
     form { display:flex; align-items:flex-end; gap:8px; padding:7px 7px 7px 13px; border:1px solid var(--line); border-radius:17px; background:Canvas }
     textarea { flex:1; min-height:38px; min-width:0; max-height:160px; resize:none; border:0; outline:0; padding:8px 2px; background:transparent; color:inherit; font:inherit; line-height:22px }
     button { flex:0 0 38px; width:38px; height:38px; border:0; border-radius:11px; background:var(--accent); color:white; font:700 20px/1 system-ui; cursor:pointer }
-    #attach,#settings-toggle { background:var(--soft); color:CanvasText; font-size:20px; font-weight:400 }
+    form > button { display:grid; place-items:center; padding:0; transition:background-color .15s }
+    form > button svg { display:block; width:20px; height:20px }
+    #attach svg,#settings-toggle svg { width:18px; height:18px }
+    #attach,#settings-toggle { background:var(--soft); color:CanvasText }
     #settings-toggle[aria-expanded="true"] { color:var(--accent) }
-    button:hover { filter:brightness(1.08) } button:disabled { opacity:.45; cursor:wait }
+    form > button:hover:not(:disabled) { background:color-mix(in srgb,var(--accent) 88%,CanvasText) }
+    #attach:hover:not(:disabled),#settings-toggle:hover:not(:disabled) { background:#8883 }
+    .attachment button:hover { filter:brightness(1.08) } button:disabled { opacity:.45; cursor:wait }
     @keyframes pulse { 50% { opacity:.5 } }
-    @media (max-width:600px) { body { padding:16px 12px 10px } header { margin-top:-16px; padding:16px 0 8px } footer { margin-bottom:-10px; padding-bottom:10px } .user { width:94% } .assistant { padding:14px } #settings { grid-template-columns:repeat(2,minmax(0,1fr)) } textarea,#settings input,#settings select { font-size:16px } }
+    @media (max-width:600px) { body { padding:16px 12px 10px } header { margin-top:-16px; padding:16px 0 8px } footer { margin-bottom:-10px; padding-bottom:10px } .user { max-width:85% } .assistant { padding:14px 0 } #settings { grid-template-columns:repeat(2,minmax(0,1fr)) } textarea,#settings input,#settings select { font-size:16px } }
   </style>
 </head>
 <body>
@@ -83,9 +92,10 @@
     <section id="settings" aria-label="Generation settings" hidden>
       <label>Reasoning
         <select id="reasoning-effort">
-          <option value="">Off</option>
+          <option value="" selected>Model default</option>
+          <option value="off" title="Explicitly disable thinking when supported by the model">Off</option>
           <option value="minimal">Minimal</option>
-          <option value="low" selected>Low</option>
+          <option value="low">Low</option>
           <option value="medium">Medium</option>
           <option value="high">High</option>
           <option value="xhigh">Max</option>
@@ -98,15 +108,57 @@
         <input id="top-p" type="number" min="0.01" max="1" step="0.01" value="1">
       </label>
       <label>Max output
-        <input id="max-output-tokens" type="number" min="1" max="32768" step="1" value="16384">
+        <input id="max-output-tokens" type="number" min="0" max="32768" step="1" value="0" title="0 uses the remaining context window">
       </label>
     </section>
     <form id="form">
       <input id="image-input" type="file" accept="image/avif,image/bmp,image/gif,image/jpeg,image/png,image/tiff,image/webp" multiple hidden>
-      <button id="attach" type="button" title="Add images" aria-label="Add images">＋</button>
+      <!--
+        Lucide icons (ISC): Copyright (c) 2026 Lucide Icons and Contributors.
+        Permission to use, copy, modify, and/or distribute this software for any
+        purpose with or without fee is hereby granted, provided that the above
+        copyright notice and this permission notice appear in all copies.
+        THE SOFTWARE IS PROVIDED "AS IS" AND THE AUTHOR DISCLAIMS ALL WARRANTIES
+        WITH REGARD TO THIS SOFTWARE INCLUDING ALL IMPLIED WARRANTIES OF
+        MERCHANTABILITY AND FITNESS. IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR
+        ANY SPECIAL, DIRECT, INDIRECT, OR CONSEQUENTIAL DAMAGES OR ANY DAMAGES
+        WHATSOEVER RESULTING FROM LOSS OF USE, DATA OR PROFITS, WHETHER IN AN
+        ACTION OF CONTRACT, NEGLIGENCE OR OTHER TORTIOUS ACTION, ARISING OUT OF
+        OR IN CONNECTION WITH THE USE OR PERFORMANCE OF THIS SOFTWARE.
+
+        Arrow-up derives from Feather (MIT): Copyright (c) 2013-present Cole Bemis.
+        Permission is hereby granted, free of charge, to any person obtaining a copy
+        of this software and associated documentation files (the "Software"), to deal
+        in the Software without restriction, including without limitation the rights
+        to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+        copies of the Software, and to permit persons to whom the Software is
+        furnished to do so, subject to the following conditions:
+        The above copyright notice and this permission notice shall be included in all
+        copies or substantial portions of the Software.
+        THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+        IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+        FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+        AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+        LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+        OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+        SOFTWARE.
+      -->
+      <button id="attach" type="button" title="Add images" aria-label="Add images">
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+          <path d="m16 6-8.414 8.586a2 2 0 0 0 2.829 2.829l8.414-8.586a4 4 0 1 0-5.657-5.657l-8.379 8.551a6 6 0 1 0 8.485 8.485l8.379-8.551"/>
+        </svg>
+      </button>
       <textarea id="prompt" rows="1" autofocus placeholder="Message the model…"></textarea>
-      <button id="settings-toggle" type="button" title="Generation settings" aria-label="Generation settings" aria-controls="settings" aria-expanded="false">⚙</button>
-      <button id="send" type="submit" title="Send" aria-label="Send">↑</button>
+      <button id="settings-toggle" type="button" title="Generation settings" aria-label="Generation settings" aria-controls="settings" aria-expanded="false">
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+          <path d="M10 5H3M12 19H3M14 3v4M16 17v4M21 12h-9M21 19h-5M21 5h-7M8 10v4M8 12H3"/>
+        </svg>
+      </button>
+      <button id="send" type="submit" title="Send" aria-label="Send">
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+          <path d="m5 12 7-7 7 7M12 19V5"/>
+        </svg>
+      </button>
     </form>
   </footer>
 <script>
@@ -191,9 +243,11 @@ form.addEventListener('submit',async e=>{
   updatePending();const statusTimer=setInterval(updatePending,250);
   let answer='',reason='',generationStartedAt=null,finishReason=null;
   try {
-    const request={model:modelEl.textContent,messages:history,temperature:Number(temperature.value),top_p:Number(topP.value),max_completion_tokens:Number(maxOutputTokens.value),stream:true,stream_options:{include_usage:true}};
+    const request={model:modelEl.textContent,messages:history,temperature:Number(temperature.value),top_p:Number(topP.value),stream:true,stream_options:{include_usage:true}};
+    const maxOutput=Number(maxOutputTokens.value);if(maxOutput>0)request.max_completion_tokens=maxOutput;
     request.routed_dp_rank=conversationRank;
-    if(reasoningEffort.value)request.reasoning_effort=reasoningEffort.value;
+    if(reasoningEffort.value==='off')request.enable_thinking=false;
+    else if(reasoningEffort.value)request.reasoning_effort=reasoningEffort.value;
     const response=await fetch('/v1/chat/completions',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify(request)});
     if(!response.ok)throw new Error((await response.json()).error?.message||response.statusText);
     const reader=response.body.getReader(),decoder=new TextDecoder();let buffer='',completed=false;
