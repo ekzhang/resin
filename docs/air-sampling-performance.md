@@ -57,8 +57,8 @@ unmeasured here.
 
 ## Kernel checks and tradeoffs
 
-The clean candidate passes **173 tests with zero skips or failures on each of
-A100, H100 and B200**. The suite covers filtering and ties, request-local random
+The clean candidate passes the **173-test CUDA qualification suite with zero
+skips or failures on each of A100, H100 and B200**. The suite covers filtering and ties, request-local random
 streams, mixed policies, graph replay with changed inputs, completion/overlap,
 raw logprobs and the exact-cutoff certificate. The first pass uses private
 histograms for large shapes; later radix passes keep the upstream algorithm.
@@ -88,7 +88,7 @@ gets faster.
 A broader baseline → clean AIR → baseline sweep covers **576 cases per GPU**:
 batch 1/8/32/128, width 1/4, vocabulary 32,768/201,088/262,144, BF16/FP32,
 normal/peaked logits and six policies. All **60,840 last-replay token IDs** per
-leg match exactly on each GPU, and all 173 CUDA tests pass in every leg. Each
+leg match exactly on each GPU, and all 173 qualification tests pass in every leg. Each
 case uses a 200 ms warmup followed by five trials of 16 graph invocations.
 [All 1,728 comparisons](assets/air-sampling-micro.csv) retain both controls,
 candidate latency, clock samples, control drift and token-match results.
@@ -107,10 +107,12 @@ median complete-sampler latency reduction over 40 cases per policy is:
 
 Positive values mean lower latency against the mean of the two control medians.
 The unweighted median across all 576 cases is slightly slower: 0.08% on A100,
-0.47% on H100 and 0.13% on B200. The largest stable regression is **20.464 µs
+0.47% on H100 and 0.13% on B200. The largest stable relative regression is **20.464 µs
 (5.89%)** on B200 with 512 rows, vocabulary 262,144, FP32 peaked logits and
-greedy sampling (347.354 → 367.818 µs). This is the cost of launching the larger
-first-pass grid even when the rows have no active top-p work.
+greedy sampling (347.354 → 367.818 µs). The largest absolute slowdown is
+**32.544 µs (1.32%)** on A100 with the same shape, FP32 normal logits and top-k
+40. The changed private first-pass launch still runs when rows have no active
+top-p work, and this overhead remains.
 
 All cases remain in the CSV, including one small-shape A100 case with different
 sampled clocks (1,140 MHz controls versus 1,410 MHz candidate) and an H100
