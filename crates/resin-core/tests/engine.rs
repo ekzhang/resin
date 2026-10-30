@@ -129,7 +129,9 @@ fn admission_credits_restored_physical_prefix_pages_only() {
         engine.enable_metrics().unwrap();
         let mut model = Model::default();
         let prefix: Vec<u32> = (0..8).collect();
-        let seed = engine.submit(input(prefix.clone(), 1)).unwrap();
+        let mut submission = input(prefix.clone(), 1);
+        submission.cache_salt = Some("a".into());
+        let seed = engine.submit(submission).unwrap();
         while engine.has_work() {
             engine.step(&mut model).unwrap();
         }
@@ -137,11 +139,10 @@ fn admission_credits_restored_physical_prefix_pages_only() {
         let requests: Vec<_> = (0..4)
             .map(|index| {
                 let mut prompt = prefix.clone();
-                if !cache_hit {
-                    prompt[0] = 90;
-                }
                 prompt.extend([100 + index, 200]);
-                engine.submit(input(prompt, 1)).unwrap()
+                let mut submission = input(prompt, 1);
+                submission.cache_salt = Some(if cache_hit { "a" } else { "b" }.into());
+                engine.submit(submission).unwrap()
             })
             .collect();
         let events = engine.step(&mut model).unwrap();
@@ -218,6 +219,7 @@ fn check_stopped_speculative_prefix(stop_token: bool) {
                 ..Default::default()
             };
             let mut submission = input(vec![10, 11, 12], if stop_token { 8 } else { 2 });
+            submission.cache_salt = Some("a".into());
             if stop_token {
                 submission.stop_token_ids = vec![14];
             }
@@ -257,7 +259,9 @@ fn check_stopped_speculative_prefix(stop_token: bool) {
             // physical block committed state at 6. A token-addressed cache can
             // reuse its first four entries; a final-only recurrent checkpoint
             // cannot supply state at that intermediate boundary.
-            let resumed = engine.submit(input(vec![10, 11, 12, 13, 99], 1)).unwrap();
+            let mut continuation = input(vec![10, 11, 12, 13, 99], 1);
+            continuation.cache_salt = Some("a".into());
+            let resumed = engine.submit(continuation).unwrap();
             let expected = if family == KvGroupFamily::State && truncated {
                 2 // The earlier authentic prefill checkpoint remains usable.
             } else {
@@ -274,6 +278,9 @@ fn check_stopped_speculative_prefix(stop_token: bool) {
                 engine.step(&mut model).unwrap();
             }
             resumed.take_result().unwrap();
+            let mut cold = input(vec![10, 11, 12, 13, 99], 1);
+            cold.cache_salt = Some("b".into());
+            assert_eq!(engine.submit(cold).unwrap().cached_tokens(), 0);
             engine.close(&mut model).unwrap();
         }
     }

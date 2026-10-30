@@ -1649,7 +1649,8 @@ impl Engine {
         batch_key = None,
         sampling_params = None,
         media: "MediaInput | None" = None,
-        prompt_target_logprobs = None
+        prompt_target_logprobs = None,
+        cache_salt = None
     ))]
     #[allow(clippy::too_many_arguments)]
     fn submit(
@@ -1661,6 +1662,7 @@ impl Engine {
         sampling_params: Option<Py<SamplingParams>>,
         media: Option<Py<PyAny>>,
         prompt_target_logprobs: Option<Vec<Vec<u32>>>,
+        cache_salt: Option<String>,
     ) -> PyResult<Py<RequestLease>> {
         self.core.raise_if_open().map_err(core_error)?;
         let token_ids = match token_ids {
@@ -1717,6 +1719,7 @@ impl Engine {
             batch_key,
             stop_token_ids: sampling_params.stop_token_ids.to_vec(),
             cache_key: cache_prompt,
+            cache_salt,
             cacheable: true,
             atomic_prefill_spans,
             payload: RequestPayload {

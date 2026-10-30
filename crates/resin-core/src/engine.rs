@@ -10,7 +10,7 @@ use crate::resources::RequestResourceRef;
 use crate::resources::kv::{KvGroupPlan, KvLayout};
 use crate::resources::paged::{CachePoolError, RequestPages, WriterAccessLease};
 use crate::resources::paged_kv::{
-    CacheMetrics, PagedKvBatchView, PagedKvError, PagedKvResources, PrefixStorage,
+    CacheMetrics, PagedKvBatchView, PagedKvError, PagedKvResources, PrefixKey, PrefixStorage,
     PrefixStoragePolicy,
 };
 use crate::{
@@ -296,6 +296,7 @@ pub struct Submission<P> {
     pub batch_key: Option<u64>,
     pub stop_token_ids: Vec<u32>,
     pub cache_key: Option<Vec<u32>>,
+    pub cache_salt: Option<String>,
     pub cacheable: bool,
     pub atomic_prefill_spans: Vec<(u32, u32)>,
     pub payload: P,
@@ -313,6 +314,7 @@ impl<P> Submission<P> {
             batch_key: None,
             stop_token_ids: Vec::new(),
             cache_key: None,
+            cache_salt: None,
             cacheable: true,
             atomic_prefill_spans: Vec::new(),
         }
@@ -380,6 +382,7 @@ struct Request<P> {
     running: bool,
     prompt: Vec<u32>,
     cache_prompt: Option<Vec<u32>>,
+    cache_namespace: Vec<u32>,
     atomic_prefill_spans: Vec<(u32, u32)>,
     resident_tokens: u32,
     generated: Vec<u32>,
@@ -835,6 +838,7 @@ impl<P: Clone> EngineCore<P> {
             batch_key,
             mut stop_token_ids,
             cache_key: cache_prompt,
+            cache_salt,
             cacheable,
             atomic_prefill_spans,
             payload,
@@ -949,14 +953,16 @@ impl<P: Clone> EngineCore<P> {
         // KV entries do not retain predecessor distributions. Scoring must run
         // the prompt once, even when an ordinary request could reuse its KV.
         let cache_identity = cache_identity.filter(|_| !prompt_logprobs);
-        let resident_tokens = match (&mut self.kv_resources, &mut pages, cache_identity) {
+        let cache_namespace = PrefixKey::namespace(cache_salt.as_deref());
+        let cache_identity = cache_identity.map(|tokens| PrefixKey::new(tokens, &cache_namespace));
+        let resident_tokens = match (&mut self.kv_resources, &mut pages, cache_identity.as_ref()) {
             (Some(resources), Some(pages), Some(identity)) => resources
                 .restore_prefix(pages, identity)
                 .map_err(Error::from)?,
             _ => 0,
         };
         let storage_pending = resident_tokens == 0
-            && cache_identity.is_some_and(|identity| {
+            && cache_identity.as_ref().is_some_and(|identity| {
                 self.kv_resources
                     .as_mut()
                     .is_some_and(|r| r.start_storage(request_id, identity))
@@ -986,6 +992,7 @@ impl<P: Clone> EngineCore<P> {
             running: false,
             prompt: token_ids,
             cache_prompt,
+            cache_namespace,
             atomic_prefill_spans,
             resident_tokens,
             generated: Vec::new(),
@@ -2026,13 +2033,14 @@ impl<P: Clone> EngineCore<P> {
                     .cache
                     .as_mut()
                     .expect("prefix-enabled requests own managed pages");
+                let key = PrefixKey::new(&tokens[..length as usize], &row.request.cache_namespace);
                 if has_recurrent_state {
                     resources
-                        .publish_state_prefix(pages, reservation_id, &tokens[..length as usize])
+                        .publish_state_prefix(pages, reservation_id, &key)
                         .map_err(Error::from)?;
                 } else {
                     resources
-                        .publish_prefix(pages, &tokens[..length as usize], length)
+                        .publish_prefix(pages, &key, length)
                         .map_err(Error::from)?;
                 }
             }
@@ -2586,6 +2594,7 @@ mod tests {
             running: false,
             prompt: prompt.to_vec(),
             cache_prompt: None,
+            cache_namespace: Vec::new(),
             atomic_prefill_spans: Vec::new(),
             resident_tokens: if generated.is_empty() {
                 0

@@ -24,6 +24,8 @@ pub struct ConversationRequest {
     pub routed_dp_rank: Option<usize>,
     pub stop: Vec<String>,
     pub reasoning_effort: Option<String>,
+    #[serde(default)]
+    pub cache_salt: Option<String>,
     pub extra: BTreeMap<String, Value>,
 }
 

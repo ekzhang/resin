@@ -1,5 +1,68 @@
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::sync::Arc;
+
+/// A logical token prefix and its opaque cache namespace.
+#[derive(Clone, Debug)]
+pub struct PrefixKey<'a> {
+    tokens: Cow<'a, [u32]>,
+    namespace: Cow<'a, [u32]>,
+}
+
+impl<'a> PrefixKey<'a> {
+    pub fn new(tokens: &'a [u32], namespace: &'a [u32]) -> Self {
+        Self {
+            tokens: tokens.into(),
+            namespace: namespace.into(),
+        }
+    }
+
+    pub(crate) fn namespace(salt: Option<&str>) -> Vec<u32> {
+        salt.map(|salt| salt.bytes().map(u32::from).chain([u32::MAX]).collect())
+            .unwrap_or_default()
+    }
+
+    pub fn parts(&self) -> (&[u32], &[u32]) {
+        (&self.namespace, &self.tokens)
+    }
+
+    pub fn len(&self) -> usize {
+        self.tokens.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.tokens.is_empty()
+    }
+
+    pub fn prefix(&self, length: usize) -> PrefixKey<'_> {
+        PrefixKey::new(&self.tokens[..length], &self.namespace)
+    }
+
+    pub fn into_owned(self) -> PrefixKey<'static> {
+        PrefixKey {
+            tokens: self.tokens.into_owned().into(),
+            namespace: self.namespace.into_owned().into(),
+        }
+    }
+
+    pub fn truncate(&mut self, length: usize) {
+        self.tokens.to_mut().truncate(length);
+    }
+
+    fn blocks(&self, alignment: usize) -> impl Iterator<Item = Cow<'_, [u32]>> {
+        self.tokens
+            .chunks_exact(alignment)
+            .enumerate()
+            .map(|(index, block)| {
+                if index == 0 && !self.namespace.is_empty() {
+                    // Extra words distinguish every salted first block from ordinary blocks.
+                    Cow::Owned([self.namespace.as_ref(), block].concat())
+                } else {
+                    Cow::Borrowed(block)
+                }
+            })
+    }
+}
 
 #[derive(Debug)]
 struct Entry<T> {
@@ -63,18 +126,22 @@ impl<T> PrefixCache<T> {
         self.alignment
     }
 
-    pub(crate) fn find(&mut self, tokens: &[u32], max_prefix_tokens: usize) -> Option<(u32, &T)> {
+    pub(crate) fn find(
+        &mut self,
+        key: &PrefixKey<'_>,
+        max_prefix_tokens: usize,
+    ) -> Option<(u32, &T)> {
         let alignment = self.alignment as usize;
-        let usable = if tokens.len().is_multiple_of(alignment) {
-            tokens.len().saturating_sub(alignment)
+        let usable = if key.len().is_multiple_of(alignment) {
+            key.len().saturating_sub(alignment)
         } else {
-            tokens.len() / alignment * alignment
+            key.len() / alignment * alignment
         }
         .min(max_prefix_tokens / alignment * alignment);
         let mut node = 0usize;
         let mut matched = None;
-        for (block_index, block) in tokens[..usable].chunks_exact(alignment).enumerate() {
-            let Some(&child) = self.nodes[node].children.get(block) else {
+        for (block_index, block) in key.prefix(usable).blocks(alignment).enumerate() {
+            let Some(&child) = self.nodes[node].children.get(block.as_ref()) else {
                 break;
             };
             node = child;
@@ -96,14 +163,14 @@ impl<T> PrefixCache<T> {
         Some((length as u32, &entry.snapshot))
     }
 
-    pub(crate) fn insert(&mut self, tokens: &[u32], snapshot: T) -> Option<T> {
-        debug_assert!(!tokens.is_empty() && tokens.len().is_multiple_of(self.alignment as usize));
+    pub(crate) fn insert(&mut self, key: &PrefixKey<'_>, snapshot: T) -> Option<T> {
+        debug_assert!(!key.is_empty() && key.len().is_multiple_of(self.alignment as usize));
         let mut node = 0usize;
-        for block in tokens.chunks_exact(self.alignment as usize) {
-            node = match self.nodes[node].children.get(block).copied() {
+        for block in key.blocks(self.alignment as usize) {
+            node = match self.nodes[node].children.get(block.as_ref()).copied() {
                 Some(child) => child,
                 None => {
-                    let block: Arc<[u32]> = block.into();
+                    let block: Arc<[u32]> = block.as_ref().into();
                     let child = self.allocate_node(node, Arc::clone(&block));
                     self.nodes[node].children.insert(block, child);
                     child
@@ -233,16 +300,40 @@ impl<T> PrefixCache<T> {
 
 #[cfg(test)]
 mod tests {
-    use super::PrefixCache;
+    use super::{PrefixCache, PrefixKey};
+
+    fn key(tokens: &[u32]) -> PrefixKey<'_> {
+        PrefixKey::new(tokens, &[])
+    }
+
+    #[test]
+    fn namespace_frames_isolate_first_blocks_without_changing_lengths() {
+        let mut cache = PrefixCache::new(2);
+        for (value, salt) in [None, Some(""), Some("a"), Some("abc")]
+            .into_iter()
+            .enumerate()
+        {
+            let namespace = PrefixKey::namespace(salt);
+            let key = PrefixKey::new(&[1, 2, 3], &namespace);
+            assert_eq!(cache.find(&key.prefix(3), usize::MAX), None);
+            cache.insert(&key.prefix(2), value);
+            assert_eq!(cache.find(&key, usize::MAX), Some((2, &value)));
+        }
+        for value in 0..4 {
+            assert_eq!(cache.evict_lru(), Some(value));
+        }
+        assert!(cache.nodes[0].children.is_empty());
+        assert_eq!(cache.free_nodes.len(), cache.nodes.len() - 1);
+    }
 
     #[test]
     fn hits_and_replacements_update_lru_order() {
         let mut cache = PrefixCache::new(1);
-        cache.insert(&[1], "one");
-        cache.insert(&[2], "two");
-        cache.insert(&[3], "three");
-        assert_eq!(cache.find(&[1, 99], usize::MAX), Some((1, &"one")));
-        assert_eq!(cache.insert(&[2], "new two"), Some("two"));
+        cache.insert(&key(&[1]), "one");
+        cache.insert(&key(&[2]), "two");
+        cache.insert(&key(&[3]), "three");
+        assert_eq!(cache.find(&key(&[1, 99]), usize::MAX), Some((1, &"one")));
+        assert_eq!(cache.insert(&key(&[2]), "new two"), Some("two"));
         assert_eq!(cache.len(), 3);
         assert_eq!(cache.evict_lru(), Some("three"));
         assert_eq!(cache.evict_lru(), Some("one"));
@@ -257,29 +348,29 @@ mod tests {
         let mut cache = PrefixCache::new(4);
         let tokens = (0..16).collect::<Vec<_>>();
         for end in [4, 8, 12] {
-            cache.insert(&tokens[..end], end);
+            cache.insert(&key(&tokens[..end]), end);
         }
-        assert_eq!(cache.find(&tokens, 8), Some((8, &8)));
-        assert_eq!(cache.find(&tokens, 7), Some((4, &4)));
-        assert_eq!(cache.find(&tokens, 0), None);
+        assert_eq!(cache.find(&key(&tokens), 8), Some((8, &8)));
+        assert_eq!(cache.find(&key(&tokens), 7), Some((4, &4)));
+        assert_eq!(cache.find(&key(&tokens), 0), None);
     }
 
     #[test]
     fn evicting_ancestors_preserves_descendants_and_reuses_pruned_nodes() {
         let mut cache = PrefixCache::new(1);
-        cache.insert(&[1], 1);
-        cache.insert(&[1, 2], 2);
-        cache.insert(&[1, 2, 3], 3);
+        cache.insert(&key(&[1]), 1);
+        cache.insert(&key(&[1, 2]), 2);
+        cache.insert(&key(&[1, 2, 3]), 3);
         assert_eq!(cache.evict_lru(), Some(1));
-        assert_eq!(cache.find(&[1, 2, 99], usize::MAX), Some((2, &2)));
+        assert_eq!(cache.find(&key(&[1, 2, 99]), usize::MAX), Some((2, &2)));
         assert_eq!(cache.evict_lru(), Some(3));
         assert_eq!(cache.evict_lru(), Some(2));
         assert!(cache.nodes[0].children.is_empty());
         assert_eq!(cache.free_nodes.len(), 3);
 
-        cache.insert(&[4, 5], 4);
+        cache.insert(&key(&[4, 5]), 4);
         assert_eq!(cache.nodes.len(), 4);
-        assert_eq!(cache.find(&[4, 5, 99], usize::MAX), Some((2, &4)));
+        assert_eq!(cache.find(&key(&[4, 5, 99]), usize::MAX), Some((2, &4)));
         assert_eq!(cache.evict_lru(), Some(4));
         assert_eq!(cache.oldest, None);
         assert_eq!(cache.newest, None);
@@ -289,7 +380,7 @@ mod tests {
     fn wide_cache_eviction_removes_exact_parent_edges() {
         let mut cache = PrefixCache::new(2);
         for id in 0..1024 {
-            cache.insert(&[id, id + 1], id);
+            cache.insert(&key(&[id, id + 1]), id);
         }
         for id in 0..1024 {
             assert_eq!(cache.evict_lru(), Some(id));
