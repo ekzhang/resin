@@ -153,3 +153,30 @@ def test_native_http_server_rejects_zero_settings(setting):
             admissions_per_step=0 if setting == "admissions_per_step" else 32,
         )
     engine.close()
+
+
+@pytest.mark.parametrize("value", [None, 0, 1, "true"])
+def test_http_server_requires_boolean_priority_setting(value):
+    engine = Engine(IncrementingRunner())
+    with pytest.raises(ValueError, match="flags must be booleans"):
+        HttpServer(
+            engine, recipe=_Recipe(), model="test", enable_priority_scheduling=value
+        )
+    engine.close()
+
+
+@pytest.mark.parametrize("value", [None, False, True])
+def test_http_server_forwards_priority_opt_in(value, monkeypatch):
+    import resin.server as serving
+
+    created = []
+    monkeypatch.setattr(
+        serving, "_HttpServer", lambda *args, **kwargs: created.append(kwargs)
+    )
+    engine = Engine(IncrementingRunner())
+    options = {} if value is None else {"enable_priority_scheduling": value}
+    HttpServer(engine, recipe=_Recipe(), model="test", **options)
+    assert created[0]["enable_priority_scheduling"] is (
+        False if value is None else value
+    )
+    engine.close()

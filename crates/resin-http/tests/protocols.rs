@@ -1,11 +1,14 @@
+use resin_http::router_with_token_counter;
+use std::sync::Arc;
+
 use axum::{
     body::Body,
     http::{Request, StatusCode, header},
 };
 use http_body_util::BodyExt;
 use resin_http::{
-    FinishReason, GeneratedTokenLogprob, GenerationEvent, GenerationJob, RouteConfig, TokenLogprob,
-    router,
+    FinishReason, GeneratedTokenLogprob, GenerationEvent, GenerationJob, RouteConfig, TokenCounter,
+    TokenLogprob, router,
 };
 use serde_json::{Value, json};
 use tokio::sync::mpsc;
@@ -38,6 +41,100 @@ fn test_router() -> axum::Router {
         }
     });
     router("test-model", jobs, RouteConfig::default(), None)
+}
+
+#[tokio::test]
+async fn token_count_routes_normalize_prompts_without_generation_limits() {
+    let (jobs, mut receiver) = mpsc::channel::<GenerationJob>(2);
+    let counter: TokenCounter = Arc::new(|request, result| {
+        assert_eq!(request.messages[0]["content"], "Be concise");
+        assert_eq!(request.messages[1]["content"], "hi");
+        assert_eq!(request.tools[0]["name"], "weather");
+        let _ = result.send(Ok(17));
+    });
+    let app = router_with_token_counter(
+        "test-model",
+        jobs,
+        Some(counter),
+        RouteConfig::default(),
+        None,
+    );
+    for (path, body, expected) in [
+        (
+            "/v1/responses/input_tokens",
+            json!({"model": "test-model", "input": "hi", "instructions": "Be concise", "tools": [{"type": "function", "name": "weather", "parameters": {"type": "object"}}]}),
+            json!({"object": "response.input_tokens", "input_tokens": 17}),
+        ),
+        (
+            "/v1/messages/count_tokens",
+            json!({"model": "test-model", "messages": [{"role": "user", "content": "hi"}], "system": "Be concise", "tools": [{"name": "weather", "input_schema": {"type": "object"}}]}),
+            json!({"input_tokens": 17}),
+        ),
+    ] {
+        let request = Request::post(path)
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap();
+        let (status, value) = json_response(app.clone(), request).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(value, expected);
+    }
+    assert!(receiver.try_recv().is_err());
+}
+
+#[tokio::test]
+async fn token_count_routes_follow_protocol_flags_and_bypass_generation_queue() {
+    for (path, body) in [
+        (
+            "/v1/responses/input_tokens",
+            json!({"model": "test-model", "input": "hi"}),
+        ),
+        (
+            "/v1/messages/count_tokens",
+            json!({"model": "test-model", "messages": [{"role": "user", "content": "hi"}]}),
+        ),
+    ] {
+        let request = || {
+            Request::post(path)
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(body.to_string()))
+                .unwrap()
+        };
+        let (jobs, _receiver) = mpsc::channel::<GenerationJob>(1);
+        let permit = jobs.reserve().await.unwrap();
+        let counter: TokenCounter = Arc::new(|_, result| {
+            let _ = result.send(Ok(17));
+        });
+        let app = router_with_token_counter(
+            "test-model",
+            jobs.clone(),
+            Some(counter),
+            RouteConfig::default(),
+            None,
+        );
+        let (status, body) = json_response(app, request()).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["input_tokens"], 17);
+        drop(permit);
+        let app = router("test-model", jobs.clone(), RouteConfig::default(), None);
+        let (status, _) = json_response(app, request()).await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        let app = router(
+            "test-model",
+            jobs,
+            RouteConfig {
+                enable_openai: false,
+                enable_anthropic: false,
+                enable_demo: false,
+                ..RouteConfig::default()
+            },
+            None,
+        );
+        assert_eq!(
+            app.oneshot(request()).await.unwrap().status(),
+            StatusCode::NOT_FOUND
+        );
+    }
 }
 
 fn tool_router() -> axum::Router {
@@ -1078,4 +1175,118 @@ async fn programmatic_shutdown_closes_the_listener() {
         .unwrap()
         .unwrap();
     assert!(tokio::net::TcpStream::connect(address).await.is_err());
+}
+
+#[tokio::test]
+async fn supplied_priority_requires_server_opt_in_on_each_api() {
+    for path in ["/v1/chat/completions", "/v1/responses", "/v1/messages"] {
+        for priority in [json!(0), json!(5), json!(-5)] {
+            let mut body = json!({
+                "model": "test-model", "input": "hi", "max_tokens": 1,
+                "messages": [{"role": "user", "content": "hi"}],
+                "priority": priority,
+            });
+            // Responses accepts input; the other adapters accept messages.
+            body["stream"] = json!(true);
+            let request = Request::post(path)
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(body.to_string()))
+                .unwrap();
+            let (status, body) = json_response(test_router(), request).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{path}");
+            assert!(
+                body["error"]["message"]
+                    .as_str()
+                    .unwrap()
+                    .contains("enable_priority_scheduling=True")
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn priority_validates_i32_and_is_separate_from_recipe_extras() {
+    for path in ["/v1/chat/completions", "/v1/responses", "/v1/messages"] {
+        for (enabled, priority) in [
+            (false, None),
+            (false, Some(json!(null))),
+            (true, None),
+            (true, Some(json!(null))),
+            (true, Some(json!(i32::MIN))),
+            (true, Some(json!(0))),
+            (true, Some(json!(i32::MAX))),
+        ] {
+            let (jobs, mut receiver) = mpsc::channel(1);
+            let app = router(
+                "test-model",
+                jobs,
+                RouteConfig {
+                    enable_priority_scheduling: enabled,
+                    ..RouteConfig::default()
+                },
+                None,
+            );
+            let mut body = json!({
+                "model": "test-model", "input": "hi", "max_tokens": 1,
+                "messages": [{"role": "user", "content": "hi"}], "stream": true,
+            });
+            if let Some(priority) = &priority {
+                body["priority"] = priority.clone();
+            }
+            let response = app
+                .oneshot(
+                    Request::post(path)
+                        .header(header::CONTENT_TYPE, "application/json")
+                        .body(Body::from(body.to_string()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK, "{path}");
+            let request = receiver.try_recv().unwrap().request;
+            let expected = priority.and_then(|p| p.as_i64()).map(|p| p as i32);
+            assert_eq!(request.priority, expected);
+            assert!(!request.extra.contains_key("priority"));
+            let encoded = serde_json::to_value(request).unwrap();
+            assert_eq!(encoded.get("priority"), expected.map(|p| json!(p)).as_ref());
+        }
+        for priority in [
+            json!(true),
+            json!(1.5),
+            json!("1"),
+            json!(-2147483649i64),
+            json!(2147483648u64),
+            json!(u64::MAX),
+        ] {
+            let (jobs, mut receiver) = mpsc::channel(1);
+            let app = router(
+                "test-model",
+                jobs,
+                RouteConfig {
+                    enable_priority_scheduling: true,
+                    ..RouteConfig::default()
+                },
+                None,
+            );
+            let body = json!({
+                "model": "test-model", "input": "hi", "max_tokens": 1,
+                "messages": [{"role": "user", "content": "hi"}], "priority": priority,
+            });
+            let response = app
+                .oneshot(
+                    Request::post(path)
+                        .header(header::CONTENT_TYPE, "application/json")
+                        .body(Body::from(body.to_string()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                response.status(),
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "{path}"
+            );
+            assert!(receiver.try_recv().is_err());
+        }
+    }
 }

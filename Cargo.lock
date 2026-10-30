@@ -1601,6 +1601,7 @@ dependencies = [
  "numpy",
  "pyo3",
  "pythonize",
+ "rayon",
  "resin-core",
  "resin-http",
  "resin-recipe",

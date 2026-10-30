@@ -1496,6 +1496,7 @@ class _HttpServer:
         enable_openai: bool = True,
         enable_anthropic: bool = True,
         enable_demo: bool = True,
+        enable_priority_scheduling: bool = False,
         distributed: Any | None = None,
     ) -> _HttpServer: ...
     def __repr__(self, /) -> str: ...

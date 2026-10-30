@@ -177,6 +177,13 @@ def _serve_rank(rank, world_size, directory, port, case):
                 recipe=recipe,
                 model=model,
                 enable_openai=not (case == "flags" and groups.drivers.local_rank == 0),
+                enable_priority_scheduling=(
+                    case == "normal"
+                    or (
+                        case == "enable_priority_scheduling"
+                        and groups.drivers.local_rank == 1
+                    )
+                ),
                 request_queue_capacity=(
                     2
                     if case == "request_queue_capacity"
@@ -372,6 +379,7 @@ def _assert_distributed_metrics(base):
 @pytest.mark.parametrize(
     "case,world_size",
     [
+        ("counts", 2),
         ("normal", 4),
         ("metrics_failure", 4),
         ("fatal", 2),
@@ -382,6 +390,7 @@ def _assert_distributed_metrics(base):
         ("bind", 2),
         ("whitespace", 2),
         ("flags", 2),
+        ("enable_priority_scheduling", 2),
         ("infer", 2),
         ("frontend", 2),
         ("stream_interval", 2),
@@ -413,6 +422,7 @@ def test_distributed_http_routes_real_replica_engines(tmp_path, case, world_size
     base = f"http://127.0.0.1:{port}"
     try:
         if case in (
+            "counts",
             "normal",
             "fatal",
             "ingress_decode",
@@ -420,7 +430,24 @@ def test_distributed_http_routes_real_replica_engines(tmp_path, case, world_size
             "event_encode",
         ):
             _wait_ready(base, tmp_path)
-        if case == "fatal":
+        if case == "counts":
+            for path, body in [
+                ("/v1/responses/input_tokens", {"input": "hello"}),
+                (
+                    "/v1/messages/count_tokens",
+                    {"messages": [{"role": "user", "content": "hello"}]},
+                ),
+            ]:
+                request = urllib.request.Request(
+                    f"{base}{path}",
+                    data=json.dumps(
+                        {"model": "rank-test", "routed_dp_rank": 1, **body}
+                    ).encode(),
+                    headers={"Content-Type": "application/json"},
+                )
+                with urllib.request.urlopen(request, timeout=5) as response:
+                    assert json.load(response)["input_tokens"] == 3
+        elif case == "fatal":
             with pytest.raises(urllib.error.HTTPError) as failure:
                 _post(base, 1, content="explode")
             assert failure.value.code == 500
@@ -435,7 +462,7 @@ def test_distributed_http_routes_real_replica_engines(tmp_path, case, world_size
                         json.load(response)["choices"][0]["message"]["content"]
                         == str(rank) * 2
                     )
-            with _post(base, 1, logprobs=True, top_logprobs=2) as response:
+            with _post(base, 1, logprobs=True, top_logprobs=2, priority=-7) as response:
                 output = json.load(response)
             assert output["choices"][0]["message"]["content"] == "11"
             # Custom parsers cannot prove a token's semantic channel; raw
@@ -513,7 +540,10 @@ def test_distributed_http_routes_real_replica_engines(tmp_path, case, world_size
         for rank in range(world_size)
     ]
     assert all(record["closed"] for record in records)
-    if case == "normal":
+    if case == "counts":
+        assert all(record["error"] is None for record in records)
+        assert all(not record["calls"] for record in records)
+    elif case == "normal":
         assert all(record["error"] is None for record in records)
         assert all(record["calls"] for record in records)
         assert any(any(record["calls"]) for record in records)
@@ -544,6 +574,7 @@ def test_distributed_http_routes_real_replica_engines(tmp_path, case, world_size
     elif case in (
         "whitespace",
         "flags",
+        "enable_priority_scheduling",
         "infer",
         "frontend",
         "initialize",
@@ -562,6 +593,7 @@ def test_distributed_http_routes_real_replica_engines(tmp_path, case, world_size
         assert records[0]["error"] is not None
         assert all(record["engine_closed"] for record in records)
         if case in (
+            "enable_priority_scheduling",
             "stream_interval",
             "request_queue_capacity",
             "max_active_requests",

@@ -1,5 +1,6 @@
 use std::{
     net::{IpAddr, SocketAddr},
+    panic::{AssertUnwindSafe, catch_unwind},
     sync::{
         Arc, Mutex,
         atomic::{AtomicBool, Ordering},
@@ -13,11 +14,12 @@ use pyo3::{
     exceptions::{PyRuntimeError, PyValueError},
     prelude::*,
 };
-use resin_http::{GenerationJob, MetricsEndpoint, RouteConfig};
+use rayon::ThreadPool;
+use resin_http::{GenerationJob, MetricsEndpoint, RouteConfig, TokenCounter};
 use tokio::sync::{mpsc, oneshot, watch};
 
 use crate::Engine;
-use crate::http_session::{RenderedJob, Session, render_job};
+use crate::http_session::{RenderedJob, Session, count_tokens, render_job};
 
 #[derive(Clone, Copy)]
 pub(crate) struct AdmissionConfig {
@@ -61,6 +63,7 @@ impl NativeHttpServer {
         enable_openai = true,
         enable_anthropic = true,
         enable_demo = true,
+        enable_priority_scheduling = false,
         distributed = None
     ))]
     #[allow(clippy::too_many_arguments)]
@@ -76,6 +79,7 @@ impl NativeHttpServer {
         enable_openai: bool,
         enable_anthropic: bool,
         enable_demo: bool,
+        enable_priority_scheduling: bool,
         distributed: Option<Py<PyAny>>,
     ) -> PyResult<Self> {
         if stream_interval == 0 {
@@ -153,6 +157,7 @@ impl NativeHttpServer {
                 enable_openai,
                 enable_anthropic,
                 enable_demo,
+                enable_priority_scheduling,
                 routed_dp_size,
             },
             running: AtomicBool::new(false),
@@ -233,7 +238,7 @@ impl NativeHttpServer {
 
     fn __repr__(&self) -> String {
         format!(
-            "_HttpServer(model={:?}, stream_interval={}, request_queue_capacity={}, max_active_requests={}, render_workers={}, admissions_per_step={}, enable_openai={}, enable_anthropic={}, enable_demo={}, running={})",
+            "_HttpServer(model={:?}, stream_interval={}, request_queue_capacity={}, max_active_requests={}, render_workers={}, admissions_per_step={}, enable_openai={}, enable_anthropic={}, enable_demo={}, enable_priority_scheduling={}, running={})",
             self.model,
             self.stream_interval,
             self.request_queue_capacity,
@@ -243,6 +248,7 @@ impl NativeHttpServer {
             self.routes.enable_openai,
             self.routes.enable_anthropic,
             self.routes.enable_demo,
+            self.routes.enable_priority_scheduling,
             self.running.load(Ordering::Acquire),
         )
     }
@@ -268,6 +274,36 @@ fn run_server(
     let listener = runtime
         .block_on(tokio::net::TcpListener::bind(address))
         .map_err(|error| format!("failed to bind {address}: {error}"))?;
+    let renders = Arc::new(
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(admission.render_workers)
+            .thread_name(|worker| format!("resin-render-{worker}"))
+            .build()
+            .map_err(|error| format!("failed to create render pool: {error}"))?,
+    );
+    let counter: TokenCounter = {
+        let renders = renders.clone();
+        let recipe = Python::attach(|py| recipe.clone_ref(py));
+        let shutdown = shutdown.subscribe();
+        Arc::new(move |request, result| {
+            let recipe = Python::attach(|py| recipe.clone_ref(py));
+            let shutdown = shutdown.clone();
+            renders.spawn_fifo(move || {
+                if result.is_closed() {
+                    return;
+                }
+                let counted = catch_unwind(AssertUnwindSafe(|| {
+                    if *shutdown.borrow() {
+                        return Err("the HTTP server is shutting down".to_owned());
+                    }
+                    count_tokens(&recipe, &request)
+                        .map_err(|error| format!("token counting failed: {error}"))
+                }))
+                .unwrap_or_else(|_| Err("token counting panicked".to_owned()));
+                let _ = result.send(counted);
+            });
+        })
+    };
     let (jobs, receiver) = mpsc::channel(request_queue_capacity as usize);
     let metrics = Python::attach(|py| engine.bind(py).borrow().metrics_enabled())
         .then(|| MetricsEndpoint::new(&model));
@@ -291,6 +327,7 @@ fn run_server(
                 engine_actor(
                     engine,
                     recipe,
+                    renders,
                     receiver,
                     actor_shutdown,
                     stream_interval,
@@ -308,12 +345,9 @@ fn run_server(
         .map_err(|error| format!("failed to start the inference thread: {error}"))?;
     let mut stopping = shutdown.subscribe();
     let stop_actor = shutdown.clone();
-    let server_result = runtime.block_on(resin_http::serve_with_shutdown(
+    let server_result = runtime.block_on(resin_http::serve_router_with_shutdown(
         listener,
-        model,
-        jobs,
-        routes,
-        metrics,
+        resin_http::router_with_token_counter(model, jobs, Some(counter), routes, metrics),
         async move {
             if !*stopping.borrow() {
                 tokio::select! {
@@ -334,10 +368,33 @@ fn run_server(
         .and(actor_result)
 }
 
+fn schedule_render(
+    pool: &ThreadPool,
+    recipe: &Py<PyAny>,
+    job: GenerationJob,
+    completed: &std_mpsc::Sender<(GenerationJob, RenderedJob)>,
+    shutdown: &watch::Receiver<bool>,
+) {
+    let recipe = Python::attach(|py| recipe.clone_ref(py));
+    let completed = completed.clone();
+    let shutdown = shutdown.clone();
+    pool.spawn_fifo(move || {
+        let rendered = catch_unwind(AssertUnwindSafe(|| {
+            if *shutdown.borrow() || job.events.is_closed() {
+                return Err(PyRuntimeError::new_err("prompt rendering was cancelled"));
+            }
+            render_job(&recipe, &job)
+        }))
+        .unwrap_or_else(|_| Err(PyRuntimeError::new_err("prompt rendering panicked")));
+        let _ = completed.send((job, rendered));
+    });
+}
+
 #[allow(clippy::too_many_arguments)]
 fn engine_actor(
     engine: Py<Engine>,
     recipe: Py<PyAny>,
+    renders: Arc<ThreadPool>,
     mut jobs: mpsc::Receiver<GenerationJob>,
     shutdown: watch::Receiver<bool>,
     stream_interval: u32,
@@ -349,30 +406,7 @@ fn engine_actor(
         Python::attach(|py| Session::new(py, engine.clone_ref(py), recipe, stream_interval))
             .map_err(|error| format_python_error("HTTP session preparation failed", error))?;
     session.metrics = metrics.clone();
-    let (render_jobs, render_queue) = std_mpsc::channel::<GenerationJob>();
-    let render_queue = Arc::new(Mutex::new(render_queue));
-    let (rendered_jobs, rendered_queue) = std_mpsc::channel::<(GenerationJob, RenderedJob)>();
-    for worker in 0..admission.render_workers {
-        let queue = render_queue.clone();
-        let results = rendered_jobs.clone();
-        let recipe = Python::attach(|py| session.recipe().clone_ref(py));
-        thread::Builder::new()
-            .name(format!("resin-render-{worker}"))
-            .spawn(move || {
-                loop {
-                    let job = match queue.lock().unwrap_or_else(|p| p.into_inner()).recv() {
-                        Ok(job) => job,
-                        Err(_) => return,
-                    };
-                    let rendered = render_job(&recipe, &job);
-                    if results.send((job, rendered)).is_err() {
-                        return;
-                    }
-                }
-            })
-            .map_err(|error| format!("failed to start a render worker: {error}"))?;
-    }
-    drop(rendered_jobs);
+    let (completed, rendered_queue) = std_mpsc::channel();
     let mut rendering = 0usize;
     let mut next_metrics = Instant::now();
     let mut disconnected = false;
@@ -405,10 +439,7 @@ fn engine_actor(
             match jobs.try_recv() {
                 Ok(job) => {
                     rendering += 1;
-                    if let Err(std_mpsc::SendError(job)) = render_jobs.send(job) {
-                        rendering -= 1;
-                        session.admit(job);
-                    }
+                    schedule_render(&renders, session.recipe(), job, &completed, &shutdown);
                 }
                 Err(mpsc::error::TryRecvError::Empty) => break,
                 Err(mpsc::error::TryRecvError::Disconnected) => {

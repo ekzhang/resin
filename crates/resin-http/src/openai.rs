@@ -16,7 +16,7 @@ use axum::{
 };
 use serde::Deserialize;
 use serde_json::{Value, json};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 
 use crate::{
     AppState,
@@ -51,6 +51,7 @@ struct StreamOptions {
 #[derive(Debug, Deserialize)]
 pub(crate) struct ChatRequest {
     model: String,
+    priority: Option<i32>,
     messages: Vec<Value>,
     #[serde(default)]
     tools: Vec<Value>,
@@ -82,6 +83,7 @@ pub(crate) struct ChatRequest {
 #[derive(Debug, Deserialize)]
 pub(crate) struct ResponsesRequest {
     model: String,
+    priority: Option<i32>,
     input: Value,
     stop: Option<OneOrManyStrings>,
     #[serde(default)]
@@ -192,6 +194,7 @@ fn chat_request(state: &AppState, body: ChatRequest) -> RequestResult<Conversati
     }
     Ok(ConversationRequest {
         id: state.request_id("chatcmpl"),
+        priority: request_priority(state, body.priority)?,
         model: body.model,
         messages: body.messages,
         tools: function_tools(body.tools)?,
@@ -382,6 +385,50 @@ pub async fn responses(
     }
 }
 
+pub async fn input_tokens(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(mut body): Json<ResponsesRequest>,
+) -> Response {
+    body.routed_dp_rank = match routed_rank(&state, &headers, body.routed_dp_rank) {
+        Ok(rank) => rank.map(|rank| json!(rank)),
+        Err(response) => return *response,
+    };
+    body.max_output_tokens = None;
+    let request = match responses_request(&state, body) {
+        Ok(request) => request,
+        Err(response) => return *response,
+    };
+    token_count_response(&state, request, true).await
+}
+
+pub(crate) async fn token_count_response(
+    state: &AppState,
+    request: ConversationRequest,
+    openai: bool,
+) -> Response {
+    let Some(counter) = &state.token_counter else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json_error("token counting is unavailable", "server_error")),
+        )
+            .into_response();
+    };
+    let (result, receiver) = oneshot::channel();
+    counter(request, result);
+    match receiver.await {
+        Ok(Ok(input_tokens)) => {
+            let mut body = json!({"input_tokens": input_tokens});
+            if openai {
+                body["object"] = json!("response.input_tokens");
+            }
+            Json(body).into_response()
+        }
+        Ok(Err(message)) => internal_error(message),
+        Err(_) => internal_error("token counting ended without a result".to_owned()),
+    }
+}
+
 fn responses_request(
     state: &AppState,
     mut body: ResponsesRequest,
@@ -421,6 +468,7 @@ fn responses_request(
     }
     Ok(ConversationRequest {
         id: state.request_id("resp"),
+        priority: request_priority(state, body.priority)?,
         model: body.model,
         messages,
         tools: function_tools(body.tools)?,
@@ -669,6 +717,18 @@ fn validate_model(state: &AppState, model: &str) -> RequestResult<()> {
                 .into_response(),
         ))
     }
+}
+
+pub(crate) fn request_priority(
+    state: &AppState,
+    priority: Option<i32>,
+) -> RequestResult<Option<i32>> {
+    if priority.is_some() && !state.enable_priority_scheduling {
+        return Err(invalid_request(
+            "priority requires HttpServer(enable_priority_scheduling=True)",
+        ));
+    }
+    Ok(priority)
 }
 
 pub(crate) fn validate_sampling(
