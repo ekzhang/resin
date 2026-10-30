@@ -239,35 +239,33 @@ def test_engine_greedy_matches_reference_across_page_boundaries() -> None:
         _assert_greedy(model, prompt, generated, 6)
 
 
-def test_live_state_follows_changing_batches() -> None:
-    model = _model()
+@pytest.mark.parametrize("staggered", [True, False])
+def test_live_state_follows_changing_batches(staggered: bool) -> None:
+    model = _model(all_experts=True)
     prompts = [_prompt(length, seed=20 + length) for length in (4, 33, 90, 150)]
     counts = [3, 9, 5, 12]
-
-    def run(staggered: bool):
-        runner = _runner(model)
-        with Engine(runner, context_length=8192) as engine:
-            leases = []
-            for prompt, count in zip(prompts, counts, strict=True):
-                params = SamplingParams(max_output_tokens=count, temperature=0.0)
-                leases.append(engine.submit(prompt, sampling_params=params))
-                # Later requests join a decode batch already in flight.
-                for _ in range(2 if staggered else 0):
-                    engine.step()
-            while engine.has_work():
+    runner = _runner(model)
+    with Engine(runner, context_length=8192) as engine:
+        leases = []
+        for prompt, count in zip(prompts, counts, strict=True):
+            params = SamplingParams(max_output_tokens=count, temperature=0.0)
+            leases.append(engine.submit(prompt, sampling_params=params))
+            # Later requests join a decode batch already in flight.
+            for _ in range(2 if staggered else 0):
                 engine.step()
-            # Finished requests release their live state.
-            assert len(runner._states) == 0
-            return [lease.take_result() for lease in leases]
-
-    assert run(staggered=True) == run(staggered=False)
+        while engine.has_work():
+            engine.step()
+        # Finished requests release their live state.
+        assert len(runner._states) == 0
+    # Batch shapes change as requests join and leave, which may break BF16
+    # ties; a row reading another row's state would not stay within them.
+    for prompt, count, lease in zip(prompts, counts, leases, strict=True):
+        _assert_greedy(model, prompt, lease.take_result(), count)
 
 
 def test_cancel_releases_live_state_and_others_continue() -> None:
-    model = _model()
+    model = _model(all_experts=True)
     prompts = [_prompt(length, seed=30 + length) for length in (20, 50, 70)]
-    with Engine(_runner(model), context_length=8192) as engine:
-        expected = _generate(engine, [prompts[0], prompts[2]], 10)
     runner = _runner(model)
     with Engine(runner, context_length=8192) as engine:
         params = SamplingParams(max_output_tokens=10, temperature=0.0)
@@ -278,8 +276,9 @@ def test_cancel_releases_live_state_and_others_continue() -> None:
         assert len(runner._states) == 2
         while engine.has_work():
             engine.step()
-        assert [leases[0].take_result(), leases[2].take_result()] == expected
         assert len(runner._states) == 0
+    for index in (0, 2):
+        _assert_greedy(model, prompts[index], leases[index].take_result(), 10)
 
 
 def test_retracted_requests_replay_from_fresh_state() -> None:
@@ -319,9 +318,9 @@ def test_snapshot_written_during_decode_serves_the_next_turn() -> None:
             engine.step()
         assert request.cached_tokens == PREFILL_CHUNK_SIZE
         cached = request.take_result()
-    with Engine(_runner(model), context_length=16384) as engine:
-        (fresh,) = _generate(engine, [turn], 4)
-    assert cached == fresh
+    # The snapshot's last positions were decoded, not prefilled, which may
+    # break BF16 ties against a fresh run; a wrong snapshot would not.
+    _assert_greedy(model, turn, cached, 4)
 
 
 def test_chunked_prefill_crosses_state_checkpoint() -> None:
