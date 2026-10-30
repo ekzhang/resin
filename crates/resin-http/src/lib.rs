@@ -38,6 +38,7 @@ pub struct RouteConfig {
     pub enable_openai: bool,
     pub enable_anthropic: bool,
     pub enable_demo: bool,
+    pub enable_priority_scheduling: bool,
     pub routed_dp_size: usize,
 }
 
@@ -47,6 +48,7 @@ impl Default for RouteConfig {
             enable_openai: true,
             enable_anthropic: true,
             enable_demo: true,
+            enable_priority_scheduling: false,
             routed_dp_size: 1,
         }
     }
@@ -58,6 +60,7 @@ struct AppState {
     model: Arc<str>,
     next_id: Arc<AtomicU64>,
     routed_dp_size: usize,
+    enable_priority_scheduling: bool,
 }
 
 impl AppState {
@@ -100,6 +103,7 @@ pub fn router(
         model: model.into(),
         next_id: Arc::new(AtomicU64::new(1)),
         routed_dp_size: routes.routed_dp_size,
+        enable_priority_scheduling: routes.enable_priority_scheduling,
     };
     let mut router = Router::new().route("/health", get(openai::health));
     if let Some(metrics) = metrics {
