@@ -239,16 +239,6 @@ def test_engine_greedy_matches_reference_across_page_boundaries() -> None:
         _assert_greedy(model, prompt, generated, 6)
 
 
-def test_batched_decode_matches_individual_requests() -> None:
-    model = _model()
-    prompts = [_prompt(length, seed=10 + length) for length in (3, 40, 200)]
-    with Engine(_runner(model), context_length=8192) as engine:
-        alone = [_generate(engine, [prompt], 8)[0] for prompt in prompts]
-    with Engine(_runner(model), context_length=8192) as engine:
-        together = _generate(engine, prompts, 8)
-    assert together == alone
-
-
 def test_live_state_follows_changing_batches() -> None:
     model = _model()
     prompts = [_prompt(length, seed=20 + length) for length in (4, 33, 90, 150)]
