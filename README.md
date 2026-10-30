@@ -50,6 +50,7 @@ Start with the two-page [architecture overview](docs/architecture.md).
 
 - [Rust batch scheduler](docs/kernel-boundary.md)
   - [Unified slab-based cache pool (KV, SWA, Recurrent)](docs/cache-pool.md)
+    - [Pluggable prefix cache storage](docs/cache-storage.md)
   - [Speculative decoding (MTP, DSpark)](docs/model-forward-pass.md)
   - [Zero-overhead overlap scheduling](docs/scheduler.md)
   - [Engine metrics and Prometheus export](docs/metrics.md)

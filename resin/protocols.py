@@ -21,6 +21,7 @@ if TYPE_CHECKING:
         RunnerConfig,
         RunnerMetrics,
     )
+    from resin.cache_storage import Regions
 
 
 class MediaTokenSpan(NamedTuple):
@@ -122,6 +123,18 @@ class ManagedRunner(Runner, Protocol):
     def bind_resources(self, resources: ResourceBinding) -> None: ...
 
 
+class CacheExporter(Protocol):
+    """Zero-copy live restore views; empty groups export no blocks."""
+
+    def cache_storage_buffers(
+        self,
+        groups: Sequence[tuple[int, Sequence[tuple[int, int]]]],
+        *,
+        prefix_length: int,
+    ) -> Sequence[Regions]:
+        raise NotImplementedError("cache_storage_buffers is not implemented")
+
+
 class MetricsRunner(Protocol):
     """Optional physical execution observations, independent of forward output.
 
@@ -139,6 +152,7 @@ class MetricsRunner(Protocol):
 __all__ = [
     "FinalizingResponseParser",
     "ManagedRunner",
+    "CacheExporter",
     "MediaInput",
     "MediaTokenSpan",
     "MetricsRunner",

@@ -3,7 +3,7 @@
     reason = "PyO3 0.29 from_py_object emits Clone::clone for Copy enums"
 )]
 
-use std::num::NonZeroU32;
+use std::num::{NonZeroU32, NonZeroUsize};
 use std::sync::{Arc, OnceLock};
 
 use numpy::{PyArray1, PyArrayLike1, PyReadonlyArray1};
@@ -15,6 +15,7 @@ use pyo3::types::{PyDict, PyTuple};
 
 mod arrays;
 mod cache;
+mod cache_storage;
 mod http;
 mod http_distributed;
 mod http_logprobs;
@@ -40,6 +41,7 @@ use cache::{
 use output::{BorrowedLogprobs, BorrowedOutput, ForwardOutput};
 use parallelism::Parallelism;
 use resin_core::engine::{self as core, CompletionReason};
+use resin_core::resources::paged_kv::PrefixStoragePolicy;
 use runner::{
     ResourceBinding, RunnerConfig, bind_runner_resources, optional_runner_callable,
     resolve_runner_config, resolve_runner_contract, runner_error_is_post_accept,
@@ -1256,6 +1258,7 @@ impl Engine {
         allow_overlap: bool,
     ) -> PyResult<Vec<Py<TokenEvent>>> {
         self.core.raise_if_open().map_err(core_error)?;
+        self.core.poll_storage(false).map_err(core_error)?;
         let mut events = Vec::new();
         if self.pending.is_some() {
             let feedback = if self.overlap
@@ -1537,7 +1540,7 @@ impl Engine {
 #[pymethods]
 impl Engine {
     #[new]
-    #[pyo3(signature = (runner: "Runner", *, max_running_requests = 32, context_length = 32768, scheduler_config = None, prefix_cache = false, enable_overlap = true, enable_metrics = true))]
+    #[pyo3(signature = (runner: "Runner", *, max_running_requests = 32, context_length = 32768, scheduler_config = None, prefix_cache = false, prefix_cache_storage = None, prefix_cache_max_inflight = None, prefix_cache_storage_policy = "write_through_selective", enable_overlap = true, enable_metrics = true))]
     #[allow(
         clippy::too_many_arguments,
         reason = "Python constructor exposes keyword configuration"
@@ -1549,9 +1552,25 @@ impl Engine {
         context_length: u32,
         scheduler_config: Option<Py<SchedulerConfig>>,
         prefix_cache: bool,
+        prefix_cache_storage: Option<Py<PyAny>>,
+        prefix_cache_max_inflight: Option<usize>,
+        prefix_cache_storage_policy: &str,
         enable_overlap: bool,
         enable_metrics: bool,
     ) -> PyResult<Self> {
+        let prefix_cache_max_inflight = NonZeroUsize::new(
+            prefix_cache_max_inflight.unwrap_or_else(|| max_running_requests.max(2)),
+        )
+        .ok_or_else(|| PyValueError::new_err("prefix_cache_max_inflight must be positive"))?;
+        let storage_policy = match prefix_cache_storage_policy {
+            "write_through" => PrefixStoragePolicy::WriteThrough,
+            "write_through_selective" => PrefixStoragePolicy::WriteThroughSelective,
+            _ => {
+                return Err(PyValueError::new_err(
+                    "prefix_cache_storage_policy must be 'write_through' or 'write_through_selective'",
+                ));
+            }
+        };
         let runner_enqueue = optional_runner_callable(py, runner.bind(py), "enqueue")?;
         let (runner_forward, runner_release) = resolve_runner_contract(py, runner.bind(py))?;
         let resolved = resolve_runner_config(py, runner.bind(py))?;
@@ -1595,6 +1614,18 @@ impl Engine {
         } else {
             None
         };
+        if let Some(provider) = prefix_cache_storage {
+            let adapter = PyModule::import(py, "resin._cache_storage")?
+                .getattr("_PrefixStorage")?
+                .call1((provider, runner, &config.cache_layout))?
+                .unbind();
+            core.set_prefix_storage(
+                Box::new(cache_storage::PythonPrefixStorage(adapter)),
+                prefix_cache_max_inflight,
+                storage_policy,
+            )
+            .map_err(core_error)?;
+        }
         let runner_config = bind_runner_resources(py, resolved, core.cache_pool_id())?;
         Ok(Self {
             core,
@@ -1782,8 +1813,9 @@ impl Engine {
         (self.overlap_enqueues, self.overlap_continuations)
     }
 
-    /// Read-only admission-aware proposal; reserves no requests or resources.
-    fn next_phase(&self) -> PyResult<Option<BatchPhase>> {
+    /// Poll storage completions before proposing the next runnable phase.
+    fn next_phase(&mut self) -> PyResult<Option<BatchPhase>> {
+        self.core.poll_storage(false).map_err(core_error)?;
         self.core
             .next_phase()
             .map(|phase| {

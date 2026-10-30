@@ -18,6 +18,7 @@ from resin import (
     CacheRetention,
     RunnerConfig,
 )
+from resin.backend.cache_storage import byte_regions, live_rows
 from resin.backend.capacity import CacheCapacityPlan, plan_cache_capacity
 from resin.backend.cuda.completion import DeviceAcceptance, DeviceCompletion
 from resin.backend.cuda.failures import GraphInputError
@@ -160,6 +161,35 @@ class _Gemma4KvArena:
         )
         global_view = self.storage.view(global_shape).permute(1, 2, 0, 3, 4, 5)
         self.global_keys, self.global_values = global_view[0], global_view[1]
+        self.packing = packing
+        self.sliding_window = getattr(config, "sliding_window", SLIDING_WINDOW)
+
+    def cache_storage_buffers(self, groups, *, prefix_length):
+        buffers = []
+        for group, (first, addresses) in enumerate(groups):
+            keys, values = (
+                (self.global_keys, self.global_values)
+                if group == 0
+                else (self.local_keys, self.local_values)
+            )
+            for block, (slab, slot) in enumerate(addresses, first):
+                rows = live_rows(
+                    prefix_length,
+                    block,
+                    PAGE_SIZE,
+                    None if group == 0 else self.sliding_window,
+                )
+                page = slab * self.packing + slot if group == 0 else slab
+                buffers.append(
+                    byte_regions(
+                        {
+                            f"{name}/{layer}": tensor[layer, page, rows]
+                            for name, tensor in (("keys", keys), ("values", values))
+                            for layer in range(keys.shape[0])
+                        }
+                    )
+                )
+        return tuple(buffers)
 
 
 @dataclass(frozen=True, slots=True)

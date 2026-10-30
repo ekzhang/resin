@@ -259,6 +259,12 @@ impl MetricsEncoder {
         Ok(())
     }
     fn cache(&mut self, c: &CacheMetrics) {
+        self.gauge(
+            "cache_storage_pending",
+            "Outstanding prefix storage operations.",
+            c.storage_pending as f64,
+            &[],
+        );
         for (state, value) in [
             ("capacity", c.capacity_slabs),
             ("free", c.free_slabs),

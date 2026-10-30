@@ -114,10 +114,10 @@ def _shape(tensor: Any) -> tuple[int, ...]:
 
 
 def _reinterpret_interleaved_scales(tensor: Any, field: str):
-    """Expose FlashInfer's interleaved scale bytes through its tested ABI view."""
+    """Keep FlashInfer's folded (or legacy flat) layout through its ABI view."""
 
     shape = _shape(tensor)
-    if len(shape) != 3 or shape[-1] % 4:
+    if len(shape) not in {3, 5} or shape[-1] % 4:
         raise RuntimeError(
             f"{field} interleaver returned incompatible shape {shape}; "
             "the last dimension must be divisible by four"

@@ -178,7 +178,7 @@ impl CachedGroupTable {
             .map(|segment| (segment.start, segment.pages.as_slice()))
     }
 
-    fn pages_rev(&self) -> impl Iterator<Item = &PageRef> {
+    pub(crate) fn pages_rev(&self) -> impl Iterator<Item = &PageRef> {
         self.segments().flat_map(|(_, pages)| pages.iter().rev())
     }
 }
@@ -1456,6 +1456,36 @@ impl CachePool {
                 self.slot_mut(old.handle).request_refs -= 1;
                 self.retire_slot_if_unused(old.handle);
             }
+        }
+        Ok(())
+    }
+
+    /// Release unselected immutable references without changing another owner.
+    pub(crate) fn retain_shared_request_pages(
+        &mut self,
+        request: &mut RequestPages,
+        keep: &[Vec<bool>],
+    ) -> Result<(), CachePoolError> {
+        self.validate_request(request)?;
+        if keep.len() != request.groups.len()
+            || request.groups.iter().zip(keep).any(|(group, mask)| {
+                group.pages.len() != mask.len() || group.pages.iter().any(|page| page.writable)
+            })
+        {
+            return Err(CachePoolError::StaleHandle);
+        }
+        for (group, mask) in request.groups.iter_mut().zip(keep) {
+            group.snapshot = Weak::new();
+            let mut index = 0;
+            group.pages.retain(|page| {
+                let retained = mask[index];
+                index += 1;
+                if !retained {
+                    self.slot_mut(page.handle).request_refs -= 1;
+                    self.retire_slot_if_unused(page.handle);
+                }
+                retained
+            });
         }
         Ok(())
     }

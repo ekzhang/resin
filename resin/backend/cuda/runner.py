@@ -394,6 +394,21 @@ class CudaRunner(Runner):
             raise RuntimeError("CUDA cache binding is already configured")
         self._cache_binding = binding
 
+    def _cache_storage_arena(self):
+        arena = getattr(self, "_cache", None)
+        if arena is None:
+            arena = getattr(self, "_kv", None)
+        if arena is None or not callable(getattr(arena, "cache_storage_buffers", None)):
+            raise NotImplementedError(
+                "this runner does not implement prefix storage export"
+            )
+        return arena
+
+    def cache_storage_buffers(self, groups, *, prefix_length):
+        return self._cache_storage_arena().cache_storage_buffers(
+            groups, prefix_length=prefix_length
+        )
+
     def bind_resources(self, binding: ResourceBinding) -> None:
         """Bind the model cache to its Engine-owned physical allocation."""
 

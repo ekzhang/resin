@@ -96,6 +96,8 @@ length, requires all State groups, and publishes only after outstanding consumer
 have drained. Terminal output truncation never relabels later state as an earlier
 prefix. Cancellation retains physical resources until all queued work finishes.
 
+[Prefix storage](cache-storage.md) adds asynchronous tiers to the device cache.
+
 ## Physical sizing
 
 CUDA runners use the shared

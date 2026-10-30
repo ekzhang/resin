@@ -10,6 +10,7 @@ import numpy as np
 import numpy.typing as npt
 import torch
 
+from resin.backend.cache_storage import byte_regions, live_rows
 from resin.backend.resources import CachePoolBinding
 
 if TYPE_CHECKING:
@@ -103,16 +104,48 @@ class PagedKvArena:
         resource: str = "paged KV",
     ) -> None:
         self.capacity = layout.parent_capacity
+        self.layout = layout
         self.page_size = page_size
         self.binding = CachePoolBinding(layout, resource=resource)
         shape = (2, layer_count, self.capacity + 1, page_size, num_kv_heads, head_dim)
         self.storage = torch.zeros(shape, dtype=dtype, device=device)
         self.keys = self.storage[0]
         self.values = self.storage[1]
+        self._cache_storage_views: dict[int, dict[str, torch.Tensor]] = {}
 
     def check_pages(self, page_ids: Iterable[int | np.integer]) -> None:
         if any(page < 0 or page > self.capacity for page in page_ids):
             raise ValueError("BatchPlan cache block ID is outside the physical slab")
+
+    def cache_storage_buffers(self, groups, *, prefix_length):
+        buffers = []
+        for group, (first, addresses) in zip(self.layout.groups, groups):
+            for block, (slab, slot) in enumerate(addresses, first):
+                if not 0 < slab <= self.capacity or slot:
+                    raise ValueError(
+                        "cache storage address is outside the managed arena"
+                    )
+                rows = live_rows(
+                    prefix_length, block, self.page_size, group.read_window_tokens
+                )
+                # FA4 can load the complete page even when attention masks rows.
+                if rows.stop <= rows.start:
+                    buffers.append({})
+                    continue
+                regions = self._cache_storage_views.get(slab)
+                if regions is None:
+                    regions = byte_regions(
+                        {
+                            f"{('keys', 'values')[kv]}/{layer}": self.storage[
+                                kv, layer, slab
+                            ]
+                            for kv in range(2)
+                            for layer in range(self.storage.shape[1])
+                        }
+                    )
+                    self._cache_storage_views[slab] = regions
+                buffers.append(regions)
+        return tuple(buffers)
 
 
 @dataclass(frozen=True, slots=True)

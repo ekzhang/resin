@@ -9,7 +9,10 @@ pub use crate::output::{OwnedTokenRows, TokenRows};
 use crate::resources::RequestResourceRef;
 use crate::resources::kv::{KvGroupPlan, KvLayout};
 use crate::resources::paged::{CachePoolError, RequestPages, WriterAccessLease};
-use crate::resources::paged_kv::{CacheMetrics, PagedKvBatchView, PagedKvError, PagedKvResources};
+use crate::resources::paged_kv::{
+    CacheMetrics, PagedKvBatchView, PagedKvError, PagedKvResources, PrefixStorage,
+    PrefixStoragePolicy,
+};
 use crate::{
     Phase, PlanningConfig, PlanningError, RequestId, RequestProgress, Schedulable, Scheduler,
     Selection, SequenceStep, TokenRange, schedule_ready_prefix,
@@ -535,6 +538,7 @@ pub struct EngineCore<P> {
     quarantined: Option<Batch<P>>,
     runner_config: RunnerConfig,
     scheduler: Scheduler<Request<P>>,
+    storage_waiting: Vec<Request<P>>,
     scheduler_config: SchedulerConfig,
     new_token_ratio: f64,
     minimum_new_token_ratio: f64,
@@ -604,6 +608,7 @@ impl<P: Clone> EngineCore<P> {
             quarantined: None,
             runner_config,
             scheduler: Scheduler::new(max_running_requests),
+            storage_waiting: Vec::new(),
             scheduler_config,
             new_token_ratio,
             minimum_new_token_ratio,
@@ -620,6 +625,50 @@ impl<P: Clone> EngineCore<P> {
 
     pub fn id(&self) -> u64 {
         self.engine_id
+    }
+
+    pub fn set_prefix_storage(
+        &mut self,
+        storage: Box<dyn PrefixStorage>,
+        max_inflight: NonZeroUsize,
+        policy: PrefixStoragePolicy,
+    ) -> Result<()> {
+        if self.prefix_alignment().is_none() {
+            return Err(Error::invalid("storage requires prefix caching"));
+        }
+        self.kv_resources.as_mut().unwrap().storage = Some((storage, max_inflight, policy));
+        Ok(())
+    }
+
+    fn storage_pending(&self) -> bool {
+        self.kv_resources
+            .as_ref()
+            .is_some_and(|r| r.storage_pending())
+    }
+
+    pub fn poll_storage(&mut self, wait: bool) -> Result<()> {
+        self.raise_if_open()?;
+        let Some(resources) = self.kv_resources.as_mut().filter(|r| r.storage_pending()) else {
+            return Ok(());
+        };
+        resources.poll_storage(wait, |id, count, mut pages| {
+            if let Some(index) = self.storage_waiting.iter().position(|r| r.id == id) {
+                let mut request = self.storage_waiting.swap_remove(index);
+                if count != 0 {
+                    std::mem::swap(&mut request.cache, &mut pages);
+                    request.resident_tokens = count;
+                    request.lease.lock().unwrap().cached_tokens = count;
+                    if let Some((metrics, state)) =
+                        self.metrics.as_mut().zip(request.metrics.as_mut())
+                    {
+                        metrics.restored(state, count);
+                    }
+                }
+                self.scheduler.restore_rejected(vec![request]);
+            }
+            pages
+        })?;
+        Ok(())
     }
 
     /// Enable native accounting before submission, preserving cumulative totals.
@@ -648,7 +697,8 @@ impl<P: Clone> EngineCore<P> {
             .scheduler
             .iter()
             .filter(|request| !request.running)
-            .count();
+            .count()
+            + self.storage_waiting.len();
         snapshot.running_requests = self
             .scheduler
             .iter()
@@ -676,17 +726,18 @@ impl<P: Clone> EngineCore<P> {
         self.context_length.get()
     }
     pub fn has_work(&self) -> bool {
-        self.in_flight.is_some() || !self.scheduler.is_empty()
+        self.in_flight.is_some() || !self.scheduler.is_empty() || self.storage_pending()
     }
     pub fn active_request_count(&self) -> usize {
         self.scheduler.len()
+            + self.storage_waiting.len()
             + self.in_flight.as_ref().map_or(0, |batch| {
                 batch.rows.iter().filter(|row| !row.terminal).count()
             })
     }
 
     pub fn ready_request_count(&self) -> usize {
-        self.scheduler.len()
+        self.scheduler.len() + self.storage_waiting.len()
     }
     pub fn max_running_requests(&self) -> usize {
         self.scheduler.max_running_requests()
@@ -904,6 +955,12 @@ impl<P: Clone> EngineCore<P> {
                 .map_err(Error::from)?,
             _ => 0,
         };
+        let storage_pending = resident_tokens == 0
+            && cache_identity.is_some_and(|identity| {
+                self.kv_resources
+                    .as_mut()
+                    .is_some_and(|r| r.start_storage(request_id, identity))
+            });
         lease_state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -938,6 +995,10 @@ impl<P: Clone> EngineCore<P> {
             cacheable,
             cache: pages,
         });
+        if storage_pending {
+            let request = self.scheduler.remove(self.scheduler.len() - 1);
+            self.storage_waiting.push(request);
+        }
         Ok(lease)
     }
     pub fn step(&mut self, runner: &mut impl Runner<P>) -> Result<Vec<TokenEvent>> {
@@ -1233,6 +1294,7 @@ impl<P: Clone> EngineCore<P> {
         overlap: bool,
     ) -> Result<Option<(Batch<P>, ExecutionPlan<P>)>> {
         self.raise_if_open()?;
+        self.poll_storage(false)?;
         if self.scheduler.is_empty() {
             return Ok(None);
         }
@@ -1402,6 +1464,11 @@ impl<P: Clone> EngineCore<P> {
         };
         if let Some(error) = growth_error {
             self.scheduler.restore_rejected(scheduled);
+            if matches!(error, CachePoolError::InsufficientCapacity { .. })
+                && self.storage_pending()
+            {
+                return Ok(None);
+            }
             if matches!(error, CachePoolError::InsufficientCapacity { .. })
                 && self.retract_one(runner)?
             {
@@ -1837,6 +1904,10 @@ impl<P: Clone> EngineCore<P> {
             return Err(Error::invalid("RequestLease belongs to a different Engine"));
         }
         let request_id = request.request_id;
+        if let Some(index) = self.storage_waiting.iter().position(|r| r.id == request_id) {
+            self.scheduler
+                .restore_rejected(vec![self.storage_waiting.swap_remove(index)]);
+        }
         if let Some(index) = self.scheduler.position(|request| request.id == request_id) {
             let mut request = self.scheduler.remove(index);
             if let Err(error) = self.validate_request_cache(&request) {
@@ -2054,13 +2125,21 @@ impl<P: Clone> EngineCore<P> {
             .iter()
             .filter(|request| request.is_running())
             .count();
-        if running_count <= 1 {
-            return Ok(false);
-        }
+        let resources = self.kv_resources.as_ref().expect("managed cache pressure");
         let Some(request_id) = self
             .scheduler
             .iter()
-            .filter(|request| request.is_running() && request.cache.is_some())
+            .filter(|request| {
+                request.cache.as_ref().is_some_and(|pages| {
+                    if running_count > 1 {
+                        request.is_running()
+                    } else {
+                        !request.is_running()
+                            && request.resident_tokens > 0
+                            && resources.pool().validate_request_idle(pages).is_ok()
+                    }
+                })
+            })
             .min_by_key(|request| (request.generated.len(), Reverse(request.prompt.len())))
             .map(|request| request.id)
         else {
@@ -2072,7 +2151,9 @@ impl<P: Clone> EngineCore<P> {
             .expect("selected retraction victim remains ready");
         let mut request = self.scheduler.remove(index);
 
-        if let Err(error) = execution_call("release", || runner.release(&[request.id])) {
+        if request.is_running()
+            && let Err(error) = execution_call("release", || runner.release(&[request.id]))
+        {
             self.scheduler.restore(index, request);
             self.poison("runner release failed during request retraction", &error);
             return Err(error);
@@ -2148,6 +2229,12 @@ impl<P: Clone> EngineCore<P> {
     }
 
     fn close_healthy(&mut self, runner: &mut impl Runner<P>) -> Result<()> {
+        if let Err(error) = self.poll_storage(true) {
+            self.poison_message("storage could not retire");
+            return Err(error);
+        }
+        self.scheduler
+            .restore_rejected(std::mem::take(&mut self.storage_waiting));
         self.retire_ready(runner)?;
         if let Some(resources) = self.kv_resources.as_mut() {
             resources.clear_prefix_cache().map_err(Error::from)?;

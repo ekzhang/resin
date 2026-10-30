@@ -159,7 +159,7 @@ class _FakeFusedMoE:
         self.scale_calls.append((tensor, group_size))
         experts, rows, groups = tensor.shape
         return _FakeTensor(
-            (experts, groups // 4, rows * 4),
+            (experts, rows // 64, groups // 4, 16, 16),
             tensor.dtype,
             device=tensor.device,
         )
@@ -328,6 +328,8 @@ class TestFlashInferMXFP4Adapter:
         assert call["quant_scales"] == [prepared.fc1_scales, prepared.fc2_scales]
         assert prepared.fc1_scales.dtype is torch.int32
         assert prepared.fc2_scales.dtype is torch.int32
+        assert prepared.fc1_scales.shape == (128, 92, 23, 16, 4)
+        assert prepared.fc2_scales.shape == (128, 46, 23, 16, 4)
         assert call["output_dtype"] is torch.bfloat16
         assert call["output"].shape == (16, 2944)
         assert call["output"].dtype is torch.bfloat16
