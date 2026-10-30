@@ -35,7 +35,9 @@ finally:
 `max_bytes` is required. The provider reserves its arena at construction, using
 pinned host memory when CUDA is available. Its LRU budget charges object keys,
 region names and payload bytes; general Python and allocator overhead is outside
-that budget. Transfers run on a background worker with private CUDA streams.
+that budget. One background worker owns a private CUDA copy stream per device.
+It queues pending reads before fencing the stream and completing their futures.
+Writes retire earlier reads before evicting or reusing their host memory.
 
 The caller owns the provider. Close every Engine using it before calling
 `storage.close()`. Stored objects can outlive an Engine, so compatible Engines can
