@@ -19,7 +19,7 @@ use serde_json::{Value, json};
 use tokio::sync::mpsc;
 
 use crate::{
-    AppState,
+    AppState, JobKind,
     protocol::{ConversationRequest, GenerationEvent, ResponseAccumulator, json_error},
     ui::index_html,
 };
@@ -376,6 +376,47 @@ pub async fn responses(
         responses_stream(request, receiver).into_response()
     } else {
         responses_response(request, receiver).await
+    }
+}
+
+pub async fn input_tokens(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(mut body): Json<ResponsesRequest>,
+) -> Response {
+    body.routed_dp_rank = match routed_rank(&state, &headers, body.routed_dp_rank) {
+        Ok(rank) => rank.map(|rank| json!(rank)),
+        Err(response) => return *response,
+    };
+    body.max_output_tokens = None;
+    let request = match responses_request(&state, body) {
+        Ok(request) => request,
+        Err(response) => return *response,
+    };
+    token_count_response(&state, request, true).await
+}
+
+pub(crate) async fn token_count_response(
+    state: &AppState,
+    request: ConversationRequest,
+    openai: bool,
+) -> Response {
+    let mut receiver = match state.enqueue_kind(request, JobKind::CountTokens) {
+        Ok(receiver) => receiver,
+        Err((status, message)) => {
+            return (status, Json(json_error(message, "server_error"))).into_response();
+        }
+    };
+    match receiver.recv().await {
+        Some(GenerationEvent::Started { input_tokens }) => {
+            let mut body = json!({"input_tokens": input_tokens});
+            if openai {
+                body["object"] = json!("response.input_tokens");
+            }
+            Json(body).into_response()
+        }
+        Some(GenerationEvent::Error { message }) => internal_error(message),
+        _ => internal_error("token counting ended without a result".to_owned()),
     }
 }
 

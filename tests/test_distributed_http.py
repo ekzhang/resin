@@ -372,6 +372,7 @@ def _assert_distributed_metrics(base):
 @pytest.mark.parametrize(
     "case,world_size",
     [
+        ("counts", 2),
         ("normal", 4),
         ("metrics_failure", 4),
         ("fatal", 2),
@@ -413,6 +414,7 @@ def test_distributed_http_routes_real_replica_engines(tmp_path, case, world_size
     base = f"http://127.0.0.1:{port}"
     try:
         if case in (
+            "counts",
             "normal",
             "fatal",
             "ingress_decode",
@@ -420,7 +422,24 @@ def test_distributed_http_routes_real_replica_engines(tmp_path, case, world_size
             "event_encode",
         ):
             _wait_ready(base, tmp_path)
-        if case == "fatal":
+        if case == "counts":
+            for path, body in [
+                ("/v1/responses/input_tokens", {"input": "hello"}),
+                (
+                    "/v1/messages/count_tokens",
+                    {"messages": [{"role": "user", "content": "hello"}]},
+                ),
+            ]:
+                request = urllib.request.Request(
+                    f"{base}{path}",
+                    data=json.dumps(
+                        {"model": "rank-test", "routed_dp_rank": 1, **body}
+                    ).encode(),
+                    headers={"Content-Type": "application/json"},
+                )
+                with urllib.request.urlopen(request, timeout=5) as response:
+                    assert json.load(response)["input_tokens"] == 3
+        elif case == "fatal":
             with pytest.raises(urllib.error.HTTPError) as failure:
                 _post(base, 1, content="explode")
             assert failure.value.code == 500
@@ -513,7 +532,10 @@ def test_distributed_http_routes_real_replica_engines(tmp_path, case, world_size
         for rank in range(world_size)
     ]
     assert all(record["closed"] for record in records)
-    if case == "normal":
+    if case == "counts":
+        assert all(record["error"] is None for record in records)
+        assert all(not record["calls"] for record in records)
+    elif case == "normal":
         assert all(record["error"] is None for record in records)
         assert all(record["calls"] for record in records)
         assert any(any(record["calls"]) for record in records)

@@ -28,7 +28,7 @@ pub use metrics::{
 pub use metrics_encoder::{MetricsEncodeError, MetricsEncoder};
 pub use protocol::{
     ConversationRequest, FinishReason, GeneratedTokenLogprob, GenerationEvent, GenerationJob,
-    TokenLogprob,
+    JobKind, TokenLogprob,
 };
 
 pub const EVENT_QUEUE_CAPACITY: usize = 64;
@@ -70,10 +70,19 @@ impl AppState {
         &self,
         request: ConversationRequest,
     ) -> Result<mpsc::Receiver<GenerationEvent>, (StatusCode, &'static str)> {
+        self.enqueue_kind(request, JobKind::Generate)
+    }
+
+    fn enqueue_kind(
+        &self,
+        request: ConversationRequest,
+        kind: JobKind,
+    ) -> Result<mpsc::Receiver<GenerationEvent>, (StatusCode, &'static str)> {
         let (events, receiver) = mpsc::channel(EVENT_QUEUE_CAPACITY);
         match self.jobs.try_send(GenerationJob {
             request,
             events,
+            kind,
             enqueued_at: Instant::now(),
         }) {
             Ok(()) => Ok(receiver),
@@ -118,10 +127,13 @@ pub fn router(
         router = router
             .route("/v1/models", get(openai::models))
             .route("/v1/chat/completions", post(openai::chat_completions))
-            .route("/v1/responses", post(openai::responses));
+            .route("/v1/responses", post(openai::responses))
+            .route("/v1/responses/input_tokens", post(openai::input_tokens));
     }
     if routes.enable_anthropic {
-        router = router.route("/v1/messages", post(anthropic::messages));
+        router = router
+            .route("/v1/messages", post(anthropic::messages))
+            .route("/v1/messages/count_tokens", post(anthropic::count_tokens));
     }
     router
         .layer(DefaultBodyLimit::max(32 * 1024 * 1024))

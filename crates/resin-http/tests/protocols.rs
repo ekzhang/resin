@@ -4,8 +4,8 @@ use axum::{
 };
 use http_body_util::BodyExt;
 use resin_http::{
-    FinishReason, GeneratedTokenLogprob, GenerationEvent, GenerationJob, RouteConfig, TokenLogprob,
-    router,
+    FinishReason, GeneratedTokenLogprob, GenerationEvent, GenerationJob, JobKind, RouteConfig,
+    TokenLogprob, router,
 };
 use serde_json::{Value, json};
 use tokio::sync::mpsc;
@@ -38,6 +38,91 @@ fn test_router() -> axum::Router {
         }
     });
     router("test-model", jobs, RouteConfig::default(), None)
+}
+
+#[tokio::test]
+async fn token_count_routes_normalize_prompts_without_generation_limits() {
+    let (jobs, mut receiver) = mpsc::channel::<GenerationJob>(2);
+    tokio::spawn(async move {
+        for _ in 0..2 {
+            let job = receiver.recv().await.unwrap();
+            assert_eq!(job.kind, JobKind::CountTokens);
+            assert_eq!(job.request.messages[0]["content"], "Be concise");
+            assert_eq!(job.request.messages[1]["content"], "hi");
+            assert_eq!(job.request.tools[0]["name"], "weather");
+            let _ = job
+                .events
+                .send(GenerationEvent::Started { input_tokens: 17 })
+                .await;
+        }
+    });
+    let app = router("test-model", jobs, RouteConfig::default(), None);
+    for (path, body, expected) in [
+        (
+            "/v1/responses/input_tokens",
+            json!({"model": "test-model", "input": "hi", "instructions": "Be concise", "tools": [{"type": "function", "name": "weather", "parameters": {"type": "object"}}]}),
+            json!({"object": "response.input_tokens", "input_tokens": 17}),
+        ),
+        (
+            "/v1/messages/count_tokens",
+            json!({"model": "test-model", "messages": [{"role": "user", "content": "hi"}], "system": "Be concise", "tools": [{"name": "weather", "input_schema": {"type": "object"}}]}),
+            json!({"input_tokens": 17}),
+        ),
+    ] {
+        let request = Request::post(path)
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap();
+        let (status, value) = json_response(app.clone(), request).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(value, expected);
+    }
+}
+
+#[tokio::test]
+async fn token_count_routes_follow_protocol_flags_and_queue_limits() {
+    for (path, body) in [
+        (
+            "/v1/responses/input_tokens",
+            json!({"model": "test-model", "input": "hi"}),
+        ),
+        (
+            "/v1/messages/count_tokens",
+            json!({"model": "test-model", "messages": [{"role": "user", "content": "hi"}]}),
+        ),
+    ] {
+        let request = || {
+            Request::post(path)
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(body.to_string()))
+                .unwrap()
+        };
+        let (jobs, receiver) = mpsc::channel::<GenerationJob>(1);
+        let permit = jobs.reserve().await.unwrap();
+        let app = router("test-model", jobs.clone(), RouteConfig::default(), None);
+        let (status, _) = json_response(app, request()).await;
+        assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+        drop(permit);
+        drop(receiver);
+        let app = router("test-model", jobs.clone(), RouteConfig::default(), None);
+        let (status, _) = json_response(app, request()).await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        let app = router(
+            "test-model",
+            jobs,
+            RouteConfig {
+                enable_openai: false,
+                enable_anthropic: false,
+                enable_demo: false,
+                ..RouteConfig::default()
+            },
+            None,
+        );
+        assert_eq!(
+            app.oneshot(request()).await.unwrap().status(),
+            StatusCode::NOT_FOUND
+        );
+    }
 }
 
 fn tool_router() -> axum::Router {

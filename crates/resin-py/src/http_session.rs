@@ -15,6 +15,7 @@ use pyo3::{
 use pythonize::pythonize;
 use resin_http::{
     EVENT_QUEUE_CAPACITY, FinishReason, GeneratedTokenLogprob, GenerationEvent, GenerationJob,
+    JobKind,
 };
 use resin_recipe::{AttributedEvent, Event as ParsedEvent, FinishReason as ParserFinishReason};
 use std::{collections::HashMap, sync::Mutex, time::Instant};
@@ -502,7 +503,7 @@ fn process(
 }
 
 /// Recipe output for one request: prompt IDs, prepared media and its parser.
-pub(crate) type RenderedJob = PyResult<(Vec<u32>, Option<Py<PyAny>>, Py<PyAny>)>;
+pub(crate) type RenderedJob = PyResult<(Vec<u32>, Option<Py<PyAny>>, Option<Py<PyAny>>)>;
 
 /// Render a request's prompt and media without touching the Engine.
 ///
@@ -539,7 +540,11 @@ pub(crate) fn render_job(recipe: &Py<PyAny>, job: &GenerationJob) -> RenderedJob
         if let Ok(native) = recipe.bind(py).cast::<NativeRecipe>() {
             let native = native.borrow();
             let rendered = native.render(py, messages, tools, Some(&options))?;
-            let parser = Py::new(py, native.create_parser(py, &rendered)?)?.into_any();
+            let parser = if job.kind == JobKind::Generate {
+                Some(Py::new(py, native.create_parser(py, &rendered)?)?.into_any())
+            } else {
+                None
+            };
             Ok((rendered.token_ids, rendered.media, parser))
         } else {
             let kwargs = PyDict::new(py);
@@ -548,10 +553,16 @@ pub(crate) fn render_job(recipe: &Py<PyAny>, job: &GenerationJob) -> RenderedJob
             let rendered = recipe
                 .bind(py)
                 .call_method("render", (messages,), Some(&kwargs))?;
-            let parser = recipe
-                .bind(py)
-                .call_method1("create_parser", (&rendered,))?
-                .unbind();
+            let parser = if job.kind == JobKind::Generate {
+                Some(
+                    recipe
+                        .bind(py)
+                        .call_method1("create_parser", (&rendered,))?
+                        .unbind(),
+                )
+            } else {
+                None
+            };
             let prompt = rendered.cast::<RenderedPrompt>()?.borrow();
             // Custom recipes also return the native prompt container, so media
             // and token ownership cross one well-defined admission boundary.
@@ -562,6 +573,22 @@ pub(crate) fn render_job(recipe: &Py<PyAny>, job: &GenerationJob) -> RenderedJob
             ))
         }
     })
+}
+
+/// Return the rendered input count without creating an engine request or parser.
+pub(crate) fn finish_count(job: GenerationJob, rendered: RenderedJob) {
+    let event = match rendered {
+        Ok((token_ids, _, _)) if !token_ids.is_empty() => GenerationEvent::Started {
+            input_tokens: token_ids.len(),
+        },
+        Ok(_) => GenerationEvent::Error {
+            message: "recipe.render returned an empty token_ids sequence".to_owned(),
+        },
+        Err(error) => GenerationEvent::Error {
+            message: format_python_error("token counting failed", error),
+        },
+    };
+    let _ = job.events.try_send(event);
 }
 
 fn admit(
@@ -595,7 +622,10 @@ fn admit_rendered(
                 "recipe.render returned an empty token_ids sequence",
             ));
         }
-        let parser = Parser::new(py, parser)?;
+        let parser = Parser::new(
+            py,
+            parser.ok_or_else(|| PyValueError::new_err("generation requires a response parser"))?,
+        )?;
         let scores = job.request.logprobs.then(OutputScores::default);
         let extra = pythonize(py, &job.request.extra)?.unbind();
         let stops = StopFilter::new(job.request.stop.clone())?;
@@ -741,6 +771,7 @@ impl NativeHttpSession {
             session.admit(GenerationJob {
                 request: request.clone(),
                 events,
+                kind: JobKind::Generate,
                 enqueued_at: Instant::now(),
             });
         }

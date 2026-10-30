@@ -13,11 +13,11 @@ use pyo3::{
     exceptions::{PyRuntimeError, PyValueError},
     prelude::*,
 };
-use resin_http::{GenerationJob, MetricsEndpoint, RouteConfig};
+use resin_http::{GenerationJob, JobKind, MetricsEndpoint, RouteConfig};
 use tokio::sync::{mpsc, oneshot, watch};
 
 use crate::Engine;
-use crate::http_session::{RenderedJob, Session, render_job};
+use crate::http_session::{RenderedJob, Session, finish_count, render_job};
 
 #[derive(Clone, Copy)]
 pub(crate) struct AdmissionConfig {
@@ -281,6 +281,7 @@ fn run_server(
             let result = if let Some(coordinator) = distributed {
                 crate::http_distributed::run(
                     coordinator,
+                    recipe,
                     receiver,
                     actor_shutdown,
                     routes.routed_dp_size,
@@ -334,6 +335,53 @@ fn run_server(
         .and(actor_result)
 }
 
+/// Shared fixed-size render workers. Callers bound queued work with their
+/// admission budget; token counts finish here without reaching inference.
+pub(crate) struct RenderWorkers {
+    pub jobs: std_mpsc::Sender<GenerationJob>,
+    pub completed: std_mpsc::Receiver<Option<(GenerationJob, RenderedJob)>>,
+}
+
+impl RenderWorkers {
+    pub fn new(recipe: &Py<PyAny>, workers: usize) -> Result<Self, String> {
+        let (render_jobs, render_queue) = std_mpsc::channel::<GenerationJob>();
+        let render_queue = Arc::new(Mutex::new(render_queue));
+        let (rendered_jobs, rendered_queue) =
+            std_mpsc::channel::<Option<(GenerationJob, RenderedJob)>>();
+        for worker in 0..workers {
+            let queue = render_queue.clone();
+            let results = rendered_jobs.clone();
+            let recipe = Python::attach(|py| recipe.clone_ref(py));
+            thread::Builder::new()
+                .name(format!("resin-render-{worker}"))
+                .spawn(move || {
+                    loop {
+                        let job = match queue.lock().unwrap_or_else(|p| p.into_inner()).recv() {
+                            Ok(job) => job,
+                            Err(_) => return,
+                        };
+                        let rendered = render_job(&recipe, &job);
+                        let completed = if job.kind == JobKind::CountTokens {
+                            finish_count(job, rendered);
+                            None
+                        } else {
+                            Some((job, rendered))
+                        };
+                        if results.send(completed).is_err() {
+                            return;
+                        }
+                    }
+                })
+                .map_err(|error| format!("failed to start a render worker: {error}"))?;
+        }
+        drop(rendered_jobs);
+        Ok(Self {
+            jobs: render_jobs,
+            completed: rendered_queue,
+        })
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn engine_actor(
     engine: Py<Engine>,
@@ -349,30 +397,7 @@ fn engine_actor(
         Python::attach(|py| Session::new(py, engine.clone_ref(py), recipe, stream_interval))
             .map_err(|error| format_python_error("HTTP session preparation failed", error))?;
     session.metrics = metrics.clone();
-    let (render_jobs, render_queue) = std_mpsc::channel::<GenerationJob>();
-    let render_queue = Arc::new(Mutex::new(render_queue));
-    let (rendered_jobs, rendered_queue) = std_mpsc::channel::<(GenerationJob, RenderedJob)>();
-    for worker in 0..admission.render_workers {
-        let queue = render_queue.clone();
-        let results = rendered_jobs.clone();
-        let recipe = Python::attach(|py| session.recipe().clone_ref(py));
-        thread::Builder::new()
-            .name(format!("resin-render-{worker}"))
-            .spawn(move || {
-                loop {
-                    let job = match queue.lock().unwrap_or_else(|p| p.into_inner()).recv() {
-                        Ok(job) => job,
-                        Err(_) => return,
-                    };
-                    let rendered = render_job(&recipe, &job);
-                    if results.send((job, rendered)).is_err() {
-                        return;
-                    }
-                }
-            })
-            .map_err(|error| format!("failed to start a render worker: {error}"))?;
-    }
-    drop(rendered_jobs);
+    let renders = RenderWorkers::new(session.recipe(), admission.render_workers)?;
     let mut rendering = 0usize;
     let mut next_metrics = Instant::now();
     let mut disconnected = false;
@@ -405,9 +430,15 @@ fn engine_actor(
             match jobs.try_recv() {
                 Ok(job) => {
                     rendering += 1;
-                    if let Err(std_mpsc::SendError(job)) = render_jobs.send(job) {
+                    if let Err(std_mpsc::SendError(job)) = renders.jobs.send(job) {
                         rendering -= 1;
-                        session.admit(job);
+                        if job.kind == JobKind::CountTokens {
+                            let _ = job.events.try_send(resin_http::GenerationEvent::Error {
+                                message: "prompt rendering is unavailable".to_owned(),
+                            });
+                        } else {
+                            session.admit(job);
+                        }
                     }
                 }
                 Err(mpsc::error::TryRecvError::Empty) => break,
@@ -418,10 +449,12 @@ fn engine_actor(
             }
         }
         for _ in 0..admission.admissions_per_step {
-            match rendered_queue.try_recv() {
-                Ok((job, rendered)) => {
+            match renders.completed.try_recv() {
+                Ok(completed) => {
                     rendering -= 1;
-                    session.admit_rendered(job, rendered);
+                    if let Some((job, rendered)) = completed {
+                        session.admit_rendered(job, rendered);
+                    }
                 }
                 Err(_) => break,
             }
