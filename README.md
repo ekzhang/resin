@@ -213,17 +213,6 @@ uv run python scripts/lfm2_chat.py
 uv run python scripts/lfm2_serve.py
 ```
 
-For prompt token counts without generation, use `POST /v1/responses/input_tokens`
-with the same `model`, `input`, `instructions`, `tools`, and reasoning options as
-Responses, or `POST /v1/messages/count_tokens` with the same `model`, `messages`,
-`system`, `tools`, and thinking options as Messages. Neither needs an output-token
-limit. Counts include the selected recipe's chat template and generation prefix,
-match generation's input usage, and do not submit an Engine request or reserve KV
-cache. Rendering uses the server's bounded worker and admission limits, including
-when serving distributed models. OpenAI returns
-`{"object":"response.input_tokens","input_tokens":N}`; Messages returns
-`{"input_tokens":N}`. Each endpoint follows its protocol's enable flag.
-
 Then open <http://127.0.0.1:8000>. The page reports prompt and generated token
 counts, elapsed generation time, and output tokens per second. The same process
 serves `/v1/chat/completions`, `/v1/responses`, `/v1/messages`, and `/v1/models`.
