@@ -65,6 +65,19 @@ by several checkpoints. Sliding-window and recurrent state belong to a specific
 checkpoint endpoint. Providers receive these objects as opaque keys and byte
 regions; the Engine decides which combination forms a usable prefix.
 
+## Request cache namespaces
+
+Pass `cache_salt="project-a"` to `Engine.submit` to isolate prefix reuse for that
+namespace. HTTP Chat Completions, Responses, and Anthropic Messages accept the
+same top-level field. Reuse requires the same salt and matching text or media
+identity, including when restoring checkpoints from a shared storage provider.
+The salt changes cache keys, not prompt tokens or generated output.
+
+Omitting `cache_salt` or passing `None` (`null` over HTTP) preserves the existing
+unsalted namespace and storage keys. An empty string is a separate namespace.
+Other values must be strings. Salts select cache namespaces; they do not provide
+authentication or access control.
+
 ## Choosing a write policy
 
 Set `prefix_cache_storage_policy` when constructing the Engine:

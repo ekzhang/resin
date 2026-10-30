@@ -73,10 +73,28 @@ pub trait PrefixStorageOperation: fmt::Debug + Send + Sync {
     fn poll(&mut self, wait: bool) -> Option<u32>;
 }
 pub trait PrefixStorage: fmt::Debug + Send + Sync {
-    fn lookup(&mut self, tokens: &[u32], maximum: u32, alignment: u32) -> StorageOp;
-    fn transfer(&mut self, tokens: &[u32], groups: &[PrefixStorageGroup], load: bool) -> StorageOp;
+    fn lookup(
+        &mut self,
+        tokens: &[u32],
+        maximum: u32,
+        alignment: u32,
+        salt: Option<&str>,
+    ) -> StorageOp;
+    fn transfer(
+        &mut self,
+        tokens: &[u32],
+        groups: &[PrefixStorageGroup],
+        load: bool,
+        salt: Option<&str>,
+    ) -> StorageOp;
 }
-type StorageJob = (StorageOp, u64, Vec<u32>, Option<RequestPages>);
+type StorageJob = (
+    StorageOp,
+    u64,
+    Vec<u32>,
+    Option<RequestPages>,
+    Option<String>,
+);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum PrefixStoragePolicy {
@@ -189,7 +207,12 @@ impl PagedKvResources {
         !self.jobs.is_empty()
     }
 
-    pub(crate) fn start_storage(&mut self, request: u64, tokens: &[u32]) -> bool {
+    pub(crate) fn start_storage(
+        &mut self,
+        request: u64,
+        tokens: &[u32],
+        salt: Option<&str>,
+    ) -> bool {
         let Some((storage, limit, _)) = &mut self.storage else {
             return false;
         };
@@ -203,9 +226,14 @@ impl PagedKvResources {
         if maximum < alignment as usize {
             return false;
         }
-        let operation = storage.lookup(tokens, maximum as u32, alignment);
-        self.jobs
-            .push((operation, request, tokens[..maximum].to_vec(), None));
+        let operation = storage.lookup(tokens, maximum as u32, alignment, salt);
+        self.jobs.push((
+            operation,
+            request,
+            tokens[..maximum].to_vec(),
+            None,
+            salt.map(str::to_owned),
+        ));
         true
     }
 
@@ -223,7 +251,7 @@ impl PagedKvResources {
                 index += 1;
                 continue;
             };
-            let (operation, request, mut tokens, pages) = self.jobs.swap_remove(index);
+            let (operation, request, mut tokens, pages, salt) = self.jobs.swap_remove(index);
             if let Some(pages) = pages {
                 let count = u32::from(request != 0 && result != 0) * tokens.len() as u32;
                 if count != 0 {
@@ -248,7 +276,7 @@ impl PagedKvResources {
                     .reserve_request(SequenceId::new(request), &demands)
                 else {
                     if self.evict_one_prefix()? {
-                        self.jobs.push((operation, request, tokens, None));
+                        self.jobs.push((operation, request, tokens, None, salt));
                     } else {
                         let _ = ready(request, 0, None);
                     }
@@ -262,8 +290,9 @@ impl PagedKvResources {
                     .collect();
                 let groups = self.storage_groups(result, tables)?;
                 let (storage, _, _) = self.storage.as_mut().unwrap();
-                let operation = storage.transfer(&tokens, &groups, true);
-                self.jobs.push((operation, request, tokens, Some(pages)));
+                let operation = storage.transfer(&tokens, &groups, true, salt.as_deref());
+                self.jobs
+                    .push((operation, request, tokens, Some(pages), salt));
             }
         }
         Ok(())
@@ -274,6 +303,7 @@ impl PagedKvResources {
         pages: &CachedPages,
         tokens: &[u32],
         reused: bool,
+        salt: Option<&str>,
     ) -> Result<(), CachePoolError> {
         if self.storage.as_ref().is_some_and(|(_, limit, policy)| {
             self.jobs.len() < limit.get()
@@ -320,8 +350,9 @@ impl PagedKvResources {
                 return Err(error);
             }
             if let Some((storage, _, _)) = &mut self.storage {
-                let operation = storage.transfer(tokens, &groups, false);
-                self.jobs.push((operation, 0, Vec::new(), Some(source)));
+                let operation = storage.transfer(tokens, &groups, false, salt);
+                self.jobs
+                    .push((operation, 0, Vec::new(), Some(source), None));
             }
         }
         Ok(())
@@ -563,11 +594,12 @@ impl PagedKvResources {
         &mut self,
         state: &mut RequestPages,
         tokens: &[u32],
+        salt: Option<&str>,
     ) -> Result<u32, CachePoolError> {
         let Some(mut cache) = self.prefix_cache.take() else {
             return Ok(0);
         };
-        let restored = self.restore_from_cache(&mut cache, state, tokens);
+        let restored = self.restore_from_cache(&mut cache, state, tokens, salt);
         self.prefix_cache = Some(cache);
         restored
     }
@@ -577,12 +609,13 @@ impl PagedKvResources {
         cache: &mut PrefixCache<CachedPages>,
         state: &mut RequestPages,
         tokens: &[u32],
+        salt: Option<&str>,
     ) -> Result<u32, CachePoolError> {
         let maximum = tokens
             .len()
             .saturating_sub(self.layout.replay_suffix_tokens() as usize);
         let pool = &mut self.pool;
-        let Some((length, snapshot)) = cache.find(tokens, maximum) else {
+        let Some((length, snapshot)) = cache.find(tokens, maximum, salt) else {
             return Ok(0);
         };
         let mut private = if !self.state_demands.is_empty() {
@@ -618,7 +651,7 @@ impl PagedKvResources {
         }
         // The matched immutable snapshot also holds STATE before its private
         // restore. Optional backup failure must not reject a successful hit.
-        let _ = self.store_prefix(snapshot, &tokens[..length as usize], true);
+        let _ = self.store_prefix(snapshot, &tokens[..length as usize], true, salt);
         Ok(length)
     }
 
@@ -629,6 +662,7 @@ impl PagedKvResources {
         state: &mut RequestPages,
         tokens: &[u32],
         resident_tokens: u32,
+        salt: Option<&str>,
     ) -> Result<bool, CachePoolError> {
         if !self.state_demands.is_empty() {
             // Live state is never frozen in place. Only an authenticated,
@@ -647,12 +681,12 @@ impl PagedKvResources {
         }
         let demands = self.demands(resident_tokens);
         let pages = self.pool.share_request_prefix(state, &demands)?;
-        self.store_prefix(&pages, &tokens[..length], false)?;
+        self.store_prefix(&pages, &tokens[..length], false, salt)?;
         let replaced = self
             .prefix_cache
             .as_mut()
             .expect("cache enablement was checked")
-            .insert(&tokens[..length], pages);
+            .insert(&tokens[..length], pages, salt);
         if let Some(replaced) = replaced {
             self.pool.retire_cached_prefix(replaced)?;
         }
@@ -834,6 +868,7 @@ impl PagedKvResources {
         state: &mut RequestPages,
         reservation_id: u64,
         tokens: &[u32],
+        salt: Option<&str>,
     ) -> Result<(), CachePoolError> {
         let snapshot = self
             .state_resources
@@ -886,12 +921,12 @@ impl PagedKvResources {
             .pool
             .combine_state_snapshots(history, copied, &self.state_groups)?;
         snapshot.ready = false;
-        self.store_prefix(&pages, tokens, false)?;
+        self.store_prefix(&pages, tokens, false, salt)?;
         let replaced = self
             .prefix_cache
             .as_mut()
             .ok_or(CachePoolError::StaleHandle)?
-            .insert(tokens, pages);
+            .insert(tokens, pages, salt);
         if let Some(replaced) = replaced {
             self.pool.retire_cached_prefix(replaced)?;
         }
@@ -1338,10 +1373,16 @@ mod tests {
         }
     }
     impl PrefixStorage for HeldStorage {
-        fn lookup(&mut self, _: &[u32], _: u32, _: u32) -> StorageOp {
+        fn lookup(&mut self, _: &[u32], _: u32, _: u32, _: Option<&str>) -> StorageOp {
             unreachable!("the test only exports checkpoints")
         }
-        fn transfer(&mut self, _: &[u32], groups: &[PrefixStorageGroup], load: bool) -> StorageOp {
+        fn transfer(
+            &mut self,
+            _: &[u32],
+            groups: &[PrefixStorageGroup],
+            load: bool,
+            _: Option<&str>,
+        ) -> StorageOp {
             assert!(!load);
             *self.1.lock().unwrap() = groups.to_vec();
             Box::new(self.clone())
@@ -1381,7 +1422,7 @@ mod tests {
                 })
                 .collect::<Vec<_>>();
             assert!(
-                r.publish_prefix(&mut request, &vec![7; length as usize], length)
+                r.publish_prefix(&mut request, &vec![7; length as usize], length, None)
                     .unwrap()
             );
             {
@@ -1453,10 +1494,12 @@ mod tests {
         let id = RequestId::new(NonZeroU64::new(1).unwrap());
         let mut request = resources.attach(id, 0).unwrap();
         resources.ensure_context(&mut request, 0, 2).unwrap();
-        resources.publish_prefix(&mut request, &[1, 2], 2).unwrap();
+        resources
+            .publish_prefix(&mut request, &[1, 2], 2, None)
+            .unwrap();
         resources.ensure_context(&mut request, 2, 4).unwrap();
         resources
-            .publish_prefix(&mut request, &[1, 2, 3, 4], 4)
+            .publish_prefix(&mut request, &[1, 2, 3, 4], 4, None)
             .unwrap();
         assert_eq!(resources.metrics().groups[0].reclaimable_blocks, 0);
         resources.retire(request).unwrap();
@@ -1738,7 +1781,7 @@ mod tests {
         resources.release(write.lease);
         assert!(
             resources
-                .publish_prefix(&mut first, &[10, 11, 12, 13], 4)
+                .publish_prefix(&mut first, &[10, 11, 12, 13], 4, None)
                 .unwrap()
         );
 
@@ -1746,7 +1789,7 @@ mod tests {
         let mut second = resources.attach(second_id, 0).unwrap();
         assert_eq!(
             resources
-                .restore_prefix(&mut second, &[10, 11, 12, 13, 14])
+                .restore_prefix(&mut second, &[10, 11, 12, 13, 14], None)
                 .unwrap(),
             4
         );
@@ -1796,7 +1839,7 @@ mod tests {
         let mut seed = resources.attach(seed_id, 0).unwrap();
         resources.ensure_context(&mut seed, 0, 4).unwrap();
         resources
-            .publish_prefix(&mut seed, &[10, 11, 12, 13], 4)
+            .publish_prefix(&mut seed, &[10, 11, 12, 13], 4, None)
             .unwrap();
         resources.retire(seed).unwrap();
 
@@ -1806,7 +1849,7 @@ mod tests {
             let mut state = resources.attach(id, 0).unwrap();
             assert_eq!(
                 resources
-                    .restore_prefix(&mut state, &[10, 11, 12, 13, 20])
+                    .restore_prefix(&mut state, &[10, 11, 12, 13, 20], None)
                     .unwrap(),
                 4
             );
@@ -1935,14 +1978,14 @@ mod tests {
             .unwrap();
         resources.release(write.lease);
         resources
-            .publish_prefix(&mut first, &[1, 2, 3, 4, 5, 6], 6)
+            .publish_prefix(&mut first, &[1, 2, 3, 4, 5, 6], 6, None)
             .unwrap();
 
         let second_id = RequestId::new(NonZeroU64::new(2).unwrap());
         let mut second = resources.attach(second_id, 0).unwrap();
         assert_eq!(
             resources
-                .restore_prefix(&mut second, &[1, 2, 3, 4, 5, 6, 7])
+                .restore_prefix(&mut second, &[1, 2, 3, 4, 5, 6, 7], None)
                 .unwrap(),
             6
         );
@@ -1978,7 +2021,7 @@ mod tests {
                 .unwrap();
         }
         resources
-            .publish_prefix(&mut state, &(0..6).collect::<Vec<_>>(), 6)
+            .publish_prefix(&mut state, &(0..6).collect::<Vec<_>>(), 6, None)
             .unwrap();
         let original = state.groups()[0]
             .pages()
@@ -2027,7 +2070,7 @@ mod tests {
             .map(|page| resources.pool().physical_address(page.handle()).unwrap())
             .collect::<Vec<_>>();
         resources
-            .publish_prefix(&mut state, &(0..6).collect::<Vec<_>>(), 6)
+            .publish_prefix(&mut state, &(0..6).collect::<Vec<_>>(), 6, None)
             .unwrap();
         resources.ensure_context(&mut state, 6, 12).unwrap();
         let access = resources
@@ -2082,7 +2125,7 @@ mod tests {
         let mut cached = resources.attach(cached_id, 0).unwrap();
         resources.ensure_context(&mut cached, 0, 4).unwrap();
         resources
-            .publish_prefix(&mut cached, &[1, 2, 3, 4], 4)
+            .publish_prefix(&mut cached, &[1, 2, 3, 4], 4, None)
             .unwrap();
         resources.retire(cached).unwrap();
         assert_eq!(resources.pool().occupied_block_count(), 2);
@@ -2185,7 +2228,7 @@ mod tests {
         resources.finish_state_initialization(&[first_id.get()]);
         resources.release(access.lease);
         resources
-            .publish_state_prefix(&mut first, receipt, &(0..128).collect::<Vec<_>>())
+            .publish_state_prefix(&mut first, receipt, &(0..128).collect::<Vec<_>>(), None)
             .unwrap();
         assert!(resources.jobs.is_empty()); // A cold STATE checkpoint is not exported.
         assert!(first.groups()[1].pages()[0].is_writable());
@@ -2202,7 +2245,7 @@ mod tests {
         let mut second = resources.attach(second_id, 0).unwrap();
         assert_eq!(
             resources
-                .restore_prefix(&mut second, &(0..129).collect::<Vec<_>>())
+                .restore_prefix(&mut second, &(0..129).collect::<Vec<_>>(), None)
                 .unwrap(),
             128
         );
@@ -2385,7 +2428,7 @@ mod tests {
         resources.finish_state_initialization(&[first_id.get()]);
         resources.release(access.lease);
         resources
-            .publish_state_prefix(&mut first, receipt, &[1, 2])
+            .publish_state_prefix(&mut first, receipt, &[1, 2], None)
             .unwrap();
         resources.retire(first).unwrap();
 
@@ -2395,7 +2438,9 @@ mod tests {
         let id = RequestId::new(NonZeroU64::new(3).unwrap());
         let mut request = resources.attach(id, 0).unwrap();
         assert_eq!(
-            resources.restore_prefix(&mut request, &[1, 2, 3]).unwrap(),
+            resources
+                .restore_prefix(&mut request, &[1, 2, 3], None)
+                .unwrap(),
             0
         );
         assert!(request.groups()[0].pages().is_empty());
@@ -2482,7 +2527,7 @@ mod tests {
             resources.finish_state_initialization(&[id.get()]);
             resources.release(access.lease);
             resources
-                .publish_state_prefix(&mut request, receipt, &[1, 2, 3, 4])
+                .publish_state_prefix(&mut request, receipt, &[1, 2, 3, 4], None)
                 .unwrap();
             assert_eq!(
                 resources.prefix_metrics().unwrap().entries,

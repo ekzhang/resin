@@ -296,6 +296,7 @@ pub struct Submission<P> {
     pub batch_key: Option<u64>,
     pub stop_token_ids: Vec<u32>,
     pub cache_key: Option<Vec<u32>>,
+    pub cache_salt: Option<String>,
     pub cacheable: bool,
     pub atomic_prefill_spans: Vec<(u32, u32)>,
     pub payload: P,
@@ -313,6 +314,7 @@ impl<P> Submission<P> {
             batch_key: None,
             stop_token_ids: Vec::new(),
             cache_key: None,
+            cache_salt: None,
             cacheable: true,
             atomic_prefill_spans: Vec::new(),
         }
@@ -380,6 +382,7 @@ struct Request<P> {
     running: bool,
     prompt: Vec<u32>,
     cache_prompt: Option<Vec<u32>>,
+    cache_salt: Option<String>,
     atomic_prefill_spans: Vec<(u32, u32)>,
     resident_tokens: u32,
     generated: Vec<u32>,
@@ -835,6 +838,7 @@ impl<P: Clone> EngineCore<P> {
             batch_key,
             mut stop_token_ids,
             cache_key: cache_prompt,
+            cache_salt,
             cacheable,
             atomic_prefill_spans,
             payload,
@@ -951,7 +955,7 @@ impl<P: Clone> EngineCore<P> {
         let cache_identity = cache_identity.filter(|_| !prompt_logprobs);
         let resident_tokens = match (&mut self.kv_resources, &mut pages, cache_identity) {
             (Some(resources), Some(pages), Some(identity)) => resources
-                .restore_prefix(pages, identity)
+                .restore_prefix(pages, identity, cache_salt.as_deref())
                 .map_err(Error::from)?,
             _ => 0,
         };
@@ -959,7 +963,7 @@ impl<P: Clone> EngineCore<P> {
             && cache_identity.is_some_and(|identity| {
                 self.kv_resources
                     .as_mut()
-                    .is_some_and(|r| r.start_storage(request_id, identity))
+                    .is_some_and(|r| r.start_storage(request_id, identity, cache_salt.as_deref()))
             });
         lease_state
             .lock()
@@ -986,6 +990,7 @@ impl<P: Clone> EngineCore<P> {
             running: false,
             prompt: token_ids,
             cache_prompt,
+            cache_salt,
             atomic_prefill_spans,
             resident_tokens,
             generated: Vec::new(),
@@ -2028,11 +2033,21 @@ impl<P: Clone> EngineCore<P> {
                     .expect("prefix-enabled requests own managed pages");
                 if has_recurrent_state {
                     resources
-                        .publish_state_prefix(pages, reservation_id, &tokens[..length as usize])
+                        .publish_state_prefix(
+                            pages,
+                            reservation_id,
+                            &tokens[..length as usize],
+                            row.request.cache_salt.as_deref(),
+                        )
                         .map_err(Error::from)?;
                 } else {
                     resources
-                        .publish_prefix(pages, &tokens[..length as usize], length)
+                        .publish_prefix(
+                            pages,
+                            &tokens[..length as usize],
+                            length,
+                            row.request.cache_salt.as_deref(),
+                        )
                         .map_err(Error::from)?;
                 }
             }
@@ -2586,6 +2601,7 @@ mod tests {
             running: false,
             prompt: prompt.to_vec(),
             cache_prompt: None,
+            cache_salt: None,
             atomic_prefill_spans: Vec::new(),
             resident_tokens: if generated.is_empty() {
                 0

@@ -506,7 +506,9 @@ class Engine:
         prefix_cache: bool = False,
         prefix_cache_storage: CacheStorage | None = None,
         prefix_cache_max_inflight: int | None = None,
-        prefix_cache_storage_policy: Literal["write_through", "write_through_selective"] = "write_through_selective",
+        prefix_cache_storage_policy: Literal[
+            "write_through", "write_through_selective"
+        ] = "write_through_selective",
         enable_overlap: bool = True,
         enable_metrics: bool = True,
     ) -> Engine: ...
@@ -599,6 +601,7 @@ class Engine:
         sampling_params: SamplingParams | None = None,
         media: "MediaInput | None" = None,
         prompt_target_logprobs: Sequence[Sequence[int]] | None = None,
+        cache_salt: str | None = None,
     ) -> RequestLease: ...
 
 @final

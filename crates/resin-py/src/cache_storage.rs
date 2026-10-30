@@ -24,24 +24,36 @@ impl PythonPrefixStorage {
     }
 }
 impl PrefixStorage for PythonPrefixStorage {
-    fn lookup(&mut self, tokens: &[u32], maximum: u32, alignment: u32) -> StorageOp {
+    fn lookup(
+        &mut self,
+        tokens: &[u32],
+        maximum: u32,
+        alignment: u32,
+        salt: Option<&str>,
+    ) -> StorageOp {
         Python::attach(|py| {
             self.wrap(
                 py,
                 self.0
                     .bind(py)
-                    .call_method1("lookup", (tokens, maximum, alignment)),
+                    .call_method1("lookup", (tokens, maximum, alignment, salt)),
                 true,
             )
         })
     }
-    fn transfer(&mut self, tokens: &[u32], groups: &[PrefixStorageGroup], load: bool) -> StorageOp {
+    fn transfer(
+        &mut self,
+        tokens: &[u32],
+        groups: &[PrefixStorageGroup],
+        load: bool,
+        salt: Option<&str>,
+    ) -> StorageOp {
         Python::attach(|py| {
             self.wrap(
                 py,
                 self.0
                     .bind(py)
-                    .call_method1("transfer", (tokens, groups, load)),
+                    .call_method1("transfer", (tokens, groups, load, salt)),
                 false,
             )
         })

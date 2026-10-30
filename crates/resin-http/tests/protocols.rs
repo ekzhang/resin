@@ -142,6 +142,51 @@ fn scored_router() -> axum::Router {
     router("test-model", jobs, RouteConfig::default(), None)
 }
 
+#[tokio::test]
+async fn cache_salts_are_typed_and_forwarded_by_every_protocol() {
+    for path in ["/v1/chat/completions", "/v1/responses", "/v1/messages"] {
+        for salt in [Value::Null, json!(""), json!("alice"), json!("λ")] {
+            let (jobs, mut receiver) = mpsc::channel(1);
+            let app = router("test-model", jobs, RouteConfig::default(), None);
+            let mut body = if path == "/v1/responses" {
+                json!({"model": "test-model", "input": "hi"})
+            } else {
+                json!({"model": "test-model", "messages": [{"role": "user", "content": "hi"}], "max_tokens": 1})
+            };
+            body["cache_salt"] = salt.clone();
+            let request = Request::post(path)
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(body.to_string()))
+                .unwrap();
+            let pending = tokio::spawn(app.oneshot(request));
+            let job = receiver.recv().await.unwrap();
+            assert_eq!(job.request.cache_salt.as_deref(), salt.as_str());
+            assert!(!job.request.extra.contains_key("cache_salt"));
+            // The distributed ingress serializes this same request type.
+            let encoded = serde_json::to_vec(&job.request).unwrap();
+            let restored: resin_http::ConversationRequest =
+                serde_json::from_slice(&encoded).unwrap();
+            assert_eq!(restored.cache_salt, job.request.cache_salt);
+            drop(job);
+            pending.await.unwrap().unwrap();
+        }
+        for salt in [json!(1), json!(true), json!([]), json!({})] {
+            let mut body = if path == "/v1/responses" {
+                json!({"model": "test-model", "input": "hi"})
+            } else {
+                json!({"model": "test-model", "messages": [{"role": "user", "content": "hi"}], "max_tokens": 1})
+            };
+            body["cache_salt"] = salt;
+            let request = Request::post(path)
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(body.to_string()))
+                .unwrap();
+            let response = test_router().oneshot(request).await.unwrap();
+            assert_eq!(response.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        }
+    }
+}
+
 fn scored_request(path: &str, stream: bool) -> Request<Body> {
     let mut body = json!({"model": "test-model", "stream": stream, "logprobs": true});
     if path == "/v1/responses" {
