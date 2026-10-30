@@ -8,6 +8,8 @@ use tokio::sync::mpsc;
 pub struct ConversationRequest {
     pub id: String,
     pub model: String,
+    #[serde(default)]
+    pub priority: i32,
     pub messages: Vec<Value>,
     pub tools: Vec<Value>,
     /// Omission lets the engine use the context budget left by the rendered prompt.

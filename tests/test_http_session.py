@@ -278,3 +278,65 @@ def test_http_session_snapshots_recipe_stops_before_rendering():
     finally:
         session.close()
         engine.close()
+
+
+def test_http_priority_survives_transport_and_orders_waiting_admission():
+    class Recipe:
+        tokenizer = None
+        stop_token_ids = []
+
+        def render(self, messages, *, tools=(), options=None):
+            return resin.recipe.RenderedPrompt([1])
+
+        def create_parser(self, prompt):
+            class Parser:
+                def feed(self, ids):
+                    return []
+
+            return Parser()
+
+    class Runner:
+        def forward(self, plan):
+            return forward_output([2] * plan.num_sequences)
+
+    request = {
+        "model": "test",
+        "messages": [],
+        "tools": [],
+        "max_output_tokens": 1,
+        "temperature": 1.0,
+        "top_p": 1.0,
+        "top_k": None,
+        "seed": None,
+        "logprobs": False,
+        "top_logprobs": 0,
+        "prompt_logprobs": False,
+        "routed_dp_rank": None,
+        "stop": [],
+        "reasoning_effort": None,
+        "extra": {},
+    }
+    packet = ingress(
+        [
+            {**request, "id": "low", "priority": -(2**31)},
+            {**request, "id": "default"},
+            {**request, "id": "high", "priority": 2**31 - 1},
+            {**request, "id": "same", "priority": 2**31 - 1},
+        ]
+    )
+    from resin._resin import _HttpIngress
+
+    packet = _HttpIngress.from_bytes(packet.to_bytes())
+    engine = Engine(Runner(), max_running_requests=1)
+    session = _HttpSession(engine, Recipe())
+    session.admit(packet)
+    completed = []
+    while engine.has_work():
+        completed.extend(
+            request_id
+            for request_id, event in decoded_events(session.process(engine.step()))
+            if event["type"] == "finished"
+        )
+    assert completed == ["high", "same", "default", "low"]
+    session.close()
+    engine.close()

@@ -25,6 +25,11 @@ class HttpServer:
     inference. Requests select a replica with routed_dp_rank or the
     resin-routed-dp-rank header; unassigned requests use round robin.
 
+    - `enable_priority_scheduling` accepts a signed 32-bit `priority` on HTTP
+      requests. Higher values are admitted first among waiting requests within
+      each engine; running requests are not preempted. Defaults to False, which
+      rejects any supplied priority.
+
     - `stream_interval` batches later output until N generated model tokens have
       accumulated, checked at step boundaries. The first semantic output is sent
       immediately, and completion flushes the remainder.
@@ -58,6 +63,7 @@ class HttpServer:
         enable_openai: bool = True,
         enable_anthropic: bool = True,
         enable_demo: bool = True,
+        enable_priority_scheduling: bool = False,
     ) -> None:
         from resin.backend.distributed import (
             DistributedEngine,
@@ -86,7 +92,12 @@ class HttpServer:
                 )
             if any(
                 type(flag) is not bool
-                for flag in (enable_openai, enable_anthropic, enable_demo)
+                for flag in (
+                    enable_openai,
+                    enable_anthropic,
+                    enable_demo,
+                    enable_priority_scheduling,
+                )
             ):
                 raise ValueError("HTTP route flags must be booleans")
             if enable_demo and not enable_openai:
@@ -104,6 +115,7 @@ class HttpServer:
                     enable_openai,
                     enable_anthropic,
                     enable_demo,
+                    enable_priority_scheduling,
                     stream_interval,
                     request_queue_capacity,
                     max_active_requests,
@@ -158,6 +170,7 @@ class HttpServer:
                     enable_openai=enable_openai,
                     enable_anthropic=enable_anthropic,
                     enable_demo=enable_demo,
+                    enable_priority_scheduling=enable_priority_scheduling,
                     distributed=self._coordinator,
                 )
         except BaseException as exc:

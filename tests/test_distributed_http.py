@@ -177,6 +177,13 @@ def _serve_rank(rank, world_size, directory, port, case):
                 recipe=recipe,
                 model=model,
                 enable_openai=not (case == "flags" and groups.drivers.local_rank == 0),
+                enable_priority_scheduling=(
+                    case == "normal"
+                    or (
+                        case == "enable_priority_scheduling"
+                        and groups.drivers.local_rank == 1
+                    )
+                ),
                 request_queue_capacity=(
                     2
                     if case == "request_queue_capacity"
@@ -382,6 +389,7 @@ def _assert_distributed_metrics(base):
         ("bind", 2),
         ("whitespace", 2),
         ("flags", 2),
+        ("enable_priority_scheduling", 2),
         ("infer", 2),
         ("frontend", 2),
         ("stream_interval", 2),
@@ -435,7 +443,7 @@ def test_distributed_http_routes_real_replica_engines(tmp_path, case, world_size
                         json.load(response)["choices"][0]["message"]["content"]
                         == str(rank) * 2
                     )
-            with _post(base, 1, logprobs=True, top_logprobs=2) as response:
+            with _post(base, 1, logprobs=True, top_logprobs=2, priority=-7) as response:
                 output = json.load(response)
             assert output["choices"][0]["message"]["content"] == "11"
             # Custom parsers cannot prove a token's semantic channel; raw
@@ -544,6 +552,7 @@ def test_distributed_http_routes_real_replica_engines(tmp_path, case, world_size
     elif case in (
         "whitespace",
         "flags",
+        "enable_priority_scheduling",
         "infer",
         "frontend",
         "initialize",
@@ -562,6 +571,7 @@ def test_distributed_http_routes_real_replica_engines(tmp_path, case, world_size
         assert records[0]["error"] is not None
         assert all(record["engine_closed"] for record in records)
         if case in (
+            "enable_priority_scheduling",
             "stream_interval",
             "request_queue_capacity",
             "max_active_requests",

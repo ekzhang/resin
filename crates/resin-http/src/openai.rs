@@ -171,7 +171,7 @@ pub async fn chat_completions(
     }
 }
 
-fn chat_request(state: &AppState, body: ChatRequest) -> RequestResult<ConversationRequest> {
+fn chat_request(state: &AppState, mut body: ChatRequest) -> RequestResult<ConversationRequest> {
     validate_model(state, &body.model)?;
     validate_sampling(body.temperature, body.top_p, body.top_k, body.seed)?;
     validate_logprobs(body.top_logprobs)?;
@@ -190,6 +190,7 @@ fn chat_request(state: &AppState, body: ChatRequest) -> RequestResult<Conversati
     }
     Ok(ConversationRequest {
         id: state.request_id("chatcmpl"),
+        priority: request_priority(state, &mut body.extra)?,
         model: body.model,
         messages: body.messages,
         tools: function_tools(body.tools)?,
@@ -418,6 +419,7 @@ fn responses_request(
     }
     Ok(ConversationRequest {
         id: state.request_id("resp"),
+        priority: request_priority(state, &mut body.extra)?,
         model: body.model,
         messages,
         tools: function_tools(body.tools)?,
@@ -665,6 +667,24 @@ fn validate_model(state: &AppState, model: &str) -> RequestResult<()> {
                 .into_response(),
         ))
     }
+}
+
+pub(crate) fn request_priority(
+    state: &AppState,
+    extra: &mut BTreeMap<String, Value>,
+) -> RequestResult<i32> {
+    let Some(priority) = extra.remove("priority") else {
+        return Ok(0);
+    };
+    if !state.enable_priority_scheduling {
+        return Err(invalid_request(
+            "priority requires HttpServer(enable_priority_scheduling=True)",
+        ));
+    }
+    priority
+        .as_i64()
+        .and_then(|priority| i32::try_from(priority).ok())
+        .ok_or_else(|| invalid_request("priority must be a signed 32-bit integer"))
 }
 
 pub(crate) fn validate_sampling(

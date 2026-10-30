@@ -16,7 +16,7 @@ use tokio::sync::mpsc;
 
 use crate::{
     AppState,
-    openai::{RequestResult, invalid_request, routed_rank, validate_sampling},
+    openai::{RequestResult, invalid_request, request_priority, routed_rank, validate_sampling},
     protocol::{ConversationRequest, GenerationEvent, ResponseAccumulator, json_error},
 };
 
@@ -133,6 +133,7 @@ fn conversation_request(
     }
     Ok(ConversationRequest {
         id: state.request_id("msg"),
+        priority: request_priority(state, &mut body.extra)?,
         model: body.model,
         messages,
         tools,
