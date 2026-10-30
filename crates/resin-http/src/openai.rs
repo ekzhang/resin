@@ -51,6 +51,7 @@ struct StreamOptions {
 #[derive(Debug, Deserialize)]
 pub(crate) struct ChatRequest {
     model: String,
+    priority: Option<i32>,
     messages: Vec<Value>,
     #[serde(default)]
     tools: Vec<Value>,
@@ -81,6 +82,7 @@ pub(crate) struct ChatRequest {
 #[derive(Debug, Deserialize)]
 pub(crate) struct ResponsesRequest {
     model: String,
+    priority: Option<i32>,
     input: Value,
     stop: Option<OneOrManyStrings>,
     #[serde(default)]
@@ -190,6 +192,7 @@ fn chat_request(state: &AppState, body: ChatRequest) -> RequestResult<Conversati
     }
     Ok(ConversationRequest {
         id: state.request_id("chatcmpl"),
+        priority: request_priority(state, body.priority)?,
         model: body.model,
         messages: body.messages,
         tools: function_tools(body.tools)?,
@@ -462,6 +465,7 @@ fn responses_request(
     }
     Ok(ConversationRequest {
         id: state.request_id("resp"),
+        priority: request_priority(state, body.priority)?,
         model: body.model,
         messages,
         tools: function_tools(body.tools)?,
@@ -709,6 +713,18 @@ fn validate_model(state: &AppState, model: &str) -> RequestResult<()> {
                 .into_response(),
         ))
     }
+}
+
+pub(crate) fn request_priority(
+    state: &AppState,
+    priority: Option<i32>,
+) -> RequestResult<Option<i32>> {
+    if priority.is_some() && !state.enable_priority_scheduling {
+        return Err(invalid_request(
+            "priority requires HttpServer(enable_priority_scheduling=True)",
+        ));
+    }
+    Ok(priority)
 }
 
 pub(crate) fn validate_sampling(

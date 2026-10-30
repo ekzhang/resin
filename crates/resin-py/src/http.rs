@@ -63,6 +63,7 @@ impl NativeHttpServer {
         enable_openai = true,
         enable_anthropic = true,
         enable_demo = true,
+        enable_priority_scheduling = false,
         distributed = None
     ))]
     #[allow(clippy::too_many_arguments)]
@@ -78,6 +79,7 @@ impl NativeHttpServer {
         enable_openai: bool,
         enable_anthropic: bool,
         enable_demo: bool,
+        enable_priority_scheduling: bool,
         distributed: Option<Py<PyAny>>,
     ) -> PyResult<Self> {
         if stream_interval == 0 {
@@ -155,6 +157,7 @@ impl NativeHttpServer {
                 enable_openai,
                 enable_anthropic,
                 enable_demo,
+                enable_priority_scheduling,
                 routed_dp_size,
             },
             running: AtomicBool::new(false),
@@ -235,7 +238,7 @@ impl NativeHttpServer {
 
     fn __repr__(&self) -> String {
         format!(
-            "_HttpServer(model={:?}, stream_interval={}, request_queue_capacity={}, max_active_requests={}, render_workers={}, admissions_per_step={}, enable_openai={}, enable_anthropic={}, enable_demo={}, running={})",
+            "_HttpServer(model={:?}, stream_interval={}, request_queue_capacity={}, max_active_requests={}, render_workers={}, admissions_per_step={}, enable_openai={}, enable_anthropic={}, enable_demo={}, enable_priority_scheduling={}, running={})",
             self.model,
             self.stream_interval,
             self.request_queue_capacity,
@@ -245,6 +248,7 @@ impl NativeHttpServer {
             self.routes.enable_openai,
             self.routes.enable_anthropic,
             self.routes.enable_demo,
+            self.routes.enable_priority_scheduling,
             self.running.load(Ordering::Acquire),
         )
     }

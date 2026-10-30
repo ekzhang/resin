@@ -16,13 +16,15 @@ use tokio::sync::mpsc;
 
 use crate::AppState;
 use crate::openai::{
-    RequestResult, invalid_request, routed_rank, token_count_response, validate_sampling,
+    RequestResult, invalid_request, request_priority, routed_rank, token_count_response,
+    validate_sampling,
 };
 use crate::protocol::{ConversationRequest, GenerationEvent, ResponseAccumulator, json_error};
 
 #[derive(Debug, Deserialize)]
 pub(crate) struct MessagesRequest {
     model: String,
+    priority: Option<i32>,
     routed_dp_rank: Option<Value>,
     messages: Vec<Value>,
     system: Option<Value>,
@@ -155,6 +157,7 @@ fn conversation_request(
     }
     Ok(ConversationRequest {
         id: state.request_id("msg"),
+        priority: request_priority(state, body.priority)?,
         model: body.model,
         messages,
         tools,
