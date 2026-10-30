@@ -14,7 +14,8 @@ use pyo3::{
 };
 use pythonize::pythonize;
 use resin_http::{
-    EVENT_QUEUE_CAPACITY, FinishReason, GeneratedTokenLogprob, GenerationEvent, GenerationJob,
+    ConversationRequest, EVENT_QUEUE_CAPACITY, FinishReason, GeneratedTokenLogprob,
+    GenerationEvent, GenerationJob,
 };
 use resin_recipe::{AttributedEvent, Event as ParsedEvent, FinishReason as ParserFinishReason};
 use std::{collections::HashMap, sync::Mutex, time::Instant};
@@ -501,60 +502,77 @@ fn process(
     Ok(())
 }
 
-/// Recipe output for one request: prompt IDs, prepared media and its parser.
+/// Generation input always includes its response parser.
 pub(crate) type RenderedJob = PyResult<(Vec<u32>, Option<Py<PyAny>>, Py<PyAny>)>;
 
-/// Render a request's prompt and media without touching the Engine.
-///
-/// Media preparation (decode, resize, patchify) dominates admission for large
-/// images. It releases the GIL, so callers may render on worker threads and
-/// submit the result on the engine thread.
+struct RenderInput {
+    messages: Vec<Py<Message>>,
+    tools: Vec<Py<Tool>>,
+    options: RenderOptions,
+}
+
+fn render_input(
+    py: Python<'_>,
+    recipe: &Py<PyAny>,
+    request: &ConversationRequest,
+) -> PyResult<RenderInput> {
+    // JSON is an HTTP concern; both native and custom recipes receive the
+    // same typed conversation. Native recipes stay inside Rust here.
+    let messages = request
+        .messages
+        .iter()
+        .map(|value| {
+            let message = if let Ok(native) = recipe.bind(py).cast::<NativeRecipe>() {
+                native.borrow().message_from_wire(py, value)?
+            } else {
+                Message::from_wire(py, value)?
+            };
+            Py::new(py, message)
+        })
+        .collect::<PyResult<Vec<_>>>()?;
+    let tools = request
+        .tools
+        .iter()
+        .map(|value| Py::new(py, Tool::from_wire(value)?))
+        .collect::<PyResult<Vec<_>>>()?;
+    let options = RenderOptions::from_wire(&serde_json::json!({
+        "reasoning_effort": request.reasoning_effort,
+        "extra": request.extra,
+    }))?;
+    Ok(RenderInput {
+        messages,
+        tools,
+        options,
+    })
+}
+
+fn render_custom<'py>(
+    py: Python<'py>,
+    recipe: &Bound<'py, PyAny>,
+    input: RenderInput,
+) -> PyResult<Bound<'py, PyAny>> {
+    let kwargs = PyDict::new(py);
+    kwargs.set_item("tools", input.tools)?;
+    kwargs.set_item("options", Py::new(py, input.options)?)?;
+    recipe.call_method("render", (input.messages,), Some(&kwargs))
+}
+
+/// Render prompt/media and create its parser off the engine thread.
 pub(crate) fn render_job(recipe: &Py<PyAny>, job: &GenerationJob) -> RenderedJob {
     Python::attach(|py| {
-        // JSON is an HTTP concern; both native and custom recipes receive the
-        // same typed conversation. Native recipes stay inside Rust here.
-        let messages = job
-            .request
-            .messages
-            .iter()
-            .map(|value| {
-                let message = if let Ok(native) = recipe.bind(py).cast::<NativeRecipe>() {
-                    native.borrow().message_from_wire(py, value)?
-                } else {
-                    Message::from_wire(py, value)?
-                };
-                Py::new(py, message)
-            })
-            .collect::<PyResult<Vec<_>>>()?;
-        let tools = job
-            .request
-            .tools
-            .iter()
-            .map(|value| Py::new(py, Tool::from_wire(value)?))
-            .collect::<PyResult<Vec<_>>>()?;
-        let options = RenderOptions::from_wire(&serde_json::json!({
-            "reasoning_effort": job.request.reasoning_effort,
-            "extra": job.request.extra,
-        }))?;
+        let input = render_input(py, recipe, &job.request)?;
         if let Ok(native) = recipe.bind(py).cast::<NativeRecipe>() {
             let native = native.borrow();
-            let rendered = native.render(py, messages, tools, Some(&options))?;
+            let rendered = native.render(py, input.messages, input.tools, Some(&input.options))?;
             let parser = Py::new(py, native.create_parser(py, &rendered)?)?.into_any();
             Ok((rendered.token_ids, rendered.media, parser))
         } else {
-            let kwargs = PyDict::new(py);
-            kwargs.set_item("tools", tools)?;
-            kwargs.set_item("options", Py::new(py, options)?)?;
-            let rendered = recipe
-                .bind(py)
-                .call_method("render", (messages,), Some(&kwargs))?;
+            let rendered = render_custom(py, recipe.bind(py), input)?;
             let parser = recipe
                 .bind(py)
                 .call_method1("create_parser", (&rendered,))?
                 .unbind();
             let prompt = rendered.cast::<RenderedPrompt>()?.borrow();
-            // Custom recipes also return the native prompt container, so media
-            // and token ownership cross one well-defined admission boundary.
             Ok((
                 prompt.token_ids.clone(),
                 prompt.media.as_ref().map(|value| value.clone_ref(py)),
@@ -562,6 +580,29 @@ pub(crate) fn render_job(recipe: &Py<PyAny>, job: &GenerationJob) -> RenderedJob
             ))
         }
     })
+}
+
+/// Count the same rendered prompt without creating a parser or Engine request.
+pub(crate) fn count_tokens(recipe: &Py<PyAny>, request: &ConversationRequest) -> PyResult<usize> {
+    let count = Python::attach(|py| -> PyResult<usize> {
+        let input = render_input(py, recipe, request)?;
+        if let Ok(native) = recipe.bind(py).cast::<NativeRecipe>() {
+            let prompt =
+                native
+                    .borrow()
+                    .render(py, input.messages, input.tools, Some(&input.options))?;
+            Ok(prompt.token_ids.len())
+        } else {
+            let rendered = render_custom(py, recipe.bind(py), input)?;
+            Ok(rendered.cast::<RenderedPrompt>()?.borrow().token_ids.len())
+        }
+    })?;
+    if count == 0 {
+        return Err(PyValueError::new_err(
+            "recipe.render returned an empty token_ids sequence",
+        ));
+    }
+    Ok(count)
 }
 
 fn admit(

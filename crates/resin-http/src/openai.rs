@@ -16,7 +16,7 @@ use axum::{
 };
 use serde::Deserialize;
 use serde_json::{Value, json};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 
 use crate::{
     AppState,
@@ -379,6 +379,50 @@ pub async fn responses(
         responses_stream(request, receiver).into_response()
     } else {
         responses_response(request, receiver).await
+    }
+}
+
+pub async fn input_tokens(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(mut body): Json<ResponsesRequest>,
+) -> Response {
+    body.routed_dp_rank = match routed_rank(&state, &headers, body.routed_dp_rank) {
+        Ok(rank) => rank.map(|rank| json!(rank)),
+        Err(response) => return *response,
+    };
+    body.max_output_tokens = None;
+    let request = match responses_request(&state, body) {
+        Ok(request) => request,
+        Err(response) => return *response,
+    };
+    token_count_response(&state, request, true).await
+}
+
+pub(crate) async fn token_count_response(
+    state: &AppState,
+    request: ConversationRequest,
+    openai: bool,
+) -> Response {
+    let Some(counter) = &state.token_counter else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json_error("token counting is unavailable", "server_error")),
+        )
+            .into_response();
+    };
+    let (result, receiver) = oneshot::channel();
+    counter(request, result);
+    match receiver.await {
+        Ok(Ok(input_tokens)) => {
+            let mut body = json!({"input_tokens": input_tokens});
+            if openai {
+                body["object"] = json!("response.input_tokens");
+            }
+            Json(body).into_response()
+        }
+        Ok(Err(message)) => internal_error(message),
+        Err(_) => internal_error("token counting ended without a result".to_owned()),
     }
 }
 

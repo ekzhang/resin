@@ -14,11 +14,12 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use tokio::sync::mpsc;
 
-use crate::{
-    AppState,
-    openai::{RequestResult, invalid_request, request_priority, routed_rank, validate_sampling},
-    protocol::{ConversationRequest, GenerationEvent, ResponseAccumulator, json_error},
+use crate::AppState;
+use crate::openai::{
+    RequestResult, invalid_request, request_priority, routed_rank, token_count_response,
+    validate_sampling,
 };
+use crate::protocol::{ConversationRequest, GenerationEvent, ResponseAccumulator, json_error};
 
 #[derive(Debug, Deserialize)]
 pub(crate) struct MessagesRequest {
@@ -29,7 +30,7 @@ pub(crate) struct MessagesRequest {
     system: Option<Value>,
     #[serde(default)]
     tools: Vec<Value>,
-    max_tokens: usize,
+    max_tokens: Option<usize>,
     #[serde(default = "default_temperature")]
     temperature: f64,
     #[serde(default = "default_top_p")]
@@ -79,6 +80,25 @@ pub async fn messages(
     }
 }
 
+pub async fn count_tokens(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(mut body): Json<MessagesRequest>,
+) -> Response {
+    body.routed_dp_rank = match routed_rank(&state, &headers, body.routed_dp_rank) {
+        Ok(rank) => rank.map(|rank| json!(rank)),
+        Err(response) => return *response,
+    };
+    // The count endpoint has no generation budget. Reuse the Messages prompt
+    // normalization without requiring the generation-only max_tokens field.
+    body.max_tokens = Some(1);
+    let request = match conversation_request(&state, body) {
+        Ok(request) => request,
+        Err(response) => return *response,
+    };
+    token_count_response(&state, request, false).await
+}
+
 fn conversation_request(
     state: &AppState,
     mut body: MessagesRequest,
@@ -101,7 +121,10 @@ fn conversation_request(
     if body.messages.is_empty() {
         return Err(invalid_request("messages must not be empty"));
     }
-    if body.max_tokens == 0 {
+    let max_tokens = body
+        .max_tokens
+        .ok_or_else(|| invalid_request("max_tokens is required"))?;
+    if max_tokens == 0 {
         return Err(invalid_request("max_tokens must be positive"));
     }
     validate_sampling(body.temperature, body.top_p, body.top_k, None)?;
@@ -138,7 +161,7 @@ fn conversation_request(
         model: body.model,
         messages,
         tools,
-        max_output_tokens: Some(body.max_tokens),
+        max_output_tokens: Some(max_tokens),
         temperature: body.temperature,
         top_p: body.top_p,
         top_k: body.top_k,
