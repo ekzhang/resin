@@ -125,15 +125,8 @@ pub struct GeneratedTokenLogprob {
 pub struct GenerationJob {
     pub request: ConversationRequest,
     pub events: mpsc::Sender<GenerationEvent>,
-    pub kind: JobKind,
     /// Frontend queue admission, before recipe rendering and engine submission.
     pub enqueued_at: Instant,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum JobKind {
-    Generate,
-    CountTokens,
 }
 
 #[derive(Debug, Default)]

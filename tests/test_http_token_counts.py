@@ -228,6 +228,42 @@ def test_slow_count_render_does_not_block_inference():
         assert errors == []
 
 
+def test_counts_bypass_a_full_inference_admission_and_queue():
+    forwarding, resume = threading.Event(), threading.Event()
+
+    class BlockingRunner(Runner):
+        def forward(self, plan):
+            forwarding.set()
+            assert resume.wait(timeout=5)
+            return super().forward(plan)
+
+    recipe = CountingRecipe()
+    with running_server(
+        BlockingRunner(),
+        recipe,
+        max_active_requests=1,
+        request_queue_capacity=1,
+        render_workers=1,
+    ) as (_, _, _, errors, base, _):
+        try:
+            with post(base, request_body(stream=True)) as first:
+                assert forwarding.wait(timeout=2)
+                with post(base, request_body(stream=True)) as queued:
+                    with pytest.raises(urllib.error.HTTPError) as failure:
+                        post(base, request_body())
+                    assert failure.value.code == 429
+                    for _, path, body, _ in CASES:
+                        with send(base, path, {"model": "test", **body}) as response:
+                            assert json.load(response)["input_tokens"] > 0
+                    assert recipe.parsers == 1
+                    resume.set()
+                    first.read()
+                    queued.read()
+            assert errors == []
+        finally:
+            resume.set()
+
+
 def test_shutdown_does_not_join_a_blocked_render():
     rendering, resume = threading.Event(), threading.Event()
 

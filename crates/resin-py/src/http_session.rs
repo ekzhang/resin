@@ -14,8 +14,8 @@ use pyo3::{
 };
 use pythonize::pythonize;
 use resin_http::{
-    EVENT_QUEUE_CAPACITY, FinishReason, GeneratedTokenLogprob, GenerationEvent, GenerationJob,
-    JobKind,
+    ConversationRequest, EVENT_QUEUE_CAPACITY, FinishReason, GeneratedTokenLogprob,
+    GenerationEvent, GenerationJob,
 };
 use resin_recipe::{AttributedEvent, Event as ParsedEvent, FinishReason as ParserFinishReason};
 use std::{collections::HashMap, sync::Mutex, time::Instant};
@@ -511,11 +511,14 @@ struct RenderInput {
     options: RenderOptions,
 }
 
-fn render_input(py: Python<'_>, recipe: &Py<PyAny>, job: &GenerationJob) -> PyResult<RenderInput> {
+fn render_input(
+    py: Python<'_>,
+    recipe: &Py<PyAny>,
+    request: &ConversationRequest,
+) -> PyResult<RenderInput> {
     // JSON is an HTTP concern; both native and custom recipes receive the
     // same typed conversation. Native recipes stay inside Rust here.
-    let messages = job
-        .request
+    let messages = request
         .messages
         .iter()
         .map(|value| {
@@ -527,15 +530,14 @@ fn render_input(py: Python<'_>, recipe: &Py<PyAny>, job: &GenerationJob) -> PyRe
             Py::new(py, message)
         })
         .collect::<PyResult<Vec<_>>>()?;
-    let tools = job
-        .request
+    let tools = request
         .tools
         .iter()
         .map(|value| Py::new(py, Tool::from_wire(value)?))
         .collect::<PyResult<Vec<_>>>()?;
     let options = RenderOptions::from_wire(&serde_json::json!({
-        "reasoning_effort": job.request.reasoning_effort,
-        "extra": job.request.extra,
+        "reasoning_effort": request.reasoning_effort,
+        "extra": request.extra,
     }))?;
     Ok(RenderInput {
         messages,
@@ -558,7 +560,7 @@ fn render_custom<'py>(
 /// Render prompt/media and create its parser off the engine thread.
 pub(crate) fn render_job(recipe: &Py<PyAny>, job: &GenerationJob) -> RenderedJob {
     Python::attach(|py| {
-        let input = render_input(py, recipe, job)?;
+        let input = render_input(py, recipe, &job.request)?;
         if let Ok(native) = recipe.bind(py).cast::<NativeRecipe>() {
             let native = native.borrow();
             let rendered = native.render(py, input.messages, input.tools, Some(&input.options))?;
@@ -581,9 +583,9 @@ pub(crate) fn render_job(recipe: &Py<PyAny>, job: &GenerationJob) -> RenderedJob
 }
 
 /// Count the same rendered prompt without creating a parser or Engine request.
-pub(crate) fn count_tokens(recipe: &Py<PyAny>, job: &GenerationJob) -> PyResult<usize> {
-    Python::attach(|py| {
-        let input = render_input(py, recipe, job)?;
+pub(crate) fn count_tokens(recipe: &Py<PyAny>, request: &ConversationRequest) -> PyResult<usize> {
+    let count = Python::attach(|py| -> PyResult<usize> {
+        let input = render_input(py, recipe, request)?;
         if let Ok(native) = recipe.bind(py).cast::<NativeRecipe>() {
             let prompt =
                 native
@@ -594,20 +596,13 @@ pub(crate) fn count_tokens(recipe: &Py<PyAny>, job: &GenerationJob) -> PyResult<
             let rendered = render_custom(py, recipe.bind(py), input)?;
             Ok(rendered.cast::<RenderedPrompt>()?.borrow().token_ids.len())
         }
-    })
-}
-
-pub(crate) fn finish_count(job: GenerationJob, result: PyResult<usize>) {
-    let event = match result {
-        Ok(input_tokens) if input_tokens > 0 => GenerationEvent::Started { input_tokens },
-        Ok(_) => GenerationEvent::Error {
-            message: "recipe.render returned an empty token_ids sequence".to_owned(),
-        },
-        Err(error) => GenerationEvent::Error {
-            message: format_python_error("token counting failed", error),
-        },
-    };
-    let _ = job.events.try_send(event);
+    })?;
+    if count == 0 {
+        return Err(PyValueError::new_err(
+            "recipe.render returned an empty token_ids sequence",
+        ));
+    }
+    Ok(count)
 }
 
 fn admit(
@@ -787,7 +782,6 @@ impl NativeHttpSession {
             session.admit(GenerationJob {
                 request: request.clone(),
                 events,
-                kind: JobKind::Generate,
                 enqueued_at: Instant::now(),
             });
         }

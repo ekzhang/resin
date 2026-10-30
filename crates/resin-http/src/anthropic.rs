@@ -14,12 +14,11 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use tokio::sync::mpsc;
 
-use crate::openai::token_count_response;
-use crate::{
-    AppState,
-    openai::{RequestResult, invalid_request, routed_rank, validate_sampling},
-    protocol::{ConversationRequest, GenerationEvent, ResponseAccumulator, json_error},
+use crate::AppState;
+use crate::openai::{
+    RequestResult, invalid_request, routed_rank, token_count_response, validate_sampling,
 };
+use crate::protocol::{ConversationRequest, GenerationEvent, ResponseAccumulator, json_error};
 
 #[derive(Debug, Deserialize)]
 pub(crate) struct MessagesRequest {

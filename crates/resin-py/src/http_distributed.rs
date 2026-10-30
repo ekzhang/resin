@@ -2,17 +2,16 @@
 
 use std::{
     collections::HashMap,
-    sync::mpsc as std_mpsc,
     thread,
     time::{Duration, Instant},
 };
 
 use pyo3::{exceptions::PyValueError, prelude::*, types::PyBytes};
-use resin_http::{ConversationRequest, GenerationEvent, GenerationJob, JobKind, MetricsEndpoint};
+use resin_http::{ConversationRequest, GenerationEvent, GenerationJob, MetricsEndpoint};
 use serde::{Deserialize, Serialize};
 use tokio::sync::{mpsc, watch};
 
-use crate::http::{AdmissionConfig, schedule_render};
+use crate::http::AdmissionConfig;
 
 /// Native ingress stays typed across the Python coordinator. Only transport
 /// between ranks encodes it; JSON never becomes a Python object graph.
@@ -130,20 +129,12 @@ impl HttpEvents {
 
 pub(crate) fn run(
     coordinator: Py<PyAny>,
-    recipe: Py<PyAny>,
     mut jobs: mpsc::Receiver<GenerationJob>,
     shutdown: watch::Receiver<bool>,
     replicas: usize,
     admission: AdmissionConfig,
     metrics: Option<MetricsEndpoint>,
 ) -> Result<(), String> {
-    let renders = rayon::ThreadPoolBuilder::new()
-        .num_threads(admission.render_workers)
-        .thread_name(|worker| format!("resin-render-{worker}"))
-        .build()
-        .map_err(|error| format!("failed to create render pool: {error}"))?;
-    let (completed, rendered_queue) = std_mpsc::channel();
-    let mut counting = 0usize;
     let mut clients = HashMap::<String, mpsc::Sender<GenerationEvent>>::new();
     let mut disconnected = false;
     let mut canceled_next = Vec::new();
@@ -151,9 +142,6 @@ pub(crate) fn run(
     let mut next_metrics = Instant::now();
     let mut started = HashMap::<String, Instant>::new();
     loop {
-        while rendered_queue.try_recv().is_ok() {
-            counting -= 1;
-        }
         if let Some(endpoint) = &metrics {
             endpoint.set_queue_size(jobs.len());
         }
@@ -175,18 +163,12 @@ pub(crate) fn run(
         let mut ingress_error = None;
         for _ in 0..admission.admissions_per_step.saturating_mul(replicas) {
             if *shutdown.borrow()
-                || clients.len() + counting
-                    >= admission.max_active_requests.saturating_mul(replicas)
+                || clients.len() >= admission.max_active_requests.saturating_mul(replicas)
             {
                 break;
             }
             match jobs.try_recv() {
                 Ok(mut job) if !job.events.is_closed() => {
-                    if job.kind == JobKind::CountTokens {
-                        counting += 1;
-                        schedule_render(&renders, &recipe, job, &completed, &shutdown);
-                        continue;
-                    }
                     if clients.contains_key(&job.request.id) {
                         ingress_error = Some("HTTP request IDs must be unique strings".to_owned());
                         break;

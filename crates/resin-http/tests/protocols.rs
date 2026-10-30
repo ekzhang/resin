@@ -1,10 +1,13 @@
+use resin_http::router_with_token_counter;
+use std::sync::Arc;
+
 use axum::{
     body::Body,
     http::{Request, StatusCode, header},
 };
 use http_body_util::BodyExt;
 use resin_http::{
-    FinishReason, GeneratedTokenLogprob, GenerationEvent, GenerationJob, JobKind, RouteConfig,
+    FinishReason, GeneratedTokenLogprob, GenerationEvent, GenerationJob, RouteConfig, TokenCounter,
     TokenLogprob, router,
 };
 use serde_json::{Value, json};
@@ -43,20 +46,19 @@ fn test_router() -> axum::Router {
 #[tokio::test]
 async fn token_count_routes_normalize_prompts_without_generation_limits() {
     let (jobs, mut receiver) = mpsc::channel::<GenerationJob>(2);
-    tokio::spawn(async move {
-        for _ in 0..2 {
-            let job = receiver.recv().await.unwrap();
-            assert_eq!(job.kind, JobKind::CountTokens);
-            assert_eq!(job.request.messages[0]["content"], "Be concise");
-            assert_eq!(job.request.messages[1]["content"], "hi");
-            assert_eq!(job.request.tools[0]["name"], "weather");
-            let _ = job
-                .events
-                .send(GenerationEvent::Started { input_tokens: 17 })
-                .await;
-        }
+    let counter: TokenCounter = Arc::new(|request, result| {
+        assert_eq!(request.messages[0]["content"], "Be concise");
+        assert_eq!(request.messages[1]["content"], "hi");
+        assert_eq!(request.tools[0]["name"], "weather");
+        let _ = result.send(Ok(17));
     });
-    let app = router("test-model", jobs, RouteConfig::default(), None);
+    let app = router_with_token_counter(
+        "test-model",
+        jobs,
+        Some(counter),
+        RouteConfig::default(),
+        None,
+    );
     for (path, body, expected) in [
         (
             "/v1/responses/input_tokens",
@@ -77,10 +79,11 @@ async fn token_count_routes_normalize_prompts_without_generation_limits() {
         assert_eq!(status, StatusCode::OK);
         assert_eq!(value, expected);
     }
+    assert!(receiver.try_recv().is_err());
 }
 
 #[tokio::test]
-async fn token_count_routes_follow_protocol_flags_and_queue_limits() {
+async fn token_count_routes_follow_protocol_flags_and_bypass_generation_queue() {
     for (path, body) in [
         (
             "/v1/responses/input_tokens",
@@ -97,13 +100,22 @@ async fn token_count_routes_follow_protocol_flags_and_queue_limits() {
                 .body(Body::from(body.to_string()))
                 .unwrap()
         };
-        let (jobs, receiver) = mpsc::channel::<GenerationJob>(1);
+        let (jobs, _receiver) = mpsc::channel::<GenerationJob>(1);
         let permit = jobs.reserve().await.unwrap();
-        let app = router("test-model", jobs.clone(), RouteConfig::default(), None);
-        let (status, _) = json_response(app, request()).await;
-        assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+        let counter: TokenCounter = Arc::new(|_, result| {
+            let _ = result.send(Ok(17));
+        });
+        let app = router_with_token_counter(
+            "test-model",
+            jobs.clone(),
+            Some(counter),
+            RouteConfig::default(),
+            None,
+        );
+        let (status, body) = json_response(app, request()).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["input_tokens"], 17);
         drop(permit);
-        drop(receiver);
         let app = router("test-model", jobs.clone(), RouteConfig::default(), None);
         let (status, _) = json_response(app, request()).await;
         assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);

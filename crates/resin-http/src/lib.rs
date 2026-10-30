@@ -28,10 +28,14 @@ pub use metrics::{
 pub use metrics_encoder::{MetricsEncodeError, MetricsEncoder};
 pub use protocol::{
     ConversationRequest, FinishReason, GeneratedTokenLogprob, GenerationEvent, GenerationJob,
-    JobKind, TokenLogprob,
+    TokenLogprob,
 };
 
 pub const EVENT_QUEUE_CAPACITY: usize = 64;
+
+/// Schedule counting without blocking the HTTP handler, then reply through the sender.
+pub type TokenCounter =
+    Arc<dyn Fn(ConversationRequest, oneshot::Sender<Result<usize, String>>) + Send + Sync>;
 
 #[derive(Clone, Copy, Debug)]
 pub struct RouteConfig {
@@ -55,6 +59,7 @@ impl Default for RouteConfig {
 #[derive(Clone)]
 struct AppState {
     jobs: mpsc::Sender<GenerationJob>,
+    token_counter: Option<TokenCounter>,
     model: Arc<str>,
     next_id: Arc<AtomicU64>,
     routed_dp_size: usize,
@@ -70,19 +75,10 @@ impl AppState {
         &self,
         request: ConversationRequest,
     ) -> Result<mpsc::Receiver<GenerationEvent>, (StatusCode, &'static str)> {
-        self.enqueue_kind(request, JobKind::Generate)
-    }
-
-    fn enqueue_kind(
-        &self,
-        request: ConversationRequest,
-        kind: JobKind,
-    ) -> Result<mpsc::Receiver<GenerationEvent>, (StatusCode, &'static str)> {
         let (events, receiver) = mpsc::channel(EVENT_QUEUE_CAPACITY);
         match self.jobs.try_send(GenerationJob {
             request,
             events,
-            kind,
             enqueued_at: Instant::now(),
         }) {
             Ok(()) => Ok(receiver),
@@ -104,8 +100,19 @@ pub fn router(
     routes: RouteConfig,
     metrics: Option<MetricsEndpoint>,
 ) -> Router {
+    router_with_token_counter(model, jobs, None, routes, metrics)
+}
+
+pub fn router_with_token_counter(
+    model: impl Into<Arc<str>>,
+    jobs: mpsc::Sender<GenerationJob>,
+    token_counter: Option<TokenCounter>,
+    routes: RouteConfig,
+    metrics: Option<MetricsEndpoint>,
+) -> Router {
     let state = AppState {
         jobs,
+        token_counter,
         model: model.into(),
         next_id: Arc::new(AtomicU64::new(1)),
         routed_dp_size: routes.routed_dp_size,
@@ -164,8 +171,16 @@ pub async fn serve_with_shutdown(
     metrics: Option<MetricsEndpoint>,
     shutdown: impl Future<Output = ()>,
 ) -> std::io::Result<()> {
+    serve_router_with_shutdown(listener, router(model, jobs, routes, metrics), shutdown).await
+}
+
+pub async fn serve_router_with_shutdown(
+    listener: tokio::net::TcpListener,
+    app: Router,
+    shutdown: impl Future<Output = ()>,
+) -> std::io::Result<()> {
     let (stop, stopped) = oneshot::channel::<()>();
-    let server = axum::serve(listener, router(model, jobs, routes, metrics))
+    let server = axum::serve(listener, app)
         .with_graceful_shutdown(async {
             let _ = stopped.await;
         })

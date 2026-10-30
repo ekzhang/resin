@@ -16,10 +16,10 @@ use axum::{
 };
 use serde::Deserialize;
 use serde_json::{Value, json};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 
 use crate::{
-    AppState, JobKind,
+    AppState,
     protocol::{ConversationRequest, GenerationEvent, ResponseAccumulator, json_error},
     ui::index_html,
 };
@@ -401,22 +401,25 @@ pub(crate) async fn token_count_response(
     request: ConversationRequest,
     openai: bool,
 ) -> Response {
-    let mut receiver = match state.enqueue_kind(request, JobKind::CountTokens) {
-        Ok(receiver) => receiver,
-        Err((status, message)) => {
-            return (status, Json(json_error(message, "server_error"))).into_response();
-        }
+    let Some(counter) = &state.token_counter else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json_error("token counting is unavailable", "server_error")),
+        )
+            .into_response();
     };
-    match receiver.recv().await {
-        Some(GenerationEvent::Started { input_tokens }) => {
+    let (result, receiver) = oneshot::channel();
+    counter(request, result);
+    match receiver.await {
+        Ok(Ok(input_tokens)) => {
             let mut body = json!({"input_tokens": input_tokens});
             if openai {
                 body["object"] = json!("response.input_tokens");
             }
             Json(body).into_response()
         }
-        Some(GenerationEvent::Error { message }) => internal_error(message),
-        _ => internal_error("token counting ended without a result".to_owned()),
+        Ok(Err(message)) => internal_error(message),
+        Err(_) => internal_error("token counting ended without a result".to_owned()),
     }
 }
 
