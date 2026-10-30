@@ -5,6 +5,7 @@ from __future__ import annotations
 from collections import OrderedDict, defaultdict
 from collections.abc import Mapping, Sequence
 from concurrent.futures import Future, ThreadPoolExecutor
+from threading import Lock
 from typing import TYPE_CHECKING, Protocol
 
 if TYPE_CHECKING:
@@ -43,6 +44,8 @@ class MemoryCacheStorage:
         self.free = [(0, max_bytes)] if max_bytes else []
         self.streams, self.runtime = {}, None
         self.halted = self.closed = False
+        self._lock, self._pending, self._retire_queued = Lock(), [], False
+        self._closing = None
         if torch.cuda.is_available():
             try:
                 from cuda.bindings import runtime
@@ -150,7 +153,7 @@ class MemoryCacheStorage:
             self._copy(pairs, True)
             return True
 
-        return self._submit(read, buffers)
+        return self._submit(read, buffers, defer=True)
 
     def store(self, keys, buffers):
         reservation, pending = [], []
@@ -195,7 +198,27 @@ class MemoryCacheStorage:
 
         return self._submit(write, buffers, publish)
 
-    def _submit(self, action, buffers, finish=lambda value: value):
+    def _retire(self):
+        pending, self._pending = self._pending, []
+        if not pending:
+            return
+        try:
+            for stream in self.streams.values():
+                stream.synchronize()
+        except BaseException:
+            self.halted = True
+            _UNRETIRED.append((self, pending))
+        for future, _, _, _, finish, result in pending:
+            try:
+                future.set_result(None if self.halted else finish(result))
+            except BaseException as error:
+                future.set_exception(error)  # The fence already proved retirement.
+
+    def _retire_task(self):
+        self._retire_queued = False
+        self._retire()
+
+    def _submit(self, action, buffers, finish=lambda value: value, *, defer=False):
         import torch
 
         if self.closed:
@@ -203,10 +226,16 @@ class MemoryCacheStorage:
 
         devices = {r.device for b in buffers for r in b.values() if r.is_cuda}
         ready = {d: torch.cuda.current_stream(d).record_event() for d in devices}
+        future = Future()
 
         def run():
+            if not future.set_running_or_notify_cancel():
+                return
+            if not defer:
+                self._retire()  # Eviction must not reuse an earlier read's host bytes.
             if self.halted:
-                return False
+                future.set_result(False)
+                return
             try:
                 for device, event in ready.items():
                     if device not in self.streams:
@@ -215,20 +244,27 @@ class MemoryCacheStorage:
                     torch.cuda.set_stream(self.streams[device])
                 with torch.inference_mode():
                     result = action()
-            except Exception:
+            except BaseException:
                 result = False
-            try:
-                for device in devices:
-                    if device in self.streams:
-                        self.streams[device].synchronize()
-            except Exception:
-                self.halted = True
-                _UNRETIRED.append((self, action, finish, buffers, ready))
-                return None
-            return finish(result)
+            self._pending.append((future, action, buffers, ready, finish, result))
+            if not defer:
+                self._retire()
+            else:
+                with self._lock:
+                    if not self.closed and not self._retire_queued:
+                        self._retire_queued = True
+                        self.executor.submit(self._retire_task)
 
-        return self.executor.submit(run)
+        with self._lock:
+            if self.closed:
+                raise RuntimeError("cache storage is closed")
+            self.executor.submit(run)
+        return future
 
     def close(self):
-        self.closed = True
+        with self._lock:
+            if self._closing is None:
+                self.closed = True
+                self._closing = self.executor.submit(self._retire)
+        self._closing.result()
         self.executor.shutdown(wait=True)

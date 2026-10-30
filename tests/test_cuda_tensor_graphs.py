@@ -10,7 +10,7 @@ from resin import BatchPhase
 from resin.backend.cuda.tensor_graphs import CudaGraphTensorRegion, TensorSpec
 
 
-def _regions(runner, *, pad_up_to=128):
+def _regions(runner, *, pad_up_to=None, max_tokens=8):
     return runner._configure_prefill_tensor_graphs(
         (
             CudaGraphTensorRegion(
@@ -26,15 +26,16 @@ def _regions(runner, *, pad_up_to=128):
                 TensorSpec((4,), torch.float32),
             ),
         ),
-        max_tokens=8,
+        max_tokens=max_tokens,
         pad_up_to=pad_up_to,
     )
 
 
 def test_projection_callbacks_stage_live_rows_and_changing_positions(monkeypatch):
     runner = _runner()
-    project, finish = _regions(runner)
+    project, finish = _regions(runner, max_tokens=1024)
     graphs = runner._prefill_tensor_graphs["prefill_attention"]
+    assert graphs.pad_up_to == 1024
     calls = []
 
     def replay(mode, shape, inputs):
@@ -46,8 +47,18 @@ def test_projection_callbacks_stage_live_rows_and_changing_positions(monkeypatch
         return step.output
 
     monkeypatch.setattr(runner, "_run_cuda_graph", replay)
+    rows = (
+        (512, 9),
+        (480, 512),
+        (1024, 7),
+        (544, 47),
+        (513, 100),
+        (3, 9),
+        (4, 32),
+        (1, 128),
+    )
     with runner._prefill_graphs():
-        for count, start in ((3, 9), (4, 32), (1, 128)):
+        for count, start in rows:
             hidden = torch.arange(count * 4, dtype=torch.bfloat16).reshape(count, 4)
             positions = start + torch.arange(count)
             qr, kv = project(hidden)
@@ -56,7 +67,18 @@ def test_projection_callbacks_stage_live_rows_and_changing_positions(monkeypatch
             output = finish(qr, positions)
             torch.testing.assert_close(output, hidden.float() * 2 + positions[:, None])
             assert output.dtype == torch.float32
-    assert calls == [(4, 1), (4, 2), (4, 1), (4, 2), (1, 1), (1, 2)]
+            bucket = 1 << (count - 1).bit_length()
+            for region in (1, 2):
+                staged, _ = graphs._buffers(bucket, region)
+                assert all(
+                    torch.count_nonzero(value[count:]) == 0 for value in staged.values()
+                )
+    assert calls == [
+        (1 << (count - 1).bit_length(), region)
+        for count, _ in rows
+        for region in (1, 2)
+    ]
+    assert runner.cuda_graph_stats["prefill_attention"]["fallback_counts"] == {}
     # Buffers are shared by layout, not by layer, and padded positions are safe.
     inputs, output = graphs._buffers(4, 2)
     assert inputs["1"].tolist() == [32, 33, 34, 35]
@@ -141,10 +163,17 @@ def test_all_projection_modes_must_be_captured_before_prefill():
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
 def test_real_projection_graphs_replay_tuple_outputs_and_new_positions():
     runner = _runner("cuda")
-    project, finish = _regions(runner)
+    project, finish = _regions(runner, max_tokens=1024)
     runner.capture_cuda_graphs()
     with runner._prefill_graphs():
-        for count, start in ((3, 9), (4, 32), (1, 128), (3, 47)):
+        for count, start in (
+            (512, 9),
+            (480, 512),
+            (1024, 7),
+            (544, 47),
+            (513, 100),
+            (3, 47),
+        ):
             hidden = torch.randn((count, 4), dtype=torch.bfloat16, device="cuda")
             positions = start + torch.arange(count, device="cuda")
             expected = hidden.float() * 2 + positions[:, None]
@@ -152,5 +181,6 @@ def test_real_projection_graphs_replay_tuple_outputs_and_new_positions():
             torch.testing.assert_close(kv, hidden[:, :2] + 1, rtol=0, atol=0)
             torch.testing.assert_close(finish(qr, positions), expected, rtol=0, atol=0)
     stats = runner.cuda_graph_stats["prefill_attention"]
-    assert stats["replay_count"] == 8 and not stats["poisoned"]
+    assert stats["replay_count"] == 12 and not stats["poisoned"]
+    assert stats["fallback_counts"] == {}
     runner.close_cuda_graphs()

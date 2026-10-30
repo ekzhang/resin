@@ -51,23 +51,24 @@ class PrefillTensorGraphs:
         regions: tuple[CudaGraphTensorRegion, ...],
         *,
         max_tokens: int,
-        pad_up_to: int = 128,
+        pad_up_to: int | None = None,
         capture_context: Callable = nullcontext,
         mode: str = "prefill_attention",
         coordinated: bool = False,
     ) -> None:
         self.runner, self.regions, self.mode = runner, tuple(regions), mode
-        self.pad_up_to, self.capture_context = pad_up_to, capture_context
+        self.pad_up_to = max_tokens if pad_up_to is None else pad_up_to
+        self.capture_context = capture_context
         self.coordinated = coordinated
         self.buffers = {}
-        self.buckets = (
-            tuple(
-                sorted(
-                    {min(2**p, max_tokens) for p in range(max_tokens.bit_length() + 1)}
-                )
+        buckets = {min(2**p, max_tokens) for p in range(max_tokens.bit_length() + 1)}
+        if coordinated:
+            # Bound FFN padding without multiplying shapes for long prefills.
+            buckets.update(
+                min(step * i, max_tokens) for step in (32, 64, 128) for i in (5, 6, 7)
             )
-            if runner.cuda_graph_prefill == "breakable"
-            else ()
+        self.buckets = (
+            tuple(sorted(buckets)) if runner.cuda_graph_prefill == "breakable" else ()
         )
         runner._require_cuda_graph_executor().add_mode(
             mode,
