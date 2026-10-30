@@ -218,14 +218,6 @@ counts, elapsed generation time, and output tokens per second. The same process
 serves `/v1/chat/completions`, `/v1/responses`, `/v1/messages`, and `/v1/models`.
 Both examples explicitly use the CPU Torch runner.
 
-Pass `enable_priority_scheduling=True` to `HttpServer` to accept the optional
-`priority` integer on Chat Completions, Responses, and Messages requests. Higher
-values are admitted first among waiting requests within each engine; running
-requests are not preempted. Omitted priorities default to zero.
-Values must fit a signed 32-bit integer. By default, supplying `priority` is
-rejected, including explicit `0` or `null`. Priority affects engine scheduling;
-it does not reorder the HTTP admission queue or preempt an inference step.
-
 ## Modal HTTP endpoints
 
 [`deploy/modal_serve.py`](deploy/modal_serve.py) serves every registered model.
