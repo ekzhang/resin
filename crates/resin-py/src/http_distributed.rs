@@ -2,6 +2,7 @@
 
 use std::{
     collections::HashMap,
+    sync::mpsc as std_mpsc,
     thread,
     time::{Duration, Instant},
 };
@@ -11,7 +12,7 @@ use resin_http::{ConversationRequest, GenerationEvent, GenerationJob, JobKind, M
 use serde::{Deserialize, Serialize};
 use tokio::sync::{mpsc, watch};
 
-use crate::http::{AdmissionConfig, RenderWorkers};
+use crate::http::{AdmissionConfig, schedule_render};
 
 /// Native ingress stays typed across the Python coordinator. Only transport
 /// between ranks encodes it; JSON never becomes a Python object graph.
@@ -136,7 +137,12 @@ pub(crate) fn run(
     admission: AdmissionConfig,
     metrics: Option<MetricsEndpoint>,
 ) -> Result<(), String> {
-    let renders = RenderWorkers::new(&recipe, admission.render_workers)?;
+    let renders = rayon::ThreadPoolBuilder::new()
+        .num_threads(admission.render_workers)
+        .thread_name(|worker| format!("resin-render-{worker}"))
+        .build()
+        .map_err(|error| format!("failed to create render pool: {error}"))?;
+    let (completed, rendered_queue) = std_mpsc::channel();
     let mut counting = 0usize;
     let mut clients = HashMap::<String, mpsc::Sender<GenerationEvent>>::new();
     let mut disconnected = false;
@@ -145,7 +151,7 @@ pub(crate) fn run(
     let mut next_metrics = Instant::now();
     let mut started = HashMap::<String, Instant>::new();
     loop {
-        while renders.completed.try_recv().is_ok() {
+        while rendered_queue.try_recv().is_ok() {
             counting -= 1;
         }
         if let Some(endpoint) = &metrics {
@@ -178,12 +184,7 @@ pub(crate) fn run(
                 Ok(mut job) if !job.events.is_closed() => {
                     if job.kind == JobKind::CountTokens {
                         counting += 1;
-                        if let Err(std::sync::mpsc::SendError(job)) = renders.jobs.send(job) {
-                            counting -= 1;
-                            let _ = job.events.try_send(GenerationEvent::Error {
-                                message: "prompt rendering is unavailable".to_owned(),
-                            });
-                        }
+                        schedule_render(&renders, &recipe, job, &completed, &shutdown);
                         continue;
                     }
                     if clients.contains_key(&job.request.id) {

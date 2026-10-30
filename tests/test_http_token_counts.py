@@ -9,7 +9,7 @@ from concurrent.futures import ThreadPoolExecutor
 from types import SimpleNamespace
 
 import pytest
-from test_http_lifecycle import Runner, running_server
+from test_http_lifecycle import Runner, post, request_body, running_server
 from test_http_stops import send
 from test_recipe import _byte_tokenizer
 
@@ -23,6 +23,7 @@ class CountingRecipe:
     def __init__(self):
         self.parsers = 0
         self.renders = []
+        self.prompts = []
 
     def render(self, messages, *, tools=(), options=None):
         assert options is not None
@@ -37,9 +38,12 @@ class CountingRecipe:
         )
         self.renders.append(signature)
         count = len(repr(signature))
-        return RenderedPrompt([1] * count)
+        prompt = RenderedPrompt([1] * count)
+        self.prompts.append(prompt)
+        return prompt
 
     def create_parser(self, prompt):
+        assert any(prompt is rendered for rendered in self.prompts)
         self.parsers += 1
         return SimpleNamespace(feed=lambda ids: [])
 
@@ -222,6 +226,34 @@ def test_slow_count_render_does_not_block_inference():
             assert pending.result(timeout=5)["input_tokens"] > 0
         assert recipe.parsers == 1
         assert errors == []
+
+
+def test_shutdown_does_not_join_a_blocked_render():
+    rendering, resume = threading.Event(), threading.Event()
+
+    class BlockingRecipe(CountingRecipe):
+        def render(self, messages, *, tools=(), options=None):
+            rendering.set()
+            assert resume.wait(timeout=5)
+            return super().render(messages, tools=tools, options=options)
+
+    with running_server(Runner(), BlockingRecipe(), render_workers=1) as (
+        server,
+        _,
+        thread,
+        errors,
+        base,
+        _,
+    ):
+        try:
+            with post(base, request_body(stream=True)):
+                assert rendering.wait(timeout=2)
+            server.shutdown()
+            thread.join(timeout=2)
+            assert not thread.is_alive(), "shutdown waited for prompt rendering"
+            assert errors == []
+        finally:
+            resume.set()
 
 
 @pytest.mark.parametrize("malformed", [False, True])

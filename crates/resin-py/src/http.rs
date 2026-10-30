@@ -1,7 +1,8 @@
 use std::{
     net::{IpAddr, SocketAddr},
+    panic::{AssertUnwindSafe, catch_unwind},
     sync::{
-        Arc, Mutex,
+        Mutex,
         atomic::{AtomicBool, Ordering},
         mpsc as std_mpsc,
     },
@@ -13,11 +14,12 @@ use pyo3::{
     exceptions::{PyRuntimeError, PyValueError},
     prelude::*,
 };
-use resin_http::{GenerationJob, JobKind, MetricsEndpoint, RouteConfig};
+use rayon::ThreadPool;
+use resin_http::{GenerationEvent, GenerationJob, JobKind, MetricsEndpoint, RouteConfig};
 use tokio::sync::{mpsc, oneshot, watch};
 
 use crate::Engine;
-use crate::http_session::{RenderedJob, Session, finish_count, render_job};
+use crate::http_session::{RenderedJob, Session, count_tokens, finish_count, render_job};
 
 #[derive(Clone, Copy)]
 pub(crate) struct AdmissionConfig {
@@ -335,51 +337,49 @@ fn run_server(
         .and(actor_result)
 }
 
-/// Shared fixed-size render workers. Callers bound queued work with their
-/// admission budget; token counts finish here without reaching inference.
-pub(crate) struct RenderWorkers {
-    pub jobs: std_mpsc::Sender<GenerationJob>,
-    pub completed: std_mpsc::Receiver<Option<(GenerationJob, RenderedJob)>>,
+/// Every submitted task releases one admission slot, including cancellations.
+#[allow(clippy::large_enum_variant)] // Keep generation jobs inline without another allocation.
+pub(crate) enum RenderCompletion {
+    Generation(GenerationJob, RenderedJob),
+    Finished,
 }
 
-impl RenderWorkers {
-    pub fn new(recipe: &Py<PyAny>, workers: usize) -> Result<Self, String> {
-        let (render_jobs, render_queue) = std_mpsc::channel::<GenerationJob>();
-        let render_queue = Arc::new(Mutex::new(render_queue));
-        let (rendered_jobs, rendered_queue) =
-            std_mpsc::channel::<Option<(GenerationJob, RenderedJob)>>();
-        for worker in 0..workers {
-            let queue = render_queue.clone();
-            let results = rendered_jobs.clone();
-            let recipe = Python::attach(|py| recipe.clone_ref(py));
-            thread::Builder::new()
-                .name(format!("resin-render-{worker}"))
-                .spawn(move || {
-                    loop {
-                        let job = match queue.lock().unwrap_or_else(|p| p.into_inner()).recv() {
-                            Ok(job) => job,
-                            Err(_) => return,
-                        };
-                        let rendered = render_job(&recipe, &job);
-                        let completed = if job.kind == JobKind::CountTokens {
-                            finish_count(job, rendered);
-                            None
-                        } else {
-                            Some((job, rendered))
-                        };
-                        if results.send(completed).is_err() {
-                            return;
-                        }
-                    }
-                })
-                .map_err(|error| format!("failed to start a render worker: {error}"))?;
-        }
-        drop(rendered_jobs);
-        Ok(Self {
-            jobs: render_jobs,
-            completed: rendered_queue,
-        })
-    }
+pub(crate) fn schedule_render(
+    pool: &ThreadPool,
+    recipe: &Py<PyAny>,
+    job: GenerationJob,
+    completed: &std_mpsc::Sender<RenderCompletion>,
+    shutdown: &watch::Receiver<bool>,
+) {
+    let recipe = Python::attach(|py| recipe.clone_ref(py));
+    let completed = completed.clone();
+    let shutdown = shutdown.clone();
+    let errors = job.events.clone();
+    pool.spawn_fifo(move || {
+        let result = catch_unwind(AssertUnwindSafe(|| {
+            if *shutdown.borrow() || job.events.is_closed() {
+                return RenderCompletion::Finished;
+            }
+            match job.kind {
+                JobKind::Generate => {
+                    let rendered = render_job(&recipe, &job);
+                    RenderCompletion::Generation(job, rendered)
+                }
+                JobKind::CountTokens => {
+                    let result = count_tokens(&recipe, &job);
+                    finish_count(job, result);
+                    RenderCompletion::Finished
+                }
+            }
+        }));
+        let result = result.unwrap_or_else(|_| {
+            let _ = errors.try_send(GenerationEvent::Error {
+                message: "prompt rendering panicked".to_owned(),
+            });
+            RenderCompletion::Finished
+        });
+        let _ = completed.send(result);
+    });
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -397,7 +397,12 @@ fn engine_actor(
         Python::attach(|py| Session::new(py, engine.clone_ref(py), recipe, stream_interval))
             .map_err(|error| format_python_error("HTTP session preparation failed", error))?;
     session.metrics = metrics.clone();
-    let renders = RenderWorkers::new(session.recipe(), admission.render_workers)?;
+    let renders = rayon::ThreadPoolBuilder::new()
+        .num_threads(admission.render_workers)
+        .thread_name(|worker| format!("resin-render-{worker}"))
+        .build()
+        .map_err(|error| format!("failed to create render pool: {error}"))?;
+    let (completed, rendered_queue) = std_mpsc::channel();
     let mut rendering = 0usize;
     let mut next_metrics = Instant::now();
     let mut disconnected = false;
@@ -430,16 +435,7 @@ fn engine_actor(
             match jobs.try_recv() {
                 Ok(job) => {
                     rendering += 1;
-                    if let Err(std_mpsc::SendError(job)) = renders.jobs.send(job) {
-                        rendering -= 1;
-                        if job.kind == JobKind::CountTokens {
-                            let _ = job.events.try_send(resin_http::GenerationEvent::Error {
-                                message: "prompt rendering is unavailable".to_owned(),
-                            });
-                        } else {
-                            session.admit(job);
-                        }
-                    }
+                    schedule_render(&renders, session.recipe(), job, &completed, &shutdown);
                 }
                 Err(mpsc::error::TryRecvError::Empty) => break,
                 Err(mpsc::error::TryRecvError::Disconnected) => {
@@ -449,10 +445,10 @@ fn engine_actor(
             }
         }
         for _ in 0..admission.admissions_per_step {
-            match renders.completed.try_recv() {
+            match rendered_queue.try_recv() {
                 Ok(completed) => {
                     rendering -= 1;
-                    if let Some((job, rendered)) = completed {
+                    if let RenderCompletion::Generation(job, rendered) = completed {
                         session.admit_rendered(job, rendered);
                     }
                 }
