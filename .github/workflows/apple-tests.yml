@@ -47,7 +47,12 @@ jobs:
           print(mx.device_info())
           PY
       - name: Rust tests
-        run: cargo test --locked --workspace --all-targets
+        run: |
+          # Rust tests embed Python; expose the same interpreter and NumPy as pytest.
+          export PYO3_PYTHON="$PWD/.venv/bin/python"
+          PYTHONPATH="$("$PYO3_PYTHON" -c 'import sysconfig; print(sysconfig.get_path("platlib"))')"
+          export PYTHONPATH
+          uv run --no-sync cargo test --locked --workspace --all-targets
       - name: MLX tests
         run: uv run --no-sync pytest -q models/mlx/tests
       - name: Python tests

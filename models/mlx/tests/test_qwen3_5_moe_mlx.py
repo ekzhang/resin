@@ -23,6 +23,15 @@ from resin_models_mlx.qwen3_5_moe.model import Qwen35MoeModel  # noqa: E402
 from resin_models_mlx.qwen3_5_moe.runner import Qwen3_5MoeMlxRunner  # noqa: E402
 
 
+@pytest.fixture(autouse=True)
+def _tiny_model_workspace(monkeypatch):
+    # The 64-wide test model does not need the production runner's 4 GiB
+    # workspace reserve, which exceeds the budget on small Apple CI runners.
+    monkeypatch.setattr(
+        "resin_models_mlx.qwen3_5_moe.runner._WORKSPACE_BYTES", 64 << 20
+    )
+
+
 def _text_config() -> dict[str, Any]:
     layers = [
         "full_attention" if (index + 1) % 4 == 0 else "linear_attention"
@@ -496,7 +505,8 @@ def test_checkpoint_loader_matches_transformers_reference(layout: str) -> None:
 
 def test_cache_writes_update_the_arena_in_place() -> None:
     model = _model()
-    runner = _runner(model, slabs=10_000)
+    # Keep a >1 GiB copy detector without occupying most of a small CI runner.
+    runner = _runner(model, slabs=5_000)
     arena = runner._cache.storage.nbytes
     with Engine(runner, context_length=8192) as engine:
         params = SamplingParams(max_output_tokens=12, temperature=0.0)
