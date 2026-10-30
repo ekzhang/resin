@@ -27,8 +27,8 @@ class HttpServer:
 
     - `enable_priority_scheduling` accepts a signed 32-bit `priority` on HTTP
       requests. Higher values are admitted first among waiting requests within
-      each engine; running requests are not preempted. Defaults to False, which
-      rejects any supplied priority.
+      each engine; running requests are not preempted. Requires opt-in for integer
+      priorities; omitted or null priorities use the default of zero.
 
     - `stream_interval` batches later output until N generated model tokens have
       accumulated, checked at step boundaries. The first semantic output is sent

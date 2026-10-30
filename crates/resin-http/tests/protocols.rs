@@ -1038,7 +1038,7 @@ async fn programmatic_shutdown_closes_the_listener() {
 #[tokio::test]
 async fn supplied_priority_requires_server_opt_in_on_each_api() {
     for path in ["/v1/chat/completions", "/v1/responses", "/v1/messages"] {
-        for priority in [json!(0), json!(null), json!(5), json!(-5)] {
+        for priority in [json!(0), json!(5), json!(-5)] {
             let mut body = json!({
                 "model": "test-model", "input": "hi", "max_tokens": 1,
                 "messages": [{"role": "user", "content": "hi"}],
@@ -1065,18 +1065,21 @@ async fn supplied_priority_requires_server_opt_in_on_each_api() {
 #[tokio::test]
 async fn priority_validates_i32_and_is_separate_from_recipe_extras() {
     for path in ["/v1/chat/completions", "/v1/responses", "/v1/messages"] {
-        for priority in [
-            None,
-            Some(json!(i32::MIN)),
-            Some(json!(0)),
-            Some(json!(i32::MAX)),
+        for (enabled, priority) in [
+            (false, None),
+            (false, Some(json!(null))),
+            (true, None),
+            (true, Some(json!(null))),
+            (true, Some(json!(i32::MIN))),
+            (true, Some(json!(0))),
+            (true, Some(json!(i32::MAX))),
         ] {
             let (jobs, mut receiver) = mpsc::channel(1);
             let app = router(
                 "test-model",
                 jobs,
                 RouteConfig {
-                    enable_priority_scheduling: true,
+                    enable_priority_scheduling: enabled,
                     ..RouteConfig::default()
                 },
                 None,
@@ -1099,14 +1102,13 @@ async fn priority_validates_i32_and_is_separate_from_recipe_extras() {
                 .unwrap();
             assert_eq!(response.status(), StatusCode::OK, "{path}");
             let request = receiver.try_recv().unwrap().request;
-            assert_eq!(
-                i64::from(request.priority),
-                priority.and_then(|p| p.as_i64()).unwrap_or(0)
-            );
+            let expected = priority.and_then(|p| p.as_i64()).map(|p| p as i32);
+            assert_eq!(request.priority, expected);
             assert!(!request.extra.contains_key("priority"));
+            let encoded = serde_json::to_value(request).unwrap();
+            assert_eq!(encoded.get("priority"), expected.map(|p| json!(p)).as_ref());
         }
         for priority in [
-            json!(null),
             json!(true),
             json!(1.5),
             json!("1"),
@@ -1128,20 +1130,19 @@ async fn priority_validates_i32_and_is_separate_from_recipe_extras() {
                 "model": "test-model", "input": "hi", "max_tokens": 1,
                 "messages": [{"role": "user", "content": "hi"}], "priority": priority,
             });
-            let (status, body) = json_response(
-                app,
-                Request::post(path)
-                    .header(header::CONTENT_TYPE, "application/json")
-                    .body(Body::from(body.to_string()))
-                    .unwrap(),
-            )
-            .await;
-            assert_eq!(status, StatusCode::BAD_REQUEST, "{path}");
-            assert!(
-                body["error"]["message"]
-                    .as_str()
-                    .unwrap()
-                    .contains("signed 32-bit integer")
+            let response = app
+                .oneshot(
+                    Request::post(path)
+                        .header(header::CONTENT_TYPE, "application/json")
+                        .body(Body::from(body.to_string()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                response.status(),
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "{path}"
             );
             assert!(receiver.try_recv().is_err());
         }

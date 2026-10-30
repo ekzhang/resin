@@ -51,6 +51,7 @@ struct StreamOptions {
 #[derive(Debug, Deserialize)]
 pub(crate) struct ChatRequest {
     model: String,
+    priority: Option<i32>,
     messages: Vec<Value>,
     #[serde(default)]
     tools: Vec<Value>,
@@ -81,6 +82,7 @@ pub(crate) struct ChatRequest {
 #[derive(Debug, Deserialize)]
 pub(crate) struct ResponsesRequest {
     model: String,
+    priority: Option<i32>,
     input: Value,
     stop: Option<OneOrManyStrings>,
     #[serde(default)]
@@ -171,7 +173,7 @@ pub async fn chat_completions(
     }
 }
 
-fn chat_request(state: &AppState, mut body: ChatRequest) -> RequestResult<ConversationRequest> {
+fn chat_request(state: &AppState, body: ChatRequest) -> RequestResult<ConversationRequest> {
     validate_model(state, &body.model)?;
     validate_sampling(body.temperature, body.top_p, body.top_k, body.seed)?;
     validate_logprobs(body.top_logprobs)?;
@@ -190,7 +192,7 @@ fn chat_request(state: &AppState, mut body: ChatRequest) -> RequestResult<Conver
     }
     Ok(ConversationRequest {
         id: state.request_id("chatcmpl"),
-        priority: request_priority(state, &mut body.extra)?,
+        priority: request_priority(state, body.priority)?,
         model: body.model,
         messages: body.messages,
         tools: function_tools(body.tools)?,
@@ -419,7 +421,7 @@ fn responses_request(
     }
     Ok(ConversationRequest {
         id: state.request_id("resp"),
-        priority: request_priority(state, &mut body.extra)?,
+        priority: request_priority(state, body.priority)?,
         model: body.model,
         messages,
         tools: function_tools(body.tools)?,
@@ -671,20 +673,14 @@ fn validate_model(state: &AppState, model: &str) -> RequestResult<()> {
 
 pub(crate) fn request_priority(
     state: &AppState,
-    extra: &mut BTreeMap<String, Value>,
-) -> RequestResult<i32> {
-    let Some(priority) = extra.remove("priority") else {
-        return Ok(0);
-    };
-    if !state.enable_priority_scheduling {
+    priority: Option<i32>,
+) -> RequestResult<Option<i32>> {
+    if priority.is_some() && !state.enable_priority_scheduling {
         return Err(invalid_request(
             "priority requires HttpServer(enable_priority_scheduling=True)",
         ));
     }
-    priority
-        .as_i64()
-        .and_then(|priority| i32::try_from(priority).ok())
-        .ok_or_else(|| invalid_request("priority must be a signed 32-bit integer"))
+    Ok(priority)
 }
 
 pub(crate) fn validate_sampling(

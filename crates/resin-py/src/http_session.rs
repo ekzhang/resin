@@ -624,7 +624,7 @@ fn admit_rendered(
         let lease = engine.bind(py).borrow_mut().submit(
             py,
             Some(token_ids),
-            job.request.priority,
+            job.request.priority.unwrap_or_default(),
             None,
             Some(sampling_params),
             media,

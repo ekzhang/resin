@@ -320,6 +320,7 @@ def test_http_priority_survives_transport_and_orders_waiting_admission():
         [
             {**request, "id": "low", "priority": -(2**31)},
             {**request, "id": "default"},
+            {**request, "id": "null", "priority": None},
             {**request, "id": "high", "priority": 2**31 - 1},
             {**request, "id": "same", "priority": 2**31 - 1},
         ]
@@ -337,6 +338,6 @@ def test_http_priority_survives_transport_and_orders_waiting_admission():
             for request_id, event in decoded_events(session.process(engine.step()))
             if event["type"] == "finished"
         )
-    assert completed == ["high", "same", "default", "low"]
+    assert completed == ["high", "same", "default", "null", "low"]
     session.close()
     engine.close()
