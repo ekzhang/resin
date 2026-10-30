@@ -297,7 +297,6 @@ pub struct Submission<P> {
     pub stop_token_ids: Vec<u32>,
     pub cache_key: Option<Vec<u32>>,
     pub cache_salt: Option<String>,
-    pub cacheable: bool,
     pub atomic_prefill_spans: Vec<(u32, u32)>,
     pub payload: P,
 }
@@ -315,7 +314,6 @@ impl<P> Submission<P> {
             stop_token_ids: Vec::new(),
             cache_key: None,
             cache_salt: None,
-            cacheable: true,
             atomic_prefill_spans: Vec::new(),
         }
     }
@@ -389,7 +387,6 @@ struct Request<P> {
     max_output_tokens: usize,
     stop_token_ids: Vec<u32>,
     payload: P,
-    cacheable: bool,
     cache: Option<RequestPages>,
 }
 
@@ -839,7 +836,6 @@ impl<P: Clone> EngineCore<P> {
             mut stop_token_ids,
             cache_key: cache_prompt,
             cache_salt,
-            cacheable,
             atomic_prefill_spans,
             payload,
         } = input;
@@ -945,16 +941,14 @@ impl<P: Clone> EngineCore<P> {
                     .map_err(Error::from)
             })
             .transpose()?;
-        // Media may provide a same-length, digest-derived identity stream. A
-        // media object without one stays out of the token-only prefix cache.
-        let cache_identity = cache_prompt
-            .as_deref()
-            .or_else(|| cacheable.then_some(token_ids.as_slice()));
+        // Media may provide a same-length, digest-derived identity stream
+        // in place of the raw token IDs.
+        let cache_tokens = cache_prompt.as_deref().unwrap_or(&token_ids);
+        let cache_namespace = PrefixKey::namespace(cache_salt.as_deref());
         // KV entries do not retain predecessor distributions. Scoring must run
         // the prompt once, even when an ordinary request could reuse its KV.
-        let cache_identity = cache_identity.filter(|_| !prompt_logprobs);
-        let cache_namespace = PrefixKey::namespace(cache_salt.as_deref());
-        let cache_identity = cache_identity.map(|tokens| PrefixKey::new(tokens, &cache_namespace));
+        let cache_identity =
+            (!prompt_logprobs).then(|| PrefixKey::new(cache_tokens, &cache_namespace));
         let resident_tokens = match (&mut self.kv_resources, &mut pages, cache_identity.as_ref()) {
             (Some(resources), Some(pages), Some(identity)) => resources
                 .restore_prefix(pages, identity)
@@ -999,7 +993,6 @@ impl<P: Clone> EngineCore<P> {
             max_output_tokens,
             stop_token_ids,
             payload,
-            cacheable,
             cache: pages,
         });
         if storage_pending {
@@ -1980,7 +1973,7 @@ impl<P: Clone> EngineCore<P> {
             .as_ref()
             .is_some_and(|layout| layout.groups().iter().any(|group| group.is_recurrent()));
         for (row, progress) in batch.rows.iter_mut().zip(progress) {
-            if row.terminal || !row.request.cacheable || progress.resident_tokens == 0 {
+            if row.terminal || progress.resident_tokens == 0 {
                 continue;
             }
             let checkpoints = if has_recurrent_state {
@@ -2605,7 +2598,6 @@ mod tests {
             max_output_tokens: 8,
             stop_token_ids: Vec::new(),
             payload: (),
-            cacheable: true,
             cache: pages,
         }
     }

@@ -1720,7 +1720,6 @@ impl Engine {
             stop_token_ids: sampling_params.stop_token_ids.to_vec(),
             cache_key: cache_prompt,
             cache_salt,
-            cacheable: true,
             atomic_prefill_spans,
             payload: RequestPayload {
                 sampling_params,
