@@ -102,72 +102,6 @@ fn input(tokens: Vec<u32>, limit: usize) -> Submission<&'static str> {
 }
 
 #[test]
-fn cache_salts_isolate_text_media_and_recurrent_prefixes() {
-    for recurrent in [false, true] {
-        for media in [false, true] {
-            let mut groups = vec![KvGroupLayout::new(2, 1, KvRetention::FullContext).unwrap()];
-            if recurrent {
-                groups.push(
-                    KvGroupLayout::new_with_family(
-                        2,
-                        1,
-                        KvRetention::FullContext,
-                        KvGroupFamily::State,
-                    )
-                    .unwrap(),
-                );
-            }
-            let mut engine = EngineCore::new(
-                RunnerConfig {
-                    cache_layout: Some(KvLayout::new(64, groups).unwrap()),
-                    continuation_prefill: true,
-                    ..Default::default()
-                },
-                4,
-                128,
-                SchedulerConfig {
-                    prefill_chunk_size: NonZeroU32::new(2).unwrap(),
-                    ..Default::default()
-                },
-                true,
-            )
-            .unwrap();
-            let mut model = Model {
-                report_checkpoints: recurrent,
-                ..Default::default()
-            };
-            for salt in [None, Some(""), Some("alice"), Some("bob")] {
-                for expected in [0, 4] {
-                    let mut submission = input(vec![1, 2, 3, 4, 5], 1);
-                    submission.cache_salt = salt.map(str::to_owned);
-                    if media {
-                        submission.cache_key = Some(vec![101, 102, 103, 104, 105]);
-                    }
-                    let request = engine.submit(submission).unwrap();
-                    assert_eq!(
-                        request.cached_tokens(),
-                        expected,
-                        "salt={salt:?}, media={media}, recurrent={recurrent}"
-                    );
-                    while engine.has_work() {
-                        engine.step(&mut model).unwrap();
-                    }
-                    assert_eq!(request.take_result().unwrap(), vec![6]);
-                    assert_eq!(model.plans.last().unwrap().token_ids, vec![5]);
-                }
-            }
-            if media {
-                let mut changed = input(vec![1, 2, 3, 4, 5], 1);
-                changed.cache_salt = Some("alice".to_owned());
-                changed.cache_key = Some(vec![201, 202, 203, 204, 205]);
-                assert_eq!(engine.submit(changed).unwrap().cached_tokens(), 0);
-            }
-            engine.close(&mut model).unwrap();
-        }
-    }
-}
-
-#[test]
 fn admission_credits_restored_physical_prefix_pages_only() {
     for cache_hit in [true, false] {
         let mut engine = EngineCore::new(
@@ -195,7 +129,9 @@ fn admission_credits_restored_physical_prefix_pages_only() {
         engine.enable_metrics().unwrap();
         let mut model = Model::default();
         let prefix: Vec<u32> = (0..8).collect();
-        let seed = engine.submit(input(prefix.clone(), 1)).unwrap();
+        let mut submission = input(prefix.clone(), 1);
+        submission.cache_salt = Some("a".into());
+        let seed = engine.submit(submission).unwrap();
         while engine.has_work() {
             engine.step(&mut model).unwrap();
         }
@@ -203,11 +139,10 @@ fn admission_credits_restored_physical_prefix_pages_only() {
         let requests: Vec<_> = (0..4)
             .map(|index| {
                 let mut prompt = prefix.clone();
-                if !cache_hit {
-                    prompt[0] = 90;
-                }
                 prompt.extend([100 + index, 200]);
-                engine.submit(input(prompt, 1)).unwrap()
+                let mut submission = input(prompt, 1);
+                submission.cache_salt = Some(if cache_hit { "a" } else { "b" }.into());
+                engine.submit(submission).unwrap()
             })
             .collect();
         let events = engine.step(&mut model).unwrap();
@@ -284,6 +219,7 @@ fn check_stopped_speculative_prefix(stop_token: bool) {
                 ..Default::default()
             };
             let mut submission = input(vec![10, 11, 12], if stop_token { 8 } else { 2 });
+            submission.cache_salt = Some("a".into());
             if stop_token {
                 submission.stop_token_ids = vec![14];
             }
@@ -323,7 +259,9 @@ fn check_stopped_speculative_prefix(stop_token: bool) {
             // physical block committed state at 6. A token-addressed cache can
             // reuse its first four entries; a final-only recurrent checkpoint
             // cannot supply state at that intermediate boundary.
-            let resumed = engine.submit(input(vec![10, 11, 12, 13, 99], 1)).unwrap();
+            let mut continuation = input(vec![10, 11, 12, 13, 99], 1);
+            continuation.cache_salt = Some("a".into());
+            let resumed = engine.submit(continuation).unwrap();
             let expected = if family == KvGroupFamily::State && truncated {
                 2 // The earlier authentic prefill checkpoint remains usable.
             } else {
@@ -340,6 +278,9 @@ fn check_stopped_speculative_prefix(stop_token: bool) {
                 engine.step(&mut model).unwrap();
             }
             resumed.take_result().unwrap();
+            let mut cold = input(vec![10, 11, 12, 13, 99], 1);
+            cold.cache_salt = Some("b".into());
+            assert_eq!(engine.submit(cold).unwrap().cached_tokens(), 0);
             engine.close(&mut model).unwrap();
         }
     }

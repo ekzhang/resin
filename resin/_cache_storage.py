@@ -44,22 +44,19 @@ class _PrefixStorage:
             and g.window_resident_block_count is None
         }
 
-    def _keys(self, tokens, salt=None):
+    def _keys(self, key):
+        namespace, tokens = key
         encoded, width = np.asarray(tokens, dtype="<u4").tobytes(), self.alignment * 4
         digest, keys = hashlib.sha256(), []
-        if salt is not None:
-            encoded_salt = salt.encode("utf-8")
-            digest.update(b"resin-prefix-cache-salt\x00")
-            digest.update(len(encoded_salt).to_bytes(8, "little"))
-            digest.update(encoded_salt)
+        if namespace:
+            digest.update(np.asarray(namespace, dtype="<u4").tobytes())
         for start in range(0, len(encoded) - width + 1, width):
             digest.update(encoded[start : start + width])
-            # A separate key length keeps salted keys disjoint from legacy hashes.
-            keys.append((b"s" if salt is not None else b"") + digest.digest())
+            keys.append((b"s" if namespace else b"") + digest.digest())
         return keys
 
-    def lookup(self, tokens, maximum, alignment, salt=None):
-        bases = self._keys(tokens[:maximum], salt)
+    def lookup(self, key):
+        bases = self._keys(key)
         tags = ([b"h"] if self.history else []) + [b"t"]
         keys = tuple(key + tag for tag in tags for key in bases)
 
@@ -69,16 +66,17 @@ class _PrefixStorage:
                 if self.history and not present[key + b"h"]:
                     break
                 if present[key + b"t"]:
-                    length = (i + 1) * alignment
+                    length = (i + 1) * self.alignment
             return length
 
         return _Operation(self, self.store.lookup(keys), matched)
 
-    def transfer(self, tokens, groups, load, salt=None):
+    def transfer(self, key, groups, load):
         import torch
 
         tensor_type, byte_dtype = torch.Tensor, torch.uint8
-        bases = self._keys(tokens, salt)
+        _, tokens = key
+        bases = self._keys(key)
         regions = iter(self.buffers(groups, prefix_length=len(tokens)))
         chunks, tail = [{} for _ in bases], {}
         for i, (first, rows) in enumerate(groups):

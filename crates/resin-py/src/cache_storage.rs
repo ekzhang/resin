@@ -1,6 +1,6 @@
 use pyo3::prelude::*;
 use resin_core::resources::paged_kv::{
-    PrefixStorage, PrefixStorageGroup, PrefixStorageOperation, StorageOp,
+    PrefixKey, PrefixStorage, PrefixStorageGroup, PrefixStorageOperation, StorageOp,
 };
 
 #[derive(Debug)]
@@ -24,36 +24,27 @@ impl PythonPrefixStorage {
     }
 }
 impl PrefixStorage for PythonPrefixStorage {
-    fn lookup(
-        &mut self,
-        tokens: &[u32],
-        maximum: u32,
-        alignment: u32,
-        salt: Option<&str>,
-    ) -> StorageOp {
+    fn lookup(&mut self, key: &PrefixKey<'_>) -> StorageOp {
         Python::attach(|py| {
             self.wrap(
                 py,
-                self.0
-                    .bind(py)
-                    .call_method1("lookup", (tokens, maximum, alignment, salt)),
+                self.0.bind(py).call_method1("lookup", (key.parts(),)),
                 true,
             )
         })
     }
     fn transfer(
         &mut self,
-        tokens: &[u32],
+        key: &PrefixKey<'_>,
         groups: &[PrefixStorageGroup],
         load: bool,
-        salt: Option<&str>,
     ) -> StorageOp {
         Python::attach(|py| {
             self.wrap(
                 py,
                 self.0
                     .bind(py)
-                    .call_method1("transfer", (tokens, groups, load, salt)),
+                    .call_method1("transfer", (key.parts(), groups, load)),
                 false,
             )
         })
