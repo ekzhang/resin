@@ -70,17 +70,20 @@ the older decode opt-out; it does not disable prefill. A nonempty list with
 `cuda_graph_decode="disabled"` is an error.
 
 Prefill uses power-of-two token buckets through the model's prefill chunk size.
-Regions of at most 128 tokens may pad their stateless inputs to the next bucket.
-Larger regions replay only exact buckets; partial chunks run at their actual
-size and record a `padding` fallback. This avoids doubling large feed-forward
-work merely to fit a graph. Attention and recurrent state always see the real
-token count. Inputs outside the captured token or dtype range also run eagerly
-and record a fallback. Graph inputs and outputs stay on the GPU.
+Feed-forward regions add nine intermediate buckets below 1024 tokens to limit
+padding for partial cached prefills. Row-independent regions pad to the next
+captured bucket and return only real token rows. For example, a 544-token FFN
+uses 640 rows; a projection uses its 1024-row bucket. These shapes count tokens, so decode batch coverage alone
+does not determine prefill coverage. Attention metadata, cache writes, and
+recurrent state always use the real request lengths. Padding reuses the same
+bounded graph catalog; it does not capture a separate graph for every request
+count. Inputs outside the captured token or dtype range run eagerly and record
+a fallback. Graph inputs and outputs stay on the GPU.
 
-Model integrations can require exact buckets even for short prefills through
-the private region configuration. DeepSeek and GLM use this policy; padding
-DeepSeek's 17-token input to 32 failed its numerical comparison. Check the
-runner's region configuration for its padding limit.
+Model integrations can set an explicit padding limit, including zero for exact
+buckets. DeepSeek and GLM retain this policy for their feed-forward regions;
+padding DeepSeek's 17-token input to 32 failed its numerical comparison. Check
+the runner's region configuration for its padding limit.
 
 Models that change row counts between regions can pass `region_tokens` to the
 distributed prefill scope: a mapping from callback index ranges to local row

@@ -483,7 +483,6 @@ class GptOssCudaRunner(CudaRunner):
             ),
             max_tokens=self.prefill_chunk_size,
             mode="prefill_attention",
-            pad_up_to=0,
         )
 
     @classmethod
