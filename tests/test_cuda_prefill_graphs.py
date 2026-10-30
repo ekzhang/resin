@@ -164,7 +164,7 @@ def test_prefill_and_capture_contexts_restore_state_after_operation_failure(
     assert not runner._prefill_graph_active and active == []
 
 
-def test_large_partial_prefill_keeps_actual_rows_while_exact_buckets_replay(
+def test_large_partial_prefill_replays_padded_buckets_with_only_live_outputs(
     monkeypatch,
 ):
     runner = _runner()
@@ -175,17 +175,81 @@ def test_large_partial_prefill_keeps_actual_rows_while_exact_buckets_replay(
         return hidden + 1
 
     (invoke,) = runner._configure_prefill_graphs(
-        (operation,), hidden_size=4, max_tokens=256
+        (operation,), hidden_size=4, max_tokens=1024
+    )
+    graphs = runner._prefill_tensor_graphs["prefill"]
+    assert graphs.pad_up_to == 1024
+    calls = []
+    _launch_instead_of_replay(monkeypatch, runner, calls)
+    counts = (128, 129, 512, 480, 1024, 544, 513)
+    buckets = (128, 160, 512, 512, 1024, 640, 640)
+    with runner._prefill_graphs():
+        for tokens in counts:
+            hidden = torch.full((tokens, 4), tokens % 7 + 1, dtype=torch.bfloat16)
+            output = invoke(hidden)
+            assert output.shape == hidden.shape
+            torch.testing.assert_close(output, hidden + 1)
+            assert torch.count_nonzero(calls[-1][1]["0"][tokens:]) == 0
+    assert observed_rows == list(buckets)
+    assert [shape for shape, _ in calls] == [(bucket, 1) for bucket in buckets]
+    assert runner.cuda_graph_stats["prefill"]["fallback_counts"] == {}
+    large_runner = _runner()
+    large_runner._configure_prefill_graphs((operation,), hidden_size=4, max_tokens=8192)
+    large_buckets = large_runner._prefill_tensor_graphs["prefill"].buckets
+    powers_of_two = {2**p for p in range(14)}
+    assert set(large_buckets) == powers_of_two | {
+        160,
+        192,
+        224,
+        320,
+        384,
+        448,
+        640,
+        768,
+        896,
+    }
+    capped_runner = _runner()
+    capped_runner._configure_prefill_graphs((operation,), hidden_size=4, max_tokens=300)
+    assert capped_runner._prefill_tensor_graphs["prefill"].buckets == (
+        1,
+        2,
+        4,
+        8,
+        16,
+        32,
+        64,
+        128,
+        160,
+        192,
+        224,
+        256,
+        300,
+    )
+
+
+@pytest.mark.parametrize("pad_up_to", [0, 128])
+def test_explicit_prefill_padding_limit_keeps_large_partial_rows_eager(
+    monkeypatch, pad_up_to
+):
+    runner = _runner()
+    observed_rows = []
+
+    def operation(hidden, _ids):
+        observed_rows.append(len(hidden))
+        return hidden + 1
+
+    (invoke,) = runner._configure_prefill_graphs(
+        (operation,), hidden_size=4, max_tokens=1024, pad_up_to=pad_up_to
     )
     calls = []
     _launch_instead_of_replay(monkeypatch, runner, calls)
     with runner._prefill_graphs():
-        for tokens in (128, 129, 256):
+        for tokens in (128, 129, 256, 544):
             hidden = torch.ones(tokens, 4, dtype=torch.bfloat16)
             torch.testing.assert_close(invoke(hidden), hidden + 1)
-    assert observed_rows == [128, 129, 256]
+    assert observed_rows == [128, 129, 256, 544]
     assert [shape for shape, _ in calls] == [(128, 1), (256, 1)]
-    assert runner.cuda_graph_stats["prefill"]["fallback_counts"] == {"padding": 1}
+    assert runner.cuda_graph_stats["prefill"]["fallback_counts"] == {"padding": 2}
 
 
 def test_exact_bucket_policy_preserves_eager_tensor_identity_and_graph_buffer(
@@ -280,11 +344,11 @@ def test_cuda_prefill_regions_replay_dynamic_lengths_with_shared_memory(with_ids
 
     operations = tuple(map(operation, weights))
     first, second = runner._configure_prefill_graphs(
-        operations, hidden_size=64, max_tokens=8, token_ids=with_ids
+        operations, hidden_size=64, max_tokens=1024, token_ids=with_ids
     )
     capture_stats = runner.capture_cuda_graphs()
     assert capture_stats["prefill"]["capture_scope"] == "feed_forward_regions"
-    for tokens in (3, 5, 1, 8, 3):
+    for tokens in (3, 480, 544, 513, 1, 1024, 3):
         hidden = torch.randn(1, tokens, 64, device="cuda", dtype=torch.bfloat16)
         ids = torch.randint(0, 16, (1, tokens), device="cuda") if with_ids else None
         flat_ids = None if ids is None else ids.flatten()
@@ -302,9 +366,12 @@ def test_cuda_prefill_regions_replay_dynamic_lengths_with_shared_memory(with_ids
     stats = runner.cuda_graph_stats
     assert stats["prefill"]["capture_scope"] == "feed_forward_regions"
     assert (
-        stats["prefill"]["capture_count"] == stats["prefill"]["graph_region_count"] == 8
+        stats["prefill"]["capture_count"]
+        == stats["prefill"]["graph_region_count"]
+        == 40
     )
-    assert stats["prefill"]["replay_count"] == 10
+    assert stats["prefill"]["replay_count"] == 14
+    assert stats["prefill"]["fallback_counts"] == {}
     assert (
         stats["prefill"]["graph_break_count"] == stats["decode"]["capture_count"] == 0
     )

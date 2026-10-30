@@ -456,7 +456,7 @@ class CudaRunner(Runner):
         hidden_size: int,
         max_tokens: int,
         token_ids: bool = False,
-        pad_up_to: int = 128,
+        pad_up_to: int | None = None,
         capture_context: Callable = nullcontext,
     ) -> tuple[_PrefillCallback, ...]:
         """Capture row-independent compute regions used by the existing forward.
@@ -464,9 +464,10 @@ class CudaRunner(Runner):
         Operations accept flattened BF16 hidden states and optional token IDs.
         Only these stateless regions are padded; attention, recurrent updates,
         and sampling keep their actual request lengths and execute eagerly.
-        Local bucket selection leaves large partial chunks eager; ``pad_up_to=0``
-        requires an exact local bucket. Explicit distributed capacities override
-        this padding policy so every participant executes the same graph shape.
+        By default, partial chunks use the next captured token bucket. An explicit
+        ``pad_up_to`` limits padding; zero requires an exact local bucket.
+        Distributed capacities override this policy so every participant executes
+        the same graph shape.
         """
 
         if self._prefill_operations:
