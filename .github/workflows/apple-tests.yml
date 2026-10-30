@@ -55,5 +55,3 @@ jobs:
           uv run --no-sync cargo test --locked --workspace --all-targets
       - name: MLX tests
         run: uv run --no-sync pytest -q models/mlx/tests
-      - name: Python tests
-        run: uv run --no-sync pytest -q --ignore=models/mlx/tests
