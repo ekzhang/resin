@@ -1,0 +1,57 @@
+name: Apple Silicon tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  apple-tests:
+    # Pin the Apple Silicon image instead of following macos-latest migrations.
+    runs-on: macos-15
+    timeout-minutes: 30
+    env:
+      RUSTUP_TOOLCHAIN: stable
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
+        with:
+          python-version: "3.13"
+          enable-cache: true
+      - name: Install Rust
+        run: rustup toolchain install stable --profile minimal
+      - name: Install dependencies and build the native extension
+        run: uv sync --locked
+      - name: Verify Apple Silicon and MLX Metal
+        run: |
+          uv run --no-sync python - <<'PY'
+          import platform
+
+          import mlx.core as mx
+
+          assert platform.system() == "Darwin", platform.platform()
+          assert platform.machine() == "arm64", platform.machine()
+          # Do not let pytest.importorskip or a CPU fallback hide missing MLX coverage.
+          assert mx.metal.is_available(), "MLX tests require a Metal GPU"
+          mx.set_default_device(mx.gpu)
+          result = mx.sum(mx.arange(16, dtype=mx.float32))
+          mx.eval(result)
+          assert result.item() == 120.0
+          print(mx.device_info())
+          PY
+      - name: Rust tests
+        run: |
+          # Rust tests embed Python; expose the same interpreter and NumPy as pytest.
+          export PYO3_PYTHON="$PWD/.venv/bin/python"
+          PYTHONPATH="$("$PYO3_PYTHON" -c 'import sysconfig; print(sysconfig.get_path("platlib"))')"
+          export PYTHONPATH
+          uv run --no-sync cargo test --locked --workspace --all-targets
+      - name: MLX tests
+        run: uv run --no-sync pytest -q models/mlx/tests
