@@ -1,17 +1,32 @@
 /*
  * Copyright (c) 2026 Resin contributors.
+ * Copyright (c) 2026 by FlashInfer team.
  *
- * Licensed under the Apache License, Version 2.0.
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
  *
- * This wrapper invokes FlashInfer's AIR Top-P implementation through its
- * installed headers. The initialization/workspace layout is adapted from
- * FlashInfer's air_top_p.cuh (Copyright 2026 FlashInfer team, Apache-2.0), whose
- * radix algorithm derives from TensorRT-LLM's samplingAirTopPKernels.cu.
+ *   http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ *
+ * The initialization, workspace layout and first-pass radix kernel are adapted
+ * from FlashInfer's air_top_p.cuh. Helpers and later passes use its installed
+ * header. The radix algorithm derives from TensorRT-LLM's
+ * samplingAirTopPKernels.cu.
  * https://github.com/flashinfer-ai/flashinfer/blob/v0.6.15/include/flashinfer/air_top_p.cuh
  */
 
 #include <flashinfer/air_top_p.cuh>
+#include <algorithm>
 #include <climits>
+#include <cstdint>
+#include <math_constants.h>
+#include <type_traits>
 #include "tvm_ffi_utils.h"
 
 namespace resin_sampling {
@@ -20,6 +35,172 @@ namespace air = flashinfer::sampling::air_top_p;
 using Counter = air::Counter<float>;
 using Histogram = air::HisT<true, float>;
 using tvm::ffi::Optional;
+
+constexpr int kPrivateGroups = 4;
+constexpr int kPrivateBuckets = 512;
+constexpr size_t kPrivateHistogramBytes =
+    kPrivateGroups * kPrivateBuckets * (sizeof(Histogram) + sizeof(air::IdxT));
+// The first-pass bucket range and reduction below require this upstream layout.
+static_assert(air::BITS_PER_PASS == 11 && air::NUM_BUCKETS == 2048 && air::BLOCK_SIZE == 512);
+static_assert(std::is_same_v<Histogram, uint64_t>);
+
+__device__ __forceinline__ void BuildFirstPassHistogram(
+    const float* input, air::IdxT length, Histogram* histogram, air::IdxT* counts,
+    Histogram* shared_histogram, air::IdxT* shared_counts) {
+  for (air::IdxT i = threadIdx.x; i < air::NUM_BUCKETS; i += blockDim.x) {
+    shared_histogram[i] = 0;
+    shared_counts[i] = 0;
+  }
+  __syncthreads();
+  const int start_bit = air::calcStartBit<float>(0);
+  const uint32_t mask = air::calcMask<float>(0);
+  extern __shared__ __align__(16) unsigned char private_histogram[];
+  auto* private_mass = reinterpret_cast<Histogram*>(private_histogram);
+  auto* private_counts = reinterpret_cast<air::IdxT*>(
+      private_mass + kPrivateGroups * kPrivateBuckets);
+  for (int i = threadIdx.x; i < kPrivateGroups * kPrivateBuckets; i += blockDim.x) {
+    private_mass[i] = 0;
+    private_counts[i] = 0;
+  }
+  __syncthreads();
+  const int group = (threadIdx.x / 32) % kPrivateGroups;
+  auto add = [start_bit, mask, shared_histogram, shared_counts,
+              private_mass, private_counts, group](float value, air::IdxT) {
+    const int bucket = air::calcBucket<float>(value, start_bit, mask);
+    // Privatize the populated positive range to reduce inter-warp contention.
+    // Other buckets retain the full histogram path for large raw weights.
+    if (bucket >= 512 && bucket < 1024) {
+      const int slot = group * kPrivateBuckets + bucket - 512;
+      air::histAtomicAdd<true, float>(private_mass + slot, value);
+      atomicAdd(private_counts + slot, static_cast<air::IdxT>(1));
+    } else {
+      air::histAtomicAdd<true, float>(shared_histogram + bucket, value);
+      atomicAdd(shared_counts + bucket, static_cast<air::IdxT>(1));
+    }
+  };
+  air::vectorizedProcess<float>(static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x,
+                               static_cast<size_t>(blockDim.x) * gridDim.x, input, length, add);
+  __syncthreads();
+  for (int bin = threadIdx.x; bin < kPrivateBuckets; bin += blockDim.x) {
+    Histogram mass = 0;
+    air::IdxT count = 0;
+#pragma unroll
+    for (int group = 0; group < kPrivateGroups; ++group) {
+      mass += private_mass[group * kPrivateBuckets + bin];
+      count += private_counts[group * kPrivateBuckets + bin];
+    }
+    shared_histogram[bin + 512] = mass;
+    shared_counts[bin + 512] = count;
+  }
+  __syncthreads();
+  for (int i = threadIdx.x; i < air::NUM_BUCKETS; i += blockDim.x) {
+    if (shared_histogram[i] != 0) {
+      atomicAdd(reinterpret_cast<unsigned long long*>(histogram + i),
+                static_cast<unsigned long long>(shared_histogram[i]));
+    }
+    if (shared_counts[i] != 0) atomicAdd(counts + i, shared_counts[i]);
+  }
+}
+
+__global__ void AirTopPFirstPassPrivateKernel(Counter* counters, Histogram* histograms,
+                                            air::IdxT* count_histograms) {
+  const int row = blockIdx.y;
+  Counter* counter = counters + row;
+  const air::IdxT current_length = counter->len;
+  if (current_length == 0) return;
+  auto* histogram = histograms + row * air::NUM_BUCKETS;
+  auto* counts = count_histograms + row * air::NUM_BUCKETS;
+  __shared__ Histogram shared_histogram[air::NUM_BUCKETS];
+  __shared__ air::IdxT shared_counts[air::NUM_BUCKETS];
+  BuildFirstPassHistogram(counter->in, counter->oriLen, histogram, counts,
+                          shared_histogram, shared_counts);
+  __syncthreads();
+  __threadfence();
+  bool is_last_block = false;
+  if (threadIdx.x == 0) {
+    const uint32_t finished = atomicInc(&counter->finishedBlockCnt, gridDim.x - 1);
+    is_last_block = (finished == gridDim.x - 1);
+  }
+  // Only the last finisher reduces; no CTA waits for another CTA to be resident.
+  if (__syncthreads_or(is_last_block)) {
+    float* histogram_values = reinterpret_cast<float*>(shared_histogram);
+    for (int i = threadIdx.x; i < air::NUM_BUCKETS; i += blockDim.x) {
+      const uint64_t value = histogram[i];
+      const air::IdxT count = counts[i];
+      if (count != 0) {
+        const uint32_t bucket_bits = i << air::calcStartBit<float>(0);
+        histogram_values[i] = air::calcFloatValue(
+            static_cast<uint32_t>(count),
+            air::calcExponent(air::twiddleOut<float>(bucket_bits, false)), value);
+      } else {
+        histogram_values[i] = 0.0f;
+      }
+    }
+    __syncthreads();
+    // Keep upstream's two-stage FP32 reduction and boundary search order.
+    constexpr int kWarpSize = 32;
+    constexpr int kWarpCount = air::NUM_BUCKETS / kWarpSize;
+    namespace cg = cooperative_groups;
+    cg::thread_block block = cg::this_thread_block();
+    cg::thread_block_tile<32> warp = cg::tiled_partition<32>(block);
+    __shared__ float warp_sum[kWarpCount];
+    __shared__ cuda::atomic<float, cuda::thread_scope_block> block_sum;
+    for (int i = threadIdx.x; i < air::NUM_BUCKETS; i += air::BLOCK_SIZE)
+      cg::reduce_store_async(warp, warp_sum + i / kWarpSize, histogram_values[i], cg::plus<float>{});
+    __syncthreads();
+    if (threadIdx.x < kWarpSize) {
+      cg::reduce_store_async(warp, block_sum, warp_sum[threadIdx.x], cg::plus<float>{});
+      cg::reduce_update_async(warp, block_sum, warp_sum[threadIdx.x + kWarpSize], cg::plus<float>{});
+    }
+    __syncthreads();
+    const float current_sum = block_sum * counter->p;
+    if (threadIdx.x == 0) {
+      float previous = 0;
+      int target_step = 0;
+      for (int i = 0; i < kWarpCount; i++) {
+        if (warp_sum[i]) {
+          target_step = i;
+          if ((previous + warp_sum[i]) >= current_sum) break;
+          previous += warp_sum[i];
+        }
+      }
+      int target_index = 0;
+      for (int i = target_step * kWarpSize; i < air::NUM_BUCKETS; i++) {
+        if (counts[i]) {
+          target_index = i;
+          if ((previous + histogram_values[i]) >= current_sum) break;
+          previous += histogram_values[i];
+        }
+      }
+      counter->sum = current_sum - previous;
+      counter->len = counts[target_index];
+      counter->kthValueBits |= static_cast<uint32_t>(target_index) << air::calcStartBit<float>(0);
+      // A nonempty bucket with zero integer mantissa mass consists entirely
+      // of powers of two: the <2^31 input bound keeps the sum below 2^54.
+      // Publish its full exact cutoff and let the original later passes exit.
+      if (counts[target_index] > 0 && histogram[target_index] == 0) {
+        const uint32_t exponent_bits = air::calcExponent(
+            air::twiddleOut<float>(counter->kthValueBits, false));
+        const float exact_value = __uint_as_float(exponent_bits);
+        // Zero/subnormal-zero and nonfinite boundaries cannot be certified.
+        if (exact_value > 0.0f && exact_value < CUDART_INF_F) {
+          counter->kthValueBits = air::twiddleIn<float>(exact_value, false);
+          counter->len = 0;
+          counter->previousLen = -1;
+        }
+      }
+    }
+    __syncthreads();
+    for (int i = threadIdx.x; i < air::NUM_BUCKETS; i += blockDim.x) {
+      histogram[i] = 0;
+      counts[i] = 0;
+    }
+    if (threadIdx.x == 0) {
+      if (counter->previousLen != -1) counter->previousLen = current_length;
+      counter->filterCnt = 0;
+    }
+  }
+}
 
 __global__ void InitAirThresholds(Counter* counters, const float* weights,
                                   const float* top_ps, const bool* active,
@@ -81,7 +262,8 @@ __global__ void EmitAirThresholds(const Counter* counters, float* output,
   const int row = blockIdx.x * blockDim.x + threadIdx.x;
   if (row >= rows) return;
   float cutoff = 0.0f;
-  if (counters[row].len > 0) {
+  if (counters[row].len > 0 || counters[row].previousLen == -1) {
+    // Init resets this marker on every call, including inactive graph replays.
     cutoff = air::twiddleOut<float>(counters[row].kthValueBits, false);
   }
   output[static_cast<int64_t>(row) * output_stride] = cutoff;
@@ -172,7 +354,22 @@ void AirTopPCutoff(TensorView weights, TensorView top_ps, TensorView active,
       guard_mass_ptr, guard_active_ptr, guard_parts);
   CheckCuda(cudaGetLastError());
   const dim3 grid(blocks, rows);
-  for (int pass = 0; pass < air::NUM_PASSES<float>; ++pass) {
+  if (rows >= 16 && vocab >= 131072) {
+    // Only pass 0 pays the private histogram's extra 24 KiB shared memory.
+    // Later passes keep the upstream kernel, occupancy and original grid.
+    CheckCuda(cudaFuncSetAttribute(AirTopPFirstPassPrivateKernel,
+                                   cudaFuncAttributeMaxDynamicSharedMemorySize,
+                                   static_cast<int>(kPrivateHistogramBytes)));
+    const uint32_t first_blocks = std::max(blocks, (static_cast<uint32_t>(vocab) + 8191u) / 8192u);
+    AirTopPFirstPassPrivateKernel<<<dim3(first_blocks, rows), air::BLOCK_SIZE,
+                                   kPrivateHistogramBytes, stream>>>(counters, histograms, counts);
+    CheckCuda(cudaGetLastError());
+  } else {
+    air::AirTopPRenormRadixKernel<true, float><<<grid, air::BLOCK_SIZE, 0, stream>>>(
+        counters, histograms, counts, 0, buffer1, buffer2);
+    CheckCuda(cudaGetLastError());
+  }
+  for (int pass = 1; pass < air::NUM_PASSES<float>; ++pass) {
     air::AirTopPRenormRadixKernel<true, float><<<grid, air::BLOCK_SIZE, 0, stream>>>(
         counters, histograms, counts, pass, buffer1, buffer2);
     CheckCuda(cudaGetLastError());

@@ -709,12 +709,16 @@ retain their original scope and source provenance.
 
 ## Shared sampler checks
 
+See [AIR sampling performance](air-sampling-performance.md) for the A100/H100/B200
+comparison and measured Gemma interactivity/throughput curves.
+
 On a CUDA environment with deployment dependencies, run:
 
 ```bash
 uv run pytest tests/test_sampling_cuda.py tests/test_sampling_fused_cuda.py \
   tests/test_sampling_filters_cuda.py tests/test_sampling_blocks_cuda.py \
-  tests/test_sampling_guard_cuda.py -q
+  tests/test_sampling_guard_cuda.py tests/test_sampling_air_certificate_cuda.py \
+  tests/test_sampling_completion_cuda.py -q
 ```
 
 These checks cover request-local random streams across batch permutations and
