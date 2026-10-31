@@ -38,9 +38,17 @@ over for a step's input and output. The live slots the Engine allocates in the
 arena go unused.
 
 MLX arrays are immutable values, so in-place updates rely on buffer donation.
-Every step evaluates its reads before issuing writes, and drops any live view of
+Every step finishes its reads before issuing writes, and drops any live view of
 the arena, so MLX updates the buffer in place rather than copying all of it;
-`test_cache_writes_update_the_arena_in_place` guards this. Writes use the
+`test_cache_writes_update_the_arena_in_place` guards this.
+
+Decode implements the Engine's `enqueue` overlap. Each step samples on the GPU
+and hands its token IDs to the next step as feedback. A continuation builds its
+graph while the previous step runs, waits for that step's reads, then submits
+the previous step's arena writes followed by its own forward pass, so the
+Engine commits the previous step while the GPU is busy. A step with no
+continuation issues its writes when its result is collected. Prefill and steps
+that return logprobs run synchronously. Writes use the
 fastest MLX primitive for each payload: keys and values scatter single rows,
 snapshot recurrent states are contiguous slice updates per layer and row, and
 the convolution tails of a row are one padded slice. Capacity is bounded by Metal's
@@ -77,15 +85,17 @@ about 3.5 GiB above the resident model from 32K to 98K tokens.
   a snapshot written during decode and reused by the next turn;
 - batched decode identical to each request alone, and unchanged when requests
   join and leave a running batch, are cancelled, or are retracted and replayed;
+- overlapped decode token-identical to synchronous steps, greedy and seeded
+  sampling, including a request that stops while its next step is in flight;
 - the paged kernel against gathered attention, including NaN-poisoned padding;
 - prompt logprobs of a multi-row prefill against the one-pass forward;
 - sampler filtering against `TorchSampler`, and row-stable seeded draws.
 
 ## Results on an M4 Max (128 GB)
 
-October 29, 2026, mlx 0.32.4 and mlx-lm 0.32.2, Ornith-1.0-35B at the pinned
-revision. Loading the BF16 checkpoint and quantizing it takes 4–14 s and leaves
-about 50 GiB resident.
+October 29 and 31 (decode), 2026, mlx 0.32.4 and mlx-lm 0.32.2, Ornith-1.0-35B
+at the pinned revision. Loading the BF16 checkpoint and quantizing it takes
+4–14 s and leaves about 50 GiB resident.
 
 mlx-lm 0.32.2 cannot load Ornith-1.0's per-expert checkpoint directly, so the
 baseline builds mlx-lm's `qwen3_5_moe` model from the same 8-bit weights, in
@@ -93,34 +103,37 @@ eval mode so its DeltaNet layers use the Metal kernel, and times its bare forwar
 pass with a plain KV cache and greedy argmax. Resin is timed through the Engine,
 with paged cache, live state, scheduling and sampling. Each engine runs in its
 own process and idles 240 s before every timed window, since a batch-16 setup
-(16 prefills of 8K tokens) otherwise heat-soaks this laptop. Decode cells are
-the median of 20 synchronized steps after 5 warmup steps, with distinct tokens
-per row. Prefill runs in 4,096-token chunks for Resin and mlx-lm's default
+(16 prefills of 8K tokens) otherwise heat-soaks this laptop. After 5 warmup
+steps, a Resin decode cell times 20 committed steps back to back, without
+synchronizing between them so overlap is kept, and reports the median of three
+such windows; an mlx-lm cell is the median of 20 synchronized steps. Rows decode
+distinct tokens. Prefill runs in 4,096-token chunks for Resin and mlx-lm's default
 2,048 for mlx-lm.
 
 | Decode, 8K context     |    1 |     2 |     4 |     8 |    16 |
 | ---------------------- | ---: | ----: | ----: | ----: | ----: |
-| Resin step (ms)        | 14.9 |  18.7 |  25.4 |  35.9 |  55.3 |
-| mlx-lm step (ms)       | 12.6 |  15.6 |  20.9 |  31.2 |  50.6 |
-| Resin / mlx-lm         | 1.18 |  1.20 |  1.21 |  1.15 |  1.09 |
-| Resin output tokens/s  | 67.2 | 106.8 | 157.5 | 223.2 | 289.2 |
-| mlx-lm output tokens/s | 79.2 | 128.6 | 191.4 | 256.2 | 316.1 |
+| Resin step (ms)        | 12.6 |  15.9 |  22.7 |  34.0 |  52.5 |
+| mlx-lm step (ms)       | 12.7 |  15.7 |  21.0 |  31.0 |  50.4 |
+| Resin / mlx-lm         | 1.00 |  1.02 |  1.08 |  1.10 |  1.04 |
+| Resin output tokens/s  | 79.1 | 125.6 | 176.6 | 235.2 | 305.0 |
+| mlx-lm output tokens/s | 79.0 | 127.8 | 190.7 | 258.0 | 317.7 |
 
 | Prefill, one request  |    4K |    8K |   16K |   32K |
 | --------------------- | ----: | ----: | ----: | ----: |
 | Resin input tokens/s  | 1,665 | 1,716 | 1,587 | 1,239 |
 | mlx-lm input tokens/s | 2,017 | 1,929 | 1,662 | 1,321 |
 
-A second round of batches 2 and 4 gives 1.17 and 1.23. Before live state, the
+Without `enqueue` overlap, timed the same way, the steps are 14.7, 18.1, 24.9,
+36.6 and 55.0 ms: overlap hides 2.1–2.6 ms of host work per step (graph
+construction and the Engine's plan, sampling and commit). Before live state, the
 steps were 18.0, 22.3, 30.4, 47.0 and 79.0 ms; copying each row's DeltaNet state
 through the arena cost 18 ms at batch 16. Swapping mlx-lm's modules into
 Resin's forward one at a time, only attention moves the batch-4 step (by
 1.5 ms); norms, DeltaNet and experts match. Serving every query head of a KV
 head from one threadgroup, or launching head groups side by side, does not
-recover it. About 3 ms of each step is host work: graph construction and the
-Engine's plan, sampling and commit.
+recover it.
 
-With eight rows decoding at 8K, a step takes 36.5 ms; the first step after a
+Without overlap, with eight rows decoding at 8K, a step takes 36.5 ms; the first step after a
 row leaves takes 37.0–39.0 ms and the first after a row joins 39.4 ms, while
 the batch's held state is regathered. An 8,292-token prompt's first token takes
 5.03 s cold and 0.68 s when its first 8,192 tokens, with their DeltaNet
@@ -138,7 +151,9 @@ snapshot, are cached.
   172, 2,091, 8,231 and 16,429 tokens. On 100 seeded MMLU questions
   (`cais/mmlu` `c30699e`, 50 subjects × 2), the model answers 92 correctly with
   a 16,384-token reasoning budget; three reasoning traces exhaust it before
-  answering. The previous runner scored 93 with one truncation. Image and video
+  answering. Rerun with `enqueue` overlap, the same checks pass and the model
+  answers 91, again with three truncations. The previous runner scored 93 with
+  one truncation. Image and video
   requests are refused.
 - **Memory.** Prefill holds 3.3–3.7 GiB above the resident model from 32K to
   98K tokens.
@@ -150,9 +165,6 @@ snapshot, are cached.
 
 - The published Ornith checkpoints declare one MTP layer but ship no MTP
   weights, so there is no speculative decoding.
-- `enqueue` overlap is not implemented. Writes must follow the step's reads to
-  update the arena in place, which serializes each step on the GPU; the
-  runner already queues writes asynchronously behind host sampling and commit.
 - Vision input, multiple devices and prompt-chunk sizes other than 4096.
 - The fused-expert and text-only loaders are tested against Transformers on a
   small configuration; only Ornith-1.0-35B has been run at full size.
