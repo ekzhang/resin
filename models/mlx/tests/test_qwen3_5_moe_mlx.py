@@ -3,6 +3,7 @@ from __future__ import annotations
 import subprocess
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, cast
 
 import numpy as np
@@ -17,9 +18,13 @@ from resin.models.qwen3_5.config import Qwen35Config  # noqa: E402
 from resin_models_mlx.qwen3_5_moe.cache import (  # noqa: E402
     PAGE_TOKENS,
     PREFILL_CHUNK_SIZE,
+    STATE_GROUP,
     CacheGeometry,
 )
-from resin_models_mlx.qwen3_5_moe.model import Qwen35MoeModel  # noqa: E402
+from resin_models_mlx.qwen3_5_moe.model import (  # noqa: E402
+    LinearState,
+    Qwen35MoeModel,
+)
 from resin_models_mlx.qwen3_5_moe.runner import Qwen3_5MoeMlxRunner  # noqa: E402
 
 
@@ -83,7 +88,9 @@ def _model(seed: int = 0, dtype=None, *, all_experts: bool = False) -> Qwen35Moe
             # Qwen RMSNorms store an offset from one.
             updates.append((name, 0.1 * mx.random.normal(value.shape)))
         elif name.endswith("A_log"):
-            updates.append((name, mx.random.uniform(-1.0, 1.0, value.shape)))
+            # Slowly decaying heads remember a request's state over a whole
+            # test prompt, so stale or misrouted state changes its output.
+            updates.append((name, mx.random.uniform(-8.0, 1.0, value.shape)))
         elif name.endswith("dt_bias"):
             updates.append((name, 0.1 * mx.random.normal(value.shape)))
     model.load_weights(updates, strict=False)
@@ -255,15 +262,18 @@ def test_live_state_follows_changing_batches(staggered: bool) -> None:
     counts = [3, 9, 5, 12]
     runner = _runner(model)
     with Engine(runner, context_length=8192) as engine:
-        leases = []
+        leases, continuations = [], []
         for prompt, count in zip(prompts, counts, strict=True):
             params = SamplingParams(max_output_tokens=count, temperature=0.0)
+            continuations.append(engine.overlap_stats[1])
             leases.append(engine.submit(prompt, sampling_params=params))
             # Later requests join a decode batch already in flight.
-            for _ in range(2 if staggered else 0):
+            for _ in range(4 if staggered else 0):
                 engine.step()
         while engine.has_work():
             engine.step()
+        # The last request joins while decode steps overlap.
+        assert continuations[-1] > 0 or not staggered
         # Finished requests release their live state.
         assert len(runner._states) == 0
     # Batch shapes change as requests join and leave, which may break BF16
@@ -288,6 +298,49 @@ def test_cancel_releases_live_state_and_others_continue() -> None:
         assert len(runner._states) == 0
     for index in (0, 2):
         _assert_greedy(model, prompts[index], leases[index].take_result(), 10)
+
+
+def test_live_states_regroup_rows_held_by_different_batches() -> None:
+    model = _model()
+    runner = _runner(model)
+    states = runner._states
+
+    def plan(sequences: list[int], contexts: list[int], restores=()) -> Any:
+        state = SimpleNamespace(restore_copies=restores, checkpoint_slots=())
+        return SimpleNamespace(
+            batch=SimpleNamespace(
+                sequence_ids=np.array(sequences), context_lengths=np.array(contexts)
+            ),
+            groups={STATE_GROUP: SimpleNamespace(state=state)},
+        )
+
+    def marked(rows: list[int]) -> LinearState:
+        # Every element of a row's state holds that row's marker.
+        def fill(value: mx.array) -> mx.array:
+            marks = mx.array(rows).reshape(-1, *[1] * (value.ndim - 1))
+            return (value + marks).astype(value.dtype)
+
+        state = model.initial_state(len(rows))
+        return LinearState(
+            tuple(map(fill, state.recurrent)), tuple(map(fill, state.convolution))
+        )
+
+    runner._cache.write_states([runner._cache.state_start(3, 0)], marked([7]))
+    states.commit(
+        plan([1, 3], [9, 9]), np.arange(2), np.array([10, 10]), marked([1, 3])
+    )
+    states.commit(
+        plan([5, 2], [19, 19]), np.arange(2), np.array([20, 20]), marked([5, 2])
+    )
+    # Sequences 1 and 2 come from different batches whose other rows left. A
+    # new request restores the null slab and another a snapshot in slab 3.
+    gathered = states.gather(
+        plan([4, 1, 2, 6], [0, 10, 20, 4096], restores=((0, 0, 0), (3, 3, 0))),
+        np.arange(4),
+    )
+    expected = mx.array([[0], [1], [2], [7]])
+    for value in (*gathered.recurrent, *gathered.convolution):
+        assert (value.reshape(4, -1) == expected).all().item()
 
 
 def test_retracted_requests_replay_from_fresh_state() -> None:
@@ -357,8 +410,9 @@ def test_snapshot_written_during_decode_serves_the_next_turn() -> None:
     model = _model(all_experts=True)
     prompt = _prompt(PREFILL_CHUNK_SIZE - 3, seed=8)
     with Engine(_runner(model), context_length=16384, prefix_cache=True) as engine:
-        # Decode crosses the 4096-token checkpoint and publishes it.
-        (first,) = _generate(engine, [prompt], 8)
+        # Decode crosses the 4096-token checkpoint and publishes it from the
+        # second row of the batch.
+        _, first = _generate(engine, [_prompt(30, seed=10), prompt], 8)
         turn = prompt + first[:3] + _prompt(5, seed=9)
         request = engine.submit(
             turn, sampling_params=SamplingParams(max_output_tokens=4, temperature=0.0)
@@ -389,7 +443,10 @@ def test_prefix_cache_hit_matches_fresh_run() -> None:
     with Engine(_runner(model), context_length=16384) as engine:
         (fresh,) = _generate(engine, [shared + suffix], 5)
     with Engine(_runner(model), context_length=16384, prefix_cache=True) as engine:
-        _generate(engine, [shared + _prompt(3, seed=6)], 1)
+        # The shared prefix's checkpoint is published from the second row of
+        # a prefill chunk, after the rest of a longer prompt.
+        prompts = [_prompt(100, seed=6), _prompt(4146, seed=7), shared + [3] * 50]
+        _generate(engine, prompts, 1)
         request = engine.submit(
             shared + suffix,
             sampling_params=SamplingParams(max_output_tokens=5, temperature=0.0),
