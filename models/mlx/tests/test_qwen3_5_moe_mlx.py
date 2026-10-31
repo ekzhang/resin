@@ -313,6 +313,46 @@ def test_retracted_requests_replay_from_fresh_state() -> None:
         _assert_greedy(model, prompt, generated, 40)
 
 
+def _decode_with_stops(
+    overlap: bool, model: Qwen35MoeModel, temperature: float, stops: tuple[int, ...]
+) -> tuple[list[list[int]], tuple[int, int]]:
+    prompts = [_prompt(length, seed=60 + length) for length in (9, 40, 100)]
+    counts = [16, 7, 20]
+    with Engine(_runner(model), context_length=8192, enable_overlap=overlap) as engine:
+        leases = [
+            engine.submit(
+                prompt,
+                sampling_params=SamplingParams(
+                    max_output_tokens=count,
+                    temperature=temperature,
+                    seed=row,
+                    stop_token_ids=stops,
+                ),
+            )
+            for row, (prompt, count) in enumerate(zip(prompts, counts, strict=True))
+        ]
+        while engine.has_work():
+            engine.step()
+        stats = engine.overlap_stats
+    return [lease.take_result() for lease in leases], stats
+
+
+@pytest.mark.parametrize("temperature", [0.0, 0.8])
+def test_overlapped_decode_matches_synchronous_steps(temperature: float) -> None:
+    model = _model(all_experts=True)
+    synchronous, stats = _decode_with_stops(False, model, temperature, ())
+    assert stats == (0, 0)
+    # The first row stops partway through while its next step is in flight.
+    stop = synchronous[0][9]
+    synchronous, _ = _decode_with_stops(False, model, temperature, (stop,))
+    overlapped, (_, continuations) = _decode_with_stops(
+        True, model, temperature, (stop,)
+    )
+    assert continuations > 0
+    assert len(synchronous[0]) < 16
+    assert overlapped == synchronous
+
+
 def test_snapshot_written_during_decode_serves_the_next_turn() -> None:
     model = _model(all_experts=True)
     prompt = _prompt(PREFILL_CHUNK_SIZE - 3, seed=8)
@@ -519,6 +559,8 @@ def test_cache_writes_update_the_arena_in_place() -> None:
         while engine.has_work():
             engine.step()
         growth = mx.get_peak_memory() - active
+        # Overlapped decode steps also issue their writes in place.
+        assert engine.overlap_stats[1] > 0
     # Prefill and decode both write; a copied arena would double its size.
     assert arena > 1 << 30
     assert growth < arena // 8
@@ -539,6 +581,23 @@ def test_context_is_capped_by_checkpoint_positions() -> None:
         with pytest.raises(Exception, match="300-token context"):
             while engine.has_work():
                 engine.step()
+
+
+def test_overlapped_decode_drains_before_the_context_cap() -> None:
+    runner = Qwen3_5MoeMlxRunner(_model(), cache_slab_capacity=64, max_seq_len=300)
+    params = SamplingParams(max_output_tokens=60, temperature=0.0)
+    with Engine(runner, context_length=8192) as engine:
+        long = engine.submit(_prompt(280, seed=1), sampling_params=params)
+        other = engine.submit(_prompt(20, seed=2), sampling_params=params)
+        with pytest.raises(Exception, match="300-token context"):
+            while engine.has_work():
+                engine.step()
+        assert engine.overlap_stats[1] > 0
+        # The failure surfaces from forward, so the Engine is not poisoned.
+        engine.cancel(long)
+        while engine.has_work():
+            engine.step()
+        assert len(other.take_result()) == 60
 
 
 def test_query_blocked_prefill_attention_matches_one_block(monkeypatch) -> None:

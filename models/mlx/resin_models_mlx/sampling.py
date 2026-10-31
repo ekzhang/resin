@@ -37,7 +37,12 @@ class MlxSampler:
     """Sample one token per plan row from ``[rows, vocab]`` MLX logits."""
 
     def __call__(self, logits: mx.array, plan) -> np.ndarray:
-        greedy = mx.argmax(logits, axis=-1)
+        return np.array(self.tokens(logits, plan)).astype(np.int64)
+
+    def tokens(self, logits: mx.array, plan) -> mx.array:
+        """Unevaluated token IDs, so they can feed the next step on the GPU."""
+
+        tokens = mx.argmax(logits, axis=-1)
         values = batch_sampling_inputs(plan, logits.shape[-1])
         sampled = [
             row
@@ -47,7 +52,7 @@ class MlxSampler:
             if should_sample and temperature != 0.0
         ]
         if not sampled:
-            return np.array(greedy).astype(np.int64)
+            return tokens
         rows = mx.array(sampled)
         order, probabilities = filtered_probabilities(
             logits[rows],
@@ -74,9 +79,8 @@ class MlxSampler:
         retained = (probabilities > 0).sum(axis=-1)
         rank = mx.minimum((cumulative < draws[:, None]).sum(axis=-1), retained - 1)
         chosen = mx.take_along_axis(order, rank[:, None], axis=-1)[:, 0]
-        result = np.array(greedy).astype(np.int64)
-        result[sampled] = np.array(chosen)
-        return result
+        tokens[rows] = chosen.astype(tokens.dtype)
+        return tokens
 
 
 __all__ = ["MlxSampler", "filtered_probabilities"]
