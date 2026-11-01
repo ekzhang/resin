@@ -16,9 +16,11 @@ from mlx.utils import tree_flatten  # noqa: E402
 from resin import Engine, SamplingParams, SchedulerConfig  # noqa: E402
 from resin.models.qwen3_5.config import Qwen35Config  # noqa: E402
 from resin_models_mlx.qwen3_5_moe.cache import (  # noqa: E402
+    KV_GROUP,
     PAGE_TOKENS,
     PREFILL_CHUNK_SIZE,
     STATE_GROUP,
+    CacheArena,
     CacheGeometry,
 )
 from resin_models_mlx.qwen3_5_moe.model import (  # noqa: E402
@@ -459,6 +461,153 @@ def test_prefix_cache_hit_matches_fresh_run() -> None:
     _assert_greedy(model, shared + suffix, fresh, 5)
 
 
+def test_arena_parts_serve_the_same_tokens(monkeypatch) -> None:
+    import resin_models_mlx.qwen3_5_moe.cache as cache_module
+
+    model = _model(all_experts=True)
+    shared = _prompt(PREFILL_CHUNK_SIZE + 104, seed=11)
+
+    def run():
+        runner = _runner(model)
+        with Engine(runner, context_length=16384, prefix_cache=True) as engine:
+            # Requests span parts: prefill gathers history across them,
+            # decode reads pages from several, and the checkpoint published
+            # at 4096 tokens serves the last prompt from its part.
+            prompts = [_prompt(n, seed=n) for n in (129, 700, 1500)] + [shared]
+            generated = _generate(engine, prompts, 8)
+            request = engine.submit(
+                shared[:PREFILL_CHUNK_SIZE] + _prompt(30, seed=12),
+                sampling_params=SamplingParams(max_output_tokens=8, temperature=0),
+            )
+            while engine.has_work():
+                engine.step()
+            assert request.cached_tokens == PREFILL_CHUNK_SIZE
+        return runner._cache, [*generated, request.take_result()]
+
+    arena, expected = run()
+    assert len(arena.parts) == 1
+    monkeypatch.setattr(cache_module, "PART_BYTES", 1)
+    arena, actual = run()
+    # Each part holds five 512-token slabs, so every long request spans parts.
+    assert len(arena.parts) == 13
+    assert actual == expected
+
+
+def _arena(monkeypatch, slabs: int, part_bytes: int) -> CacheArena:
+    monkeypatch.setattr("resin_models_mlx.qwen3_5_moe.cache.PART_BYTES", part_bytes)
+    geometry = CacheGeometry.from_config(Qwen35Config.from_hugging_face(_text_config()))
+    return CacheArena(geometry.layout(slabs), geometry)
+
+
+def test_decode_binds_only_the_parts_its_pages_occupy(monkeypatch) -> None:
+    arena = _arena(monkeypatch, 64, 1)
+    assert len(arena.parts) == 13
+    assert arena.part_units == 40
+    tables = {
+        0: ([12, 3], [1, 0]),
+        1: ([], []),
+        2: ([12], [3]),
+    }
+    group = SimpleNamespace(
+        block_slabs=lambda row: np.array(tables[row][0], dtype=np.int64),
+        block_slots=lambda row: np.array(tables[row][1], dtype=np.int64),
+    )
+    plan = SimpleNamespace(groups={KV_GROUP: group})
+    bound = []
+    units = arena._units
+
+    def spy(part: int) -> mx.array:
+        bound.append(part)
+        return units(part)
+
+    monkeypatch.setattr(arena, "_units", spy)
+    history = arena.paged_history(
+        cast(Any, plan), np.arange(3), np.array([200, 0, 100])
+    )
+
+    assert bound == [0, 2]
+    # One kernel serves every batch, so the bound parts repeat to a fixed count.
+    assert len(history.parts) == len(arena.parts)
+    # Slabs 12 and 3 are in parts 2 and 0, renumbered 1 and 0; padding reads
+    # nothing.
+    assert history.pages.tolist() == [[58, 24], [0, 0], [62, 0]]
+    assert history.part_units == 40
+
+    bound.clear()
+    empty = arena.paged_history(cast(Any, plan), np.array([1]), np.array([0]))
+    assert bound == [0]
+    assert len(empty.parts) == len(arena.parts)
+
+
+def test_states_round_trip_across_parts_in_row_order(monkeypatch) -> None:
+    arena = _arena(monkeypatch, 64, 1)
+    geometry = arena.geometry
+    mx.random.seed(0)
+    state = LinearState(
+        tuple(
+            mx.random.normal((3, *geometry.recurrent_shape[1:]))
+            for _ in range(geometry.linear_layers)
+        ),
+        tuple(
+            mx.random.normal((3, *geometry.convolution_shape[1:])).astype(mx.bfloat16)
+            for _ in range(geometry.linear_layers)
+        ),
+    )
+    # Slabs 40, 4 and 63 lie in different parts, out of order.
+    starts = [arena.state_start(slab, 0) for slab in (40, 4, 63)]
+    arena.write_states(starts, state)
+    mx.eval(*arena.parts)
+
+    actual = arena.read_states(np.array(starts))
+
+    for written, read in zip(
+        (*state.recurrent, *state.convolution),
+        (*actual.recurrent, *actual.convolution),
+        strict=True,
+    ):
+        assert mx.array_equal(written, read).item()
+
+
+def test_scatter_across_parts_updates_each_in_place(monkeypatch) -> None:
+    arena = _arena(monkeypatch, 4095, 512 << 20)
+    assert len(arena.parts) == 2
+    first = arena.parts[0].shape[0] // arena.geometry.slab_units
+    # One token lands in each part.
+    plan = SimpleNamespace(
+        groups={
+            KV_GROUP: SimpleNamespace(
+                append_slab_ids=np.array([1, first + 1]),
+                append_slotnums=np.array([0, 0]),
+                append_block_offsets=np.array([3, 4]),
+            )
+        }
+    )
+    geometry = arena.geometry
+    # Every token and layer writes its own value.
+    tokens = mx.array([20.0, 40.0]).reshape(2, 1, 1)
+    shape = (2, geometry.kv_heads, geometry.head_dim)
+    keys = tuple(
+        mx.broadcast_to(tokens + layer + 1, shape).astype(mx.bfloat16)
+        for layer in range(geometry.full_layers)
+    )
+    values = tuple(-key for key in keys)
+    mx.eval(keys, values)
+    mx.synchronize()
+    mx.reset_peak_memory()
+    active = mx.get_active_memory()
+
+    arena.write_tokens(cast(Any, plan), keys, values, np.arange(2))
+    mx.eval(*arena.parts)
+
+    # A copied part would add half a GiB.
+    assert mx.get_peak_memory() - active < 64 << 20
+    for part, offset, token in ((0, 3, 20), (1, 4, 40)):
+        for layer in range(geometry.full_layers):
+            unit = arena.parts[part][geometry.slab_units + layer]
+            assert unit[offset, 0].item() == token + layer + 1
+            assert unit[PAGE_TOKENS + offset, 0].item() == -(token + layer + 1)
+
+
 def test_prompt_logprobs_match_one_pass_forward() -> None:
     model = _model()
     prompts = [_prompt(37, seed=8), _prompt(21, seed=9)]
@@ -604,7 +753,7 @@ def test_cache_writes_update_the_arena_in_place() -> None:
     model = _model()
     # Keep a >1 GiB copy detector without occupying most of a small CI runner.
     runner = _runner(model, slabs=5_000)
-    arena = runner._cache.storage.nbytes
+    arena = sum(part.nbytes for part in runner._cache.parts)
     with Engine(runner, context_length=8192) as engine:
         params = SamplingParams(max_output_tokens=12, temperature=0.0)
         for seed in range(3):
@@ -618,9 +767,63 @@ def test_cache_writes_update_the_arena_in_place() -> None:
         growth = mx.get_peak_memory() - active
         # Overlapped decode steps also issue their writes in place.
         assert engine.overlap_stats[1] > 0
-    # Prefill and decode both write; a copied arena would double its size.
+    # Prefill and decode both write; copying any part would exceed this bound.
     assert arena > 1 << 30
     assert growth < arena // 8
+
+
+def test_decode_writes_every_bound_part_in_place(monkeypatch) -> None:
+    part_bytes = 16 << 20
+    monkeypatch.setattr("resin_models_mlx.qwen3_5_moe.cache.PART_BYTES", part_bytes)
+    runner = _runner(_model(), slabs=250)
+    assert len(runner._cache.parts) > 1
+    bound = []
+    paged_history = runner._cache.paged_history
+
+    def spy(plan, rows, lengths):
+        history = paged_history(plan, rows, lengths)
+        bound.append(len({id(part) for part in history.parts}))
+        return history
+
+    monkeypatch.setattr(runner._cache, "paged_history", spy)
+    params = SamplingParams(max_output_tokens=12, temperature=0.0)
+    growth = 0
+    with Engine(runner, context_length=8192) as engine:
+        # The free list walks upward, so a later request straddles two parts.
+        for seed in range(60):
+            bound.clear()
+            engine.submit(_prompt(2000, seed=seed), sampling_params=params)
+            engine.step()
+            mx.synchronize()
+            mx.reset_peak_memory()
+            active = mx.get_active_memory()
+            while engine.has_work():
+                engine.step()
+            growth = max(growth, mx.get_peak_memory() - active)
+            if max(bound) > 1:
+                break
+        assert max(bound) > 1
+        assert engine.overlap_stats[1] > 0
+    # A copied part shows here as at least 7 MiB; in-place writes stay under 1.
+    assert growth < part_bytes // 4
+
+
+def test_capacity_allows_one_buffer_per_part(monkeypatch) -> None:
+    geometry = CacheGeometry.from_config(Qwen35Config.from_hugging_face(_text_config()))
+    limit = 4 * geometry.slab_bytes
+    device = {**mx.device_info(), "max_buffer_length": limit}
+    monkeypatch.setattr(mx, "device_info", lambda: device)
+    monkeypatch.setattr("resin_models_mlx.qwen3_5_moe.cache.PART_BYTES", 1)
+    runner = Qwen3_5MoeMlxRunner(_model())
+    # The reserved null slab counts toward the buffers.
+    assert runner.cache_layout.parent_capacity == 16 * 4 - 1
+    assert [part.nbytes for part in runner._cache.parts] == [limit] * 16
+
+
+def test_last_part_holds_the_remaining_slabs(monkeypatch) -> None:
+    geometry = CacheGeometry.from_config(Qwen35Config.from_hugging_face(_text_config()))
+    arena = _arena(monkeypatch, 6, 2 * geometry.slab_bytes)
+    assert [part.nbytes // geometry.slab_bytes for part in arena.parts] == [2, 2, 2, 1]
 
 
 def test_context_is_capped_by_checkpoint_positions() -> None:

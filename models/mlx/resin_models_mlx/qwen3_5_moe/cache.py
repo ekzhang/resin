@@ -1,16 +1,21 @@
 """Fungible full-attention and DeltaNet-state slabs in one MLX arena.
 
-The arena is one BF16 array of *units* shaped ``[units, 2 * page, kv_width]``.
+The arena is BF16 *units* shaped ``[units, 2 * page, kv_width]``.
 A unit holds the keys, then the values, of one 128-token page of one
 full-attention layer; a KV block of ``L`` layers occupies ``L`` consecutive
 units of a slab. A DeltaNet checkpoint is packed into whole units: each linear
 layer's FP32 recurrent state fills whole units, followed by the BF16
 convolution tails of every layer.
 
+The units are split across parts, separate arrays of whole slabs. The first
+use of a Metal buffer left unused for a couple of seconds costs about 11 ms per
+GiB on an M4 Max; a step after an idle pause pays that only for the parts it
+touches, not the whole arena.
+
 Reads gather with ``take``. Keys and values scatter single rows; DeltaNet
 snapshots are written as contiguous slice updates, which MLX performs far
 faster than large-payload scatters. Every write happens after the step's reads
-are evaluated, so MLX updates the arena in place instead of copying it. Live
+are evaluated, so MLX updates each part in place instead of copying it. Live
 DeltaNet state stays outside the arena between steps (see ``state.py``).
 """
 
@@ -40,6 +45,11 @@ STATE_GROUP = 1
 
 BF16_BYTES = 2
 FP32_BYTES = 4
+
+# Target part size in whole slabs; MAX_PARTS parts share a larger arena.
+PART_BYTES = 1 << 30
+# Decode attention binds the parts it reads, within Metal's 31 kernel buffers.
+MAX_PARTS = 16
 
 
 @dataclass(frozen=True, slots=True)
@@ -166,17 +176,42 @@ class CacheArena:
         self.geometry = geometry
         self.binding = CachePoolBinding(layout, resource="Qwen3.5-MoE MLX cache")
         self.slabs = layout.parent_capacity + 1
-        self.storage = mx.zeros(
-            (self.slabs * geometry.slab_units, 2 * PAGE_TOKENS, geometry.kv_width),
-            dtype=mx.bfloat16,
+        part_slabs = max(
+            1,
+            PART_BYTES // geometry.slab_bytes,
+            math.ceil(self.slabs / MAX_PARTS),
         )
-        mx.eval(self.storage)
+        self.part_units = part_slabs * geometry.slab_units
+        self.parts = [
+            mx.zeros(
+                (
+                    min(part_slabs, self.slabs - first) * geometry.slab_units,
+                    2 * PAGE_TOKENS,
+                    geometry.kv_width,
+                ),
+                dtype=mx.bfloat16,
+            )
+            for first in range(0, self.slabs, part_slabs)
+        ]
+        mx.eval(*self.parts)
 
-    def _units(self) -> mx.array:
-        return self.storage.reshape(-1, 2, PAGE_TOKENS, self.geometry.kv_width)
+    def _units(self, part: int) -> mx.array:
+        return self.parts[part].reshape(-1, 2, PAGE_TOKENS, self.geometry.kv_width)
 
     def _unit(self, slabs: np.ndarray, units: np.ndarray) -> np.ndarray:
         return slabs.astype(np.int64) * self.geometry.slab_units + units
+
+    def _take(self, units: np.ndarray) -> mx.array:
+        """Gather arena ``units`` in order."""
+
+        parts, units = np.divmod(units, self.part_units)
+        # Each run within one part gathers at once.
+        cuts = np.flatnonzero(np.diff(parts)) + 1
+        gathered = [
+            mx.take(self.parts[int(part[0])], mx.array(run.astype(np.int32)), 0)
+            for part, run in zip(np.split(parts, cuts), np.split(units, cuts))
+        ]
+        return gathered[0] if len(gathered) == 1 else mx.concatenate(gathered)
 
     # Reads ---------------------------------------------------------------
 
@@ -205,16 +240,30 @@ class CacheArena:
         if length == 0:
             return (None,) * layers
         bases = self._kv_bases(plan, np.array([row]), np.array([length]))[0]
-        return _GatheredHistory(self._units(), bases, length, layers, self.geometry)
+        return _GatheredHistory(self, bases, length, layers, self.geometry)
 
     def paged_history(
         self, plan: PagedCachePlan, rows: np.ndarray, lengths: np.ndarray
     ) -> PagedHistory:
-        """Page tables for attending to history in place during decode."""
+        """Page tables for attending to history in place during decode.
 
+        Only the parts holding the rows' pages are bound, renumbered in order
+        and repeated to a fixed count, so the kernel doesn't depend on how many
+        parts a batch reads.
+        """
+
+        bases = self._kv_bases(plan, rows, lengths)
+        parts, units = np.divmod(bases, self.part_units)
+        blocks = np.arange(bases.shape[1])
+        read = blocks[None, :] < np.ceil(lengths / PAGE_TOKENS)[:, None]
+        used = np.unique(parts[read]) if read.any() else np.zeros(1, np.int64)
+        # Padding reads nothing; its base 0 resolves to the first bound part.
+        slots = np.searchsorted(used, parts)
+        bound = [self._units(int(part)) for part in used]
         return PagedHistory(
-            self._units(),
-            mx.array(self._kv_bases(plan, rows, lengths).astype(np.int32)),
+            tuple(bound + bound[:1] * (len(self.parts) - len(bound))),
+            self.part_units,
+            mx.array((slots * self.part_units + units).astype(np.int32)),
             mx.array(lengths.astype(np.int32)),
         )
 
@@ -246,14 +295,12 @@ class CacheArena:
         for layer in range(layers):
             units = starts[:, None] + layer * per_layer + np.arange(per_layer)
             recurrent.append(
-                mx.take(self.storage, mx.array(units.reshape(-1).astype(np.int32)), 0)
-                .view(mx.float32)
-                .reshape(recurrent_shape)
+                self._take(units.reshape(-1)).view(mx.float32).reshape(recurrent_shape)
             )
         # Every layer's convolution tail follows the recurrent states.
         tail_units = geometry.state_units - layers * per_layer
         units = starts[:, None] + layers * per_layer + np.arange(tail_units)
-        tails = mx.take(self.storage, mx.array(units.reshape(-1).astype(np.int32)), 0)
+        tails = self._take(units.reshape(-1))
         tails = tails.reshape(count, -1)[:, : geometry.convolution_elements]
         tails = tails.reshape(count, layers, *geometry.convolution_shape[1:])
         convolution = [tails[:, layer] for layer in range(layers)]
@@ -290,12 +337,22 @@ class CacheArena:
             axis=1,
         )
         shape = (count, layers, 2)
-        self.storage[
-            mx.array(
-                np.broadcast_to(units[:, :, None], shape).reshape(-1).astype(np.int32)
-            ),
-            mx.array(np.broadcast_to(rows, shape).reshape(-1).astype(np.int32)),
-        ] = update.reshape(-1, self.geometry.kv_width)
+        parts, units = np.divmod(
+            np.broadcast_to(units[:, :, None], shape), self.part_units
+        )
+        parts, units = parts.reshape(-1), units.reshape(-1)
+        rows = np.broadcast_to(rows, shape).reshape(-1)
+        update = update.reshape(-1, self.geometry.kv_width)
+        for part in np.unique(parts).tolist():
+            selected = np.flatnonzero(parts == part)
+            self.parts[part][
+                mx.array(units[selected].astype(np.int32)),
+                mx.array(rows[selected].astype(np.int32)),
+            ] = (
+                update
+                if len(selected) == len(parts)
+                else update[mx.array(selected.astype(np.int32))]
+            )
 
     def write_states(self, starts: Sequence[int], state: LinearState) -> None:
         """Store row ``i`` of ``state`` in the STATE block starting at ``starts[i]``.
@@ -315,7 +372,10 @@ class CacheArena:
             units = units.reshape(count, per_layer, *unit_shape)
             first = layer * per_layer
             for index, start in enumerate(starts):
-                self.storage[start + first : start + first + per_layer] = units[index]
+                part, start = divmod(start, self.part_units)
+                self.parts[part][start + first : start + first + per_layer] = units[
+                    index
+                ]
         layers = geometry.linear_layers
         tail_units = geometry.state_units - layers * per_layer
         tails = mx.concatenate(
@@ -338,7 +398,8 @@ class CacheArena:
         ).reshape(count, tail_units, *unit_shape)
         first = layers * per_layer
         for index, start in enumerate(starts):
-            self.storage[start + first : start + first + tail_units] = tails[index]
+            part, start = divmod(start, self.part_units)
+            self.parts[part][start + first : start + first + tail_units] = tails[index]
 
 
 class _GatheredHistory(Sequence[AttentionHistory | None]):
@@ -350,17 +411,18 @@ class _GatheredHistory(Sequence[AttentionHistory | None]):
 
     def __init__(
         self,
-        units: mx.array,
+        arena: CacheArena,
         bases: np.ndarray,
         length: int,
         layers: int,
         geometry: CacheGeometry,
     ) -> None:
-        self._units = units
+        self._arena = arena
         self._bases = bases
         self._length = length
         self._layers = layers
         self._shape = (1, len(bases) * PAGE_TOKENS, geometry.kv_heads, -1)
+        self._unit_shape = (-1, 2, PAGE_TOKENS, geometry.kv_width)
 
     def __len__(self) -> int:
         return self._layers
@@ -368,7 +430,7 @@ class _GatheredHistory(Sequence[AttentionHistory | None]):
     def __getitem__(self, layer):  # type: ignore[override]
         if not isinstance(layer, int) or not 0 <= layer < self._layers:
             raise IndexError(layer)
-        pages = mx.take(self._units, mx.array(self._bases + layer), axis=0)
+        pages = self._arena._take(self._bases + layer).reshape(self._unit_shape)
         keys = pages[:, 0].reshape(self._shape)[:, : self._length]
         values = pages[:, 1].reshape(self._shape)[:, : self._length]
         return AttentionHistory(keys, values)
