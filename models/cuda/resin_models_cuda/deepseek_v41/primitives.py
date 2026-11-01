@@ -13,7 +13,6 @@ from torch import nn
 from torch.nn import functional as F
 
 from resin.backend.cuda.parallel import TensorParallelContext, TensorParallelLayout
-from resin.backend.transformer import RMSNorm as SharedRMSNorm
 
 
 def _default_tensor_parallel() -> TensorParallelContext:
@@ -63,11 +62,6 @@ class ParallelEmbedding(nn.Module):
         if self.tensor_parallel.enabled:
             y[mask] = 0
         return self.allreduce(y)
-
-
-class RMSNorm(SharedRMSNorm):
-    def __init__(self, dim: int, eps: float = 1e-6):
-        super().__init__(dim, eps, weight_dtype=torch.bfloat16)
 
 
 @lru_cache(2)

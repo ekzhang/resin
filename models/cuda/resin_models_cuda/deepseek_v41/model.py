@@ -19,6 +19,7 @@ from resin.backend.cuda.parallel import (
     TensorParallelLayout,
     TensorShard,
 )
+from resin.backend.layers import RMSNorm
 from resin.backend.loading import prepare_model
 from resin.backend.torch import benchmark_expert_indices
 from resin_models_cuda.deepseek_v41.attention import (
@@ -42,7 +43,6 @@ from resin_models_cuda.deepseek_v41.linear import Linear, SharedExpert
 from resin_models_cuda.deepseek_v41.primitives import (
     ParallelEmbedding,
     ParallelHead,
-    RMSNorm,
     apply_rotary_emb,
     precompute_freqs_cis,
 )

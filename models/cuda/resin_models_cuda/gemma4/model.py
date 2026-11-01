@@ -10,8 +10,9 @@ import torch
 from torch import Tensor, nn
 from torch.nn import functional as F
 
+from resin.backend.layers import RMSNorm
 from resin.models.gemma4.config import SLIDING_ATTENTION, Gemma4Nvfp4Config
-from resin.models.gemma4.model import RMSNorm, RotaryEmbedding, apply_rotary
+from resin.models.gemma4.model import RotaryEmbedding, apply_rotary
 from resin_models_cuda.nvfp4 import Nvfp4LinearWeights
 
 if TYPE_CHECKING:
@@ -273,7 +274,6 @@ __all__ = [
     "Gemma4Attention",
     "Gemma4DecoderLayer",
     "Gemma4ForConditionalGeneration",
-    "RMSNorm",
     "RotaryEmbedding",
     "apply_rotary",
 ]

@@ -13,8 +13,8 @@ import torch
 from torch import Tensor, nn
 from torch.nn import functional as F
 
+from resin.backend.layers import RMSNorm
 from resin.backend.torch import benchmark_expert_indices
-from resin.backend.transformer import RMSNorm
 from resin.models.gpt_oss.config import GptOssConfig
 
 
@@ -225,8 +225,12 @@ class MoEDecoderLayer(nn.Module):
         super().__init__()
         self.self_attn = SinkAttention(config, layer_index)
         self.mlp = MLP(config)
-        self.input_layernorm = RMSNorm(config.hidden_size, config.rms_norm_eps)
-        self.post_attention_layernorm = RMSNorm(config.hidden_size, config.rms_norm_eps)
+        self.input_layernorm = RMSNorm(
+            config.hidden_size, config.rms_norm_eps, weight_dtype=torch.float32
+        )
+        self.post_attention_layernorm = RMSNorm(
+            config.hidden_size, config.rms_norm_eps, weight_dtype=torch.float32
+        )
 
 
 class MoETransformerModel(nn.Module):
@@ -242,7 +246,9 @@ class MoETransformerModel(nn.Module):
                 for index in range(config.num_hidden_layers)
             ),
         )
-        self.norm = RMSNorm(config.hidden_size, config.rms_norm_eps)
+        self.norm = RMSNorm(
+            config.hidden_size, config.rms_norm_eps, weight_dtype=torch.float32
+        )
         self.rotary_emb = YarnRotaryEmbedding(config)
 
 

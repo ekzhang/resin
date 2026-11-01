@@ -197,9 +197,6 @@ def load_model(
     )
 
     model.materialize_buffers(target)
-    for module in model.modules():
-        if module.__class__.__name__ == "RMSNorm":
-            module.float()
     unprepared = [
         index
         for index, layer in enumerate(model.model.layers)

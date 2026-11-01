@@ -1,4 +1,4 @@
-"""Backend-neutral Gemma 4 normalization and rotary primitives."""
+"""Backend-neutral Gemma 4 rotary primitives."""
 
 from __future__ import annotations
 
@@ -7,7 +7,6 @@ from typing import Protocol
 import torch
 from torch import Tensor, nn
 
-from resin.backend.transformer import RMSNorm as SharedRMSNorm
 from resin.models.gemma4.config import SLIDING_ATTENTION
 
 
@@ -22,16 +21,6 @@ class Gemma4RotaryConfig(Protocol):
     def global_rope_theta(self) -> float: ...
     @property
     def global_partial_rotary_factor(self) -> float: ...
-
-
-class RMSNorm(SharedRMSNorm):
-    def __init__(self, width: int, eps: float, *, with_scale: bool = True) -> None:
-        super().__init__(
-            width,
-            eps,
-            weight_dtype=torch.bfloat16,
-            with_scale=with_scale,
-        )
 
 
 class RotaryEmbedding(nn.Module):
@@ -97,4 +86,4 @@ def apply_rotary(hidden: Tensor, cos: Tensor, sin: Tensor) -> Tensor:
     return hidden * cos.unsqueeze(1) + rotated * sin.unsqueeze(1)
 
 
-__all__ = ["RMSNorm", "RotaryEmbedding", "apply_rotary"]
+__all__ = ["RotaryEmbedding", "apply_rotary"]

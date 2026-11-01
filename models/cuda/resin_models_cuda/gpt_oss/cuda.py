@@ -324,8 +324,7 @@ class GptOssCudaRunner(CudaRunner):
         for layer in self._model.model.layers:
             layer.self_attn.pack_qkv_projection()
             # MNNVL's fused RMSNorm reads gamma in the communication tensor's
-            # dtype. The checkpoint values are BF16 even though RMSNorm
-            # parameters are initially materialized as FP32.
+            # dtype.
             layer.input_layernorm.to(dtype=torch.bfloat16)
             layer.post_attention_layernorm.to(dtype=torch.bfloat16)
         self._model.model.norm.to(dtype=torch.bfloat16)

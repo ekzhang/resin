@@ -10,7 +10,7 @@ not split implementations into `runners`, `kernels`, `drafts`, `media`, or
 `loading` directories. Importers use the owning module directly, without
 compatibility aliases or implementation registries.
 
-Resin itself also owns shared transformer primitives and CUDA host mechanics:
+Resin itself owns backend-neutral model math and CUDA host mechanics:
 graph capture/replay, fixed-buffer staging, sampling inputs, and slab page-
 table addressing. Concrete CUDA, cuTile, TileLang, FlashInfer, and model-
 specific fused kernels remain directly importable from
@@ -19,10 +19,13 @@ selected through a registry. A small cross-model CUDA primitive may live as a
 root module, such as `paged_kv.py`, when it has multiple model
 owners and does not justify another package layer.
 
-For example, RMSNorm stays in `resin.backend.transformer`, while GPT-OSS YaRN,
-sink attention, routers, and experts live in `resin_models_cuda.gpt_oss.model`
-and consume `GptOssConfig` directly. Sharing a primitive does not move a model
-family's composition or configuration contract into the generic backend.
+For example, `RMSNorm` lives in `resin.backend.layers` and selects Quack on
+SM90+ or FlashInfer on older CUDA devices, with compiled PyTorch math for
+non-CUDA tensors and FP32 inputs unsupported by FlashInfer. Gemma's targets
+and assistants use this same layer. GPT-OSS YaRN, sink attention, routers, and
+experts live in `resin_models_cuda.gpt_oss.model` and consume `GptOssConfig`
+directly. Sharing a layer does not move a model family's composition or
+configuration contract into the generic backend.
 
 Every CUDA model runner derives from `resin.backend.cuda.runner.CudaRunner`.
 That base owns device normalization, KV precision selection, failure

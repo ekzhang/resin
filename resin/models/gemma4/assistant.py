@@ -10,8 +10,9 @@ import torch
 from torch import Tensor, nn
 from torch.nn import functional as F
 
+from resin.backend.layers import RMSNorm
 from resin.models.gemma4.config import FULL_ATTENTION, SLIDING_ATTENTION
-from resin.models.gemma4.model import RMSNorm, RotaryEmbedding, apply_rotary
+from resin.models.gemma4.model import RotaryEmbedding, apply_rotary
 
 
 @dataclass(frozen=True, slots=True)

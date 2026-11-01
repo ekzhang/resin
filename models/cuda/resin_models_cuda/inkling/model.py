@@ -9,7 +9,7 @@ import torch
 import torch.nn.functional as F
 from torch import Tensor, nn
 
-from resin.backend.transformer import RMSNorm as SharedRMSNorm
+from resin.backend.layers import RMSNorm
 from resin.models.inkling.config import InklingConfig
 from resin_models_cuda.inkling.attention import (
     PagedAttentionBatch,
@@ -28,11 +28,6 @@ from resin_models_cuda.inkling.cache import (
     DeviceCache,
 )
 from resin_models_cuda.nvfp4 import prepare_nvfp4_moe_weights, quantize_nvfp4
-
-
-class RMSNorm(SharedRMSNorm):
-    def __init__(self, width: int, eps: float) -> None:
-        super().__init__(width, eps, weight_dtype=torch.bfloat16)
 
 
 class ShortConvolution(nn.Module):
@@ -860,7 +855,6 @@ __all__ = [
     "InklingVisionEncoderLayer",
     "InklingVisionModel",
     "Nvfp4Experts",
-    "RMSNorm",
     "Router",
     "ShortConvolution",
     "SparseMlp",

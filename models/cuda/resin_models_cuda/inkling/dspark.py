@@ -11,6 +11,7 @@ import torch
 import torch.nn.functional as F
 from torch import Tensor, nn
 
+from resin.backend.layers import RMSNorm
 from resin.models.inkling.config import (
     InklingConfig,
     InklingDSparkConfig,
@@ -23,7 +24,7 @@ from resin_models_cuda.inkling.attention import (
     prepare_paged_attention_batch,
 )
 from resin_models_cuda.inkling.cache import DRAFT_GROUP, DRAFT_LAYERS, DeviceCache
-from resin_models_cuda.inkling.model import InklingTarget, RMSNorm
+from resin_models_cuda.inkling.model import InklingTarget
 
 
 @lru_cache(8)

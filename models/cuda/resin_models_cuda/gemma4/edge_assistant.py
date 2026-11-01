@@ -16,8 +16,6 @@ from resin.models.gemma4.assistant import (
     Gemma4AssistantForCausalLM,
 )
 from resin.models.gemma4.config import FULL_ATTENTION, SLIDING_ATTENTION
-from resin.models.gemma4.model import RMSNorm
-from resin_models_cuda.gemma4.edge_model import EdgeRMSNorm
 
 DEFAULT_ASSISTANT = "google/gemma-4-E2B-it-assistant"
 DEFAULT_ASSISTANT_REVISION = "2d874ef7d29f9a30599a1e4b3c1cbc9595f005df"
@@ -159,19 +157,7 @@ class Gemma4EdgeMaskedEmbedder(nn.Module):
 class Gemma4EdgeAssistantForCausalLM(Gemma4AssistantForCausalLM):
     def __init__(self, config: Gemma4EdgeAssistantConfig) -> None:
         super().__init__(config)
-        # The shared mathematical modules use Quack for larger-model kernels.
-        # E2B needs a norm implementation whose CUDA path supports SM80.
-        for parent in tuple(self.modules()):
-            for name, child in tuple(parent.named_children()):
-                if isinstance(child, RMSNorm):
-                    setattr(parent, name, EdgeRMSNorm(child.width, child.eps))
         self.masked_embedding = Gemma4EdgeMaskedEmbedder(config)
-
-    def materialize_buffers(self, device: torch.device) -> None:
-        super().materialize_buffers(device)
-        for module in self.modules():
-            if isinstance(module, EdgeRMSNorm):
-                module.materialize(device)
 
     def forward_step(
         self,

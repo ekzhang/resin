@@ -15,50 +15,12 @@ import torch
 from torch import Tensor, nn
 from torch.nn import functional as F
 
+from resin.backend.layers import RMSNorm
 from resin.models.gemma4.config import SLIDING_ATTENTION
 from resin.models.gemma4.model import RotaryEmbedding, apply_rotary
 
 if TYPE_CHECKING:
     from resin.models.gemma4.edge_config import Gemma4EdgeConfig
-
-
-class EdgeRMSNorm(nn.Module):
-    """Gemma's multiplicative RMSNorm, using FlashInfer on Ampere and newer."""
-
-    def __init__(self, width: int, eps: float, *, with_scale: bool = True) -> None:
-        super().__init__()
-        self.width = width
-        self.eps = eps
-        if with_scale:
-            self.weight = nn.Parameter(torch.ones(width, dtype=torch.bfloat16))
-        else:
-            self.register_parameter("weight", None)
-        self.register_buffer("unit_weight", None, persistent=False)
-
-    def materialize(self, device: torch.device) -> None:
-        if self.weight is None:
-            self.unit_weight = torch.ones(
-                self.width, dtype=torch.bfloat16, device=device
-            )
-
-    def forward(self, hidden: Tensor) -> Tensor:
-        if hidden.is_cuda:
-            from flashinfer import rmsnorm
-
-            weight = self.weight if self.weight is not None else self.unit_weight
-            if weight is None:
-                raise RuntimeError(
-                    "unit RMSNorm weight must be prepared before capture"
-                )
-            flat = hidden.reshape(-1, self.width)
-            return rmsnorm(flat, weight, eps=self.eps).reshape(hidden.shape)
-        normalized = hidden.float()
-        normalized = normalized * torch.pow(
-            normalized.square().mean(-1, keepdim=True) + self.eps, -0.5
-        )
-        if self.weight is not None:
-            normalized = normalized * self.weight.float()
-        return normalized.to(hidden.dtype)
 
 
 class EdgeScaledEmbedding(nn.Embedding):
@@ -107,7 +69,7 @@ class Gemma4EdgeAttention(nn.Module):
             bias=False,
             dtype=torch.bfloat16,
         )
-        self.q_norm = EdgeRMSNorm(self.head_dim, config.rms_norm_eps)
+        self.q_norm = RMSNorm(self.head_dim, config.rms_norm_eps)
         if not self.is_kv_shared_layer:
             self.k_proj = nn.Linear(
                 config.hidden_size,
@@ -121,10 +83,8 @@ class Gemma4EdgeAttention(nn.Module):
                 bias=False,
                 dtype=torch.bfloat16,
             )
-            self.k_norm = EdgeRMSNorm(self.head_dim, config.rms_norm_eps)
-            self.v_norm = EdgeRMSNorm(
-                self.head_dim, config.rms_norm_eps, with_scale=False
-            )
+            self.k_norm = RMSNorm(self.head_dim, config.rms_norm_eps)
+            self.v_norm = RMSNorm(self.head_dim, config.rms_norm_eps, with_scale=False)
         self.o_proj = nn.Linear(
             self.num_heads * self.head_dim,
             config.hidden_size,
@@ -265,14 +225,12 @@ class Gemma4EdgeDecoderLayer(nn.Module):
         super().__init__()
         self.self_attn = Gemma4EdgeAttention(config, layer_index)
         self.mlp = Gemma4EdgeMLP(config, layer_index)
-        self.input_layernorm = EdgeRMSNorm(config.hidden_size, config.rms_norm_eps)
-        self.post_attention_layernorm = EdgeRMSNorm(
+        self.input_layernorm = RMSNorm(config.hidden_size, config.rms_norm_eps)
+        self.post_attention_layernorm = RMSNorm(config.hidden_size, config.rms_norm_eps)
+        self.pre_feedforward_layernorm = RMSNorm(
             config.hidden_size, config.rms_norm_eps
         )
-        self.pre_feedforward_layernorm = EdgeRMSNorm(
-            config.hidden_size, config.rms_norm_eps
-        )
-        self.post_feedforward_layernorm = EdgeRMSNorm(
+        self.post_feedforward_layernorm = RMSNorm(
             config.hidden_size, config.rms_norm_eps
         )
         self.register_buffer("layer_scalar", torch.ones(1, dtype=torch.bfloat16))
@@ -288,7 +246,7 @@ class Gemma4EdgeDecoderLayer(nn.Module):
             bias=False,
             dtype=torch.bfloat16,
         )
-        self.post_per_layer_input_norm = EdgeRMSNorm(
+        self.post_per_layer_input_norm = RMSNorm(
             config.hidden_size, config.rms_norm_eps
         )
 
@@ -341,7 +299,7 @@ class Gemma4EdgeTextModel(nn.Module):
                 for index in range(config.num_hidden_layers)
             ),
         )
-        self.norm = EdgeRMSNorm(config.hidden_size, config.rms_norm_eps)
+        self.norm = RMSNorm(config.hidden_size, config.rms_norm_eps)
         self.rotary_emb = RotaryEmbedding(config)
         self.embed_tokens_per_layer = EdgeScaledEmbedding(
             config.vocab_size_per_layer_input,
@@ -355,7 +313,7 @@ class Gemma4EdgeTextModel(nn.Module):
             bias=False,
             dtype=torch.bfloat16,
         )
-        self.per_layer_projection_norm = EdgeRMSNorm(
+        self.per_layer_projection_norm = RMSNorm(
             config.hidden_size_per_layer_input, config.rms_norm_eps
         )
 
@@ -398,9 +356,7 @@ class Gemma4EdgeForCausalLM(nn.Module):
     def materialize_buffers(self, device: torch.device) -> None:
         self.language_model.rotary_emb.materialize(device)
         for module in self.modules():
-            if isinstance(module, EdgeRMSNorm):
-                module.materialize(device)
-            elif isinstance(module, EdgeScaledEmbedding):
+            if isinstance(module, EdgeScaledEmbedding):
                 module.materialize_scale()
             elif isinstance(module, Gemma4EdgeMLP):
                 module.gelu_zero_bias = module.gate_proj.weight.new_zeros(
@@ -427,7 +383,6 @@ class Gemma4EdgeForCausalLM(nn.Module):
 
 
 __all__ = [
-    "EdgeRMSNorm",
     "Gemma4EdgeAttention",
     "Gemma4EdgeDecoderLayer",
     "Gemma4EdgeForCausalLM",
