@@ -22,6 +22,10 @@ dependencies = ["blake3>=1.0,<2", "numpy>=1.26,<3", "torch>=2.13.0"]
 cuda = [
   "flashinfer-python>=0.6.15.post1; sys_platform == 'linux'",
   "cuda-bindings>=13.3,<14; sys_platform == 'linux'",
+  "nvidia-cutlass-dsl==4.6.2; sys_platform == 'linux'",
+  "nvidia-cutlass-dsl-libs-base==4.6.2; sys_platform == 'linux'",
+  "apache-tvm-ffi==0.1.12; sys_platform == 'linux'",
+  "quack-kernels==0.6.4; sys_platform == 'linux'",
 ]
 
 [dependency-groups]
@@ -58,7 +62,6 @@ python-source = "."
 python-packages = ["resin"]
 features = ["pyo3/extension-module"]
 include = [
-  { path = "resin/backend/cuda/sampling_air.cu", format = ["sdist", "wheel"] },
   { path = "resin/backend/cuda/sampling_topk.cu", format = ["sdist", "wheel"] },
 ]
 
