@@ -1,6 +1,6 @@
 use resin_recipe::ResponseParser;
 mod common;
-use common::SemanticParser;
+use common::{SemanticParser, coalesce};
 
 use std::sync::{
     Arc,
@@ -82,20 +82,6 @@ fn reasoning(text: &str) -> Event {
     Event::ReasoningDelta {
         delta: text.to_owned(),
     }
-}
-
-fn coalesce(events: Vec<Event>) -> Vec<Event> {
-    let mut result = Vec::new();
-    for event in events {
-        match (result.last_mut(), event) {
-            (Some(Event::TextDelta { delta }), Event::TextDelta { delta: next })
-            | (Some(Event::ReasoningDelta { delta }), Event::ReasoningDelta { delta: next }) => {
-                delta.push_str(&next)
-            }
-            (_, event) => result.push(event),
-        }
-    }
-    result
 }
 
 #[test]

@@ -1,10 +1,8 @@
 use resin_recipe::{Recipe, gemma::Gemma4Recipe};
 mod common;
-use common::SemanticParser;
+use common::{ByteDecoder, SemanticParser, bytes};
 
-use resin_recipe::{
-    AttributedText, Decoder, Error, Event, FinishReason, Gemma4Parser, Gemma4Tokens, PromptSpan,
-};
+use resin_recipe::{Event, FinishReason, Gemma4Parser, Gemma4Tokens, PromptSpan};
 use serde_json::{Value, json};
 
 const TOKENS: Gemma4Tokens = Gemma4Tokens {
@@ -20,35 +18,6 @@ const TOKENS: Gemma4Tokens = Gemma4Tokens {
     eos: 1009,
 };
 
-#[derive(Default)]
-struct ByteDecoder(Vec<u8>);
-impl Decoder for ByteDecoder {
-    fn push(&mut self, ids: &[u32], _token_start: u32) -> Result<AttributedText, Error> {
-        for &id in ids {
-            self.0
-                .push(u8::try_from(id).map_err(|_| Error::new("invalid byte token"))?);
-        }
-        let length = match std::str::from_utf8(&self.0) {
-            Ok(_) => self.0.len(),
-            Err(error) if error.error_len().is_none() => error.valid_up_to(),
-            Err(_) => return Err(Error::new("invalid UTF-8")),
-        };
-        Ok(AttributedText::plain(
-            String::from_utf8(self.0.drain(..length).collect()).unwrap(),
-        ))
-    }
-    fn finish(&mut self) -> Result<AttributedText, Error> {
-        Ok(AttributedText::plain(
-            String::from_utf8_lossy(&std::mem::take(&mut self.0)).into_owned(),
-        ))
-    }
-    fn reset(&mut self) {
-        self.0.clear();
-    }
-}
-fn bytes(text: &str) -> Vec<u32> {
-    text.bytes().map(u32::from).collect()
-}
 fn parser(prompt: &[u32]) -> Gemma4Parser {
     Gemma4Parser::new(TOKENS, Box::<ByteDecoder>::default(), prompt).unwrap()
 }

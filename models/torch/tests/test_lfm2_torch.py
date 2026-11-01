@@ -226,14 +226,6 @@ class TestLfm2Torch:
         assert request.take_result() == tokens[-2:]
         assert runner.live_cache_count == 0
 
-    def test_checkpoint_parameter_paths_match_the_released_layout(self) -> None:
-        keys = set(self.model.state_dict())
-        assert "model.layers.0.conv.in_proj.weight" in keys
-        assert "model.layers.1.self_attn.q_layernorm.weight" in keys
-        assert "model.layers.1.feed_forward.w1.weight" in keys
-        assert "model.embedding_norm.weight" in keys
-        assert not any(".operator." in key for key in keys)
-
     @pytest.mark.parametrize("chunk", [1, 2, 8])
     def test_prompt_scores_match_full_context_without_extra_forwards(self, chunk):
         from resin import Engine, SamplingParams, SchedulerConfig

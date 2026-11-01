@@ -218,6 +218,14 @@ class _Torch:
         return np.array_equal(left.values, right.values)
 
 
+@pytest.fixture
+def graph_torch(monkeypatch):
+    torch = _Torch()
+    monkeypatch.setattr(staging, "torch", torch)
+    monkeypatch.setattr(graph_runtime, "torch", torch)
+    return torch
+
+
 def _cache(shapes, build, synchronize_failure=lambda: None):
     return _CudaGraphCache(
         "cuda:0",
@@ -355,12 +363,8 @@ class TestCudaGraph:
             runner._configure_cache_binding(CachePoolBinding(layout))
 
     def test_model_runner_owns_modes_capture_hooks_selection_and_stats(
-        self, monkeypatch
+        self, graph_torch
     ) -> None:
-        torch = _Torch()
-        monkeypatch.setattr(staging, "torch", torch)
-        monkeypatch.setattr(graph_runtime, "torch", torch)
-
         class ModelRunner(_ConcreteCudaRunner):
             device = "cuda:0"
 
@@ -428,11 +432,8 @@ class TestCudaGraph:
             _resolve_kv_cache_dtype("float16")
 
     def test_runner_reuses_one_mechanism_across_execution_modes(
-        self, monkeypatch
+        self, graph_torch
     ) -> None:
-        torch = _Torch()
-        monkeypatch.setattr(staging, "torch", torch)
-        monkeypatch.setattr(graph_runtime, "torch", torch)
         events = []
 
         def build_prefill(_shape):
@@ -563,11 +564,8 @@ class TestCudaGraph:
         assert graphs.match(lambda shape: shape[0] == 1 and shape[1] >= 5) is None
 
     def test_explicit_capture_precedes_replay_of_the_same_static_step(
-        self, monkeypatch
+        self, graph_torch
     ) -> None:
-        torch = _Torch()
-        monkeypatch.setattr(staging, "torch", torch)
-        monkeypatch.setattr(graph_runtime, "torch", torch)
         staged = [7]
         allocations = []
 
@@ -588,11 +586,9 @@ class TestCudaGraph:
 
     @pytest.mark.parametrize("builder", [CudaGraphStep, CudaGraphProgram])
     def test_device_output_preserves_identity_without_host_conversion(
-        self, monkeypatch, builder
+        self, monkeypatch, graph_torch, builder
     ):
-        torch = _Torch()
-        monkeypatch.setattr(staging, "torch", torch)
-        monkeypatch.setattr(graph_runtime, "torch", torch)
+        torch = graph_torch
         monkeypatch.setattr(
             _Tensor,
             "tolist",
@@ -615,11 +611,8 @@ class TestCudaGraph:
         assert torch.host_allocations == 0
 
     def test_capture_all_owns_shape_iteration_and_model_state_hooks(
-        self, monkeypatch
+        self, graph_torch
     ) -> None:
-        torch = _Torch()
-        monkeypatch.setattr(staging, "torch", torch)
-        monkeypatch.setattr(graph_runtime, "torch", torch)
         events = []
 
         def build(shape):
@@ -650,11 +643,9 @@ class TestCudaGraph:
         assert events == ["before", "after"]
 
     def test_all_modes_share_one_lazy_pool_and_stream_and_capture_largest_first(
-        self, monkeypatch
+        self, graph_torch
     ):
-        torch = _Torch()
-        monkeypatch.setattr(staging, "torch", torch)
-        monkeypatch.setattr(graph_runtime, "torch", torch)
+        torch = graph_torch
         order = []
 
         def mode(name):
@@ -703,11 +694,9 @@ class TestCudaGraph:
         assert len({graph.stream for graph in torch.cuda.graphs}) == 1
 
     def test_pool_lifetime_is_per_executor_and_closing_one_mode_keeps_siblings(
-        self, monkeypatch
+        self, graph_torch
     ):
-        torch = _Torch()
-        monkeypatch.setattr(staging, "torch", torch)
-        monkeypatch.setattr(graph_runtime, "torch", torch)
+        torch = graph_torch
 
         def build(_shape):
             state = _Tensor([0])
@@ -743,11 +732,9 @@ class TestCudaGraph:
         assert all(graph.reset_count == 1 for graph in torch.cuda.graphs)
 
     def test_capture_warms_stream_local_kernel_state_and_preserves_breaks_and_pool(
-        self, monkeypatch
+        self, graph_torch
     ):
-        torch = _Torch()
-        monkeypatch.setattr(staging, "torch", torch)
-        monkeypatch.setattr(graph_runtime, "torch", torch)
+        torch = graph_torch
         caller = torch.cuda.current_stream("cuda:0")
         initialized, events = set(), []
 
@@ -791,11 +778,9 @@ class TestCudaGraph:
         assert cache._workspace is None
 
     def test_cache_close_resets_graphs_after_synchronizing_and_is_idempotent(
-        self, monkeypatch
+        self, monkeypatch, graph_torch
     ):
-        torch = _Torch()
-        monkeypatch.setattr(staging, "torch", torch)
-        monkeypatch.setattr(graph_runtime, "torch", torch)
+        torch = graph_torch
 
         def build(_shape):
             state = _Tensor([0])
@@ -851,11 +836,9 @@ class TestCudaGraph:
                 operation()
 
     def test_runner_close_synchronizes_once_across_modes_before_group_teardown(
-        self, monkeypatch
+        self, monkeypatch, graph_torch
     ):
-        torch = _Torch()
-        monkeypatch.setattr(staging, "torch", torch)
-        monkeypatch.setattr(graph_runtime, "torch", torch)
+        torch = graph_torch
 
         def mode():
             def build(_shape):
@@ -905,16 +888,15 @@ class TestCudaGraph:
                 operation()
 
     def test_runtime_counts_track_success_and_survive_close_without_catalog_scan(
-        self, monkeypatch
+        self, graph_torch
     ):
-        torch = _Torch()
-        monkeypatch.setattr(staging, "torch", torch)
-        monkeypatch.setattr(graph_runtime, "torch", torch)
+        torch = graph_torch
 
         def build(_shape):
             state = _Tensor([0])
             return CudaGraphStep({"value": state}, state, lambda: None)
 
+        synchronized = []
         executor = CudaGraphExecutor(
             "cuda:0",
             {
@@ -922,7 +904,7 @@ class TestCudaGraph:
                     ((1, 4), (2, 4)), build, lambda _: {"value": [1]}
                 )
             },
-            synchronize_failure=lambda: None,
+            synchronize_failure=lambda: synchronized.append(True),
         )
         cache = executor.mode("decode")
         cache.capture((1, 4), {"value": [1]})
@@ -945,8 +927,11 @@ class TestCudaGraph:
             "fallback_counts": cache.stats["fallback_counts"],
         } == cache.runtime_counts
         torch.cuda.graphs[0].error = RuntimeError("illegal replay")
-        with pytest.raises(PostAcceptCudaError, match="illegal replay"):
+        with pytest.raises(PostAcceptCudaError, match="illegal replay") as caught:
             cache.run((1, 4), {"value": [4]})
+        assert caught.value._resin_post_accept is True
+        assert synchronized == [True]
+        assert "graph replay" in (cache.stats["poison_error"] or "")
         assert executor.runtime_counts == expected
         executor.close()
         assert executor.runtime_counts == expected
@@ -982,10 +967,8 @@ class TestCudaGraph:
         with pytest.raises(RuntimeError, match="closed"):
             executor.capture_all()
 
-    def test_replay_reuses_persistent_pinned_staging(self, monkeypatch) -> None:
-        torch = _Torch()
-        monkeypatch.setattr(staging, "torch", torch)
-        monkeypatch.setattr(graph_runtime, "torch", torch)
+    def test_replay_reuses_persistent_pinned_staging(self, graph_torch) -> None:
+        torch = graph_torch
 
         def build(_shape):
             state = _Tensor([0])
@@ -1001,11 +984,9 @@ class TestCudaGraph:
         assert torch.host_allocations == allocations_after_capture
 
     def test_program_replays_captured_regions_around_an_eager_break(
-        self, monkeypatch
+        self, graph_torch
     ) -> None:
-        torch = _Torch()
-        monkeypatch.setattr(staging, "torch", torch)
-        monkeypatch.setattr(graph_runtime, "torch", torch)
+        torch = graph_torch
         events = []
 
         def build(_shape):
@@ -1044,7 +1025,7 @@ class TestCudaGraph:
             )
 
     def test_capture_can_prepare_mutable_state_before_each_parity_run(
-        self, monkeypatch
+        self, graph_torch
     ) -> None:
         prepared = []
 
@@ -1057,9 +1038,6 @@ class TestCudaGraph:
                 prepare=lambda: prepared.append(True),
             )
 
-        torch = _Torch()
-        monkeypatch.setattr(staging, "torch", torch)
-        monkeypatch.setattr(graph_runtime, "torch", torch)
         graphs = _cache(((1, 4),), build)
 
         graphs.capture((1, 4), {"value": [7]})
@@ -1067,12 +1045,8 @@ class TestCudaGraph:
         assert len(prepared) == 5
 
     def test_graph_inputs_can_copy_directly_from_device_tensors(
-        self, monkeypatch
+        self, graph_torch
     ) -> None:
-        torch = _Torch()
-        monkeypatch.setattr(staging, "torch", torch)
-        monkeypatch.setattr(graph_runtime, "torch", torch)
-
         def build(_shape):
             state = _Tensor([0])
             return CudaGraphStep({"value": state}, state, lambda: None)
@@ -1122,7 +1096,7 @@ class TestCudaGraph:
         graphs.check_ready()
 
     def test_host_shape_error_is_retryable_and_drops_fresh_step(
-        self, monkeypatch
+        self, graph_torch
     ) -> None:
         builds = []
 
@@ -1131,9 +1105,6 @@ class TestCudaGraph:
             state = _Tensor([0])
             return CudaGraphStep({"value": state}, state, lambda: None)
 
-        torch = _Torch()
-        monkeypatch.setattr(staging, "torch", torch)
-        monkeypatch.setattr(graph_runtime, "torch", torch)
         graphs = _cache(((1, 4),), build)
         with pytest.raises(GraphInputError):
             graphs.capture((1, 4), {})
@@ -1141,7 +1112,7 @@ class TestCudaGraph:
         assert graphs.capture((1, 4), {"value": [1]}).tolist() == [1]
         assert len(builds) == 2
 
-    def test_capture_mismatch_poisons_before_future_work(self, monkeypatch) -> None:
+    def test_capture_mismatch_poisons_before_future_work(self, graph_torch) -> None:
         synchronized = []
 
         def build(_shape):
@@ -1152,9 +1123,7 @@ class TestCudaGraph:
 
             return CudaGraphStep({"value": state}, state, launch)
 
-        torch = _Torch()
-        monkeypatch.setattr(staging, "torch", torch)
-        monkeypatch.setattr(graph_runtime, "torch", torch)
+        torch = graph_torch
         graphs = _cache(((1, 4),), build, lambda: synchronized.append(True))
         with pytest.raises(RuntimeError, match="differs"):
             graphs.capture((1, 4), {"value": [0]})
@@ -1207,12 +1176,9 @@ class TestCudaGraph:
         assert sampled_sizes == [8, 8]
         assert graphs.stats["poisoned"]
 
-    def test_device_copy_failure_poisons_before_capture(self, monkeypatch) -> None:
+    def test_device_copy_failure_poisons_before_capture(self, graph_torch) -> None:
         state = _Tensor([0])
         state.copy_error = RuntimeError("copy failed")
-        torch = _Torch()
-        monkeypatch.setattr(staging, "torch", torch)
-        monkeypatch.setattr(graph_runtime, "torch", torch)
         graphs = _cache(
             ((1, 4),),
             lambda _shape: CudaGraphStep({"value": state}, state, lambda: None),
@@ -1222,23 +1188,3 @@ class TestCudaGraph:
             graphs.capture((1, 4), {"value": [1]})
         assert graphs.stats["capture_count"] == 0
         assert "graph input copy" in graphs.stats["poison_error"]
-
-    def test_replay_failure_poisons_without_counting_replay(self, monkeypatch) -> None:
-        torch = _Torch()
-        monkeypatch.setattr(staging, "torch", torch)
-        monkeypatch.setattr(graph_runtime, "torch", torch)
-
-        def build(_shape):
-            state = _Tensor([1])
-            return CudaGraphStep({"value": state}, state, lambda: None)
-
-        synchronized = []
-        graphs = _cache(((1, 4),), build, lambda: synchronized.append(True))
-        graphs.capture((1, 4), {"value": [1]})
-        torch.cuda.graphs[0].error = RuntimeError("illegal replay")
-        with pytest.raises(PostAcceptCudaError, match="illegal replay") as caught:
-            graphs.run((1, 4), {"value": [1]})
-        assert caught.value._resin_post_accept is True
-        assert synchronized == [True]
-        assert graphs.stats["replay_count"] == 0
-        assert "graph replay" in graphs.stats["poison_error"]

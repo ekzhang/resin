@@ -1,10 +1,10 @@
 use resin_recipe::{
-    AttributedText, Decoder, Error, Event, FinishReason, GlmParser, GlmTokens, Recipe,
+    Event, FinishReason, GlmParser, GlmTokens, Recipe,
     glm::{Glm53FlashRecipe, Glm53FlashRecipeParams},
 };
 use serde_json::{Value, json};
 mod common;
-use common::SemanticParser;
+use common::{ByteDecoder, SemanticParser, bytes, coalesce};
 
 const TOKENS: GlmTokens = GlmTokens {
     endoftext: 1000,
@@ -19,35 +19,14 @@ const TOKENS: GlmTokens = GlmTokens {
     arg_value: 1009,
     arg_value_end: 1010,
 };
-#[derive(Default)]
-struct Bytes(Vec<u8>);
-impl Decoder for Bytes {
-    fn push(&mut self, ids: &[u32], _token_start: u32) -> Result<AttributedText, Error> {
-        self.0
-            .extend(ids.iter().map(|&id| u8::try_from(id).unwrap()));
-        let length = match std::str::from_utf8(&self.0) {
-            Ok(_) => self.0.len(),
-            Err(error) if error.error_len().is_none() => error.valid_up_to(),
-            Err(_) => return Err(Error::new("invalid bytes")),
-        };
-        Ok(AttributedText::plain(
-            String::from_utf8(self.0.drain(..length).collect()).unwrap(),
-        ))
-    }
-    fn finish(&mut self) -> Result<AttributedText, Error> {
-        let text = String::from_utf8_lossy(&self.0).into_owned();
-        self.0.clear();
-        Ok(AttributedText::plain(text))
-    }
-    fn reset(&mut self) {
-        self.0.clear();
-    }
-}
-fn bytes(text: &str) -> Vec<u32> {
-    text.bytes().map(u32::from).collect()
-}
 fn parser(tools: &Value) -> GlmParser {
-    GlmParser::new(TOKENS, Box::<Bytes>::default(), &[TOKENS.think], tools).unwrap()
+    GlmParser::new(
+        TOKENS,
+        Box::<ByteDecoder>::default(),
+        &[TOKENS.think],
+        tools,
+    )
+    .unwrap()
 }
 fn append_argument(ids: &mut Vec<u32>, key: &str, value: &str) {
     ids.push(TOKENS.arg_key);
@@ -55,19 +34,6 @@ fn append_argument(ids: &mut Vec<u32>, key: &str, value: &str) {
     ids.extend([TOKENS.arg_key_end, TOKENS.arg_value]);
     ids.extend(bytes(value));
     ids.push(TOKENS.arg_value_end);
-}
-fn coalesce(events: Vec<Event>) -> Vec<Event> {
-    let mut out = Vec::new();
-    for event in events {
-        match (out.last_mut(), event) {
-            (Some(Event::TextDelta { delta }), Event::TextDelta { delta: next })
-            | (Some(Event::ReasoningDelta { delta }), Event::ReasoningDelta { delta: next }) => {
-                delta.push_str(&next)
-            }
-            (_, event) => out.push(event),
-        }
-    }
-    out
 }
 
 #[test]
@@ -243,7 +209,7 @@ fn all_released_stop_markers_end_generation() {
                 user: TOKENS.endoftext,
                 ..TOKENS
             },
-            Box::<Bytes>::default(),
+            Box::<ByteDecoder>::default(),
             &[],
             &Value::Null
         )

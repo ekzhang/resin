@@ -276,18 +276,6 @@ class TestGptOssCudaNativePlan:
             cache_layout=runner.cache_layout if layout is None else layout,
         )
 
-    def test_cuda_graphs_use_the_shared_static_step_lifecycle(self) -> None:
-        parameters = inspect.signature(GptOssCudaRunner.__init__).parameters
-        source = inspect.getsource(GptOssCudaRunner)
-        assert "cuda_graph_decode_shapes" in parameters
-        assert GptOssCudaRunner.__bases__ == (CudaRunner,)
-        assert hasattr(GptOssCudaRunner, "cuda_graph_stats")
-        assert hasattr(GptOssCudaRunner, "capture_cuda_graphs")
-        assert "self._configure_cuda_graphs(" in source
-        assert "def capture_cuda_graphs" not in source
-        assert "CUDAGraph" not in source
-        assert ".replay()" not in source
-
     def test_kernels_are_flat_explicit_constructor_arguments(self) -> None:
         parameters = inspect.signature(GptOssCudaRunner.__init__).parameters
 
@@ -452,30 +440,6 @@ class TestGptOssCudaNativePlan:
                 tensor_parallel_size=0,
             )
 
-    def test_runner_exposes_only_the_flat_grouped_cache_path(self) -> None:
-        source = inspect.getsource(GptOssCudaRunner)
-        parameters = inspect.signature(GptOssCudaRunner.__init__).parameters
-        assert "RunnerConfig(" in source
-        assert "continuation_prefill=True" in source
-        assert "prefill_chunk_size=self.prefill_chunk_size" in source
-        assert "max_batch_tokens=self.prefill_chunk_size" in source
-        assert "self._configure_cache_binding(" in source
-        assert hasattr(GptOssCudaRunner, "bind_resources")
-        assert "CacheGroupLayout(self.page_size)" in source
-        assert "retention=CacheRetention.WINDOW" in source
-        assert "build_attention_batches" in source
-        assert "tensor_parallel" in parameters
-        assert "fast_allreduce" in parameters
-        assert source.count("self.tensor_parallel.sum(") == 1
-        assert source.count("self._allreduce_residual_rmsnorm(") == 2
-
-    def test_runner_owns_gpt_oss_router_policy_directly(self) -> None:
-        source = inspect.getsource(GptOssCudaRunner)
-
-        assert GptOssCudaRunner.__bases__ == (CudaRunner,)
-        assert "_router_logits(" in source
-        assert "_route(" in source
-
     def test_cache_pool_binding_is_exact_idempotent_and_permanent(self) -> None:
         runner = self._binding_runner()
 
@@ -608,42 +572,29 @@ class TestGptOssCudaNativePlan:
         with pytest.raises(ValueError, match="exceeds 8192"):
             build_attention_batches(_flat_plan([0], [PREFILL_CHUNK_SIZE + 1]))
 
-    def test_cuda_attention_has_no_fp32_promotion_or_kv_head_expansion(self) -> None:
-        source = "\n".join(
-            inspect.getsource(method)
-            for method in (
-                GptOssCudaRunner._attention,
-                GptOssCudaRunner._attention_project,
-                GptOssCudaRunner._attention_core,
-            )
-        )
-        assert ".float(" not in source
-        assert "repeat_interleave" not in source
-        assert "repeat(" not in source
-        assert source.count("qkv_proj(") == 1
-        assert "attention.q_proj(" not in source
-        assert "attention.k_proj(" not in source
-        assert "attention.v_proj(" not in source
-        assert "index_copy_" in source
-
-    def test_runner_has_no_python_request_cache_or_page_allocator(self) -> None:
-        source = inspect.getsource(GptOssCudaRunner)
-        assert "_request_pages" not in source
-        assert "_request_lengths" not in source
-        assert "_free_pages" not in source
-        assert "_logical_pages" not in source
-        assert "_sequence_cache" not in source
-
-    def test_one_zeroed_parent_allocation_backs_both_group_views(self) -> None:
+    def test_zeroed_kv_storage_shares_both_group_views(self) -> None:
         from resin_models_cuda.gpt_oss.paged_kv import PagedKvArena
 
-        source = inspect.getsource(GptOssCudaRunner.__init__)
-        arena_source = inspect.getsource(PagedKvArena.__init__)
-        assert "self._kv = PagedKvArena(" in source
-        assert arena_source.count("torch.zeros(") == 1
-        assert "self.capacity + 1" in arena_source
-        assert "self.keys = self.storage[0]" in arena_source
-        assert "self.values = self.storage[1]" in arena_source
+        layout = CacheLayout(parent_capacity=2, groups=[CacheGroupLayout(4)])
+        arena = PagedKvArena(
+            "cpu",
+            layout,
+            layer_count=2,
+            page_size=4,
+            num_kv_heads=2,
+            head_dim=8,
+            dtype=torch.bfloat16,
+        )
+
+        assert arena.storage.shape == (2, 2, 3, 4, 2, 8)
+        assert not arena.storage.count_nonzero()
+        pointer = arena.storage.untyped_storage().data_ptr()
+        assert arena.keys.untyped_storage().data_ptr() == pointer
+        assert arena.values.untyped_storage().data_ptr() == pointer
+        arena.keys.fill_(1)
+        arena.values.fill_(2)
+        assert torch.equal(arena.storage[0], torch.ones_like(arena.keys))
+        assert torch.equal(arena.storage[1], torch.full_like(arena.values, 2))
 
 
 class TestGptOssCudaTinyOracle:

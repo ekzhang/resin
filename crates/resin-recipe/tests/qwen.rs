@@ -3,9 +3,9 @@ use resin_recipe::{
     qwen::{OrnithRecipe, Qwen35Recipe, Qwen38Recipe, QwenRecipeParams},
 };
 mod common;
-use common::SemanticParser;
+use common::{ByteDecoder, SemanticParser, bytes, coalesce};
 
-use resin_recipe::{AttributedText, Decoder, Error, Event, FinishReason, QwenParser, QwenTokens};
+use resin_recipe::{Error, Event, FinishReason, QwenParser, QwenTokens};
 
 const TOKENS: QwenTokens = QwenTokens {
     im_end: 1000,
@@ -15,46 +15,6 @@ const TOKENS: QwenTokens = QwenTokens {
     tool_call: 1004,
     tool_call_end: 1005,
 };
-#[derive(Default)]
-struct Bytes(Vec<u8>);
-impl Decoder for Bytes {
-    fn push(&mut self, ids: &[u32], _token_start: u32) -> Result<AttributedText, Error> {
-        self.0
-            .extend(ids.iter().map(|&id| u8::try_from(id).unwrap()));
-        let length = match std::str::from_utf8(&self.0) {
-            Ok(_) => self.0.len(),
-            Err(error) if error.error_len().is_none() => error.valid_up_to(),
-            Err(_) => return Err(Error::new("invalid bytes")),
-        };
-        Ok(AttributedText::plain(
-            String::from_utf8(self.0.drain(..length).collect()).unwrap(),
-        ))
-    }
-    fn finish(&mut self) -> Result<AttributedText, Error> {
-        let text = String::from_utf8_lossy(&self.0).into_owned();
-        self.0.clear();
-        Ok(AttributedText::plain(text))
-    }
-    fn reset(&mut self) {
-        self.0.clear();
-    }
-}
-fn bytes(text: &str) -> Vec<u32> {
-    text.bytes().map(u32::from).collect()
-}
-fn coalesce(events: Vec<Event>) -> Vec<Event> {
-    let mut out = Vec::new();
-    for event in events {
-        match (out.last_mut(), event) {
-            (Some(Event::TextDelta { delta }), Event::TextDelta { delta: next })
-            | (Some(Event::ReasoningDelta { delta }), Event::ReasoningDelta { delta: next }) => {
-                delta.push_str(&next)
-            }
-            (_, event) => out.push(event),
-        }
-    }
-    out
-}
 
 #[test]
 fn pinned_hf_templates_match_all_variants_tools_history_and_vision() {
@@ -103,8 +63,13 @@ fn reasoning_text_and_schema_aware_tools_are_chunk_invariant() {
         },
     ];
     for width in 1..=ids.len() {
-        let mut parser =
-            QwenParser::new(TOKENS, Box::<Bytes>::default(), &[TOKENS.think], &tools).unwrap();
+        let mut parser = QwenParser::new(
+            TOKENS,
+            Box::<ByteDecoder>::default(),
+            &[TOKENS.think],
+            &tools,
+        )
+        .unwrap();
         let mut events = Vec::new();
         for chunk in ids.chunks(width) {
             events.extend(parser.semantic_feed(chunk).unwrap());
@@ -125,7 +90,7 @@ fn reasoning_text_and_schema_aware_tools_are_chunk_invariant() {
 fn incomplete_xml_stays_uncommitted_and_text_finalization_flushes_bytes() {
     let mut parser = QwenParser::new(
         TOKENS,
-        Box::<Bytes>::default(),
+        Box::<ByteDecoder>::default(),
         &[],
         &serde_json::Value::Null,
     )
@@ -141,7 +106,7 @@ fn incomplete_xml_stays_uncommitted_and_text_finalization_flushes_bytes() {
     );
     let mut parser = QwenParser::new(
         TOKENS,
-        Box::<Bytes>::default(),
+        Box::<ByteDecoder>::default(),
         &[TOKENS.think, TOKENS.think_end],
         &serde_json::Value::Null,
     )
@@ -159,7 +124,7 @@ fn incomplete_xml_stays_uncommitted_and_text_finalization_flushes_bytes() {
 fn literal_control_spellings_never_change_response_state() {
     let mut parser = QwenParser::new(
         TOKENS,
-        Box::<Bytes>::default(),
+        Box::<ByteDecoder>::default(),
         &[],
         &serde_json::Value::Null,
     )

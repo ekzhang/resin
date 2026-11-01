@@ -91,6 +91,7 @@ def test_reused_state_matches_full_reference_and_independent_output(width, bound
     before = data["initial"].clone()
     expected = original(data, bound)
     independent = candidate(data, bound)
+    torch.testing.assert_close(data["initial"], before, rtol=0, atol=0)
     actual = inplace(data, bound)
     assert actual is data["initial"]
     assert independent.data_ptr() != actual.data_ptr()

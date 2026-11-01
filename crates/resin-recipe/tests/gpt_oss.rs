@@ -1,10 +1,8 @@
 use resin_recipe::{Recipe, gpt_oss::GptOssRecipe};
 mod common;
-use common::SemanticParser;
+use common::{ByteDecoder, SemanticParser, bytes, coalesce};
 
-use resin_recipe::{
-    AttributedText, Decoder, Error, Event, FinishReason, GptOssParser, GptOssTokens,
-};
+use resin_recipe::{Event, FinishReason, GptOssParser, GptOssTokens};
 
 const TOKENS: GptOssTokens = GptOssTokens {
     start: 1000,
@@ -16,39 +14,6 @@ const TOKENS: GptOssTokens = GptOssTokens {
     constrain: 1006,
 };
 
-#[derive(Default)]
-struct Bytes(Vec<u8>);
-
-impl Decoder for Bytes {
-    fn push(&mut self, ids: &[u32], _token_start: u32) -> Result<AttributedText, Error> {
-        self.0
-            .extend(ids.iter().map(|&id| u8::try_from(id).unwrap()));
-        let length = match std::str::from_utf8(&self.0) {
-            Ok(_) => self.0.len(),
-            Err(error) if error.error_len().is_none() => error.valid_up_to(),
-            Err(_) => return Err(Error::new("invalid UTF-8")),
-        };
-        Ok(AttributedText::plain(
-            String::from_utf8(self.0.drain(..length).collect()).unwrap(),
-        ))
-    }
-    fn finish(&mut self) -> Result<AttributedText, Error> {
-        let text = String::from_utf8_lossy(&self.0).into_owned();
-        self.0.clear();
-        Ok(AttributedText::plain(text))
-    }
-    fn reset(&mut self) {
-        self.0.clear();
-    }
-}
-
-fn bytes(text: &str) -> Vec<u32> {
-    text.as_bytes()
-        .iter()
-        .map(|&byte| u32::from(byte))
-        .collect()
-}
-
 fn header(channel: &str, recipient: Option<&str>) -> Vec<u32> {
     let mut ids = vec![TOKENS.start];
     ids.extend(bytes("assistant"));
@@ -59,20 +24,6 @@ fn header(channel: &str, recipient: Option<&str>) -> Vec<u32> {
     }
     ids.push(TOKENS.message);
     ids
-}
-
-fn coalesce(events: Vec<Event>) -> Vec<Event> {
-    let mut result = Vec::new();
-    for event in events {
-        match (result.last_mut(), event) {
-            (Some(Event::TextDelta { delta }), Event::TextDelta { delta: next })
-            | (Some(Event::ReasoningDelta { delta }), Event::ReasoningDelta { delta: next }) => {
-                delta.push_str(&next)
-            }
-            (_, event) => result.push(event),
-        }
-    }
-    result
 }
 
 #[test]
@@ -111,7 +62,7 @@ fn channel_headers_tools_and_unicode_are_independent_of_chunk_boundaries() {
         },
     ];
     for width in 1..=ids.len() {
-        let mut parser = GptOssParser::new(TOKENS, Box::<Bytes>::default(), &prompt).unwrap();
+        let mut parser = GptOssParser::new(TOKENS, Box::<ByteDecoder>::default(), &prompt).unwrap();
         let mut events = Vec::new();
         for chunk in ids.chunks(width) {
             events.extend(parser.semantic_feed(chunk).unwrap());
@@ -132,7 +83,7 @@ fn channel_headers_tools_and_unicode_are_independent_of_chunk_boundaries() {
 fn prompt_initialization_does_not_reemit_a_prompt_body() {
     let mut prompt = header("analysis", None);
     prompt.extend(bytes("Already generated."));
-    let mut parser = GptOssParser::new(TOKENS, Box::<Bytes>::default(), &prompt).unwrap();
+    let mut parser = GptOssParser::new(TOKENS, Box::<ByteDecoder>::default(), &prompt).unwrap();
     assert_eq!(
         parser.semantic_feed(&bytes("New.")).unwrap(),
         vec![Event::ReasoningDelta {
@@ -146,7 +97,7 @@ fn incomplete_and_invalid_tool_calls_stay_uncommitted() {
     for payload in ["{", r#"{"x":1}"#] {
         let mut parser = GptOssParser::new(
             TOKENS,
-            Box::<Bytes>::default(),
+            Box::<ByteDecoder>::default(),
             &header("commentary", Some("functions.f")),
         )
         .unwrap();
@@ -160,7 +111,7 @@ fn incomplete_and_invalid_tool_calls_stay_uncommitted() {
     }
     let mut parser = GptOssParser::new(
         TOKENS,
-        Box::<Bytes>::default(),
+        Box::<ByteDecoder>::default(),
         &header("commentary", Some("functions.f")),
     )
     .unwrap();
@@ -174,7 +125,7 @@ fn tool_arguments_preserve_numeric_lexemes_and_whitespace() {
     let payload = "{\"x\": 3.777859190353473e-35, \"y\": -0.0}";
     let mut parser = GptOssParser::new(
         TOKENS,
-        Box::<Bytes>::default(),
+        Box::<ByteDecoder>::default(),
         &header("commentary", Some("functions.f")),
     )
     .unwrap();
@@ -192,8 +143,12 @@ fn tool_arguments_preserve_numeric_lexemes_and_whitespace() {
 
 #[test]
 fn partial_byte_sequence_flushes_at_a_model_control_boundary() {
-    let mut parser =
-        GptOssParser::new(TOKENS, Box::<Bytes>::default(), &header("analysis", None)).unwrap();
+    let mut parser = GptOssParser::new(
+        TOKENS,
+        Box::<ByteDecoder>::default(),
+        &header("analysis", None),
+    )
+    .unwrap();
     assert_eq!(
         parser.semantic_feed(&[0xf0, 0x9f, TOKENS.end]).unwrap(),
         vec![Event::ReasoningDelta {
@@ -213,7 +168,7 @@ fn recipient_before_channel_and_constrained_headers_are_hidden() {
     ids.push(TOKENS.message);
     ids.extend(bytes("{}"));
     ids.push(TOKENS.tool_end);
-    let mut parser = GptOssParser::new(TOKENS, Box::<Bytes>::default(), &[]).unwrap();
+    let mut parser = GptOssParser::new(TOKENS, Box::<ByteDecoder>::default(), &[]).unwrap();
     assert_eq!(
         parser.semantic_feed(&ids).unwrap(),
         vec![

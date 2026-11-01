@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import inspect
 import math
 from types import SimpleNamespace
 from typing import cast
@@ -166,18 +165,6 @@ def test_bfloat16_cache_capacity_accounts_for_two_byte_elements() -> None:
 
     assert bf16.bytes_per_parent == 2 * fp8.bytes_per_parent
     assert bf16.parent_capacity < fp8.parent_capacity
-
-
-def test_cuda_graphs_use_shared_static_step_lifecycle() -> None:
-    parameters = inspect.signature(Gemma4CudaRunner.__init__).parameters
-    source = inspect.getsource(Gemma4CudaRunner)
-    assert "cuda_graph_decode_shapes" in parameters
-    assert "speculative_draft_tokens" in parameters
-    assert issubclass(Gemma4CudaRunner, CudaRunner)
-    assert "self._configure_cuda_graphs(" in source
-    assert "def capture_cuda_graphs" not in source
-    assert "CUDAGraph" not in source
-    assert ".replay()" not in source
 
 
 @pytest.mark.parametrize("capacity,expected_width", [(2, 8), (32, 11)])

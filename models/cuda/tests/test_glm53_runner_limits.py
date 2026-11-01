@@ -1,4 +1,4 @@
-"""The public context limit excludes internal speculative verification rows."""
+"""Public context limits and shared target/decode profiles."""
 
 from types import SimpleNamespace
 
@@ -19,46 +19,27 @@ from resin_models_cuda.glm5_3_flash.cache import CacheGeometry
 from resin_models_cuda.glm5_3_flash.cuda import Glm53FlashCudaRunner
 
 
-@pytest.mark.parametrize("drafts", [0, 1, 3, 7])
-@pytest.mark.parametrize("ep", [1, 2, 4])
-@pytest.mark.parametrize(
-    "catalog,policy,expected",
-    [
-        (None, "full", ((1, 4096), (2, 4096), (4, 4096), (8, 4096))),
-        (((3, 4096), (8, 4096)), "full", ((3, 4096), (8, 4096))),
-        ((), "full", ()),
-        (None, "disabled", ()),
-    ],
-)
-def test_direct_constructor_preserves_common_ordinary_decode_catalog(
-    monkeypatch, drafts, ep, catalog, policy, expected
-):
+@pytest.fixture
+def construct_runner(monkeypatch):
     import resin_models_cuda.glm5_3_flash.cuda as module
     from resin.models.glm5_3_flash.config import Glm53Config
 
-    # Execute actual constructor shape selection; replace only loading/device
-    # allocation and graph-registration boundaries. No CUDA or weights needed.
+    # Keep real profile/catalog calculation; replace loading and device work.
     monkeypatch.setattr(
         module.CudaRunner,
         "__init__",
         lambda self, **kwargs: setattr(self, "device", torch.device("cpu")),
     )
     monkeypatch.setattr(module, "resolve_model_path", lambda value: value)
-    monkeypatch.setattr(
-        module,
-        "load_model",
-        lambda *args, **kwargs: (
-            SimpleNamespace(layers=(), mtp=None),
-            Glm53Config(),
-            {},
-        ),
-    )
-    monkeypatch.setattr(
-        module.CudaRunner, "_configure_parallel_graphs", lambda *args: None
-    )
-    monkeypatch.setattr(
-        module.CudaRunner, "_configure_cache_binding", lambda *args: None
-    )
+    loads = []
+
+    def load(*args, **kwargs):
+        loads.append(kwargs)
+        return SimpleNamespace(layers=(), mtp=None), Glm53Config(), {}
+
+    monkeypatch.setattr(module, "load_model", load)
+    for name in ("_configure_parallel_graphs", "_configure_cache_binding"):
+        monkeypatch.setattr(module.CudaRunner, name, lambda *args: None)
     monkeypatch.setattr(
         module.CudaRunner, "_configure_prefill_graphs", lambda *args, **kwargs: ()
     )
@@ -71,13 +52,32 @@ def test_direct_constructor_preserves_common_ordinary_decode_catalog(
         module, "CacheArena", lambda *args, **kwargs: SimpleNamespace(binding=None)
     )
     monkeypatch.setattr(torch.cuda, "synchronize", lambda *args: None)
-    monkeypatch.setattr(
-        torch.cuda, "mem_get_info", lambda *args: (128 * 1024**3, 128 * 1024**3)
-    )
-    model = Glm53FlashCudaRunner(
-        "unused",
-        device="cpu",
-        max_seq_len=4096,
+    monkeypatch.setattr(torch.cuda, "mem_get_info", lambda *args: (128 * 1024**3,) * 2)
+
+    def construct(**options):
+        model = Glm53FlashCudaRunner(
+            "unused", device="cpu", max_seq_len=4096, **options
+        )
+        return model, loads[-1]
+
+    return construct
+
+
+@pytest.mark.parametrize("drafts", [0, 1, 3, 7])
+@pytest.mark.parametrize("ep", [1, 2, 4])
+@pytest.mark.parametrize(
+    "catalog,policy,expected",
+    [
+        (None, "full", ((1, 4096), (2, 4096), (4, 4096), (8, 4096))),
+        (((3, 4096), (8, 4096)), "full", ((3, 4096), (8, 4096))),
+        ((), "full", ()),
+        (None, "disabled", ()),
+    ],
+)
+def test_direct_constructor_preserves_common_ordinary_decode_catalog(
+    construct_runner, drafts, ep, catalog, policy, expected
+):
+    model, _ = construct_runner(
         max_batch_size=8,
         speculative_draft_tokens=drafts,
         parallel_groups=SimpleNamespace(
@@ -90,6 +90,29 @@ def test_direct_constructor_preserves_common_ordinary_decode_catalog(
     assert model.prefill_chunk_size == 8192
     assert model.runner_config.prefill_chunk_size == 8192
     assert model.cache_geometry.state_tokens == 8192
+
+
+@pytest.mark.parametrize("drafts", [0, 1, 3, 5, 7])
+@pytest.mark.parametrize("capacity", [None, 2, 8, 64])
+def test_constructor_target_profile_is_shared_across_capacity_and_draft_width(
+    construct_runner, drafts, capacity
+):
+    options = {} if capacity is None else {"max_batch_size": capacity}
+    model, load_options = construct_runner(
+        prefill_chunk_size=512,
+        speculative_draft_tokens=drafts,
+        **options,
+    )
+    batch = 8 if capacity is None else capacity
+    assert model.max_batch_size == batch
+    assert model.target_projection_rows == 64
+    assert model.max_seq_len == 4096
+    assert model.runner_config.max_accepted_per_step == drafts + 1
+    assert model.cache_layout.decode_write_extra_tokens == int(bool(drafts))
+    assert load_options["max_tokens"] == max(512, batch * (drafts + 1))
+    assert getattr(model, "observed_modes")["decode"].shapes == tuple(
+        (size, 4096) for size in (1, 2, 4, 8, 12, 16, 24, 32, 64) if size <= batch
+    )
 
 
 def runner(drafts):

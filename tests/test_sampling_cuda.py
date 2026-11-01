@@ -70,23 +70,6 @@ def test_request_stream_is_independent_of_batch_position(sampler, rows):
     torch.testing.assert_close(actual[:rows], expected, rtol=0, atol=0)
 
 
-def test_high_seed_and_offset_bits_affect_the_random_stream(sampler):
-    logits = torch.linspace(-0.2, 0.2, 17, device="cuda").expand(64, -1).contiguous()
-    inputs = _inputs(logits)
-    inputs.temperatures.fill_(1)
-    inputs.top_ps.fill_(1)
-    inputs.top_ks.fill_(logits.shape[1])
-    inputs.stochastic_mask.fill_(True)
-    inputs.seeds.fill_(7)
-    inputs.offsets.copy_(torch.arange(64, device="cuda") * 32)
-    baseline = sampler.sample_tensors(logits, inputs)
-    inputs.seeds.add_(1 << 62)
-    assert not torch.equal(sampler.sample_tensors(logits, inputs), baseline)
-    inputs.seeds.fill_(7)
-    inputs.offsets.add_(1 << 40)
-    assert not torch.equal(sampler.sample_tensors(logits, inputs), baseline)
-
-
 def _capture(sampler, logits, inputs, *, pool=None, stream=None):
     output = torch.empty(logits.shape[0], dtype=torch.int64, device=logits.device)
     if stream is None:

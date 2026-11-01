@@ -1,10 +1,8 @@
 use resin_recipe::{Recipe, deepseek::DeepSeekV41Recipe};
 mod common;
-use common::SemanticParser;
+use common::{ByteDecoder, SemanticParser};
 
-use resin_recipe::{
-    AttributedText, Decoder, DeepSeekV41Parser, DeepSeekV41Tokens, Error, Event, FinishReason,
-};
+use resin_recipe::{DeepSeekV41Parser, DeepSeekV41Tokens, Event, FinishReason};
 use serde_json::{Value, json};
 
 const TOKENS: DeepSeekV41Tokens = DeepSeekV41Tokens {
@@ -14,34 +12,6 @@ const TOKENS: DeepSeekV41Tokens = DeepSeekV41Tokens {
     thinking_end: 1003,
     dsml: 1004,
 };
-
-#[derive(Default)]
-struct ByteDecoder(Vec<u8>);
-
-impl Decoder for ByteDecoder {
-    fn push(&mut self, ids: &[u32], _token_start: u32) -> Result<AttributedText, Error> {
-        for &id in ids {
-            self.0
-                .push(u8::try_from(id).map_err(|_| Error::new("invalid byte token"))?);
-        }
-        let length = match std::str::from_utf8(&self.0) {
-            Ok(_) => self.0.len(),
-            Err(error) if error.error_len().is_none() => error.valid_up_to(),
-            Err(_) => return Err(Error::new("invalid UTF-8")),
-        };
-        Ok(AttributedText::plain(
-            String::from_utf8(self.0.drain(..length).collect()).unwrap(),
-        ))
-    }
-    fn finish(&mut self) -> Result<AttributedText, Error> {
-        Ok(AttributedText::plain(
-            String::from_utf8_lossy(&std::mem::take(&mut self.0)).into_owned(),
-        ))
-    }
-    fn reset(&mut self) {
-        self.0.clear();
-    }
-}
 
 fn ids(text: &str) -> Vec<u32> {
     // Only this fixture's explicit delimiter spellings become control IDs.

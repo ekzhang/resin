@@ -79,19 +79,6 @@ def candidate(data, bound):
     )
 
 
-@pytest.mark.parametrize("width", range(1, 9))
-@pytest.mark.parametrize("bound", [None, -5.0])
-@torch.inference_mode()
-def test_exact_state(width, bound):
-    data = fixture(9, width)
-    before = data["initial"].clone()
-    expected = original(data, bound)
-    actual = candidate(data, bound)
-    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
-    torch.testing.assert_close(data["initial"], before, rtol=0, atol=0)
-    assert actual.data_ptr() != data["initial"].data_ptr()
-
-
 @pytest.mark.parametrize("rows", [8, 64])
 @torch.inference_mode()
 def test_real_geometry_graph_changed_inputs(rows):

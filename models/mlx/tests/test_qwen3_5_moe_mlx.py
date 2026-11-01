@@ -247,7 +247,8 @@ def test_incremental_state_matches_full_forward_exactly() -> None:
 
 def test_engine_greedy_matches_reference_across_page_boundaries() -> None:
     model = _model(all_experts=True)
-    prompts = [_prompt(length, seed=length) for length in (5, 127, 128, 129)]
+    lengths = (5, PAGE_TOKENS - 2, PAGE_TOKENS - 1, PAGE_TOKENS, PAGE_TOKENS + 1)
+    prompts = [_prompt(length, seed=length) for length in lengths]
 
     with Engine(_runner(model), context_length=8192) as engine:
         results = _generate(engine, prompts, 6)
@@ -477,15 +478,6 @@ def test_prompt_logprobs_match_one_pass_forward() -> None:
         ]
         actual = [item.logprob for item in scores[1:] if item is not None]
         assert actual == pytest.approx(expected.tolist(), abs=0.05)
-
-
-def test_decode_crosses_kv_page_boundary() -> None:
-    model = _model(all_experts=True)
-    prompt = _prompt(PAGE_TOKENS - 2, seed=7)
-
-    with Engine(_runner(model), context_length=8192) as engine:
-        (generated,) = _generate(engine, [prompt], 6)
-    _assert_greedy(model, prompt, generated, 6)
 
 
 def _assert_checkpoint_loader_matches_transformers(layout: str) -> None:
