@@ -120,6 +120,35 @@ def test_filtered_draw_matches_sorting_and_philox(dtype, vocab):
     _assert_reference(logits, inputs, actual)
 
 
+@pytest.mark.parametrize("vocab", [1, 2, 31, 511, 512, 513, 2047, 2048])
+def test_small_vocabularies_share_filtered_sampling(vocab):
+    logits = (torch.arange(vocab, device="cuda") % 11).float().mul_(0.25).repeat(4, 1)
+    logits[:2, [0, vocab - 1]] = 4  # Inclusive ties at both vocabulary ends.
+    logits[2, -1] = 5  # Native top-k must find a unique winner in the tail.
+    inputs = _inputs(logits)
+    inputs.temperatures.fill_(1)
+    inputs.temperatures[3] = float("nan")
+    inputs.top_ks.copy_(torch.tensor([vocab, 1, 1, 1], device="cuda"))
+    inputs.top_ps.copy_(torch.tensor([0.63, 0.79, 1.0, 0.8], device="cuda"))
+    inputs.stochastic_mask.fill_(True)
+    sampler = FusedSampler()
+    actual = sampler.sample_tensors(logits, inputs)
+    _assert_reference(logits, inputs, actual)
+    assert actual[2].item() == vocab - 1
+
+    if vocab == 513:
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            actual = sampler.sample_tensors(logits, inputs)
+        inputs.top_ks.copy_(torch.tensor([1, vocab, vocab, vocab], device="cuda"))
+        inputs.top_ps.copy_(torch.tensor([1.0, 0.41, 0.72, 1.0], device="cuda"))
+        inputs.temperatures.fill_(1)
+        inputs.stochastic_mask[0] = False
+        inputs.offsets.add_(32)
+        graph.replay()
+        _assert_reference(logits, inputs, actual)
+
+
 @pytest.mark.parametrize("top_k,top_p", [(3, 1.0), (2051, 0.25), (3, 0.25)])
 def test_cutoff_ties_across_tiles_are_all_retained(top_k, top_p):
     logits = torch.zeros(64, 2051, device="cuda")
@@ -134,25 +163,26 @@ def test_cutoff_ties_across_tiles_are_all_retained(top_k, top_p):
     assert (actual > 1024).any()
 
 
-def test_one_graph_replays_unfiltered_filtered_and_greedy_policies():
-    from resin.backend.cuda import filtered_sampling, logits_sampling, sampling_native
+def test_one_graph_replays_unfiltered_filtered_and_greedy_policies(monkeypatch):
+    from resin.backend.cuda import (
+        _sampling_cutedsl,
+        filtered_sampling,
+        logits_sampling,
+        sampling_native,
+    )
 
     def entries():
         device = torch.cuda.current_device()
         triton_entries = {
             (module.__name__, name): set(value.device_caches[device][0])
-            for module in (filtered_sampling, logits_sampling)
+            for module in (filtered_sampling, logits_sampling, _sampling_cutedsl)
             for name, value in vars(module).items()
             if hasattr(value, "device_caches")
         }
         native = sampling_native._load_native_module
         cache = native.cache_info()
-        # Ignore cache hits, which grow normally. These modules must already
-        # be loaded by eager warmup and stay identical as policies change.
-        modules = tuple(
-            id(native(source)) for source in ("sampling_air.cu", "sampling_topk.cu")
-        )
-        return triton_entries, (cache.misses, cache.currsize), modules
+        # Ignore hits, which grow normally. Warmup loads the sole native module.
+        return triton_entries, (cache.misses, cache.currsize), id(native())
 
     logits = torch.randn(
         8, 2051, device="cuda", generator=torch.Generator("cuda").manual_seed(73)
@@ -169,6 +199,11 @@ def test_one_graph_replays_unfiltered_filtered_and_greedy_policies():
     with torch.cuda.stream(stream):
         sampler.sample_tensors(logits, inputs, out=output)
     stream.synchronize()
+
+    def unexpected_compile(*args, **kwargs):
+        raise AssertionError("CuTe kernels must not compile after eager warmup")
+
+    monkeypatch.setattr(_sampling_cutedsl.cute, "compile", unexpected_compile)
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph, stream=stream):
         sampler.sample_tensors(logits, inputs, out=output)

@@ -727,13 +727,12 @@ mutable graph inputs. The graph catalogue captures batches 1 through 128 in a
 shared pool, and the vocabulary smoke uses 201,088 classes. Environments without
 CUDA skip these tests; the CPU sampler contract tests remain in the normal suite.
 
-`FusedSampler` is the shared CUDA runner default. Parallel radix selectors handle
-runtime top-k/top-p for large vocabularies, while a single-block selector handles
-small vocabularies. Inactive rows skip vocabulary filtering. Two tiled kernels
-then choose a vocabulary tile and token using one per-request Philox CDF draw.
+`FusedSampler` is the shared CUDA runner default. Native radix selection finds
+the raw top-k cutoff and CuTe histograms find the nucleus cutoff for every
+vocabulary size. Inactive rows skip vocabulary filtering. Two tiled kernels
+choose a vocabulary tile and token using one per-request Philox CDF draw.
 Top-p uses the full temperature-scaled distribution, followed by the top-k cap,
-retaining all cutoff ties. This changes the previous top-k-before-top-p behavior. There
-are no CUDA graph conditional nodes or host reads of sampling policy tensors.
+retaining all cutoff ties. CUDA graphs read policy tensors directly on the GPU.
 
 The full request seed is the Philox key, with counter words
 `(0, 0, offset_low32, offset_high32)`. All 32 bits of the first random word form
@@ -744,18 +743,24 @@ columns. Each call owns its scratch, so captured columns and separate streams do
 not share mutable sampler buffers. Parameters and strides stay runtime inputs;
 changing temperature, k, p, seed, offset, or mask does not compile another variant.
 
-CDF sampling replaces the former vocabulary-wide Gumbel draws and intentionally
-changes seeded token choices. A request still produces the same choices when
-sampled alone, reordered, padded, or combined into a verification block. Top-p
-uses FP32 exponential weights. The native AIR selector reconstructs deterministic
-FP32 bucket masses; the small-vocabulary selector accumulates FP64 mass. Tests
-compare against independent sorting, FP64 distributions and Philox arithmetic,
-including FP16/BF16 logits, cutoff ties, nonfinite fallback, large finite logits, shifted
-pointers, changed-input graph replay and the two real vocabulary sizes.
+A request produces the same choices when sampled alone, reordered, padded,
+or combined into a verification block. Top-p
+uses FP32 exponential weights. CuTe selects their exponent and mantissa with
+integer histograms and reconstructs bucket masses in FP64. This avoids a dense
+FP32 weight matrix and keeps atomic accumulation independent of CTA order.
+Tests compare against independent sorting, FP64 distributions and Philox
+arithmetic, including FP16/BF16 logits, cutoff ties, nonfinite fallback, large
+finite logits, shifted pointers, changed-input graph replay and real vocabulary
+sizes.
 When the inclusive top-k set has less than `(top_p - 0.001)` of the full mass,
-top-p cannot remove any of those tokens. FP64 mass partials certify this shortcut;
-AIR skips its vocabulary work for that row. Rows near the boundary still run
+top-p cannot remove any of those tokens. FP32 tile sums with an FP64 row
+reduction certify this shortcut;
+CuTe skips its vocabulary work for that row. Rows near the boundary still run
 the complete selector.
+
+CuTe executors persist in the kernel cache, keyed by source, GPU capability and
+compiler/runtime ABI. Batch size, strides and sampling policies stay runtime
+arguments; eager warmup prepares the same kernels later used by graph replay.
 
 `FusedSampler.sample_block(logits, sampling, start_step=0)` handles verification
 logits shaped `[requests, positions, vocabulary]` in one sampler invocation.
@@ -771,6 +776,65 @@ depend on previously sampled tokens still run sequentially. Qwen verification
 begins at `start_step=1`; the other verification blocks begin at zero. Qwen
 retains the states produced during verification and selects the accepted prefix
 after block sampling. DeepSeek broadcasts the complete sampled block once.
+
+### CuTe nucleus selection (2026-11-01)
+
+Paired GPU-event measurements compare the previous native AIR pipeline with
+CuTe, including block metadata expansion and the seeded draw. Each graph
+contains eight sampler calls; five interleaved trials time ten replays each.
+Compilation, host scheduling and model execution are excluded. Inputs are BF16,
+temperature 0.8, with 32 requests × 4 positions and vocabulary 262,144. Times
+below are microseconds per complete sampler call; percentages show the latency
+change. Both implementations in each row run on the same GPU.
+
+| GPU | Distribution | Top-p .95, previous → CuTe | Top-k 64 + top-p .95, previous → CuTe |
+| --- | --- | ---: | ---: |
+| A100 SXM4 40 GB | peaked | 1395.4 → 962.1 (−31%) | 1742.9 → 1382.9 (−21%) |
+| A100 SXM4 40 GB | flat | 2558.2 → 2096.9 (−18%) | 642.4 → 596.8 (−7%) |
+| A100 SXM4 40 GB | ties | 3640.8 → 607.5 (−83%) | 3972.9 → 1025.4 (−74%) |
+| H200 | peaked | 789.8 → 475.3 (−40%) | 960.3 → 669.2 (−30%) |
+| H200 | flat | 1442.5 → 965.0 (−33%) | 324.4 → 319.5 (−2%) |
+| H200 | ties | 2017.7 → 364.3 (−82%) | 2181.7 → 558.2 (−74%) |
+| B200 | peaked | 831.1 → 380.0 (−54%) | 983.2 → 548.8 (−44%) |
+| B200 | flat | 1606.5 → 738.8 (−54%) | 295.3 → 279.7 (−5%) |
+| B200 | ties | 2335.6 → 321.1 (−86%) | 2485.0 → 495.2 (−80%) |
+| B300 SXM6 | peaked | 805.1 → 371.4 (−54%) | 1191.3 → 537.6 (−55%) |
+| B300 SXM6 | flat | 1558.5 → 719.9 (−54%) | 525.2 → 275.2 (−48%) |
+| B300 SXM6 | ties | 2258.8 → 314.3 (−86%) | 2635.1 → 483.9 (−82%) |
+
+These synthetic profiles are diagnostic rather than recorded model logits:
+peaked has 512 descending head logits and a low background, flat has normal
+noise with standard deviation 0.1, and ties has 1,024 equal maxima. Their
+nuclei contain about 20 tokens, 94% of the vocabulary, and 1,024 tokens
+respectively. These results do not establish end-to-end model speedups.
+Single-row flat joint sampling is 2–8% slower. The plan-based eager greedy
+shortcut still uses argmax directly.
+The H200 mixed-policy matrix improves from 522.16 to 367.38 µs for peaked
+inputs and 582.96 to 533.70 µs for flat inputs at 128 distributions. Additional
+preparation launches still add about 4–5 µs to small greedy, unfiltered and
+top-k-only graph calls, and about 11 µs at 128 distributions.
+
+The joint-mass guard uses FP32 sums over 1,024 weights per tile and combines
+those partials in FP64. Even a sequential tile sum has less than 6.1e-5 relative
+error, covered by the conservative 0.001 skip margin. The nucleus histogram
+and prefix calculations retain FP64. On B300, this limits FP64 work to small
+reductions: the guard falls from 300.45 µs with FP64 tile sums to 51.92 µs,
+versus 53.27 µs on B200. B300 uses nvcc 13.3.73 and Torch 2.13.0+cu130; device
+execution and all measured outputs were checked directly.
+
+Raw-logit top-k remains native: at 128 rows on H200, BF16 top-k 64 takes
+109–116 µs, versus 127–508 µs for the standalone CuTe alternative. CuTe wins
+at one row but regresses the larger batches.
+
+On H200, PyTorch-tracked peak temporary allocation falls from 147.59 MB to
+1.058 MB for the large shape, and from 576 KB to 9.216 KB for a single row.
+All 170 sampling tests pass there, including tiny vocabularies, a large-k
+mass-margin regression and changed-policy graph replay. All measured outputs
+on the four GPUs pass independent sorting/Philox checks. The cache audit
+reports 27 cold builds and zero builds after a fresh-process restart; batch,
+stride and policy changes also build no new variants. The tested kernel source
+SHA-256 starts with `5427b033`; the image uses Torch 2.13.0+cu130, CUDA 13.3.1,
+CuTe 4.6.2 and QuACK 0.6.4.
 
 ### Sampler qualification (2026-10-25)
 
