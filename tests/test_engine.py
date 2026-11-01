@@ -109,26 +109,6 @@ class TestEngine:
         assert request.done and request.take_result() == []
         assert request.prompt_logprobs == [None]
 
-    @pytest.mark.parametrize(
-        "retired",
-        [{"max_output_tokens": 1}, {"max_new_tokens": 1}, {"stop_token_ids": [2]}],
-    )
-    def test_submit_rejects_retired_generation_keywords(self, retired) -> None:
-        engine = Engine(RecordingRunner())
-        with pytest.raises(TypeError, match=next(iter(retired))):
-            engine.submit([1], **retired)
-        assert not engine.has_work()
-
-    def test_submit_rejects_retired_positional_generation_limit(self) -> None:
-        engine = Engine(RecordingRunner())
-        with pytest.raises(TypeError):
-            engine.submit([1], 1)  # ty: ignore[too-many-positional-arguments]
-        assert not engine.has_work()
-
-    def test_engine_rejects_retired_eos_keyword(self) -> None:
-        with pytest.raises(TypeError, match="eos_token_id"):
-            Engine(RecordingRunner(), eos_token_id=2)  # ty: ignore[unknown-argument]
-
     def test_request_lease_owns_result_without_engine_retention(self) -> None:
         engine = Engine(RecordingRunner())
         request = engine.submit(

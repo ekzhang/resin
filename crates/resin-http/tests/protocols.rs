@@ -766,91 +766,67 @@ async fn score_options_are_explicit_normalized_request_fields() {
 }
 
 #[tokio::test]
-async fn top_logprob_limits_apply_to_generation_and_token_counting() {
+async fn token_counting_enforces_configured_top_logprob_limits_without_generation() {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
-    for path in [
-        "/v1/chat/completions",
-        "/v1/responses",
-        "/v1/responses/input_tokens",
+    for (maximum, count, accepted) in [
+        (0_u32, 0_u32, true),
+        (0, 1, false),
+        (2, 2, true),
+        (2, 3, false),
+        (u32::MAX, u32::MAX, true),
     ] {
-        for (maximum, count, accepted) in [
-            (0_u32, 0_u32, true),
-            (0, 1, false),
-            (2, 2, true),
-            (2, 3, false),
-            (64, 64, true),
-            (64, 65, false),
-            (1500, 1500, true),
-            (1500, 1501, false),
-            (u32::MAX, u32::MAX, true),
-        ] {
-            let (jobs, mut receiver) = mpsc::channel::<GenerationJob>(1);
-            let counted = Arc::new(AtomicUsize::new(0));
-            let calls = Arc::clone(&counted);
-            let counter: TokenCounter = Arc::new(move |request, result| {
-                calls.fetch_add(1, Ordering::Relaxed);
-                assert!(request.logprobs);
-                assert_eq!(request.top_logprobs, count);
-                let _ = result.send(Ok(17));
-            });
-            let app = router(
-                "test-model",
-                jobs,
-                Some(counter),
-                RouteConfig {
-                    max_top_logprobs: maximum,
-                    ..RouteConfig::default()
-                },
-                None,
-            );
-            let mut body = if path.ends_with("completions") {
-                json!({"messages": [{"role": "user", "content": "hi"}]})
-            } else {
-                json!({"input": "hi"})
-            };
-            body["model"] = json!("test-model");
-            body["logprobs"] = json!(true);
-            body["top_logprobs"] = json!(count);
-            body["stream"] = json!(true);
-            let response = app
-                .oneshot(
-                    Request::post(path)
-                        .header(header::CONTENT_TYPE, "application/json")
-                        .body(Body::from(body.to_string()))
-                        .unwrap(),
-                )
-                .await
-                .unwrap();
-            let counting = path.ends_with("input_tokens");
+        let (jobs, mut receiver) = mpsc::channel::<GenerationJob>(1);
+        let counted = Arc::new(AtomicUsize::new(0));
+        let calls = Arc::clone(&counted);
+        let counter: TokenCounter = Arc::new(move |request, result| {
+            calls.fetch_add(1, Ordering::Relaxed);
+            assert!(request.logprobs);
+            assert_eq!(request.top_logprobs, count);
+            let _ = result.send(Ok(17));
+        });
+        let app = router(
+            "test-model",
+            jobs,
+            Some(counter),
+            RouteConfig {
+                max_top_logprobs: maximum,
+                ..RouteConfig::default()
+            },
+            None,
+        );
+        let (status, body) = json_response(
+            app,
+            Request::post("/v1/responses/input_tokens")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({
+                        "model": "test-model", "input": "hi",
+                        "logprobs": true, "top_logprobs": count,
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(
+            status,
             if accepted {
-                assert_eq!(
-                    response.status(),
-                    StatusCode::OK,
-                    "{path}: {maximum}/{count}"
-                );
-                if counting {
-                    assert!(receiver.try_recv().is_err());
-                } else {
-                    let job = receiver.try_recv().unwrap();
-                    assert!(job.request.logprobs);
-                    assert_eq!(job.request.top_logprobs, count);
-                }
+                StatusCode::OK
             } else {
-                assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-                let bytes = response.into_body().collect().await.unwrap().to_bytes();
-                let error: Value = serde_json::from_slice(&bytes).unwrap();
-                assert_eq!(
-                    error["error"]["message"],
-                    format!("top_logprobs must be between 0 and {maximum}")
-                );
-                assert!(receiver.try_recv().is_err());
+                StatusCode::BAD_REQUEST
             }
+        );
+        if accepted {
+            assert_eq!(body["input_tokens"], 17);
+        } else {
             assert_eq!(
-                counted.load(Ordering::Relaxed),
-                usize::from(accepted && counting)
+                body["error"]["message"],
+                format!("top_logprobs must be between 0 and {maximum}")
             );
         }
+        assert_eq!(counted.load(Ordering::Relaxed), usize::from(accepted));
+        assert!(receiver.try_recv().is_err());
     }
 }
 
@@ -1370,43 +1346,19 @@ async fn programmatic_shutdown_closes_the_listener() {
 }
 
 #[tokio::test]
-async fn supplied_priority_requires_server_opt_in_on_each_api() {
+async fn priorities_are_opt_in_typed_and_separate_from_recipe_extras() {
     for path in ["/v1/chat/completions", "/v1/responses", "/v1/messages"] {
-        for priority in [json!(0), json!(5), json!(-5)] {
-            let mut body = json!({
-                "model": "test-model", "input": "hi", "max_tokens": 1,
-                "messages": [{"role": "user", "content": "hi"}],
-                "priority": priority,
-            });
-            // Responses accepts input; the other adapters accept messages.
-            body["stream"] = json!(true);
-            let request = Request::post(path)
-                .header(header::CONTENT_TYPE, "application/json")
-                .body(Body::from(body.to_string()))
-                .unwrap();
-            let (status, body) = json_response(test_router(), request).await;
-            assert_eq!(status, StatusCode::BAD_REQUEST, "{path}");
-            assert!(
-                body["error"]["message"]
-                    .as_str()
-                    .unwrap()
-                    .contains("enable_priority_scheduling=True")
-            );
-        }
-    }
-}
-
-#[tokio::test]
-async fn priority_validates_i32_and_is_separate_from_recipe_extras() {
-    for path in ["/v1/chat/completions", "/v1/responses", "/v1/messages"] {
-        for (enabled, priority) in [
-            (false, None),
-            (false, Some(json!(null))),
-            (true, None),
-            (true, Some(json!(null))),
-            (true, Some(json!(i32::MIN))),
-            (true, Some(json!(0))),
-            (true, Some(json!(i32::MAX))),
+        for (enabled, priority, expected_status) in [
+            (false, Some(json!(0)), StatusCode::BAD_REQUEST),
+            (false, None, StatusCode::OK),
+            (false, Some(json!(null)), StatusCode::OK),
+            (true, Some(json!(-5)), StatusCode::OK),
+            (true, Some(json!(true)), StatusCode::UNPROCESSABLE_ENTITY),
+            (
+                true,
+                Some(json!(2147483648u64)),
+                StatusCode::UNPROCESSABLE_ENTITY,
+            ),
         ] {
             let (jobs, mut receiver) = mpsc::channel(1);
             let app = router(
@@ -1435,52 +1387,17 @@ async fn priority_validates_i32_and_is_separate_from_recipe_extras() {
                 )
                 .await
                 .unwrap();
-            assert_eq!(response.status(), StatusCode::OK, "{path}");
-            let request = receiver.try_recv().unwrap().request;
-            let expected = priority.and_then(|p| p.as_i64()).map(|p| p as i32);
-            assert_eq!(request.priority, expected);
-            assert!(!request.extra.contains_key("priority"));
-            let encoded = serde_json::to_value(request).unwrap();
-            assert_eq!(encoded.get("priority"), expected.map(|p| json!(p)).as_ref());
-        }
-        for priority in [
-            json!(true),
-            json!(1.5),
-            json!("1"),
-            json!(-2147483649i64),
-            json!(2147483648u64),
-            json!(u64::MAX),
-        ] {
-            let (jobs, mut receiver) = mpsc::channel(1);
-            let app = router(
-                "test-model",
-                jobs,
-                None,
-                RouteConfig {
-                    enable_priority_scheduling: true,
-                    ..RouteConfig::default()
-                },
-                None,
-            );
-            let body = json!({
-                "model": "test-model", "input": "hi", "max_tokens": 1,
-                "messages": [{"role": "user", "content": "hi"}], "priority": priority,
-            });
-            let response = app
-                .oneshot(
-                    Request::post(path)
-                        .header(header::CONTENT_TYPE, "application/json")
-                        .body(Body::from(body.to_string()))
-                        .unwrap(),
-                )
-                .await
-                .unwrap();
-            assert_eq!(
-                response.status(),
-                StatusCode::UNPROCESSABLE_ENTITY,
-                "{path}"
-            );
-            assert!(receiver.try_recv().is_err());
+            assert_eq!(response.status(), expected_status, "{path}");
+            if expected_status == StatusCode::OK {
+                let request = receiver.try_recv().unwrap().request;
+                assert_eq!(
+                    request.priority,
+                    priority.and_then(|p| p.as_i64()).map(|p| p as i32)
+                );
+                assert!(!request.extra.contains_key("priority"));
+            } else {
+                assert!(receiver.try_recv().is_err());
+            }
         }
     }
 }

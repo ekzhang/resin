@@ -14,12 +14,13 @@ class ImmediateDeviceRunner:
 
     vocab_size = 1024
 
-    def __init__(self, drafts, extra_write_row):
+    def __init__(self, drafts, extra_write_row, *, accepted=None, page_tokens=4096):
         self.speculative_draft_tokens = drafts
+        self.accepted = drafts if accepted is None else accepted
         self.runner_config = RunnerConfig(
             cache_layout=CacheLayout(
-                parent_capacity=16,
-                groups=[CacheGroupLayout(4096)],
+                parent_capacity=256,
+                groups=[CacheGroupLayout(page_tokens)],
                 decode_write_extra_tokens=extra_write_row,
             ),
             max_accepted_per_step=drafts + 1,
@@ -36,7 +37,7 @@ class ImmediateDeviceRunner:
             plan.context_lengths.tolist() if feedback is None else feedback.positions
         )
         rows = [
-            [token + index + 1 for index in range(self.speculative_draft_tokens + 1)]
+            [token + index + 1 for index in range(self.accepted + 1)]
             for token in tokens
         ]
         return forward_output(rows), SimpleNamespace(
@@ -56,46 +57,67 @@ class ImmediateDeviceRunner:
         return SimpleNamespace(feedback=next_feedback, result=lambda: output)
 
 
-def exercise(*, drafts, extra_write_row, warmup, passes, declared=True):
-    raw = ImmediateDeviceRunner(drafts, extra_write_row)
+def exercise(
+    *,
+    drafts,
+    extra_write_row,
+    warmup,
+    passes,
+    declared=True,
+    accepted=None,
+    context=64,
+    page_tokens=4096,
+    traced=True,
+):
+    raw = ImmediateDeviceRunner(
+        drafts, extra_write_row, accepted=accepted, page_tokens=page_tokens
+    )
     observed = BenchmarkRunner(raw)
-    # Exact public capacity from the admission helper, with no cache-page edge
-    # anywhere in the window. Output-budget failures cannot hide behind pages.
+    # Large default pages isolate output budgeting; small pages cover crossings.
     budget = decode_output_budget(
         warmup_steps=warmup,
         measure_steps=12,
         draft_tokens=drafts,
         overlap=True,
-        trace_passes=passes,
+        trace_passes=passes if traced else 0,
         max_accepted_per_step=raw.runner_config.max_accepted_per_step,
     )
-    engine = Engine(observed, context_length=64 + budget, max_running_requests=2)
+    engine = Engine(observed, context_length=context + budget, max_running_requests=2)
     trace_stats = []
+    reductions = []
+
+    def reduce_step(value):
+        reductions.append(value)
+        return value
 
     def trace(case, run_pass):
-        assert engine.overlap_pending and engine.overlap_ready
+        before_reductions = len(reductions)
         for _ in range(passes):
             before = engine.overlap_stats
+            before_enqueues = raw.enqueued
             value = run_pass()
             trace_stats.append(
                 {
                     "delta": tuple(a - b for a, b in zip(engine.overlap_stats, before)),
+                    "enqueues": raw.enqueued - before_enqueues,
                     "ready": engine.overlap_ready,
                     "pending": engine.overlap_pending,
                     "tokens": value["committed_tokens"],
                 }
             )
+        assert len(reductions) == before_reductions
 
     try:
         record = run_sweep(
             engine,
-            [BenchCase(phase="decode", context_length=64, batch_size=2)],
+            [BenchCase(phase="decode", context_length=context, batch_size=2)],
             runner=observed,
             prompt_tokens=[1],
             warmup_steps=warmup,
             measure_steps=12,
-            trace_step=trace,
-            trace_decode_passes=passes if declared else None,
+            trace_step=trace if traced else None,
+            trace_decode_passes=passes if traced and declared else None,
+            reduce_step=reduce_step,
         )[0]
         assert not engine.has_work()
     finally:
@@ -103,9 +125,18 @@ def exercise(*, drafts, extra_write_row, warmup, passes, declared=True):
     return raw, record, trace_stats
 
 
-@pytest.mark.parametrize("drafts,extra_write_row", [(0, 0), (3, 0), (3, 1), (5, 1)])
-@pytest.mark.parametrize("warmup", [0, 3])
-@pytest.mark.parametrize("passes", [1, 3, 5])
+@pytest.mark.parametrize(
+    "drafts,extra_write_row,warmup,passes",
+    [
+        (0, 0, 0, 1),
+        (0, 0, 3, 3),
+        (3, 0, 0, 5),
+        (3, 1, 3, 1),
+        (3, 1, 3, 5),
+        (5, 1, 0, 3),
+        (5, 1, 3, 5),
+    ],
+)
 def test_every_trace_completion_retains_real_engine_overlap(
     drafts, extra_write_row, warmup, passes
 ):
@@ -117,9 +148,50 @@ def test_every_trace_completion_retains_real_engine_overlap(
     assert raw.synchronous_decodes == 0
     assert (
         traced
-        == [dict(delta=(1, 1), ready=True, pending=True, tokens=2 * (drafts + 1))]
+        == [
+            dict(
+                delta=(1, 1),
+                enqueues=1,
+                ready=True,
+                pending=True,
+                tokens=2 * (drafts + 1),
+            )
+        ]
         * passes
     )
+
+
+@pytest.mark.parametrize("drafts,accepted", [(0, 0), (3, 0), (3, 3)])
+def test_overlap_trace_preserves_measurements_across_page_boundary(
+    monkeypatch, drafts, accepted
+):
+    def run(traced):
+        monkeypatch.setattr(
+            "resin.bench.time.perf_counter", iter(range(10000)).__next__
+        )
+        _, record, trace = exercise(
+            drafts=drafts,
+            accepted=accepted,
+            extra_write_row=0,
+            warmup=3,
+            passes=3,
+            context=513,
+            page_tokens=64,
+            traced=traced,
+        )
+        if traced:
+            assert sum(row["enqueues"] for row in trace) >= 2
+        return record
+
+    baseline, profiled = run(False), run(True)
+    for field in (
+        "step_seconds",
+        "committed_tokens",
+        "measure_steps",
+        "measured_context_start_min",
+        "measured_context_end_max",
+    ):
+        assert baseline[field] == profiled[field]
 
 
 def test_plain_trace_callback_defaults_to_three_overlap_completions():

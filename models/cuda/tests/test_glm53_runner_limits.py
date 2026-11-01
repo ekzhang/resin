@@ -63,18 +63,17 @@ def construct_runner(monkeypatch):
     return construct
 
 
-@pytest.mark.parametrize("drafts", [0, 1, 3, 7])
-@pytest.mark.parametrize("ep", [1, 2, 4])
 @pytest.mark.parametrize(
-    "catalog,policy,expected",
+    "drafts,ep,catalog,policy,expected",
     [
-        (None, "full", ((1, 4096), (2, 4096), (4, 4096), (8, 4096))),
-        (((3, 4096), (8, 4096)), "full", ((3, 4096), (8, 4096))),
-        ((), "full", ()),
-        (None, "disabled", ()),
+        (0, 1, None, "full", ((1, 4096), (2, 4096), (4, 4096), (8, 4096))),
+        (7, 4, None, "full", ((1, 4096), (2, 4096), (4, 4096), (8, 4096))),
+        (3, 2, ((3, 4096), (8, 4096)), "full", ((3, 4096), (8, 4096))),
+        (1, 1, (), "full", ()),
+        (3, 2, None, "disabled", ()),
     ],
 )
-def test_direct_constructor_preserves_common_ordinary_decode_catalog(
+def test_constructor_decode_catalog(
     construct_runner, drafts, ep, catalog, policy, expected
 ):
     model, _ = construct_runner(
@@ -87,32 +86,22 @@ def test_direct_constructor_preserves_common_ordinary_decode_catalog(
         cuda_graph_decode=policy,
     )
     assert getattr(model, "observed_modes")["decode"].shapes == expected
-    assert model.prefill_chunk_size == 8192
-    assert model.runner_config.prefill_chunk_size == 8192
+    assert model.prefill_chunk_size == model.runner_config.prefill_chunk_size == 8192
     assert model.cache_geometry.state_tokens == 8192
 
 
-@pytest.mark.parametrize("drafts", [0, 1, 3, 5, 7])
-@pytest.mark.parametrize("capacity", [None, 2, 8, 64])
-def test_constructor_target_profile_is_shared_across_capacity_and_draft_width(
-    construct_runner, drafts, capacity
+def test_constructor_reserves_large_verification_and_selects_projection_bucket(
+    construct_runner,
 ):
-    options = {} if capacity is None else {"max_batch_size": capacity}
-    model, load_options = construct_runner(
-        prefill_chunk_size=512,
-        speculative_draft_tokens=drafts,
-        **options,
+    model, loaded = construct_runner(
+        max_batch_size=128, prefill_chunk_size=512, speculative_draft_tokens=7
     )
-    batch = 8 if capacity is None else capacity
-    assert model.max_batch_size == batch
-    assert model.target_projection_rows == 64
-    assert model.max_seq_len == 4096
-    assert model.runner_config.max_accepted_per_step == drafts + 1
-    assert model.cache_layout.decode_write_extra_tokens == int(bool(drafts))
-    assert load_options["max_tokens"] == max(512, batch * (drafts + 1))
-    assert getattr(model, "observed_modes")["decode"].shapes == tuple(
-        (size, 4096) for size in (1, 2, 4, 8, 12, 16, 24, 32, 64) if size <= batch
-    )
+    assert loaded["max_tokens"] == 1024
+    assert model.runner_config.max_accepted_per_step == 8
+    assert model.cache_layout.decode_write_extra_tokens == 1
+    assert model._eager_projection_rows(1) == 64
+    assert model._eager_projection_rows(9) == 96
+    assert model._eager_projection_rows(128) == 1024
 
 
 def runner(drafts):

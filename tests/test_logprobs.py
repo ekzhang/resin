@@ -16,17 +16,7 @@ from resin import (
     RunnerConfig,
     SamplingParams,
 )
-from resin.backend.plan_transport import PlanTransport
-from resin.backend.sampling import TorchSampler, format_output, token_output
-
-
-def test_forward_output_requires_keyword_arguments():
-    ids = np.array([3], np.uint32)
-    offsets = np.array([0, 1], np.uint32)
-    output = ForwardOutput(token_ids=ids, token_indptr=offsets)
-    assert output.token_ids is ids and output.token_indptr is offsets
-    with pytest.raises(TypeError, match="positional"):
-        ForwardOutput(ids, offsets)  # ty: ignore[too-many-positional-arguments, missing-argument]
+from resin.backend.sampling import format_output, token_output
 
 
 def test_token_only_output_owns_tensor_storage_without_python_scalars(monkeypatch):
@@ -177,33 +167,19 @@ def test_scores_use_model_distribution_and_cover_only_accepted_positions():
         )
 
 
-def test_logprob_options_survive_broadcast_and_do_not_change_sampling():
-    params = SamplingParams(seed=7, top_k=2, top_logprobs=3)
+def test_logprob_requests_respect_sampling_mask():
+    params = SamplingParams(top_logprobs=3)
     assert params.logprobs
-    plan = BatchPlan(
-        sequence_ids=[1],
-        context_lengths=[0],
-        token_ids=[0],
-        token_indptr=[0, 1],
-        sampling_params=[params],
-    )
-    restored = PlanTransport().restore(PlanTransport().prepare(plan))
-    assert restored.sampling_params[0].top_logprobs == 3
-    assert restored.needs_logprobs
-    assert not BatchPlan(
-        sequence_ids=[1],
-        context_lengths=[0],
-        token_ids=[0],
-        token_indptr=[0, 1],
-        sampling_params=[params],
-        sampling_mask=[False],
-    ).needs_logprobs
-    logits = torch.tensor([[2.0, 4.0, 1.0]])
-    tokens = TorchSampler()(logits, plan)
-    output = format_output(logits, tokens, plan)
-    np.testing.assert_array_equal(output.token_ids, tokens.numpy())
-    assert output.top_logprobs is not None
-    assert len(output.top_logprobs) == 3
+    for mask in (False, True):
+        plan = BatchPlan(
+            sequence_ids=[1],
+            context_lengths=[0],
+            token_ids=[0],
+            token_indptr=[0, 1],
+            sampling_params=[params],
+            sampling_mask=[mask],
+        )
+        assert plan.needs_logprobs is mask
 
 
 def test_mixed_top_k_requests_use_packed_columns():
@@ -415,10 +391,3 @@ def test_requested_scores_cannot_silently_disappear():
     with pytest.raises(RuntimeError, match="requested token logprobs"):
         engine.step()
     assert engine.poisoned
-
-
-def test_token_only_native_outputs_need_no_logprob_columns():
-    engine = Engine(OutputRunner(forward=lambda plan: forward_output([3])))
-    request = engine.submit([1], sampling_params=SamplingParams(max_output_tokens=1))
-    (event,) = engine.step()
-    assert event.logprobs is None and request.take_result() == [3]

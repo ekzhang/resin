@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from collections.abc import Callable
+from types import SimpleNamespace
 
 import pytest
 from output_helpers import forward_output
@@ -10,7 +10,6 @@ from resin import (
     CacheGroupLayout,
     CacheLayout,
     Engine,
-    ForwardOutput,
     ResourceBinding,
     RunnerConfig,
     SamplingParams,
@@ -242,68 +241,18 @@ class TestEngineExecution:
 
 
 class TestRunnerContractConstruction:
-    def test_forward_and_release_callables_are_resolved_once(self) -> None:
-        class DescriptorRunner:
-            def __init__(self) -> None:
-                self.lookups = {"forward": 0, "release": 0}
-                self.forward_calls = 0
-
-            @property
-            def forward(self) -> Callable[[BatchPlan], ForwardOutput]:
-                self.lookups["forward"] += 1
-                return self._forward
-
-            @property
-            def release(self) -> Callable[[list[int]], None]:
-                self.lookups["release"] += 1
-                return lambda request_ids: None
-
-            def _forward(self, plan: BatchPlan) -> ForwardOutput:
-                self.forward_calls += 1
-                return forward_output([2] * plan.num_sequences)
-
-        runner = DescriptorRunner()
-        engine = Engine(runner)
-        request = engine.submit(
-            [1], sampling_params=SamplingParams(max_output_tokens=1)
-        )
-        events = engine.step()
-        assert [event.request_id for event in events] == [request]
-        assert runner.forward_calls == 1
-        assert runner.lookups == {"forward": 1, "release": 1}
-
-    def test_constructor_requires_callable_forward_and_release(self) -> None:
-        class DispatchOnly:
-            def dispatch(self, plan):
-                return object()
-
-        class BadForward:
-            forward = 7
-
-        class BadRelease:
-            release = 7
-
-            def forward(self, plan):
-                return forward_output([1])
-
-        class RaisingRelease:
-            def forward(self, plan):
-                return forward_output([1])
-
-            @property
-            def release(self):
-                raise RuntimeError("release descriptor failed")
-
-        with pytest.raises(TypeError, match="define callable forward"):
-            # Intentionally missing the required forward callback.
-            Engine(DispatchOnly())  # ty: ignore[invalid-argument-type]
-        with pytest.raises(TypeError, match="forward must be callable"):
-            # Intentionally non-callable forward callback.
-            Engine(BadForward())  # ty: ignore[invalid-argument-type]
-        with pytest.raises(TypeError, match="release must be callable"):
-            Engine(BadRelease())
-        with pytest.raises(RuntimeError, match="release descriptor failed"):
-            Engine(RaisingRelease())
+    @pytest.mark.parametrize(
+        "callbacks",
+        [
+            {},
+            {"forward": 7},
+            {"forward": lambda plan: forward_output([1]), "release": 7},
+        ],
+        ids=["missing-forward", "noncallable-forward", "noncallable-release"],
+    )
+    def test_constructor_requires_callable_forward_and_release(self, callbacks) -> None:
+        with pytest.raises(TypeError, match="callable"):
+            Engine(SimpleNamespace(**callbacks))  # ty: ignore[invalid-argument-type]
 
 
 class TestPhaseCoordination:

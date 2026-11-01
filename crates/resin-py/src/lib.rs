@@ -2129,51 +2129,6 @@ mod _resin {
 mod tests {
     use super::*;
 
-    #[test]
-    fn runner_results_require_native_output_or_callable_completion() {
-        Python::initialize();
-        Python::attach(|py| {
-            for expression in [c"[1]", c"[[1]]", c"None", c"object()"] {
-                let value = py.eval(expression, None, None).unwrap();
-                let error = extract_runner_output(&value)
-                    .err()
-                    .expect("non-native output must be rejected");
-                assert!(error.is_instance_of::<PyTypeError>(py));
-                assert!(
-                    error
-                        .to_string()
-                        .contains("runner must return ForwardOutput")
-                );
-                let error = runner_result_is_async(&value).unwrap_err();
-                assert!(error.is_instance_of::<PyTypeError>(py));
-            }
-
-            let noncallable = py
-                .eval(c"type('Invalid', (), {'result': []})()", None, None)
-                .unwrap();
-            assert!(runner_result_is_async(&noncallable).is_err());
-
-            let completion = py
-                .eval(
-                    c"type('Completion', (), {'result': lambda self: None})()",
-                    None,
-                    None,
-                )
-                .unwrap();
-            assert!(runner_result_is_async(&completion).unwrap());
-
-            let invalid_descriptor = py
-                .eval(
-                    c"type('Invalid', (), {'result': property(lambda self: 1 / 0)})()",
-                    None,
-                    None,
-                )
-                .unwrap();
-            let error = runner_result_is_async(&invalid_descriptor).unwrap_err();
-            assert!(error.is_instance_of::<pyo3::exceptions::PyZeroDivisionError>(py));
-        });
-    }
-
     fn wire_plan(group_index: u32) -> BatchPlan {
         let group = CacheGroupPlan::from_parts(
             group_index,

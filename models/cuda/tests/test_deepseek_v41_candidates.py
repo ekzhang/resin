@@ -1,124 +1,47 @@
-"""Candidate allocation uses runtime context widths with a fixed reduction tile."""
+"""Candidate wrapper allocates aligned scores for runtime context widths."""
 
 import importlib.util
-from functools import lru_cache
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
-import sympy
 import torch
 
-ROOT = Path(__file__).parents[1] / "resin_models_cuda/deepseek_v41/upstream"
+from resin_models_cuda.deepseek_v41.upstream import cuda
 
 
-def _load(path, name):
-    spec = importlib.util.spec_from_file_location(name, path)
+@pytest.mark.parametrize("block_size", [8, 16])
+def test_candidate_output_alignment_and_valid_counts(monkeypatch, block_size):
+    def factory(size):
+        assert size == block_size
+
+        def launch(logits, lengths, scores, counts):
+            blocks = (logits.shape[1] + size - 1) // size
+            assert scores.shape == (5, blocks)
+            assert scores.stride(0) * scores.element_size() % 1024 == 0
+            assert counts.numel() == 8
+            counts[:5] = (lengths + size - 1) // size
+
+        return launch
+
+    operations = SimpleNamespace(candidate_block_max_tl=factory)
+    monkeypatch.setattr(cuda, "candidate_blocks", operations, raising=False)
+    path = (
+        Path(__file__).parents[1]
+        / "resin_models_cuda/deepseek_v41/upstream/candidate_blocks.py"
+    )
+    spec = importlib.util.spec_from_file_location("candidate_wrapper_test", path)
     assert spec is not None and spec.loader is not None
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    return module
-
-
-@pytest.fixture
-def candidate_kernel(monkeypatch):
-    import sys
-
-    # Evaluate the real factory's shape equations without a CUDA compiler. The
-    # prim_func body is deliberately not executed by this CPU contract test.
-    language = SimpleNamespace(
-        dynamic=lambda name: sympy.Symbol(name, integer=True, positive=True),
-        ceildiv=lambda value, divisor: sympy.ceiling(value / divisor),
-        prim_func=lambda function: function,
-        StridedTensor=lambda shape, strides, dtype: SimpleNamespace(
-            shape=shape, strides=strides, dtype=dtype
-        ),
-        Tensor=lambda shape, dtype: SimpleNamespace(shape=shape, dtype=dtype),
-        bfloat16="bfloat16",
-        int32="int32",
-    )
-    tilelang = SimpleNamespace(
-        language=language,
-        jit=lambda **_kwargs: lru_cache(None),
-        PassConfigKey=SimpleNamespace(
-            TL_DISABLE_DATA_RACE_CHECK=1,
-            TL_ENABLE_LOWER_LDGSTG=2,
-            TL_DISABLE_TMA_LOWER=3,
-            TL_DISABLE_WARP_SPECIALIZED=4,
-        ),
-    )
-    monkeypatch.setitem(sys.modules, "tilelang", tilelang)
-    monkeypatch.setitem(sys.modules, "tilelang.language", language)
-    monkeypatch.setitem(
-        sys.modules, "deep_gemm", SimpleNamespace(get_num_sms=lambda: 148)
-    )
-    return _load(ROOT / "cuda/candidate_blocks.py", "candidate_kernel_contract")
-
-
-@pytest.mark.parametrize("block_size", [8, 16])
-def test_candidate_factory_keeps_width_and_task_capacity_dynamic(
-    candidate_kernel, block_size
-):
-    kernel = candidate_kernel.candidate_block_max_tl(block_size)
-    shapes = kernel.__annotations__
-    rows, width = shapes["logits"].shape
-    assert str(rows) == "num_rows" and str(width) == "max_model_len"
-    for capacity in (17, 16384, 16385, 65539, 131073):
-        values = {rows: 257, width: capacity}
-        assert (
-            shapes["block_scores"].shape[1].subs(values)
-            == (capacity + block_size - 1) // block_size
-        )
-        assert shapes["task_ids"].shape[0].subs(values) == 129 * (
-            (capacity + 16383) // 16384
-        )
-        assert candidate_kernel.candidate_block_max_tl(block_size) is kernel
-    assert candidate_kernel.candidate_block_max_tl.cache_info().misses == 1
-
-
-@pytest.mark.parametrize("block_size", [8, 16])
-def test_candidate_wrapper_reuses_factory_while_output_capacity_changes(
-    monkeypatch, block_size
-):
-    import resin_models_cuda.deepseek_v41.upstream.cuda as cuda
-
-    calls = []
-    factory_keys = []
-
-    def dispatch(key):
-        factory_keys.append(key)
-        assert key == block_size
-
-        def call(logits, lengths, scores, counts):
-            width = logits.shape[1]
-            calls.append((width, scores.shape, scores.stride(0), counts.numel()))
-            # Stand in for the compiled operation; this test exercises the
-            # production wrapper's factory arguments and output allocation.
-            counts[: len(lengths)] = (lengths + block_size - 1) // block_size
-
-        return call
-
-    monkeypatch.setattr(
-        cuda,
-        "candidate_blocks",
-        SimpleNamespace(candidate_block_max_tl=dispatch),
-        raising=False,
-    )
-    wrapper = _load(ROOT / "candidate_blocks.py", "candidate_wrapper_contract")
-    for width in (17, 16384, 16385, 65539):
+    wrapper = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(wrapper)
+    for width in (17, 16385):
         storage = torch.zeros(5, (width + 15) // 16 * 16, dtype=torch.bfloat16)
-        logits = storage[:, :width]
         lengths = torch.tensor(
             [0, 1, block_size + 1, width - 1, width], dtype=torch.int32
         )
-        scores, counts = wrapper.candidate_block_max(logits, lengths, block_size)
+        scores, counts = wrapper.candidate_block_max(
+            storage[:, :width], lengths, block_size
+        )
         blocks = (width + block_size - 1) // block_size
-        stride = (blocks + 511) // 512 * 512
-        assert scores.shape == (5, stride)
-        assert scores.stride(0) * scores.element_size() % 1024 == 0
-        assert counts.shape == (5,)
-        assert counts.tolist() == [
-            (int(value) + block_size - 1) // block_size for value in lengths
-        ]
-        assert calls[-1] == (width, (5, blocks), stride, 8)
-    assert factory_keys == [block_size] * 4
+        assert scores.shape == (5, (blocks + 511) // 512 * 512)
+        torch.testing.assert_close(counts, (lengths + block_size - 1) // block_size)

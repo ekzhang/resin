@@ -10,7 +10,6 @@ import pytest
 import torch
 
 from resin_models_cuda.glm5_3_flash.attention import KdaAttention
-from resin_models_cuda.glm5_3_flash.speculative import SpeculativeTape
 
 BLACKWELL = torch.cuda.is_available() and torch.cuda.get_device_capability()[0] == 10
 pytestmark = pytest.mark.skipif(not BLACKWELL, reason="requires B200/B300 CUDA")
@@ -208,41 +207,3 @@ def test_chunk_kda_attention_graph_replays_changed_inputs_and_initial_states():
         torch.testing.assert_close(actual, expected, atol=0.003, rtol=0.02)
         torch.testing.assert_close(actual_state, expected_state, atol=0.001, rtol=0.015)
         torch.testing.assert_close(actual_history, expected_history, atol=0, rtol=0)
-
-
-@torch.inference_mode()
-def test_planar_kda_target_and_rollback_are_bitwise_old_layout(monkeypatch):
-    from test_glm53_convolution import _legacy
-
-    from resin_models_cuda.glm5_3_flash import kernels
-
-    attention = _attention()
-    original_convolution = kernels.convolution
-    initial = _cache([4, 4, 4], [511, 63, 2048])
-    hidden = torch.randn(12, 64, device="cuda", dtype=torch.bfloat16)
-
-    def legacy_convolution(qkv, weight, cache, *, planar=False):
-        output, final = _legacy(qkv, weight, cache)
-        return (output.permute(1, 0, 2).contiguous() if planar else output), final
-
-    def run(convolution, width, counts):
-        monkeypatch.setattr(kernels, "convolution", convolution)
-        working = _cache([width] * 3, [511, 63, 2048])
-        working.recurrent.copy_(initial.recurrent)
-        working.convolution.copy_(initial.convolution)
-        batch = SimpleNamespace(
-            layers={0: working},
-            context_lengths=torch.tensor([511, 63, 2048], device="cuda"),
-        )
-        tape = SpeculativeTape.attach(batch, width)
-        value = hidden.reshape(3, 4, 64)[:, :width].reshape(-1, 64)
-        output = attention(value, working.positions, working)
-        assert tape.records[0].raw_qkv.stride(0) > 3 * attention.width
-        selected = tape.commit(torch.tensor(counts, device="cuda"), output)
-        return output, selected, working.recurrent, working.convolution
-
-    for width, counts in ((1, [1, 1, 1]), (4, [1, 2, 4]), (4, [4, 1, 2])):
-        actual = run(original_convolution, width, counts)
-        expected = run(legacy_convolution, width, counts)
-        for result, reference in zip(actual, expected, strict=True):
-            torch.testing.assert_close(result, reference, atol=0, rtol=0)

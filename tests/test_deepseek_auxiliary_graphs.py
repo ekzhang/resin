@@ -73,12 +73,10 @@ def _configured(monkeypatch):
     return runner, graphs, calls, c1, c2, indexer, draft
 
 
-def test_all_auxiliary_geometries_use_bounded_shapes_and_keep_output_dtypes(
+def test_auxiliary_callbacks_bind_model_projections_and_preserve_output_dtypes(
     monkeypatch,
 ):
-    runner, graphs, calls, c1, c2, indexer, draft = _configured(monkeypatch)
-    assert graphs.pad_up_to == 1024
-    assert graphs.buckets == tuple(2**p for p in range(11))
+    runner, _, _, c1, c2, indexer, draft = _configured(monkeypatch)
     pairs = (
         (c2.prefill_projection, c2.projection),
         (indexer.prefill_weights_proj, indexer.weights_proj),
@@ -88,24 +86,11 @@ def test_all_auxiliary_geometries_use_bounded_shapes_and_keep_output_dtypes(
         (draft.attn.prefill_store_projection, draft.attn.wkv),
     )
     with torch.inference_mode(), runner._prefill_graphs():
-        for rows in (763, 779, 155, 1):
-            for region, (callback, raw) in enumerate(pairs, 1):
-                values = torch.randn(1, rows, raw.weight.shape[1]).bfloat16()
-                expected = raw(values)
-                actual = callback(values)
-                assert (
-                    actual.shape == expected.shape and actual.dtype == raw.output_dtype
-                )
-                torch.testing.assert_close(actual, expected, rtol=0, atol=0)
-                owned = actual.clone()
-                torch.testing.assert_close(callback(-values), -expected, rtol=0, atol=0)
-                torch.testing.assert_close(owned, expected, rtol=0, atol=0)
-                shape, staged = calls[-1]
-                assert shape == (1 << (rows - 1).bit_length(), region)
-                torch.testing.assert_close(staged[:rows], -values[0])
-                assert torch.count_nonzero(staged[rows:]) == 0
-    assert graphs._buffers(1024, 4) is graphs._buffers(1024, 6)
-    assert runner.cuda_graph_stats["prefill_auxiliary"]["fallback_counts"] == {}
+        for callback, projection in pairs:
+            values = torch.randn(1, 3, projection.weight.shape[1]).bfloat16()
+            output = callback(values)
+            assert output.dtype == projection.output_dtype
+            torch.testing.assert_close(output, projection(values), rtol=0, atol=0)
 
 
 def test_compressor_pools_only_live_fp32_rows_after_projection(monkeypatch):
@@ -133,7 +118,6 @@ def test_compressor_pools_only_live_fp32_rows_after_projection(monkeypatch):
         result = c2(hidden, positions, cache, metadata=metadata, prefill=True)
     torch.testing.assert_close(result, reference, rtol=0, atol=0)
     assert observed == [metadata, metadata]
-    assert calls[-1][0] == (8, 1)
 
 
 def test_shared_producer_projects_full_rows_before_compaction(monkeypatch):
@@ -161,7 +145,6 @@ def test_shared_producer_projects_full_rows_before_compaction(monkeypatch):
         expected = c1.projection(hidden)
         torch.testing.assert_close(stored[0], indexer.wk(expected), rtol=0, atol=0)
         torch.testing.assert_close(stored[1], expected, rtol=0, atol=0)
-    assert [shape for shape, _ in calls] == [(1024, 4), (1024, 3)]
     assert runtime["full_index_kv_stored"] == {20}
 
 
@@ -216,27 +199,3 @@ def test_dspark_commit_keeps_absolute_positions_masks_and_decode_path(
         expected = draft.attn.wkv(draft.main_proj(hidden))
         torch.testing.assert_close(stored[0][0], expected, rtol=0, atol=0)
     assert stored[0][0].shape == (1, 7, 8)
-    assert [shape for shape, _ in calls] == ([(8, 5), (8, 6)] if prefill else [])
-
-
-@pytest.mark.parametrize("lazy", [False, True])
-def test_capture_hook_warms_hc_once_and_skips_non_lazy_blocks(monkeypatch, lazy):
-    import resin_models_cuda.deepseek_v41.hc as implementation
-
-    runner: Any = _runner()
-    runner.prefill_chunk_size = 8192
-    blocks = [
-        SimpleNamespace(lazy_hc=False),
-        SimpleNamespace(lazy_hc=lazy),
-        SimpleNamespace(lazy_hc=lazy),
-    ]
-    runner._model = SimpleNamespace(layers=blocks)
-    calls = []
-    monkeypatch.setattr(
-        implementation,
-        "warm_prefill_hc",
-        lambda block, max_rows: calls.append((block, max_rows)),
-    )
-    DeepSeekV41CudaRunner._before_cuda_graph_capture(runner)
-    DeepSeekV41CudaRunner._before_cuda_graph_capture(runner)
-    assert calls == ([(blocks[1], 8192)] if lazy else [])

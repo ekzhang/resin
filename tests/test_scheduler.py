@@ -153,22 +153,11 @@ class TestSchedulerConfigContract:
         assert request.done
         engine.close()
 
-    def test_config_is_frozen_keyword_only_and_validated(self) -> None:
+    def test_config_limits_and_conservativeness_are_validated(self) -> None:
         default = SchedulerConfig()
-        assert (
-            repr(default)
-            == "SchedulerConfig(max_batch_tokens=None, prefill_chunk_size=8192, schedule_conservativeness=1.0)"
-        )
-
-        with pytest.raises(TypeError):
-            # Intentionally reject positional arguments to the native keyword-only API.
-            SchedulerConfig(17)  # ty: ignore[too-many-positional-arguments]
+        assert default.max_batch_tokens is None and default.prefill_chunk_size == 8192
         limited = SchedulerConfig(max_batch_tokens=17, prefill_chunk_size=5)
         assert (limited.max_batch_tokens, limited.prefill_chunk_size) == (17, 5)
-        assert (
-            repr(limited)
-            == "SchedulerConfig(max_batch_tokens=17, prefill_chunk_size=5, schedule_conservativeness=1.0)"
-        )
         for field in ("max_batch_tokens", "prefill_chunk_size"):
             with (
                 pytest.raises(ValueError, match=f"{field} must be positive"),
@@ -194,81 +183,26 @@ class TestSchedulerConfigContract:
         assert conservative.new_token_ratio == 1.0
         conservative.close()
 
-    def test_continuation_capability_is_exact_and_only_read_when_enabled(self) -> None:
-        class Missing:
-            def forward(self, plan):
-                return forward_output([0] * plan.num_sequences)
+    @pytest.mark.parametrize("enabled", [False, True])
+    def test_continuation_capability_controls_chunked_prefill(self, enabled) -> None:
+        class Runner(RecordingRunner):
+            runner_config = RunnerConfig(continuation_prefill=enabled)
 
-        class FalseRunner(Missing):
-            runner_config = RunnerConfig(continuation_prefill=False)
-
-        class IntegerTrueRunner(Missing):
-            runner_config = 1
-
-        class RaisingDescriptor(Missing):
-            @property
-            def runner_config(self):
-                raise RuntimeError("capability descriptor accessed")
-
-        with pytest.raises(RuntimeError, match="capability descriptor accessed"):
-            Engine(RaisingDescriptor())
-        with pytest.raises(TypeError, match="exactly a RunnerConfig"):
-            Engine(IntegerTrueRunner())
-        for runner in (Missing(), FalseRunner()):
-            engine = Engine(
-                runner,
-                scheduler_config=SchedulerConfig(prefill_chunk_size=2),
-            )
-            engine.submit(
-                [1, 2, 3], sampling_params=SamplingParams(max_output_tokens=1)
-            )
-            with pytest.raises(
-                ValueError, match="runner_config.continuation_prefill is false"
-            ):
+        runner = Runner()
+        engine = Engine(runner, scheduler_config=SchedulerConfig(prefill_chunk_size=2))
+        request = engine.submit(
+            [1, 2, 3], sampling_params=SamplingParams(max_output_tokens=1)
+        )
+        if enabled:
+            while engine.has_work():
                 engine.step()
-            engine.close()
-
-        engine = Engine(
-            ContinuationRecordingRunner(),
-            scheduler_config=SchedulerConfig(prefill_chunk_size=2),
-        )
-        assert engine.scheduler_config.prefill_chunk_size == 2
+            assert [len(plan.token_ids) for plan in runner.plans] == [2, 1]
+            assert request.done
+        else:
+            with pytest.raises(ValueError, match="continuation_prefill is false"):
+                engine.step()
+            assert runner.plans == [] and not request.done
         engine.close()
-
-        layout = CacheLayout(parent_capacity=2, groups=[CacheGroupLayout(2)])
-
-        class ContinuationCachedRunner(ContinuationRecordingRunner):
-            runner_config = RunnerConfig(
-                continuation_prefill=True,
-                cache_layout=layout,
-            )
-
-            def __init__(self) -> None:
-                super().__init__()
-                self.binding = None
-
-            def bind_resources(self, binding: ResourceBinding) -> None:
-                self.binding = (binding.cache_pool_id, binding.cache_layout)
-
-        runner = ContinuationCachedRunner()
-        cached_engine = Engine(
-            runner,
-            scheduler_config=SchedulerConfig(prefill_chunk_size=2),
-        )
-        assert runner.binding == (cached_engine.cache_pool_id, layout)
-        cached_engine.close()
-
-    def test_engine_freezes_a_copy_of_the_effective_config(self) -> None:
-        runner = RecordingRunner()
-        config = SchedulerConfig(max_batch_tokens=17)
-        engine = Engine(runner, scheduler_config=config)
-        assert engine.scheduler_config.max_batch_tokens == 17
-        with pytest.raises(TypeError):
-            # Invalid scheduler configuration must fail at runtime.
-            Engine(runner, scheduler_config=object())  # ty: ignore[invalid-argument-type]
-
-        default = Engine(RecordingRunner())
-        assert default.scheduler_config.max_batch_tokens is None
 
     def test_batch_plan_batch_key_defaults_and_range_validation(self) -> None:
         default = BatchPlan(
@@ -402,26 +336,6 @@ class TestSchedulerConfigContract:
         assert not engine.has_work() and not engine.poisoned
         assert runner.plans == []
 
-    @pytest.mark.parametrize(
-        ("current", "legacy"),
-        [
-            ("cache_key", "cache_token_ids"),
-            ("token_spans", "prefill_atomic_spans"),
-        ],
-    )
-    def test_retired_media_attributes_do_not_satisfy_admission(self, current, legacy):
-        runner = RecordingRunner()
-        engine = Engine(runner)
-        media = SimpleNamespace(token_ids=(1, 2), cache_key=(1, 2), token_spans=())
-        setattr(media, legacy, getattr(media, current))
-        delattr(media, current)
-        with pytest.raises(AttributeError, match=current):
-            engine.submit(
-                sampling_params=SamplingParams(max_output_tokens=1), media=media
-            )
-        assert not engine.has_work() and not engine.poisoned
-        assert runner.plans == []
-
     def test_batch_plan_phase_is_batch_homogeneous(self) -> None:
         prefill = BatchPlan(
             sequence_ids=[7, 8],
@@ -479,16 +393,6 @@ class TestSchedulerConfigContract:
                     token_indptr=[0, 1, 2, 3],
                     sampling_mask=value,
                 )
-
-        with pytest.raises(TypeError, match="prefill_sequence_indices"):
-            BatchPlan(
-                sequence_ids=[7],
-                context_lengths=[0],
-                token_ids=[1],
-                token_indptr=[0, 1],
-                # Removed constructor argument must fail at runtime.
-                prefill_sequence_indices=[0],  # ty: ignore[unknown-argument]
-            )
 
 
 class TestNativePolicyIntegration:

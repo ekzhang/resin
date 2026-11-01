@@ -486,8 +486,37 @@ def _device_cache(source):
     return SimpleNamespace(**data)
 
 
+@pytest.mark.parametrize("lengths", [[0], [1, 0, 4]])
+def test_planar_convolution_matches_causal_equation_and_preserves_idle_history(lengths):
+    source = torch.randn(sum(lengths), 3, 16, dtype=torch.bfloat16)[:, :, ::2]
+    weights = torch.randn(3, 8, 4)
+    history = torch.randn(len(lengths), 2, 3, 8, 3, dtype=torch.bfloat16)[:, 1]
+    before = history.clone()
+    cache = SimpleNamespace(**_batch(lengths), convolution=history)
+    expected, final = torch.empty_like(source), history.clone()
+    start = 0
+    for row, length in enumerate(lengths):
+        joined = torch.cat(
+            (history[row], source[start : start + length].permute(1, 2, 0)), -1
+        )
+        for index in range(length):
+            value = (joined[..., index : index + 4].float() * weights).sum(-1)
+            expected[start + index] = F.silu(value)
+        final[row] = joined[..., -3:]
+        start += length
+    actual, actual_final = kernels.convolution(source, weights, cache, planar=True)
+    assert actual.shape == (3, sum(lengths), 8)
+    assert all(plane.is_contiguous() for plane in actual)
+    torch.testing.assert_close(
+        actual.permute(1, 0, 2), expected, atol=0.008, rtol=0.008
+    )
+    torch.testing.assert_close(actual_final, final, atol=0, rtol=0)
+    torch.testing.assert_close(history, before, atol=0, rtol=0)
+
+
 @pytest.mark.skipif(not _BLACKWELL, reason="requires B200/B300 CUDA")
-def test_cuda_conv_changed_input_replay_matches_reference():
+@pytest.mark.parametrize("planar", [False, True])
+def test_cuda_conv_changed_input_replay_matches_reference(planar):
     torch.manual_seed(31)
     qkv = torch.randn(73, 3, 256, dtype=torch.bfloat16)
     weights = torch.randn(3, 256, 4)
@@ -495,20 +524,31 @@ def test_cuda_conv_changed_input_replay_matches_reference():
         **_batch([65, 8]), convolution=torch.randn(2, 3, 256, 3, dtype=torch.bfloat16)
     )
     cache = _device_cache(source)
-    inputs, device_weights = qkv.cuda(), weights.cuda()
+    inputs = torch.empty(73, 3, 512, dtype=torch.bfloat16, device="cuda")[:, :, ::2]
+    inputs.copy_(qkv)
+    device_weights = weights.cuda()
     for _ in range(3):
-        kernels.convolution(inputs, device_weights, cache)
+        kernels.convolution(inputs, device_weights, cache, planar=planar)
     torch.cuda.synchronize()
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
-        actual, final = kernels.convolution(inputs, device_weights, cache)
+        actual, final = kernels.convolution(
+            inputs, device_weights, cache, planar=planar
+        )
     for seed in (32, 33):
         torch.manual_seed(seed)
         qkv.normal_()
         inputs.copy_(qkv)
+        source.convolution.normal_()
+        cache.convolution.copy_(source.convolution)
         graph.replay()
         expected, expected_final = kernels.convolution(qkv, weights, source)
-        torch.testing.assert_close(actual.cpu(), expected, atol=0.03125, rtol=0.008)
+        torch.testing.assert_close(
+            (actual.permute(1, 0, 2) if planar else actual).cpu(),
+            expected,
+            atol=0.03125,
+            rtol=0.008,
+        )
         torch.testing.assert_close(final.cpu(), expected_final, atol=0, rtol=0)
 
 

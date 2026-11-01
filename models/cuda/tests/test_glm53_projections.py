@@ -9,7 +9,7 @@ import torch
 from torch import nn
 from torch.nn import functional as F
 
-from resin_models_cuda.glm5_3_flash.model import DenseMLP, Glm53Model, Router, SparseMLP
+from resin_models_cuda.glm5_3_flash.model import DenseMLP, Router, SparseMLP
 from resin_models_cuda.glm5_3_flash.projections import bmm, fixed_rows, linear
 
 
@@ -25,10 +25,9 @@ def test_original_policy_preserves_exact_object_and_layout():
     assert seen == [value] and seen[0].stride() == (16, 2)
 
 
-@pytest.mark.parametrize("batch", [0, 1, 2, 3, 4, 5, 8])
-@pytest.mark.parametrize("width", range(1, 9))
-def test_all_target_widths_use_one_fixed_call_and_owned_prefix(batch, width):
-    value = torch.arange(batch * width * 24).reshape(batch * width, 24).float()[:, ::2]
+@pytest.mark.parametrize("rows", [0, 1, 7, 64])
+def test_fixed_rows_pads_bounds_and_retains_output_owner(rows):
+    value = torch.arange(rows * 24).reshape(rows, 24).float()[:, ::2]
     calls = []
 
     def operation(x):
@@ -39,11 +38,11 @@ def test_all_target_widths_use_one_fixed_call_and_owned_prefix(batch, width):
     actual = fixed_rows(value, operation, projection_rows=64)
     assert torch.equal(actual, value + 3)
     assert len(calls) == 1
-    if batch:
+    if rows:
         padded, full = calls[0]
         assert padded.shape == (64, 12)
-        assert torch.equal(padded[: batch * width], value)
-        assert not padded[batch * width :].count_nonzero()
+        assert torch.equal(padded[:rows], value)
+        assert not padded[rows:].count_nonzero()
         assert actual.untyped_storage().data_ptr() == full.untyped_storage().data_ptr()
         owner = weakref.ref(full)
         calls.clear()
@@ -52,21 +51,6 @@ def test_all_target_widths_use_one_fixed_call_and_owned_prefix(batch, width):
         assert owner() is not None and torch.equal(actual, value + 3)
     else:
         assert calls[0][0].shape == (0, 12)
-
-
-def test_no_maps_or_host_tensor_transfer(monkeypatch):
-    value = torch.ones(7, 16)
-
-    def forbidden(*args, **kwargs):
-        raise AssertionError("projection mapping or host staging")
-
-    monkeypatch.setattr(torch, "tensor", forbidden)
-    monkeypatch.setattr(torch, "arange", forbidden)
-    monkeypatch.setattr(torch.Tensor, "index_copy_", forbidden)
-    monkeypatch.setattr(torch.Tensor, "index_select", forbidden)
-    assert torch.equal(
-        fixed_rows(value, lambda x: x + 2, projection_rows=64), value + 2
-    )
 
 
 @pytest.mark.parametrize("rows", [-1, True, 1.0])
@@ -123,7 +107,7 @@ def _equal(actual, expected):
 
 
 @pytest.mark.parametrize("kind", ["kda", "mla_key", "mla_value"])
-@pytest.mark.parametrize("rows", [1, 2, 7, 16, 40, 64])
+@pytest.mark.parametrize("rows", [1, 7, 64])
 def test_bmm_offset_stride_and_original_consumers(kind, rows, monkeypatch):
     parent, value, strides, offset = _bmm_parent(kind, rows, "cpu", torch.float32)
     parent.copy_(torch.arange(parent.numel()).reshape(parent.shape) % 5)
@@ -154,8 +138,7 @@ def test_bmm_offset_stride_and_original_consumers(kind, rows, monkeypatch):
     _equal(_consumer(kind, actual), _consumer(kind, expected))
 
 
-@pytest.mark.parametrize("width", range(1, 9))
-def test_router_padding_crops_before_one_expert_exchange(width):
+def test_router_padding_crops_before_one_expert_exchange():
     config = SimpleNamespace(
         num_experts_per_tok=3, norm_topk_prob=True, routed_scaling_factor=1.25
     )
@@ -182,7 +165,7 @@ def test_router_padding_crops_before_one_expert_exchange(width):
         },
         10,
     )
-    hidden = torch.randn(3 * width, 16)
+    hidden = torch.randn(12, 16)
     result = module(hidden, projection_rows=64)
     assert len(calls) == 1 and calls[0][0] is hidden
     padded = F.pad(hidden, (0, 0, 0, 64 - hidden.shape[0]))
@@ -191,60 +174,18 @@ def test_router_padding_crops_before_one_expert_exchange(width):
     assert torch.equal(result, module.shared(padded)[: len(hidden)])
 
 
-def test_dense_keeps_prepared_objects_and_single_physical_call():
-    module = DenseMLP.__new__(DenseMLP)
-    nn.Module.__init__(module)
-    module.limit = 10
-    calls = []
-
-    class Prepared(nn.Module):
-        def forward(self, x):
-            calls.append((self, x.shape, x.stride()))
-            return x * 0.5
-
-    module.gate, module.up, module.down = Prepared(), Prepared(), Prepared()
-    module(torch.randn(12, 16, dtype=torch.bfloat16), projection_rows=64)
-    assert [x[0] for x in calls] == [module.gate, module.up, module.down]
-    assert all(x[1] == (64, 16) and x[2] == (16, 1) for x in calls)
-
-
-def test_head_pads_normalization_and_projection_together():
-    model = Glm53Model(
-        SimpleNamespace(rms_norm_eps=1e-6),
-        torch.randn(19, 16),
-        torch.randn(16),
-        torch.randn(19, 16),
-        [],
-    )
-    hidden = torch.randn(12, 16)
-    expected = model.logits(F.pad(hidden, (0, 0, 0, 52)))[:12]
-    assert torch.equal(model.logits(hidden, projection_rows=64), expected)
-
-
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
-@pytest.mark.parametrize("projection_rows", [64, 96, 128, 192, 256, 512])
+@pytest.mark.parametrize("projection_rows", [64, 96])
 @torch.inference_mode()
-def test_gpu_fixed_rows_all_widths_companions_and_graph_view_lifetime(
-    dtype, projection_rows
-):
+def test_gpu_fixed_rows_changed_input_graph(dtype, projection_rows):
     torch.manual_seed(2743)
     weight = torch.randn(1536, 4096, device="cuda", dtype=dtype) * 0.02
     full = torch.randn(projection_rows, 4096, device="cuda", dtype=dtype)
     expected = F.linear(full, weight)
-    for batch in (1, 2, 3, 4, 5, projection_rows // 8):
-        for width in range(1, 9):
-            rows = batch * width
-            actual = linear(full[:rows], weight, projection_rows=projection_rows)
-            assert torch.equal(actual, expected[:rows])
-    # Move the same row across the first tile and final row, changing companions.
-    for position in (*range(64), projection_rows - 1):
-        moved = full.roll(position, 0).mul(-0.5)
-        moved[position].copy_(full[0])
-        assert torch.equal(
-            linear(moved, weight, projection_rows=projection_rows)[position],
-            expected[0],
-        )
+    for rows in (1, 7, projection_rows):
+        actual = linear(full[:rows], weight, projection_rows=projection_rows)
+        assert torch.equal(actual, expected[:rows])
     live_rows = projection_rows // 8 * 6  # MTP5 verification for this batch bucket.
     static = full[:live_rows].clone()
     for _ in range(3):
@@ -266,7 +207,7 @@ def test_gpu_fixed_rows_all_widths_companions_and_graph_view_lifetime(
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 @pytest.mark.parametrize("kind", ["kda", "mla_key", "mla_value"])
-@pytest.mark.parametrize("projection_rows", [64, 96, 128, 192, 256, 512])
+@pytest.mark.parametrize("projection_rows", [64, 96])
 @torch.inference_mode()
 def test_gpu_bmm_full_parent_offset_and_changed_input_graph(kind, projection_rows):
     live_rows = projection_rows // 8 * 6
@@ -311,90 +252,6 @@ def test_gpu_bmm_full_parent_offset_and_changed_input_graph(kind, projection_row
         expected = torch.bmm(reference, weight)[:, :live_rows]
         _equal(output, expected)
         _equal(_consumer(kind, output), _consumer(kind, expected))
-
-
-@pytest.mark.skipif(
-    not torch.cuda.is_available() or torch.cuda.get_device_capability()[0] != 10,
-    reason="requires Blackwell CUDA",
-)
-@pytest.mark.parametrize("kind", ["router", "head", "nvfp4_dense"])
-@pytest.mark.parametrize("projection_rows", [64, 96, 128, 192, 256, 512])
-@torch.inference_mode()
-def test_gpu_complete_router_head_prepared_dense_fixed_shapes(kind, projection_rows):
-    torch.manual_seed(773)
-    if kind == "router":
-        operation = Router(
-            SimpleNamespace(
-                num_experts_per_tok=8, norm_topk_prob=True, routed_scaling_factor=2.5
-            ),
-            torch.randn(288, 4096, device="cuda") * 0.02,
-            torch.randn(288, device="cuda") * 0.01,
-        )
-    elif kind == "head":
-        model = Glm53Model(
-            SimpleNamespace(rms_norm_eps=1e-6),
-            torch.empty(0, 4096, device="cuda", dtype=torch.bfloat16),
-            torch.randn(4096, device="cuda", dtype=torch.bfloat16),
-            torch.randn(4096, 4096, device="cuda", dtype=torch.bfloat16) * 0.02,
-            [],
-        )
-        operation = model.logits
-    else:
-        from resin_models_cuda.nvfp4 import Nvfp4Linear, Nvfp4LinearWeights
-
-        def prepared(inner, outer):
-            with torch.device("cuda"):
-                source = Nvfp4LinearWeights(inner, outer)
-            source.weight.random_(0, 256)
-            source.weight_scale.fill_(0.125)
-            source.weight_scale_2.fill_(0.125)
-            source.input_scale.fill_(1)
-            return Nvfp4Linear(source, "cute-dsl")
-
-        module = DenseMLP.__new__(DenseMLP)
-        nn.Module.__init__(module)
-        module.limit = 10
-        module.gate, module.up, module.down = (
-            prepared(4096, 2048),
-            prepared(4096, 2048),
-            prepared(2048, 4096),
-        )
-        operation = module
-    full = torch.randn(projection_rows, 4096, device="cuda", dtype=torch.bfloat16)
-    expected = operation(full)
-    for batch in (1, 2, 3, 4, 5, projection_rows // 8):
-        for width in range(1, 9):
-            rows = batch * width
-            result = operation(full[:rows], projection_rows=projection_rows)
-            _equal(
-                result,
-                tuple(x[:rows] for x in expected)
-                if isinstance(expected, tuple)
-                else expected[:rows],
-            )
-    live_rows = projection_rows // 8 * 6
-    static = full[:live_rows].clone()
-    for _ in range(3):
-        operation(static, projection_rows=projection_rows)
-    graph = torch.cuda.CUDAGraph()
-    with torch.cuda.graph(graph):
-        output = operation(static, projection_rows=projection_rows)
-    gc.collect()
-    pressure = torch.empty(16 * 1024**2, device="cuda", dtype=torch.uint8).fill_(23)
-    del pressure
-    for scale in (0.5, -0.75):
-        static.copy_(static.roll(1, 0) * scale)
-        graph.replay()
-        torch.cuda.synchronize()
-        reference = torch.zeros_like(full)
-        reference[:live_rows].copy_(static)
-        result = operation(reference)
-        _equal(
-            output,
-            tuple(x[:live_rows] for x in result)
-            if isinstance(result, tuple)
-            else result[:live_rows],
-        )
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")

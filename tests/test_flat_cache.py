@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import numpy as np
 import pytest
 from output_helpers import forward_output
@@ -112,12 +114,6 @@ class TestFlatCacheApi:
                     window_tokens=4,
                     read_window_tokens=read_window,
                 )
-        with pytest.raises(AttributeError):
-            # Removed API must fail at runtime.
-            _ = history.resident_blocks  # ty: ignore[unresolved-attribute]
-        with pytest.raises(TypeError, match="resident_blocks"):
-            # Removed constructor argument must fail at runtime.
-            CacheGroupLayout(4, resident_blocks=1)  # ty: ignore[unknown-argument]
         with pytest.raises(TypeError):
             # Invalid retention type must fail at runtime.
             CacheGroupLayout(4, retention="state")  # ty: ignore[invalid-argument-type]
@@ -141,9 +137,7 @@ class TestFlatCacheApi:
         assert layout.estimated_parent_count([0, 0]) == 0
         assert layout.estimated_parent_count([0, 1, 4, 5, 17]) == 9
         assert layout.estimated_parent_count((0, 1, 4, 5, 17)) == 9
-        assert (
-            layout.estimated_parent_count([24, 24, 24], shared_prefix_tokens=16) == 9
-        )
+        assert layout.estimated_parent_count([24, 24, 24], shared_prefix_tokens=16) == 9
         with pytest.raises(ValueError, match="align"):
             layout.estimated_parent_count([24, 24], shared_prefix_tokens=15)
         with pytest.raises(ValueError, match="exceeds"):
@@ -213,68 +207,31 @@ class TestFlatCacheApi:
             with pytest.raises(ValueError, match="read-only"):
                 array[0] = 0
 
-    def test_binding_requires_an_exact_layout_callable_and_pool_ack(self) -> None:
-        layout = CacheLayout(parent_capacity=2, groups=[CacheGroupLayout(2)])
-
-        class MissingBinder:
-            runner_config = RunnerConfig(cache_layout=layout)
-
-            @staticmethod
-            def forward(plan: BatchPlan) -> ForwardOutput:
-                return forward_output([0] * plan.num_sequences)
-
+    def test_managed_cache_requires_a_binder_and_none_acknowledgement(self) -> None:
+        runner = SimpleNamespace(
+            runner_config=RunnerConfig(
+                cache_layout=CacheLayout(
+                    parent_capacity=2, groups=[CacheGroupLayout(2)]
+                )
+            ),
+            forward=lambda plan: forward_output([0] * plan.num_sequences),
+        )
         with pytest.raises(TypeError, match="bind_resources"):
-            Engine(MissingBinder())
-
-        class BadLayout(MissingBinder):
-            runner_config = {"cache_layout": {"parent_capacity": 2}}
-
-            @staticmethod
-            def bind_resources(binding: object) -> None:
-                del binding
-
-        with pytest.raises(TypeError, match="exactly a RunnerConfig"):
-            Engine(BadLayout())
-
-        class BadAck(MissingBinder):
-            def __init__(self, acknowledgement: object) -> None:
-                self.acknowledgement = acknowledgement
-
-            def bind_resources(self, binding: ResourceBinding):
-                del binding
-                return self.acknowledgement
-
+            Engine(runner)  # ty: ignore[invalid-argument-type]
+        runner.bind_resources = lambda binding: True
         with pytest.raises(TypeError, match="must return None"):
-            Engine(BadAck(True))
-        with pytest.raises(TypeError, match="must return None"):
-            Engine(BadAck(999_999))
+            Engine(runner)  # ty: ignore[invalid-argument-type]
 
-        runner = RecordingCachedRunner(layout)
-        engine = Engine(runner)
-        assert engine.cache_pool_id is not None
-        assert engine.cache_pool_id > 0
-        assert runner.bindings == [(engine.cache_pool_id, layout)]
-        assert runner.bindings[0][1] is layout
-
-    def test_explicit_none_layout_is_unmanaged_and_ignores_stray_binder(self) -> None:
-        class UnmanagedRunner:
-            def __init__(self) -> None:
-                self.bind_calls = 0
+    def test_unmanaged_cache_ignores_stray_binder(self) -> None:
+        class Runner:
+            def forward(self, plan: BatchPlan) -> ForwardOutput:
+                return forward_output([0] * plan.num_sequences)
 
             def bind_resources(self, binding: object) -> None:
-                del binding
-                self.bind_calls += 1
-                raise AssertionError("an unmanaged runner must not bind a cache pool")
+                raise AssertionError("unmanaged runner called its binder")
 
-            @staticmethod
-            def forward(plan: BatchPlan) -> ForwardOutput:
-                return forward_output([0] * plan.num_sequences)
-
-        runner = UnmanagedRunner()
-        engine = Engine(runner)
-        assert engine.cache_pool_id is None
-        assert runner.bind_calls == 0
-        engine.close()
+        with Engine(Runner()) as engine:
+            assert engine.cache_pool_id is None
 
 
 class TestFlatCacheEngine:

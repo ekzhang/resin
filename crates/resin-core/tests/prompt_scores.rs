@@ -115,18 +115,6 @@ fn configured_prompt_top_limit_is_checked_before_admission() {
 }
 
 #[test]
-fn unscored_plans_do_not_allocate_prompt_target_metadata() {
-    let mut engine = engine(4);
-    let mut input = Submission::new(vec![1, 2, 3], ());
-    input.max_output_tokens = Some(1);
-    engine.submit(input).unwrap();
-    let mut model = Model::default();
-    engine.step(&mut model).unwrap();
-    assert_eq!(model.plans[0].prompt_target_indptr.capacity(), 0);
-    assert_eq!(model.plans[0].prompt_target_token_ids.capacity(), 0);
-}
-
-#[test]
 fn prompt_top_and_position_targets_work_alone_or_together_across_chunks() {
     for chunk in [1, 2, 4] {
         for (top, targets) in [

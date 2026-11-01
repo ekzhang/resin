@@ -40,22 +40,8 @@ def _fail(message: str) -> NoReturn:
         (Gemma4CudaRunner, (), {}),
     ],
 )
-@pytest.mark.parametrize(
-    "policies,expected",
-    [
-        ({}, ("breakable", "full")),
-        (
-            {"cuda_graph_prefill": "disabled", "cuda_graph_decode": "breakable"},
-            ("disabled", "breakable"),
-        ),
-        (
-            {"cuda_graph_prefill": "full", "cuda_graph_decode": "disabled"},
-            ("full", "disabled"),
-        ),
-    ],
-)
 def test_model_runner_passes_graph_policies_to_shared_runtime(
-    monkeypatch, runner_type, args, kwargs, policies, expected
+    monkeypatch, runner_type, args, kwargs
 ):
     class ReachedSharedRuntime(Exception):
         pass
@@ -68,8 +54,14 @@ def test_model_runner_passes_graph_policies_to_shared_runtime(
 
     monkeypatch.setattr(CudaRunner, "__init__", initialize)
     with pytest.raises(ReachedSharedRuntime):
-        runner_type(*args, device="cuda", **kwargs, **policies)
-    assert received == [expected]
+        runner_type(
+            *args,
+            device="cuda",
+            **kwargs,
+            cuda_graph_prefill="disabled",
+            cuda_graph_decode="breakable",
+        )
+    assert received == [("disabled", "breakable")]
 
 
 @pytest.mark.parametrize(

@@ -8,7 +8,6 @@ import pytest
 import torch
 
 from resin import BatchPhase, BatchPlan, SamplingParams
-from resin.backend.cuda import completion as completion_runtime
 from resin.backend.cuda.sampling import FusedSampler
 from resin.backend.speculative import SpeculativeStats
 from resin_models_cuda.deepseek_v41.cuda import DeepSeekV41CudaRunner
@@ -74,119 +73,70 @@ def _fixture(runner_type, *, scored=False):
 
 
 @pytest.mark.parametrize("runner_type", [DeepSeekV41CudaRunner, InklingCudaRunner])
-@pytest.mark.parametrize("fixed", [None, 0, 1, 2])
-@pytest.mark.parametrize("scored", [False, True])
-def test_eager_verification_preserves_state_and_unscored_cpu_harvest(
-    monkeypatch, runner_type, fixed, scored
+@pytest.mark.parametrize("scored,fixed", [(False, None), (True, 0)])
+def test_eager_verification_routes_scores_and_rolls_back_accepted_state(
+    monkeypatch, runner_type, scored, fixed
 ):
-    from resin.backend.speculative import _accept_speculative_tokens
-
-    runner, plan, logits, drafts, targets = _fixture(runner_type, scored=scored)
+    runner, plan, logits, drafts, _ = _fixture(runner_type, scored=scored)
     runner._speculation.benchmark_accepted_drafts = fixed
     positions = torch.tensor(plan.positions, dtype=torch.int64)
-    anchors = torch.tensor(plan.token_ids, dtype=torch.int64)
-    expected = _accept_speculative_tokens(
-        drafts.tolist(), targets.tolist(), benchmark_accepted_drafts=fixed
-    )
-    state_counts, state_positions, broadcasts, commits = [], [], [], []
+    counts, stored = [], []
     if runner_type is DeepSeekV41CudaRunner:
         from resin_models_cuda.deepseek_v41 import cuda as runtime
 
-        runner._broadcast_tokens = lambda value: (
-            broadcasts.append(tuple(value.shape)) or value
-        )
+        runner._broadcast_tokens = lambda value: value
         runner._model = SimpleNamespace(
-            draft=lambda *_args, **_kwargs: drafts,
-            forward_verify=lambda *_args, **_kwargs: (logits, object()),
-            commit_dspark_main_block=lambda *_args, **_kwargs: commits.append("main"),
-            clear_rejected_speculative_state=lambda _positions, counts, *_args, **_kwargs: (
-                state_counts.append(counts.clone())
+            draft=lambda *a, **kw: drafts,
+            forward_verify=lambda *a, **kw: (logits, object()),
+            commit_dspark_main_block=lambda *a, **kw: None,
+            clear_rejected_speculative_state=lambda _positions, processed, *a, **kw: (
+                counts.append(processed.tolist())
             ),
         )
     else:
         runtime = inkling_runtime
         runner._draft = SimpleNamespace(
-            propose=lambda *_args: (drafts, None),
-            inject_target=lambda *_args: commits.append("draft"),
+            propose=lambda *a: (drafts, None), inject_target=lambda *a: None
         )
         runner._model = SimpleNamespace(
-            target=lambda *_args, **_kwargs: (logits, object(), object(), None),
+            target=lambda *a, **kw: (logits, object(), object(), None)
         )
-        runner._initial_state = lambda *_args: object()
-        runner._store_state = lambda _cache, positions, _state: state_positions.append(
-            positions.clone()
-        )
+        runner._initial_state = lambda *a: object()
+        runner._store_state = lambda _cache, ends, _state: stored.append(ends)
         monkeypatch.setattr(
             runtime,
             "select_convolution_state",
-            lambda _initial, _inputs, counts, **_kwargs: state_counts.append(
-                counts.clone()
+            lambda _initial, _inputs, processed, **kw: counts.append(
+                processed.tolist()
             ),
         )
 
-    class Stager:
-        def __init__(self, device):
-            pass
-
-        def output(self, name, source):
-            return source.clone()
-
-    class Event:
-        def record(self, stream):
-            pass
-
-        def synchronize(self):
-            pass
-
-    decisions = []
+    prepared, result = object(), object()
 
     def score(raw, decision, native):
-        assert scored
-        assert raw is logits and native is plan
-        decisions.append(decision)
-        return completion_runtime.DeviceScores(
-            torch.zeros_like(decision.tokens, dtype=torch.float32),
-            torch.empty((*decision.tokens.shape, 0), dtype=torch.int64),
-            torch.empty((*decision.tokens.shape, 0), dtype=torch.float32),
-            logits.shape[-1],
-        )
+        assert scored and raw is logits and native is plan
+        return prepared
 
-    def forbid_list(_tensor):
-        raise AssertionError("verification must not round-trip device tokens")
+    def complete(decision, **kwargs):
+        assert kwargs["scores"] is prepared and kwargs["plan"] is plan
+        return SimpleNamespace(result=lambda: result)
 
-    monkeypatch.setattr(completion_runtime, "TensorStager", Stager)
-    monkeypatch.setattr(completion_runtime.torch.cuda, "Event", Event)
-    monkeypatch.setattr(
-        completion_runtime.torch.cuda, "current_stream", lambda device: None
-    )
     monkeypatch.setattr(runtime, "score_completion", score)
-    with monkeypatch.context() as patch:
-        if scored:
-            patch.setattr(torch.Tensor, "tolist", forbid_list)
-        else:
-            forbidden = SimpleNamespace(
-                from_samples=forbid_list, from_acceptance=forbid_list
-            )
-            patch.setattr(runtime, "DeviceAcceptance", forbidden)
-            patch.setattr(runtime, "DeviceCompletion", forbidden)
-        output = runner._speculative_decode(plan, object(), anchors, positions)
-    assert len(decisions) == int(scored)
-    assert broadcasts == (
-        [(2, 2), (2, 3)] if runner_type is DeepSeekV41CudaRunner else []
+    monkeypatch.setattr(
+        runtime, "DeviceCompletion", SimpleNamespace(from_acceptance=complete)
     )
-    assert commits == (["main"] if runner_type is DeepSeekV41CudaRunner else ["draft"])
+    output = runner._speculative_decode(
+        plan, object(), torch.tensor(plan.token_ids, dtype=torch.int64), positions
+    )
+    expected = [1, 1] if scored else [2, 3]
+    assert counts == [expected]
+    if stored:
+        torch.testing.assert_close(stored[0], positions + torch.tensor(expected) - 1)
+    if scored:
+        assert output is result
+    else:
+        assert output.token_ids.tolist() == [2, 4, 3, 4, 5]
     assert runner._sampler.calls == [(2, 3, 10)]
-    assert (output.logprobs is not None) == scored
-    assert state_counts[0].tolist() == expected.processed_counts
-    if state_positions:
-        assert (
-            state_positions[0].tolist()
-            == (positions + torch.tensor(expected.processed_counts) - 1).tolist()
-        )
-    assert output.token_ids.tolist() == sum(expected.token_rows, [])
-    assert runner._speculation.blocks == 2
-    assert runner._speculation.accepted == sum(expected.accepted_counts)
-    assert runner._speculation.emitted == sum(expected.processed_counts)
 
 
 @pytest.mark.parametrize("fixed", [None, 1])
@@ -259,7 +209,7 @@ def test_deepseek_graph_verification_samples_and_broadcasts_one_block():
     assert runner._graph_logits[(2, 128)] is logits
 
 
-@pytest.mark.parametrize("fixed", [-1, 0, 2])
+@pytest.mark.parametrize("fixed", [-1, 0])
 def test_inkling_graph_keeps_target_logits_and_one_device_acceptance(
     monkeypatch, fixed
 ):

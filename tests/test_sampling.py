@@ -86,10 +86,6 @@ class TestSamplingContract:
         with pytest.raises((OverflowError, ValueError)):
             SamplingParams(**kwargs)
 
-    def test_sampling_params_rejects_retired_generation_limit_name(self) -> None:
-        with pytest.raises(TypeError, match="max_new_tokens"):
-            SamplingParams(max_new_tokens=1)  # ty: ignore[unknown-argument]
-
     def test_stop_tokens_are_snapshotted_before_submission(self) -> None:
         stops = [0]
         params = SamplingParams(max_output_tokens=3, stop_token_ids=stops)

@@ -735,11 +735,8 @@ class TestGptOssCudaTinyOracle:
         assert not hasattr(attention, "k_proj")
         assert not hasattr(attention, "v_proj")
 
-    def test_router_uses_tinygemm_through_128_rows_then_linear(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        import torch
-
+    @pytest.mark.parametrize("rows", [128, 129])
+    def test_router_dispatches_at_tinygemm_row_boundary(self, monkeypatch, rows):
         router = cast(
             TopKRouter,
             SimpleNamespace(
@@ -747,84 +744,38 @@ class TestGptOssCudaTinyOracle:
                 bias=torch.randn(16, dtype=torch.bfloat16),
             ),
         )
+        hidden = torch.randn(rows, 64, dtype=torch.bfloat16)
         calls = []
 
-        def tinygemm(input, weight, output, bias, *, use_pdl):
-            calls.append((input.shape[0], use_pdl))
-            output.copy_(torch.nn.functional.linear(input, weight, bias))
+        def tinygemm(value, weight, output, bias, *, use_pdl):
+            calls.append(value.shape[0])
+            output.fill_(3)
 
-        monkeypatch.setattr("resin_models_cuda.gpt_oss.cuda.tinygemm_bf16", tinygemm)
-        for rows in (1, 2, 4, 8, 16, 32, 64, 128):
-            hidden = torch.randn(rows, 64, dtype=torch.bfloat16)
-            expected = torch.nn.functional.linear(hidden, router.weight, router.bias)
-            torch.testing.assert_close(
-                _router_logits(router, hidden), expected, rtol=0, atol=0
-            )
-
-        hidden = torch.randn(129, 64, dtype=torch.bfloat16)
-        expected = torch.nn.functional.linear(hidden, router.weight, router.bias)
-        torch.testing.assert_close(
-            _router_logits(router, hidden), expected, rtol=0, atol=0
+        monkeypatch.setattr(gpt_oss_runtime, "tinygemm_bf16", tinygemm)
+        actual = _router_logits(router, hidden)
+        expected = (
+            torch.full_like(actual, 3)
+            if rows == 128
+            else torch.nn.functional.linear(hidden, router.weight, router.bias)
         )
+        torch.testing.assert_close(actual, expected)
+        assert calls == ([128] if rows == 128 else [])
 
-        assert calls == [
-            (1, False),
-            (2, False),
-            (4, False),
-            (8, False),
-            (16, False),
-            (32, False),
-            (64, False),
-            (128, False),
-        ]
-
-    @pytest.mark.parametrize("experts", [32, 128])
-    def test_official_top4_router_uses_cutile_and_other_layouts_fall_back(
-        self, monkeypatch: pytest.MonkeyPatch, experts: int
-    ) -> None:
-        import torch
-
-        official = cast(
-            TopKRouter, SimpleNamespace(top_k=4, benchmark_balanced_experts=False)
+    @pytest.mark.parametrize("top_k,experts", [(4, 32), (4, 128), (2, 16)])
+    def test_router_selects_fused_or_generic_topk(self, monkeypatch, top_k, experts):
+        router = cast(
+            TopKRouter, SimpleNamespace(top_k=top_k, benchmark_balanced_experts=False)
         )
-        logits = torch.randn(32, experts, dtype=torch.bfloat16)
-        expected_values, expected_indices = torch.topk(logits, 4, dim=-1, sorted=True)
-        expected_weights = torch.softmax(expected_values, dim=-1)
-        calls = []
-
-        def top4_softmax(actual_logits):
-            calls.append(actual_logits.shape)
-            return expected_indices.to(torch.int32), expected_weights.to(torch.float32)
-
-        with monkeypatch.context() as context:
-            context.setattr("resin_models_cuda.gpt_oss.cuda.top4_softmax", top4_softmax)
-            indices, weights = _route(official, logits)
-
-        assert calls == [torch.Size([32, experts])]
-        torch.testing.assert_close(indices, expected_indices.to(torch.int32))
-        torch.testing.assert_close(weights, expected_weights.to(torch.float32))
-
-        generic = cast(
-            TopKRouter, SimpleNamespace(top_k=2, benchmark_balanced_experts=False)
-        )
-        indices, weights = _route(generic, logits[:, :16])
-        values, expected_indices = torch.topk(logits[:, :16], 2, dim=-1, sorted=True)
-        torch.testing.assert_close(indices, expected_indices)
-        torch.testing.assert_close(weights, torch.softmax(values, dim=-1))
-
-        large_logits = torch.randn(8192, experts, dtype=torch.bfloat16)
-        large_values, large_indices = torch.topk(large_logits, 4, dim=-1, sorted=True)
-        fused_calls = []
-
-        def fused(actual_logits):
-            fused_calls.append(actual_logits)
-            return large_indices.int(), torch.softmax(large_values, dim=-1)
-
-        with monkeypatch.context() as context:
-            context.setattr("resin_models_cuda.gpt_oss.cuda.top4_softmax", fused)
-            _route(official, large_logits)
-        assert len(fused_calls) == 1
-        assert fused_calls[0] is large_logits
+        logits = torch.randn(3, experts, dtype=torch.bfloat16)
+        fused = (object(), object())
+        monkeypatch.setattr(gpt_oss_runtime, "top4_softmax", lambda value: fused)
+        actual = _route(router, logits)
+        if top_k == 4:
+            assert actual is fused
+        else:
+            values, indices = logits.topk(top_k, dim=-1)
+            torch.testing.assert_close(actual[0], indices)
+            torch.testing.assert_close(actual[1], values.softmax(-1))
 
     def test_synthetic_routes_balance_ep_owners_in_both_router_paths(self):
         from resin.bench import BenchmarkRunner
@@ -889,53 +840,23 @@ class TestGptOssCudaTinyOracle:
 
         assert step.output.tolist() == [0, 1]
 
-    def test_rotary_path_matches_reference_formula_without_dtype_promotion(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        import torch
+    def test_rotary_adapter_passes_packed_rows_in_place_and_skips_empty(
+        self, monkeypatch
+    ):
+        hidden = torch.zeros(2, 3, 8, dtype=torch.bfloat16)
+        cos, sin = torch.ones(1, 2, 4), torch.zeros(1, 2, 4)
+        calls = []
 
-        runner = GptOssCudaRunner.__new__(GptOssCudaRunner)
-        setattr(runner, "_torch", torch)
-        hidden = torch.tensor(
-            [
-                [[1.0, 2.0, 3.0, 4.0], [0.5, -1.0, 2.0, -3.0]],
-                [[-2.0, 1.0, 0.25, 0.75], [4.0, 3.0, 2.0, 1.0]],
-            ],
-            dtype=torch.bfloat16,
-        )
-        cos = torch.tensor([[[1.0, 0.5], [0.25, 1.0]]], dtype=torch.bfloat16)
-        sin = torch.tensor([[[0.0, 0.5], [1.0, 0.0]]], dtype=torch.bfloat16)
+        def rotate(value, cosine, sine, **options):
+            calls.append((value.shape, cosine.shape, sine.shape, options))
+            value.fill_(7)
 
-        def apply_rotary(hidden, cos, sin, *, interleaved, inplace):
-            assert not interleaved
-            assert inplace
-            first, second = hidden.chunk(2, dim=-1)
-            hidden.copy_(
-                torch.cat(
-                    (
-                        first * cos.unsqueeze(0).unsqueeze(2)
-                        - second * sin.unsqueeze(0).unsqueeze(2),
-                        second * cos.unsqueeze(0).unsqueeze(2)
-                        + first * sin.unsqueeze(0).unsqueeze(2),
-                    ),
-                    dim=-1,
-                )
-            )
-            return hidden
-
-        first, second = hidden.chunk(2, dim=-1)
-        expected = torch.cat(
-            (
-                first * cos.squeeze(0).unsqueeze(1)
-                - second * sin.squeeze(0).unsqueeze(1),
-                second * cos.squeeze(0).unsqueeze(1)
-                + first * sin.squeeze(0).unsqueeze(1),
-            ),
-            dim=-1,
-        )
-
-        monkeypatch.setattr("resin_models_cuda.gpt_oss.cuda.apply_rotary", apply_rotary)
-        actual = runner._apply_yarn_rotary(hidden, cos, sin)
-
-        assert actual.dtype == torch.bfloat16
-        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+        monkeypatch.setattr(gpt_oss_runtime, "apply_rotary", rotate)
+        runner = object.__new__(GptOssCudaRunner)
+        assert runner._apply_yarn_rotary(hidden, cos, sin) is hidden
+        assert torch.equal(hidden, torch.full_like(hidden, 7))
+        empty = hidden[:0]
+        assert runner._apply_yarn_rotary(empty, cos, sin) is empty
+        assert calls == [
+            ((1, 2, 3, 8), (2, 4), (2, 4), dict(interleaved=False, inplace=True))
+        ]

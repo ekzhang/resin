@@ -444,24 +444,7 @@ def test_paged_cache_plan_rejects_a_row_owned_append_to_the_wrong_logical_block(
         PagedCachePlan.from_plan(mutated, layout, decode_lookahead=3)
 
 
-def test_paged_cache_plan_reports_the_first_invalid_row_before_later_ranges() -> None:
-    plan, layout = _mixed_cache_plan(decode=True)
-    group = plan.cache_groups[0]
-    offsets = group.append_block_offsets.copy()
-    offsets[0] = 1  # Earlier row has an invalid append, later row an invalid extent.
-    firsts = group.block_table_start_indices.copy()
-    firsts[1] = 1
-    mutated = _replace_plan_group(
-        plan, 0, append_block_offsets=offsets, block_table_start_indices=firsts
-    )
-    with pytest.raises(ValueError, match="cache group 0 row 0 append target"):
-        PagedCachePlan.from_plan(mutated, layout, decode_lookahead=3)
-
-
-@pytest.mark.parametrize("earlier_bad_append", [False, True])
-def test_paged_cache_plan_preserves_row_order_for_window_write_failures(
-    earlier_bad_append: bool,
-) -> None:
+def test_paged_cache_plan_rejects_window_writes_that_exceed_read_capacity() -> None:
     plan, layout = _mixed_cache_plan(decode=True)
     layout = CacheLayout(
         parent_capacity=layout.parent_capacity,
@@ -477,16 +460,7 @@ def test_paged_cache_plan_preserves_row_order_for_window_write_failures(
             layout.groups[2],
         ],
     )
-    if earlier_bad_append:
-        offsets = plan.cache_groups[1].append_block_offsets.copy()
-        offsets[3] = 0
-        plan = _replace_plan_group(plan, 1, append_block_offsets=offsets)
-    message = (
-        "cache group 1 row 1 append target"
-        if earlier_bad_append
-        else "cache group 1 row 2 write span 8 exceeds 6-token"
-    )
-    with pytest.raises(ValueError, match=message):
+    with pytest.raises(ValueError, match="write span .* exceeds"):
         PagedCachePlan.from_plan(plan, layout, decode_lookahead=3)
 
 

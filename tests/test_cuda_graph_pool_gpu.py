@@ -309,3 +309,68 @@ def test_fused_sampling_shared_pool_replays_policies_and_preserves_owned_outputs
             assert stats["eager_fallback_count"] == 0
     finally:
         graphs.close()
+
+
+@torch.inference_mode()
+def test_pending_feedback_drives_successor_before_either_shared_pool_result_is_harvested():
+    from resin.backend.cuda.completion import DeviceAcceptance, DeviceCompletion
+
+    def build(shape):
+        rows = shape[0]
+        tokens = torch.zeros(rows, dtype=torch.int64, device="cuda")
+        positions = torch.ones(rows, dtype=torch.int64, device="cuda")
+        samples = torch.empty((rows, 3), dtype=torch.int64, device="cuda")
+
+        def launch():
+            samples[:, 0].copy_(tokens + 1)
+            samples[:, 1].copy_(tokens + 1)
+            samples[:, 2].copy_(tokens + 2)
+
+        return CudaGraphStep(
+            {"tokens": tokens, "positions": positions}, (samples, positions), launch
+        )
+
+    def mode(shapes):
+        return CudaGraphMode(
+            shapes,
+            build,
+            lambda shape: {
+                "tokens": torch.zeros(shape[0], dtype=torch.int64, device="cuda"),
+                "positions": torch.ones(shape[0], dtype=torch.int64, device="cuda"),
+            },
+        )
+
+    graphs = CudaGraphExecutor(
+        "cuda",
+        {"decode": mode(((1,),)), "other": mode(((4,),))},
+        synchronize_failure=lambda: torch.cuda.synchronize(),
+    )
+    try:
+        graphs.capture_all()
+
+        def enqueue(tokens, positions):
+            samples, anchors = graphs.mode("decode").run(
+                (1,), {"tokens": tokens, "positions": positions}
+            )
+            accepted = DeviceAcceptance.from_samples(
+                samples[:, :1], samples[:, 1:], anchors
+            )
+            return DeviceCompletion.from_acceptance(accepted, rows=1)
+
+        first = enqueue(
+            torch.tensor([3], device="cuda"), torch.tensor([5], device="cuda")
+        )
+        second = enqueue(first.feedback.token_ids, first.feedback.positions)
+        graphs.mode("other").run(
+            (4,),
+            {
+                "tokens": torch.full((4,), 100, dtype=torch.int64, device="cuda"),
+                "positions": torch.ones(4, dtype=torch.int64, device="cuda"),
+            },
+        )
+        assert second.result().token_ids.tolist() == [6, 7]
+        assert first.result().token_ids.tolist() == [4, 5]
+        assert first.feedback.positions.tolist() == [7]
+        assert second.feedback.positions.tolist() == [9]
+    finally:
+        graphs.close()

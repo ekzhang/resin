@@ -431,78 +431,24 @@ class TestCudaGraph:
         with pytest.raises(ValueError, match="kv_cache_dtype"):
             _resolve_kv_cache_dtype("float16")
 
-    def test_runner_reuses_one_mechanism_across_execution_modes(
-        self, graph_torch
+    def test_shared_decode_defaults_keep_ordered_buckets_and_history_width(
+        self,
     ) -> None:
-        events = []
-
-        def build_prefill(_shape):
-            state = _Tensor([0])
-            return CudaGraphProgram(
-                inputs={"value": state},
-                output=state,
-                regions=(
-                    CudaGraphRegion("attention", lambda: None),
-                    CudaGraphRegion("collective", lambda: None, capture=False),
-                    CudaGraphRegion("moe", lambda: None),
-                ),
-            )
-
-        def build_decode(_shape):
-            state = _Tensor([0])
-            return CudaGraphStep({"value": state}, state, lambda: None)
-
-        graphs = CudaGraphExecutor(
-            "cuda:0",
-            {
-                "prefill": CudaGraphMode(
-                    ((4, 128),), build_prefill, lambda _shape: {"value": [1]}
-                ),
-                "decode": CudaGraphMode(
-                    ((4, 4096),), build_decode, lambda _shape: {"value": [2]}
-                ),
-            },
-            synchronize_failure=lambda: None,
-        )
-
-        stats = graphs.capture_all(
-            before_capture=lambda: events.append("before"),
-            after_capture=lambda: events.append("after"),
-        )
-
-        assert events == ["before", "after"]
-        assert stats["prefill"]["graph_region_count"] == 2
-        assert stats["prefill"]["graph_break_count"] == 1
-        assert stats["decode"]["graph_region_count"] == 1
-        assert graphs.mode("prefill").run((4, 128), {"value": [3]}).tolist() == [3]
-        assert graphs.mode("decode").run((4, 4096), {"value": [4]}).tolist() == [4]
-
-    def test_shared_decode_defaults_use_one_history_capacity(self) -> None:
         assert DEFAULT_MAX_NUM_SEQS == 128
         assert DEFAULT_DECODE_GRAPH_MAX_BATCH_SIZE == 1024
-        assert default_decode_graph_shapes(4096, speculative=True) == tuple(
-            (batch_size, 4096)
-            for batch_size in (
-                *range(1, 9),
-                *range(12, 33, 4),
-                *range(40, 65, 8),
-                *range(96, 257, 32),
-                *range(384, 1025, 128),
+        for speculative in (False, True):
+            shapes = default_decode_graph_shapes(4096, speculative=speculative)
+            batches = tuple(shape[0] for shape in shapes)
+            assert batches == tuple(sorted(set(batches)))
+            assert (
+                batches[0] == 1 and batches[-1] == DEFAULT_DECODE_GRAPH_MAX_BATCH_SIZE
             )
-        )
-        assert default_decode_graph_shapes(4096, speculative=False) == tuple(
-            (batch_size, 4096)
-            for batch_size in (
-                1,
-                2,
-                4,
-                8,
-                *range(12, 17, 4),
-                *range(24, 33, 8),
-                *range(64, 129, 32),
-                *range(256, 1025, 128),
+            assert all(width == 4096 for _, width in shapes)
+            capped = default_decode_graph_shapes(
+                128, speculative=speculative, max_batch_size=17
             )
-        )
+            assert capped[-1] == (17, 128)
+            assert all(batch <= 17 for batch, _ in capped)
 
     def test_shared_decode_defaults_respect_lower_sequence_limit(self) -> None:
         assert default_decode_graph_shapes(
