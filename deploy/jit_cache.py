@@ -1,4 +1,4 @@
-"""Persistent compiler namespaces and FlashInfer artifact loading for Modal runtimes."""
+"""Persistent compiler namespaces and artifact loading for Modal runtimes."""
 
 from __future__ import annotations
 
@@ -48,7 +48,8 @@ KERNEL_CACHE_ENV = {
     "FLASH_ATTENTION_CUTE_DSL_CACHE_ENABLED": "1",
     "FLASH_ATTENTION_CUTE_DSL_CACHE_DIR": _cache_dir("flash-attention-4"),
     "FLASH_ATTENTION_ARCH": "sm_90a",
-    # Underlying CUTLASS DSL MLIR cache and QuACK's compiled object cache.
+    # Underlying CUTLASS DSL MLIR cache and persistent CuTe executables.
+    # RMSNorm and Resin's scorer both use QuACK's compiled-object cache.
     "CUTE_DSL_CACHE_DIR": _cache_dir("cute-dsl"),
     "CUTE_DSL_ARCH": "sm_90a",
     "QUACK_CACHE_ENABLED": "1",

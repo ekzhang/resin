@@ -86,14 +86,25 @@ FA4/CuTe DSL, Triton, compiler-extension helpers, and MoE tactic files each have
 their own upstream reuse semantics. Routing all of their directories beneath one
 mount is not equivalent to validating them with `ArtifactCache`.
 
+The CUDA scorer uses QuACK's persistent CuTe object cache. With
+`QUACK_CACHE_ENABLED=1`, compiled objects are exported under `QUACK_CACHE_DIR`
+and loaded directly on subsequent processes. Serving routes this directory into
+the shared kernel volume alongside the lower-level `CUTE_DSL_CACHE_DIR`.
+Scoring keys include its source digest, target architecture, compiler/runtime
+versions, and kernel configuration; batch size and requested top count remain
+runtime arguments. In-memory executors are isolated by CUDA context, while disk
+objects remain reusable across processes. QuACK owns locking, publication, and
+unloadable-object recovery; these objects do not use Resin's `ArtifactCache`
+sidecars.
+
 ## Runtime integration
 
 The shared deployment registry selects compiler environment variables and
 persistent cache volumes. Before importing GPU libraries, runtime setup creates
 the compiler directories and installs the FlashInfer content-addressed loading
-wrapper where applicable. A cache miss builds in local scratch and publishes
-the completed library through `ArtifactCache`; later workers validate that
-specific artifact before loading it.
+wrapper where applicable. A covered FlashInfer cache miss builds in local scratch
+and publishes the completed library through `ArtifactCache`; later workers
+validate that specific artifact before loading it.
 
 The launchers capture graphs and warm up their model before serving, then commit
 the kernel volume. They do not run a separate prewarm/reuse-verification job or

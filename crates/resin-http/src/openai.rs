@@ -67,7 +67,7 @@ pub(crate) struct ChatRequest {
     top_k: Option<u32>,
     seed: Option<i64>,
     logprobs: Option<bool>,
-    top_logprobs: Option<usize>,
+    top_logprobs: Option<u32>,
     #[serde(default)]
     prompt_logprobs: bool,
     routed_dp_rank: Option<Value>,
@@ -102,7 +102,7 @@ pub(crate) struct ResponsesRequest {
     top_k: Option<u32>,
     seed: Option<i64>,
     logprobs: Option<bool>,
-    top_logprobs: Option<usize>,
+    top_logprobs: Option<u32>,
     #[serde(default)]
     prompt_logprobs: bool,
     routed_dp_rank: Option<Value>,
@@ -181,7 +181,7 @@ pub async fn chat_completions(
 fn chat_request(state: &AppState, body: ChatRequest) -> RequestResult<ConversationRequest> {
     validate_model(state, &body.model)?;
     validate_sampling(body.temperature, body.top_p, body.top_k, body.seed)?;
-    validate_logprobs(body.top_logprobs)?;
+    validate_logprobs(body.top_logprobs, state.max_top_logprobs)?;
     validate_stops(body.stop.as_ref())?;
     if body.messages.is_empty() {
         return Err(invalid_request("messages must not be empty"));
@@ -438,7 +438,7 @@ fn responses_request(
 ) -> RequestResult<ConversationRequest> {
     validate_model(state, &body.model)?;
     validate_sampling(body.temperature, body.top_p, body.top_k, body.seed)?;
-    validate_logprobs(body.top_logprobs)?;
+    validate_logprobs(body.top_logprobs, state.max_top_logprobs)?;
     validate_stops(body.stop.as_ref())?;
     body.logprobs = Some(
         body.logprobs.unwrap_or(false)
@@ -801,9 +801,11 @@ fn unix_seconds() -> u64 {
         .map_or(0, |duration| duration.as_secs())
 }
 
-fn validate_logprobs(top_logprobs: Option<usize>) -> RequestResult<()> {
-    if top_logprobs.is_some_and(|count| count > 20) {
-        return Err(invalid_request("top_logprobs must be between 0 and 20"));
+fn validate_logprobs(top_logprobs: Option<u32>, maximum: u32) -> RequestResult<()> {
+    if top_logprobs.is_some_and(|count| count > maximum) {
+        return Err(invalid_request(format!(
+            "top_logprobs must be between 0 and {maximum}"
+        )));
     }
     Ok(())
 }

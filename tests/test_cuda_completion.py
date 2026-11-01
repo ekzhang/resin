@@ -318,29 +318,23 @@ def test_scored_completion_preserves_speculative_outputs_across_replay(monkeypat
     from resin.backend.cuda import completion as runtime
     from resin.backend.sampling import format_output
 
-    use_cuda = torch.cuda.is_available()
-    if not use_cuda:
+    class Stager:
+        def __init__(self, device):
+            pass
 
-        class Stager:
-            def __init__(self, device):
-                pass
+        def output(self, name, source):
+            return source.clone()
 
-            def output(self, name, source):
-                return source.clone()
+    class Event:
+        def record(self, stream):
+            pass
 
-            def device(self, name, values, dtype):
-                return torch.as_tensor(values, dtype=dtype).clone()
+        def synchronize(self):
+            pass
 
-        class Event:
-            def record(self, stream):
-                pass
-
-            def synchronize(self):
-                pass
-
-        monkeypatch.setattr(runtime, "TensorStager", Stager)
-        monkeypatch.setattr(runtime.torch.cuda, "Event", Event)
-        monkeypatch.setattr(runtime.torch.cuda, "current_stream", lambda device: None)
+    monkeypatch.setattr(runtime, "TensorStager", Stager)
+    monkeypatch.setattr(runtime.torch.cuda, "Event", Event)
+    monkeypatch.setattr(runtime.torch.cuda, "current_stream", lambda device: None)
 
     plan = BatchPlan(
         sequence_ids=[1, 2, 3, 4],
@@ -374,34 +368,31 @@ def test_scored_completion_preserves_speculative_outputs_across_replay(monkeypat
         for row, count in zip(tokens[:4].tolist(), counts[:4].tolist(), strict=True)
     ]
     expected = format_output(logits[:4], accepted, plan)
-    device = "cuda" if use_cuda else "cpu"
-    tokens, counts, logits = (value.to(device) for value in (tokens, counts, logits))
-    feedback = runtime.DeviceFeedback(
-        feedback.token_ids.to(device), feedback.positions.to(device)
+    values = logits.log_softmax(-1)
+    top_values, top_ids = values.topk(2, dim=-1)
+    scores = runtime.DeviceScores(
+        values.gather(-1, tokens[..., None]).squeeze(-1),
+        top_ids,
+        top_values,
+        logits.shape[-1],
     )
-    normalize = torch.Tensor.log_softmax
-    score_shapes = []
+    with pytest.raises(ValueError, match="require prepared scores"):
+        runtime.DeviceCompletion(tokens, counts, feedback, rows=4, plan=plan)
 
-    def record_normalize(tensor, *args, **kwargs):
-        score_shapes.append(tuple(tensor.shape))
-        return normalize(tensor, *args, **kwargs)
+    def forbid_normalize(*args, **kwargs):
+        raise AssertionError("completion must only stage prepared scores")
 
-    monkeypatch.setattr(torch.Tensor, "log_softmax", record_normalize)
-    debug_mode = torch.cuda.get_sync_debug_mode() if use_cuda else 0
-    try:
-        if use_cuda:
-            torch.cuda.set_sync_debug_mode("error")
-        pending = runtime.DeviceCompletion(
-            tokens, counts, feedback, rows=4, plan=plan, logits=logits
-        )
-        # The next replay may replace every graph output before CPU harvest.
-        tokens.fill_(-1)
-        counts.zero_()
-        logits.fill_(100)
-    finally:
-        if use_cuda:
-            torch.cuda.set_sync_debug_mode(debug_mode)
-    assert score_shapes == [(2, 4, 7)]
+    monkeypatch.setattr(torch.Tensor, "log_softmax", forbid_normalize)
+    pending = runtime.DeviceCompletion(
+        tokens, counts, feedback, rows=4, plan=plan, scores=scores
+    )
+    # The next replay may replace every graph output before CPU harvest.
+    tokens.fill_(-1)
+    counts.zero_()
+    logits.fill_(100)
+    scores.logprobs.fill_(100)
+    scores.top_ids.fill_(0)
+    scores.top_logprobs.fill_(100)
     actual = pending.result()
     assert pending.result() is actual
     for name in (

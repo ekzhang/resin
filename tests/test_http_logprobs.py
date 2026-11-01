@@ -176,7 +176,7 @@ def collect_scores(response, *, api, stream, partial_tokens):
             value = next(
                 chunk["response"]
                 for chunk in chunks
-                if chunk["type"] == "response.completed"
+                if chunk["type"] in ("response.completed", "response.incomplete")
             )
             final_scores = [
                 token

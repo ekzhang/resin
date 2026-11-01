@@ -44,8 +44,6 @@ from resin.backend.plans import PagedCachePlan
 from resin.backend.sampling import (
     SAMPLING_OFFSET_STRIDE,
     PromptScores,
-    format_output,
-    prompt_scores,
 )
 from resin.backend.speculative import SpeculativeStats
 from resin.backend.topology import ParallelGroups, ParallelismCapabilities
@@ -71,6 +69,7 @@ from resin_models_cuda.qwen3_5.checkpoint import (
     resolve_model_path,
 )
 from resin_models_cuda.qwen3_5.model import Qwen35DecoderLayer
+from resin_models_cuda.scoring import format_output, prompt_scores, score_completion
 
 if TYPE_CHECKING:
     from resin import BatchPlan, ForwardOutput
@@ -269,6 +268,8 @@ class Qwen3_5CudaRunner(CudaRunner):
         self._graph_device_caches: dict[GraphShape, DeviceCache] = {}
         self._graph_attention: dict[GraphShape, GraphPagedAttentionRuntime] = {}
         self._graph_acceptance: dict[GraphShape, DeviceAcceptance] = {}
+        self._graph_logits: dict[GraphShape, torch.Tensor] = {}
+        self._feedback_graph_inputs = {}
         self._graph_next_hidden: dict[GraphShape, torch.Tensor] = {}
         self._continuation = CudaContinuation()
         cache_dtype = self.kv_cache_torch_dtype
@@ -626,11 +627,9 @@ class Qwen3_5CudaRunner(CudaRunner):
                 recurrent_pool=cache.recurrent_pool(previous, positions),
             )
             cache.store_hidden(positions, hidden[:, -1])
-            output_ids[:, 0].copy_(
-                graph_sample(
-                    self._sampler, self._model.logits(hidden[:, -1]), sampling, 0
-                )
-            )
+            logits = self._model.logits(hidden[:, -1])
+            self._graph_logits[shape] = logits
+            output_ids[:, 0].copy_(graph_sample(self._sampler, logits, sampling, 0))
             self._graph_acceptance[shape] = DeviceAcceptance.from_samples(
                 output_ids[:, :0],
                 output_ids,
@@ -687,9 +686,9 @@ class Qwen3_5CudaRunner(CudaRunner):
                 ),
                 recurrent_pool=pool,
             )
-            targets = self._sampler.sample_block(
-                self._model.logits(verify_hidden), sampling, start_step=0
-            )
+            logits = self._model.logits(verify_hidden)
+            self._graph_logits[shape] = logits
+            targets = self._sampler.sample_block(logits, sampling, start_step=0)
             acceptance = DeviceAcceptance.from_samples(
                 drafts,
                 targets,
@@ -765,9 +764,9 @@ class Qwen3_5CudaRunner(CudaRunner):
                 rotary_positions=pair_rotary,
                 recurrent_pool=pool,
             )
-            targets = self._sampler.sample_block(
-                self._model.logits(hidden), sampling, start_step=0
-            )
+            logits = self._model.logits(hidden)
+            self._graph_logits[shape] = logits
+            targets = self._sampler.sample_block(logits, sampling, start_step=0)
             acceptance = DeviceAcceptance.from_samples(
                 draft_ids[:, None],
                 targets,
@@ -825,8 +824,6 @@ class Qwen3_5CudaRunner(CudaRunner):
         inputs.update(self._cache.graph_device_inputs(cache))
         inputs.update(attention.graph_inputs())
         inputs.update(self._sampler.graph_inputs(sampling))
-        if not hasattr(self, "_feedback_graph_inputs"):
-            self._feedback_graph_inputs = {}
         self._feedback_graph_inputs[shape] = inputs
 
         def prepare() -> None:
@@ -849,9 +846,6 @@ class Qwen3_5CudaRunner(CudaRunner):
         enqueue: bool = False,
         feedback=None,
     ):
-        if plan.needs_logprobs:
-            self._cuda_graph_fallback("decode", "logprobs")
-            return None
         batch_size = plan.num_sequences
         history_pages = max(
             int(np.diff(cache_plan.groups[index].block_indptr).max())
@@ -962,6 +956,8 @@ class Qwen3_5CudaRunner(CudaRunner):
             device=self.device,
             stats=self._speculation if self.speculative_draft_tokens else None,
             next_hidden=next_hidden,
+            plan=plan,
+            scores=score_completion(self._graph_logits[shape], acceptance, plan),
         )
         # A later conservative plan can advance by the Engine's maximum output
         # width. Drain before it could exceed this graph's token capacity;
@@ -1143,10 +1139,9 @@ class Qwen3_5CudaRunner(CudaRunner):
         token_ids: torch.Tensor,
         positions: torch.Tensor,
     ) -> ForwardOutput:
-        final_logits = []
-        prompt_rows = []
-        outputs = []
-        states = []
+        final_logits: list[torch.Tensor] = []
+        prompt_rows: list[PromptScores | None] = []
+        states: list[tuple] = []
         for row, (start, end) in enumerate(rows):
             row_cache = cache.row(row)
             row_ids = token_ids[start:end][None]
@@ -1219,9 +1214,8 @@ class Qwen3_5CudaRunner(CudaRunner):
                 convolution,
                 hidden[:, -1],
             )
-            outputs.append(int(sampled[row]))
         scores = PromptScores.concat(cast(list[PromptScores], prompt_rows))
-        return format_output(logits, outputs, plan, prompt_logprobs=scores)
+        return format_output(logits, sampled, plan, prompt_logprobs=scores)
 
     @torch.inference_mode()
     def _initialize_drafts(self, plan, cache, anchors, positions):
@@ -1413,7 +1407,7 @@ class Qwen3_5CudaRunner(CudaRunner):
             stats=self._speculation,
             device=self.device,
             plan=plan,
-            logits=verify_logits,
+            scores=score_completion(verify_logits, acceptance, plan),
             next_hidden=next_hidden if self.speculative_draft_tokens > 1 else None,
         ).result()
 
@@ -1458,15 +1452,9 @@ class Qwen3_5CudaRunner(CudaRunner):
     @execute_state
     def enqueue(self, plan: BatchPlan, *, feedback=None):
         """Device-feedback decode over one retained graph admission."""
-        if (
-            plan.phase != BatchPhase.DECODE
-            or plan.needs_logprobs
-            or plan.needs_prompt_logprobs
-        ):
+        if plan.phase != BatchPhase.DECODE or plan.needs_prompt_logprobs:
             if feedback is not None:
-                raise RuntimeError(
-                    "a device continuation requires unscored captured decode"
-                )
+                raise RuntimeError("a device continuation requires captured decode")
             return self.forward(plan)
         self._check_cuda_graphs(plan.phase)
         if feedback is not None:

@@ -3,6 +3,9 @@
 use crate::engine::{Error, Result};
 use crate::output::TokenRows;
 
+/// Default limit on top alternatives per generated or prompt token.
+pub const DEFAULT_MAX_TOP_LOGPROBS: u32 = 32;
+
 #[derive(Clone, Debug)]
 pub struct TokenLogprobs {
     pub logprob: f32,

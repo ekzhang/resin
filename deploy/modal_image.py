@@ -147,6 +147,13 @@ def build_modal_image(
             f"{_SOURCE_ROOT}/models/torch/resin_models_torch/__init__.py",
             copy=True,
         )
+        # uv resolves declared workspace sources even for --no-deps builds.
+        # Only the MLX manifest is needed; its package and runtime stay excluded.
+        .add_local_file(
+            root / "models/mlx/pyproject.toml",
+            f"{_SOURCE_ROOT}/models/mlx/pyproject.toml",
+            copy=True,
+        )
         .add_local_dir(
             root / "models/cuda",
             f"{_SOURCE_ROOT}/models/cuda",

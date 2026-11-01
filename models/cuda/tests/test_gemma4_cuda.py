@@ -461,6 +461,8 @@ def test_graph_attention_contract_matches_capture_and_replay(
     runner._graph_attention = {}
     runner._graph_spec_attention = {}
     runner._graph_verify_hidden = {}
+    runner._graph_logits = {}
+    runner._graph_acceptance = {}
     shape = (2, 3)
     step = runner._new_decode_graph_step(shape)
     inputs = runner._graph_capture_inputs(shape, vocab_size=16)

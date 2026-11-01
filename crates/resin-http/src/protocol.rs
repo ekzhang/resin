@@ -19,7 +19,7 @@ pub struct ConversationRequest {
     pub top_k: Option<u32>,
     pub seed: Option<i64>,
     pub logprobs: bool,
-    pub top_logprobs: usize,
+    pub top_logprobs: u32,
     pub prompt_logprobs: bool,
     pub routed_dp_rank: Option<usize>,
     pub stop: Vec<String>,

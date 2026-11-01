@@ -34,6 +34,7 @@ from resin_models_cuda.gemma4.edge_checkpoint import (
     load_edge_model,
 )
 from resin_models_cuda.gemma4.edge_kernels import norm_residual
+from resin_models_cuda.scoring import score_completion
 
 
 class _EdgeHiddenLease:
@@ -647,7 +648,7 @@ class Gemma4EdgeCudaRunner(Gemma4CudaRunner):
         return super()._speculative_graph_forward(native, batch)
 
     def _enqueue_graph(self, native, batch, feedback):
-        if not self._cuda_graph_mode_enabled("decode") or native.needs_logprobs:
+        if not self._cuda_graph_mode_enabled("decode"):
             return None
         sequence_ids = tuple(map(int, native.sequence_ids))
         if (
@@ -828,6 +829,8 @@ class Gemma4EdgeCudaRunner(Gemma4CudaRunner):
             rows=rows,
             stats=self._speculation if self.speculative_draft_tokens else None,
             device=self.device,
+            plan=native,
+            scores=score_completion(self._graph_logits[shape], accepted, native),
         )
         if hidden_lease is not None:
             hidden_lease.record_use()
@@ -854,11 +857,9 @@ class Gemma4EdgeCudaRunner(Gemma4CudaRunner):
         """Queue genuine graph work; Engine owns completion and writer leases."""
         if feedback is None:
             self._continuation.drain()
-        if plan.phase != BatchPhase.DECODE or plan.needs_logprobs:
+        if plan.phase != BatchPhase.DECODE:
             if feedback is not None:
-                raise GraphInputError(
-                    "a continuation requires captured decode without logprobs"
-                )
+                raise GraphInputError("a continuation requires captured decode")
             return self.forward(plan)
         self._check_cuda_graphs(plan.phase)
         if isinstance(feedback, _EdgeDeviceFeedback) and self._wide_graph(

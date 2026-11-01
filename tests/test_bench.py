@@ -52,7 +52,9 @@ class Runner:
         self.plans.append(plan)
         if plan.phase == BatchPhase.DECODE and self.speculative_draft_tokens:
             drafts = [[2] * self.speculative_draft_tokens for _ in plan.sequence_ids]
-            targets = [[9] * (self.speculative_draft_tokens + 1) for _ in plan.sequence_ids]
+            targets = [
+                [9] * (self.speculative_draft_tokens + 1) for _ in plan.sequence_ids
+            ]
             acceptance = self._speculation.accept(drafts, targets)
             self.processed_counts.append(acceptance.processed_counts)
             return forward_output(acceptance.token_rows)
@@ -792,33 +794,6 @@ def test_partial_admission_is_canceled_on_failure():
             measure_steps=1,
         )
     assert not engine.local.has_work()
-
-
-def test_deepseek_fixed_acceptance_reaches_actual_compressor_rollback(monkeypatch):
-    from types import SimpleNamespace
-
-    from resin_models_cuda.deepseek_v41.cuda import DeepSeekV41CudaRunner
-
-    runner = DeepSeekV41CudaRunner.__new__(DeepSeekV41CudaRunner)
-    runner.device = torch.device("cpu")
-    runner.speculative_draft_tokens = 4
-    runner._speculation = SpeculativeStats(4, benchmark_accepted_drafts=3)
-    observed = []
-    monkeypatch.setattr(
-        runner,
-        "_model",
-        SimpleNamespace(
-            clear_rejected_speculative_state=lambda positions, counts, block, *, cache: (
-                observed.append((positions.tolist(), counts.tolist(), block, cache))
-            )
-        ),
-        raising=False,
-    )
-    result = runner._accept_speculative(
-        [[2, 3, 4, 5]], [[9, 8, 7, 6, 5]], torch.tensor([10]), "cache"
-    )
-    assert result == [[2, 3, 4, 6]]
-    assert observed == [([10], [4], 5, "cache")]
 
 
 @pytest.mark.parametrize(

@@ -34,12 +34,12 @@ from resin.backend.cuda.staging import TensorStager
 from resin.backend.cuda.state import execute_state
 from resin.backend.cuda.vision_cache import VisionFeatureCache
 from resin.backend.plans import PagedCachePlan
-from resin.backend.sampling import format_output, prompt_scores
 from resin.backend.speculative import SpeculativeStats
 from resin.backend.topology import ParallelismCapabilities
 from resin.backend.torch import use_default_dtype
 from resin_models_cuda.glm5_3_flash.cache import CacheArena, CacheGeometry
 from resin_models_cuda.glm5_3_flash.checkpoint import load_model, resolve_model_path
+from resin_models_cuda.scoring import format_output, prompt_scores, score_completion
 
 
 @dataclass(frozen=True)
@@ -262,14 +262,6 @@ class Glm53FlashCudaRunner(CudaRunner):
             device=self.device,
             dtype=torch.long,
         )
-        logits_buffer = torch.empty(
-            (size, draft_tokens + 1, self.vocab_size)
-            if draft_tokens
-            else (size, self.vocab_size),
-            device=self.device,
-            dtype=torch.float32,
-        )
-        self._graph_logits[shape] = logits_buffer
         valid = (
             torch.empty((), device=self.device, dtype=torch.int32)
             if self.parallel_groups is not None
@@ -319,7 +311,7 @@ class Glm53FlashCudaRunner(CudaRunner):
                         projection_rows=projection_rows,
                     )
                     output.copy_(acceptance.tokens)
-                    logits_buffer.copy_(logits)
+                    self._graph_logits[shape] = logits
                 else:
                     with self._parallel_graph_capacity(size, valid_rows=valid):
                         batch = cache.batch(
@@ -333,8 +325,8 @@ class Glm53FlashCudaRunner(CudaRunner):
                         batch.store(hidden)
                         logits = self._model.logits(
                             hidden, projection_rows=projection_rows
-                        ).float()
-                        logits_buffer.copy_(logits)
+                        )
+                        self._graph_logits[shape] = logits
                         self._sampler.sample_tensors(logits, sampling, out=output)
                     acceptance = DeviceAcceptance.from_samples(
                         output[:, None][:, :0], output[:, None], positions
@@ -430,13 +422,14 @@ class Glm53FlashCudaRunner(CudaRunner):
         if enqueue:
             return self._enqueue_graph_output(plan, shape, inputs, feedback)
         self._run_cuda_graph("decode", shape, inputs)
+        acceptance = self._graph_acceptance[shape]
         completion = DeviceCompletion.from_acceptance(
-            self._graph_acceptance[shape],
+            acceptance,
             rows=batch_size,
             device=self.device,
             stats=self._speculation if self.speculative_draft_tokens else None,
             plan=plan,
-            logits=self._graph_logits[shape] if plan.needs_logprobs else None,
+            scores=score_completion(self._graph_logits[shape], acceptance, plan),
         )
         return completion.result()
 
@@ -463,9 +456,7 @@ class Glm53FlashCudaRunner(CudaRunner):
             if self.speculative_draft_tokens and plan is not None
             else None,
             plan=plan,
-            logits=self._graph_logits[shape]
-            if plan is not None and plan.needs_logprobs
-            else None,
+            scores=score_completion(self._graph_logits[shape], acceptance, plan),
         )
         maximum = self.runner_config.max_accepted_per_step
         writes = maximum + self.cache_layout.decode_write_extra_tokens
@@ -519,7 +510,7 @@ class Glm53FlashCudaRunner(CudaRunner):
                 device=self.device,
                 stats=self._speculation,
                 plan=plan,
-                logits=logits,
+                scores=score_completion(logits, acceptance, plan),
             ).result()
         contexts = staging.device("context_lengths", plan.context_lengths, torch.int32)
         indptr = staging.device("indptr", plan.token_indptr, torch.int32)
@@ -556,9 +547,7 @@ class Glm53FlashCudaRunner(CudaRunner):
             )
         last = (indptr[1:] - 1).long()
         batch.store(hidden[last])
-        logits = self._model.logits(
-            hidden[last], projection_rows=batch.projection_rows
-        ).float()
+        logits = self._model.logits(hidden[last], projection_rows=batch.projection_rows)
         scores = (
             prompt_scores(plan, hidden, self._model.logits)
             if plan.needs_prompt_logprobs

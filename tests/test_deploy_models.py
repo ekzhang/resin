@@ -2,6 +2,7 @@
 
 import importlib
 from dataclasses import replace
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
@@ -12,9 +13,32 @@ from deploy.models import (
     create_runner,
     download_checkpoint,
     get_model,
+    image_environment,
+    prepare_runtime,
     require_checkpoint,
     validate_gpu,
 )
+
+
+@pytest.mark.parametrize("spec", MODEL_SPECS.values(), ids=lambda spec: spec.name)
+def test_cuda_scorer_cache_is_persisted_for_every_deployment(spec):
+    env = image_environment(spec)
+    if spec.backend != "cuda":
+        assert env == {}
+        return
+    assert spec.kernel_volume is not None and spec.kernel_mount is not None
+    assert env["QUACK_CACHE_ENABLED"] == "1"
+    for key in ("QUACK_CACHE_DIR", "CUTE_DSL_CACHE_DIR"):
+        assert Path(env[key]).is_relative_to(spec.kernel_mount)
+
+
+@pytest.mark.parametrize("name", ["gemma4", "gemma4-e2b", "deepseek-v41"])
+def test_runtime_prepares_persistent_cute_cache(tmp_path, name):
+    spec = replace(get_model(name), kernel_mount=str(tmp_path))
+    prepare_runtime(spec)
+    env = image_environment(spec)
+    assert Path(env["QUACK_CACHE_DIR"]).is_dir()
+    assert Path(env["CUTE_DSL_CACHE_DIR"]).is_dir()
 
 
 def test_mlx_factory_constructs_single_device_runner(monkeypatch, tmp_path):

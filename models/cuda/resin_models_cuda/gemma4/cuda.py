@@ -43,8 +43,6 @@ from resin.backend.cuda.vision_cache import VisionFeatureCache
 from resin.backend.resources import CachePoolBinding
 from resin.backend.sampling import (
     SAMPLING_OFFSET_STRIDE,
-    format_output,
-    prompt_scores,
     token_output,
 )
 from resin.backend.speculative import SpeculativeStats
@@ -77,6 +75,7 @@ from resin_models_cuda.gemma4.model import (
 )
 from resin_models_cuda.gemma4.parallel import attention_geometry
 from resin_models_cuda.nvfp4 import select_nvfp4_backend as _select_nvfp4_backend
+from resin_models_cuda.scoring import format_output, prompt_scores, score_completion
 
 if TYPE_CHECKING:
     from resin import BatchPlan, ForwardOutput
@@ -327,6 +326,7 @@ class Gemma4CudaRunner(CudaRunner):
         self._graph_spec_attention: dict[GraphShape, tuple[Any, Any, Any, Any]] = {}
         self._graph_verify_hidden: dict[GraphShape, Tensor] = {}
         self._graph_acceptance: dict[GraphShape, DeviceAcceptance] = {}
+        self._graph_logits: dict[GraphShape, Tensor] = {}
         torch.cuda.synchronize(self.device)
         free_memory, total_memory = torch.cuda.mem_get_info(self.device)
         capacity_plan = plan_gemma4_kv_capacity(
@@ -1001,6 +1001,7 @@ class Gemma4CudaRunner(CudaRunner):
                 token_ids,
             )
             logits = self._model.logits(hidden)
+            self._graph_logits[shape] = logits
             self._sampler.sample_tensors(logits, sampling, out=output_ids)
 
         inputs = {
@@ -1031,9 +1032,6 @@ class Gemma4CudaRunner(CudaRunner):
         return BatchPrefillWithPagedKVCacheWrapper(*args, **kwargs)
 
     def _new_speculative_graph_step(self, shape: GraphShape) -> CudaGraphStep:
-        if not hasattr(self, "_graph_acceptance"):
-            self._graph_acceptance = {}
-
         assistant = self._assistant
         if assistant is None:
             raise RuntimeError("speculative graph requires the Gemma 4 assistant")
@@ -1207,6 +1205,7 @@ class Gemma4CudaRunner(CudaRunner):
             verify_logits = self._model.logits(hidden).view(
                 batch_size, width, self.config.vocab_size
             )
+            self._graph_logits[shape] = verify_logits
             if phase_timing is not None:
                 phase_timing.mark(2)
             output_ids[:, : self.speculative_draft_tokens].copy_(drafts)
@@ -1393,9 +1392,6 @@ class Gemma4CudaRunner(CudaRunner):
     def _graph_forward(
         self, native: BatchPlan, batch: Gemma4BatchPlan
     ) -> ForwardOutput | None:
-        if native.needs_logprobs:
-            self._cuda_graph_fallback("decode", "logprobs")
-            return None
         if not self._cuda_graph_mode_enabled("decode"):
             return None
         active_rows = native.num_sequences
@@ -1441,14 +1437,14 @@ class Gemma4CudaRunner(CudaRunner):
             )
         )
         self._prepare_graph_attention(shape, inputs)
-        return token_output(self._run_cuda_graph("decode", shape, inputs)[:active_rows])
+        output = self._run_cuda_graph("decode", shape, inputs)
+        if native.needs_logprobs:
+            return format_output(self._graph_logits[shape], output, native)
+        return token_output(output[:active_rows])
 
     def _speculative_graph_forward(
         self, native: BatchPlan, batch: Gemma4BatchPlan
     ) -> ForwardOutput | None:
-        if native.needs_logprobs:
-            self._cuda_graph_fallback("decode", "logprobs")
-            return None
         if not self._cuda_graph_mode_enabled("decode"):
             return None
         sequence_ids = [int(value) for value in native.sequence_ids]
@@ -1529,6 +1525,8 @@ class Gemma4CudaRunner(CudaRunner):
             rows=active_rows,
             stats=self._speculation,
             device=self.device,
+            plan=native,
+            scores=score_completion(self._graph_logits[shape], accepted, native),
         ).result()
 
     def _eager_transformer(self, native: BatchPlan, batch: Gemma4BatchPlan) -> Tensor:
@@ -1748,7 +1746,7 @@ class Gemma4CudaRunner(CudaRunner):
             stats=self._speculation,
             device=self.device,
             plan=native,
-            logits=verify_logits,
+            scores=score_completion(verify_logits, accepted, native),
         ).result()
 
     def _build_batch_plan(self, plan):

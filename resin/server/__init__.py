@@ -122,6 +122,7 @@ class HttpServer:
                     render_workers,
                     admissions_per_step,
                     engine.local.metrics_enabled,
+                    engine.local.max_top_logprobs,
                 )
             )
             states = engine.worker._drivers(

@@ -3,6 +3,7 @@
 //! The engine owns requests and cache leases; a runner only executes a frozen
 //! plan and releases model-local state. Opaque payloads carry frontend metadata.
 
+use crate::logprobs::DEFAULT_MAX_TOP_LOGPROBS;
 pub use crate::logprobs::{LogprobView, TokenLogprobs};
 use crate::metrics::{EngineMetricsSnapshot, EngineMetricsState, RequestMetricsState};
 pub use crate::output::{OwnedTokenRows, TokenRows};
@@ -541,6 +542,7 @@ pub struct EngineCore<P> {
     minimum_new_token_ratio: f64,
     new_token_ratio_decay: f64,
     context_length: NonZeroU32,
+    max_top_logprobs: u32,
     engine_id: u64,
     next_request_id: u64,
     next_batch_id: u64,
@@ -611,6 +613,7 @@ impl<P: Clone> EngineCore<P> {
             minimum_new_token_ratio,
             new_token_ratio_decay,
             context_length,
+            max_top_logprobs: DEFAULT_MAX_TOP_LOGPROBS,
             engine_id: mint_engine_id()?,
             next_request_id: 1,
             next_batch_id: 1,
@@ -721,6 +724,15 @@ impl<P: Clone> EngineCore<P> {
     }
     pub fn context_length(&self) -> u32 {
         self.context_length.get()
+    }
+
+    pub fn max_top_logprobs(&self) -> u32 {
+        self.max_top_logprobs
+    }
+
+    /// Set the alternative-count limit used for future admissions.
+    pub fn set_max_top_logprobs(&mut self, max_top_logprobs: u32) {
+        self.max_top_logprobs = max_top_logprobs;
     }
     pub fn has_work(&self) -> bool {
         self.in_flight.is_some() || !self.scheduler.is_empty() || self.storage_pending()
@@ -839,10 +851,11 @@ impl<P: Clone> EngineCore<P> {
         if token_ids.is_empty() {
             return Err(Error::invalid("token_ids must be non-empty"));
         }
-        if prompt_top_logprobs > 1000 {
-            return Err(Error::invalid(
-                "prompt_top_logprobs must be between 0 and 1000",
-            ));
+        if prompt_top_logprobs > self.max_top_logprobs {
+            return Err(Error::invalid(format!(
+                "prompt_top_logprobs must be between 0 and {}",
+                self.max_top_logprobs
+            )));
         }
         if let Some(targets) = &prompt_target_logprobs {
             if targets.len() != token_ids.len() || !targets[0].is_empty() {

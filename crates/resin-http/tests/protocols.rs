@@ -752,7 +752,7 @@ async fn score_options_are_explicit_normalized_request_fields() {
         assert_eq!(normalized["logprobs"], true);
         assert_eq!(normalized["top_logprobs"], 3);
         assert_eq!(normalized["prompt_logprobs"], true);
-        body["top_logprobs"] = json!(21);
+        body["top_logprobs"] = json!(33);
         let (status, _) = json_response(
             recording_router(1),
             Request::post(path)
@@ -762,6 +762,95 @@ async fn score_options_are_explicit_normalized_request_fields() {
         )
         .await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
+    }
+}
+
+#[tokio::test]
+async fn top_logprob_limits_apply_to_generation_and_token_counting() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    for path in [
+        "/v1/chat/completions",
+        "/v1/responses",
+        "/v1/responses/input_tokens",
+    ] {
+        for (maximum, count, accepted) in [
+            (0_u32, 0_u32, true),
+            (0, 1, false),
+            (2, 2, true),
+            (2, 3, false),
+            (64, 64, true),
+            (64, 65, false),
+            (1500, 1500, true),
+            (1500, 1501, false),
+            (u32::MAX, u32::MAX, true),
+        ] {
+            let (jobs, mut receiver) = mpsc::channel::<GenerationJob>(1);
+            let counted = Arc::new(AtomicUsize::new(0));
+            let calls = Arc::clone(&counted);
+            let counter: TokenCounter = Arc::new(move |request, result| {
+                calls.fetch_add(1, Ordering::Relaxed);
+                assert!(request.logprobs);
+                assert_eq!(request.top_logprobs, count);
+                let _ = result.send(Ok(17));
+            });
+            let app = router(
+                "test-model",
+                jobs,
+                Some(counter),
+                RouteConfig {
+                    max_top_logprobs: maximum,
+                    ..RouteConfig::default()
+                },
+                None,
+            );
+            let mut body = if path.ends_with("completions") {
+                json!({"messages": [{"role": "user", "content": "hi"}]})
+            } else {
+                json!({"input": "hi"})
+            };
+            body["model"] = json!("test-model");
+            body["logprobs"] = json!(true);
+            body["top_logprobs"] = json!(count);
+            body["stream"] = json!(true);
+            let response = app
+                .oneshot(
+                    Request::post(path)
+                        .header(header::CONTENT_TYPE, "application/json")
+                        .body(Body::from(body.to_string()))
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            let counting = path.ends_with("input_tokens");
+            if accepted {
+                assert_eq!(
+                    response.status(),
+                    StatusCode::OK,
+                    "{path}: {maximum}/{count}"
+                );
+                if counting {
+                    assert!(receiver.try_recv().is_err());
+                } else {
+                    let job = receiver.try_recv().unwrap();
+                    assert!(job.request.logprobs);
+                    assert_eq!(job.request.top_logprobs, count);
+                }
+            } else {
+                assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+                let bytes = response.into_body().collect().await.unwrap().to_bytes();
+                let error: Value = serde_json::from_slice(&bytes).unwrap();
+                assert_eq!(
+                    error["error"]["message"],
+                    format!("top_logprobs must be between 0 and {maximum}")
+                );
+                assert!(receiver.try_recv().is_err());
+            }
+            assert_eq!(
+                counted.load(Ordering::Relaxed),
+                usize::from(accepted && counting)
+            );
+        }
     }
 }
 

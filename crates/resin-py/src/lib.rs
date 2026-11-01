@@ -41,6 +41,7 @@ use cache::{
 use output::{BorrowedLogprobs, BorrowedOutput, ForwardOutput};
 use parallelism::Parallelism;
 use resin_core::engine::{self as core, CompletionReason};
+use resin_core::logprobs::DEFAULT_MAX_TOP_LOGPROBS;
 use resin_core::resources::paged_kv::PrefixStoragePolicy;
 use runner::{
     ResourceBinding, RunnerConfig, bind_runner_resources, optional_runner_callable,
@@ -183,9 +184,9 @@ struct SamplingParams {
     top_k: Option<u32>,
     seed: Option<i64>,
     logprobs: bool,
-    top_logprobs: usize,
+    top_logprobs: u32,
     prompt_logprobs: bool,
-    prompt_top_logprobs: usize,
+    prompt_top_logprobs: u32,
     extra: Option<Arc<Py<PyAny>>>,
 }
 
@@ -220,9 +221,9 @@ impl SamplingParams {
         top_k: Option<u32>,
         seed: Option<i64>,
         logprobs: bool,
-        top_logprobs: usize,
+        top_logprobs: u32,
         prompt_logprobs: bool,
-        prompt_top_logprobs: usize,
+        prompt_top_logprobs: u32,
         extra: Option<Py<PyAny>>,
     ) -> PyResult<Self> {
         if !temperature.is_finite() || temperature < 0.0 {
@@ -243,16 +244,6 @@ impl SamplingParams {
         if seed.is_some_and(|seed| seed < 0) {
             return Err(PyValueError::new_err(
                 "seed must be non-negative when supplied",
-            ));
-        }
-        if top_logprobs > 1000 {
-            return Err(PyValueError::new_err(
-                "top_logprobs must be between 0 and 1000",
-            ));
-        }
-        if prompt_top_logprobs > 1000 {
-            return Err(PyValueError::new_err(
-                "prompt_top_logprobs must be between 0 and 1000",
             ));
         }
         Ok(Self {
@@ -309,12 +300,12 @@ impl SamplingParams {
         self.prompt_logprobs
     }
     #[getter]
-    fn prompt_top_logprobs(&self) -> usize {
+    fn prompt_top_logprobs(&self) -> u32 {
         self.prompt_top_logprobs
     }
 
     #[getter]
-    fn top_logprobs(&self) -> usize {
+    fn top_logprobs(&self) -> u32 {
         self.top_logprobs
     }
 
@@ -573,10 +564,6 @@ impl BatchPlan {
         }
         if plan.prompt_score_token_ids.len() != plan.prompt_score_indices.len()
             || plan.prompt_score_top_counts.len() != plan.prompt_score_indices.len()
-            || plan
-                .prompt_score_top_counts
-                .iter()
-                .any(|&count| count > 1000)
             || plan
                 .prompt_score_indptr
                 .windows(2)
@@ -1528,7 +1515,7 @@ impl Engine {
 #[pymethods]
 impl Engine {
     #[new]
-    #[pyo3(signature = (runner: "Runner", *, max_running_requests = 32, context_length = 32768, scheduler_config = None, prefix_cache = false, prefix_cache_storage: "CacheStorage | None" = None, prefix_cache_max_inflight = None, prefix_cache_storage_policy: r#"Literal["write_through", "write_through_selective"]"# = "write_through_selective", enable_overlap = true, enable_metrics = true))]
+    #[pyo3(signature = (runner: "Runner", *, max_running_requests = 32, context_length = 32768, max_top_logprobs = DEFAULT_MAX_TOP_LOGPROBS, scheduler_config = None, prefix_cache = false, prefix_cache_storage: "CacheStorage | None" = None, prefix_cache_max_inflight = None, prefix_cache_storage_policy: r#"Literal["write_through", "write_through_selective"]"# = "write_through_selective", enable_overlap = true, enable_metrics = true))]
     #[allow(
         clippy::too_many_arguments,
         reason = "Python constructor exposes keyword configuration"
@@ -1538,6 +1525,7 @@ impl Engine {
         runner: Py<PyAny>,
         max_running_requests: usize,
         context_length: u32,
+        max_top_logprobs: u32,
         scheduler_config: Option<Py<SchedulerConfig>>,
         prefix_cache: bool,
         prefix_cache_storage: Option<Py<PyAny>>,
@@ -1588,6 +1576,7 @@ impl Engine {
             prefix_cache,
         )
         .map_err(core_error)?;
+        core.set_max_top_logprobs(max_top_logprobs);
         if enable_metrics {
             core.enable_metrics().map_err(core_error)?;
         }
@@ -1692,12 +1681,23 @@ impl Engine {
         let mut sampling_params = sampling_params
             .map(|params| params.borrow(py).clone())
             .unwrap_or_default();
+        let max_top_logprobs = self.core.max_top_logprobs();
+        for (name, count) in [
+            ("top_logprobs", sampling_params.top_logprobs),
+            ("prompt_top_logprobs", sampling_params.prompt_top_logprobs),
+        ] {
+            if count > max_top_logprobs {
+                return Err(PyValueError::new_err(format!(
+                    "{name} must be between 0 and {max_top_logprobs}"
+                )));
+            }
+        }
         sampling_params.seed.get_or_insert_with(|| {
             default_sampling_seed(self.core.id(), self.core.next_request_id())
         });
         let input = core::Submission {
             prompt_logprobs: sampling_params.prompt_logprobs,
-            prompt_top_logprobs: sampling_params.prompt_top_logprobs as u32,
+            prompt_top_logprobs: sampling_params.prompt_top_logprobs,
             prompt_target_logprobs,
             token_ids,
             max_output_tokens: sampling_params
@@ -1887,6 +1887,12 @@ impl Engine {
         self.core.max_running_requests()
     }
 
+    /// Maximum top alternatives per generated or prompt token.
+    #[getter]
+    fn max_top_logprobs(&self) -> u32 {
+        self.core.max_top_logprobs()
+    }
+
     #[getter]
     fn poisoned(&self) -> bool {
         self.core.poisoned()
@@ -2053,7 +2059,7 @@ fn validate_requested_logprobs(
                 let count = top.and_then(|top| {
                     let start = *top.indptr.get(index)?;
                     let end = *top.indptr.get(index + 1)?;
-                    end.checked_sub(start).map(|count| count as usize)
+                    end.checked_sub(start)
                 });
                 if !count.is_some_and(|count| count > 0 && count <= params.top_logprobs) {
                     return Err(PyRuntimeError::new_err(
