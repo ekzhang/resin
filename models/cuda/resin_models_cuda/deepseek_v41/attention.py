@@ -6,9 +6,9 @@ import torch
 from torch import nn
 from torch.nn import functional as F
 
-from resin.backend.cuda.mega_moe import prepare_weights
 from resin_models_cuda.deepseek_v41.kernels import act_quant, fp4_act_quant, unpack_kv
 from resin_models_cuda.deepseek_v41.linear import PreparedLinear, weight_scale_rows
+from resin_models_cuda.mega_moe import prepare_weights
 
 
 def pack_kv(value, *, fp4=False):

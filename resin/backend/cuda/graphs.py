@@ -72,7 +72,7 @@ class CudaGraphStats(TypedDict):
     poison_error: str | None
 
 
-def graph_shapes(value: object, *, dimensions: int) -> tuple[GraphShape, ...]:
+def _graph_shapes(value: object, *, dimensions: int) -> tuple[GraphShape, ...]:
     """Freeze positive integer CUDA graph shapes in deterministic order."""
 
     if value is None:
@@ -109,7 +109,7 @@ def default_decode_graph_shapes(
     """Return shared decode graph buckets with one dynamic-history capacity.
 
     Speculative decode uses denser batch buckets because padding repeats the
-    whole draft-and-verify path. Ordinary decode uses power-of-two buckets.
+    whole draft-and-verify path. Ordinary decode uses coarser batch buckets.
     The shared catalog extends through 1024 rows. Deployments should cap it at
     their scheduler's maximum number of sequences so every admitted decode
     batch has a compatible graph bucket.
@@ -145,7 +145,7 @@ def resolve_decode_graph_shapes(
         return default_decode_graph_shapes(
             width, speculative=speculative, max_batch_size=max_batch_size
         )
-    shapes = graph_shapes(value, dimensions=2)
+    shapes = _graph_shapes(value, dimensions=2)
     if policy == "disabled" and shapes:
         raise ValueError("disabled CUDA graphs cannot have nonempty graph shapes")
     return shapes
@@ -327,7 +327,7 @@ class _GraphEntry:
     memory_bytes: int | None = None
 
 
-class CudaGraphCache:
+class _CudaGraphCache:
     """Capture and replay reusable static CUDA steps.
 
     A model describes each physical shape with a simple :class:`CudaGraphStep`
@@ -721,7 +721,7 @@ class CudaGraphExecutor:
         self._synchronize_failure = synchronize_failure
         self._workspace: _CudaGraphWorkspace | None = _CudaGraphWorkspace()
         self._modes: dict[str, CudaGraphMode] = {}
-        self._caches: dict[str, CudaGraphCache] = {}
+        self._caches: dict[str, _CudaGraphCache] = {}
         self._closed = False
         for name, mode in modes.items():
             self.add_mode(name, mode)
@@ -734,7 +734,7 @@ class CudaGraphExecutor:
         if not isinstance(name, str) or not name.strip() or name in self._modes:
             raise ValueError(f"invalid or duplicate CUDA graph mode: {name!r}")
         self._modes[name] = mode
-        self._caches[name] = CudaGraphCache(
+        self._caches[name] = _CudaGraphCache(
             self.device,
             mode.shapes,
             build=mode.build,
@@ -742,7 +742,7 @@ class CudaGraphExecutor:
             _workspace=self._workspace,
         )
 
-    def mode(self, name: str) -> CudaGraphCache:
+    def mode(self, name: str) -> _CudaGraphCache:
         if self._closed:
             raise RuntimeError("CUDA graph executor is closed")
         try:
@@ -772,18 +772,6 @@ class CudaGraphExecutor:
         self._workspace = None
         self._modes.clear()
         self._closed = True
-
-    def capture(self, name: str, shape: GraphShape) -> CudaGraphStats:
-        """Capture one configured shape using its mode-owned synthetic inputs."""
-
-        self.check()
-        try:
-            mode = self._modes[name]
-        except KeyError as error:
-            raise KeyError(f"unknown CUDA graph mode: {name}") from error
-        cache = self.mode(name)
-        cache.capture(shape, mode.capture_inputs(shape))
-        return cache.stats
 
     def capture_all(
         self,

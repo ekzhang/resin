@@ -18,14 +18,14 @@ def test_resolve_dtype_rejects_unknown_names_and_types() -> None:
         resolve_dtype(16)  # type: ignore[arg-type]  # ty: ignore[invalid-argument-type]
 
 
-def test_load_safetensor_weights_streams_with_name_replacements(tmp_path) -> None:
+def test_load_safetensor_weights_streams_and_casts(tmp_path) -> None:
     safetensors = pytest.importorskip("safetensors.torch")
     expected_weight = torch.arange(6, dtype=torch.float32).view(2, 3)
     expected_bias = torch.tensor([7.0, 8.0])
     safetensors.save_file(
         {
-            "checkpoint.weight.tensor": expected_weight,
-            "checkpoint.bias.tensor": expected_bias,
+            "weight": expected_weight,
+            "bias": expected_bias,
         },
         tmp_path / "model.safetensors",
     )
@@ -36,7 +36,6 @@ def test_load_safetensor_weights_streams_with_name_replacements(tmp_path) -> Non
         model,
         device="cpu",
         dtype="float64",
-        name_replacements={"checkpoint.": "", ".tensor": ""},
     )
 
     assert model.weight.dtype is torch.float64

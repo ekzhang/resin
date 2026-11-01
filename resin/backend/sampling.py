@@ -98,6 +98,29 @@ class PromptScores:
         return columns
 
 
+@torch.compile(  # ty: ignore[no-matching-overload]
+    dynamic=True, fullgraph=True, recompile_limit=128
+)
+def _score_tensors(
+    logits: torch.Tensor,
+    selected: torch.Tensor,
+    max_k: int,
+    target_rows: torch.Tensor,
+    target_ids: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Normalize once and return only the requested score columns."""
+    torch._dynamo.mark_static(logits, -1)
+    values = logits.float().log_softmax(dim=-1)
+    chosen = values.gather(1, selected[:, None]).squeeze(1)
+    if max_k:
+        top_values, top_ids = values.topk(max_k, dim=-1)
+    else:
+        top_values = logits.new_empty((logits.shape[0], 0), dtype=torch.float32)
+        top_ids = logits.new_empty((logits.shape[0], 0), dtype=torch.int64)
+    targets = values[target_rows, target_ids]
+    return chosen, top_values, top_ids, targets
+
+
 def _score_distribution(
     logits: torch.Tensor,
     selected: torch.Tensor,
@@ -112,27 +135,33 @@ def _score_distribution(
         raise ValueError(
             f"prompt target token IDs must be less than vocabulary size {vocab}"
         )
-    values = logits.float().log_softmax(dim=-1)
-    chosen = values.gather(1, selected[:, None]).squeeze(1)
     top_counts = np.minimum(top_counts, vocab).astype(np.uint32)
     max_k = int(top_counts.max()) if top_counts.size else 0
+    if target_ids is not None and target_counts is not None and len(target_ids):
+        target_rows = torch.as_tensor(
+            np.repeat(np.arange(len(selected)), target_counts), device=logits.device
+        )
+        target_tokens = torch.as_tensor(
+            target_ids.astype(np.int64), device=logits.device
+        )
+    else:
+        target_rows = torch.empty(0, dtype=torch.int64, device=logits.device)
+        target_tokens = torch.empty_like(target_rows)
+    chosen, top_values, top_ids, target_values = _score_tensors(
+        logits, selected, max_k, target_rows, target_tokens
+    )
     top = None
     if max_k:
-        top_values, top_ids = values.topk(max_k, dim=-1)
         keep = (
-            torch.arange(max_k, device=values.device)[None, :]
-            < torch.as_tensor(top_counts.astype(np.int64), device=values.device)[
+            torch.arange(max_k, device=logits.device)[None, :]
+            < torch.as_tensor(top_counts.astype(np.int64), device=logits.device)[
                 :, None
             ]
         )
         top = _ScoreColumns(top_counts, top_ids[keep], top_values[keep])
     targets = None
     if target_ids is not None and target_counts is not None and len(target_ids):
-        rows = torch.as_tensor(
-            np.repeat(np.arange(len(chosen)), target_counts), device=values.device
-        )
-        ids = torch.as_tensor(target_ids.astype(np.int64), device=values.device)
-        targets = _ScoreColumns(target_counts, ids, values[rows, ids])
+        targets = _ScoreColumns(target_counts, target_tokens, target_values)
     return PromptScores(chosen, top, targets)
 
 
@@ -270,7 +299,7 @@ def format_output(
     token_ids: _TokenIds,
     plan: BatchPlan,
     *,
-    prompt_logprobs: PromptScores | torch.Tensor | None = None,
+    prompt_logprobs: PromptScores | None = None,
 ) -> ForwardOutput:
     """Materialize accepted tokens and optional raw-model logprob columns.
 
@@ -287,17 +316,7 @@ def format_output(
     if plan.needs_prompt_logprobs:
         if prompt_logprobs is None:
             raise ValueError("prefill did not provide requested prompt scores")
-        if isinstance(prompt_logprobs, PromptScores):
-            prompt_columns = prompt_logprobs.output(plan)
-        else:
-            prompt_columns = {
-                "prompt_logprobs": prompt_logprobs.detach()
-                .to(device="cpu", dtype=torch.float32)
-                .numpy(),
-                "prompt_logprob_indptr": np.asarray(
-                    plan.prompt_score_indptr, dtype=np.uint32
-                ),
-            }
+        prompt_columns = prompt_logprobs.output(plan)
     if not plan.needs_logprobs:
         return ForwardOutput(token_ids=ids, token_indptr=offsets, **prompt_columns)
     logits = cast(torch.Tensor, logits)
@@ -349,7 +368,7 @@ def format_output(
     )
 
 
-class SamplingInputs(TypedDict):
+class _SamplingInputs(TypedDict):
     temperatures: tuple[float, ...]
     top_ps: tuple[float, ...]
     top_ks: tuple[int, ...]
@@ -358,7 +377,7 @@ class SamplingInputs(TypedDict):
     sampling_mask: npt.NDArray[np.bool_]
 
 
-def batch_sampling_inputs(plan: BatchPlan, vocab_size: int) -> SamplingInputs:
+def batch_sampling_inputs(plan: BatchPlan, vocab_size: int) -> _SamplingInputs:
     """Extract backend-friendly primitive arrays from one immutable plan."""
 
     if vocab_size <= 0:
@@ -396,15 +415,45 @@ def batch_sampling_inputs(plan: BatchPlan, vocab_size: int) -> SamplingInputs:
     }
 
 
+@torch.compile(  # ty: ignore[no-matching-overload]
+    dynamic=True, fullgraph=True, recompile_limit=128
+)
+def _sampling_distribution(
+    logits: torch.Tensor,
+    temperature: torch.Tensor,
+    top_p: torch.Tensor,
+    top_k: int,
+    nucleus: bool,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Prepare probabilities without capturing the row-local random draw."""
+    torch._dynamo.mark_static(logits, -1)
+    scores = logits.float() / temperature
+    if top_k < scores.numel() and not nucleus:
+        scores, token_ids = torch.topk(scores, top_k, sorted=True)
+    else:
+        scores, token_ids = torch.sort(scores, descending=True)
+    probabilities = torch.softmax(scores, dim=-1)
+    if nucleus:
+        # Select the nucleus from the full temperature distribution before
+        # applying the top-k limit and normalizing its retained mass.
+        cumulative = probabilities.cumsum(dim=-1)
+        probabilities = probabilities * (cumulative - probabilities < top_p)
+        probabilities = probabilities[:top_k]
+        token_ids = token_ids[:top_k]
+        probabilities = probabilities / probabilities.sum()
+    return probabilities, token_ids
+
+
+def sampling_seed(seed: int, offset: int) -> int:
+    """Mix a request seed and absolute sampling offset for reference backends."""
+    value = (seed + offset * 0x9E3779B97F4A7C15) & ((1 << 64) - 1)
+    value = ((value ^ (value >> 30)) * 0xBF58476D1CE4E5B9) & ((1 << 64) - 1)
+    value = ((value ^ (value >> 27)) * 0x94D049BB133111EB) & ((1 << 64) - 1)
+    return (value ^ (value >> 31)) & ((1 << 63) - 1)
+
+
 class TorchSampler:
     """Readable reference sampler with row-stable stateless randomness."""
-
-    @staticmethod
-    def _mixed_seed(seed: int, offset: int) -> int:
-        value = (seed + offset * 0x9E3779B97F4A7C15) & ((1 << 64) - 1)
-        value = ((value ^ (value >> 30)) * 0xBF58476D1CE4E5B9) & ((1 << 64) - 1)
-        value = ((value ^ (value >> 27)) * 0x94D049BB133111EB) & ((1 << 64) - 1)
-        return (value ^ (value >> 31)) & ((1 << 63) - 1)
 
     def __call__(
         self,
@@ -426,36 +475,36 @@ class TorchSampler:
             raise ValueError("sampling logits must contain one row per plan sequence")
 
         result = logits.argmax(dim=-1)
-        for row, (temperature, should_sample) in enumerate(
-            zip(values["temperatures"], values["sampling_mask"], strict=True)
-        ):
-            if not should_sample or temperature == 0.0:
-                continue
-            scores = logits[row].float() / temperature
-            top_k = values["top_ks"][row]
-            top_p = values["top_ps"][row]
-            if top_k < scores.numel() and top_p == 1.0:
-                scores, token_ids = torch.topk(scores, top_k, sorted=True)
-            else:
-                scores, token_ids = torch.sort(scores, descending=True)
-            probabilities = torch.softmax(scores, dim=-1)
-            if top_p < 1.0:
-                # Select the nucleus from the full temperature distribution,
-                # then apply the top-k limit and normalize the retained mass.
-                cumulative = probabilities.cumsum(dim=-1)
-                keep = cumulative - probabilities < top_p
-                probabilities = probabilities * keep
-                probabilities = probabilities[:top_k]
-                token_ids = token_ids[:top_k]
-                probabilities = probabilities / probabilities.sum()
-            generator = torch.Generator(device=logits.device)
-            generator.manual_seed(
-                self._mixed_seed(values["seeds"][row], values["offsets"][row])
+        sampled = [
+            row
+            for row, (temperature, should_sample) in enumerate(
+                zip(values["temperatures"], values["sampling_mask"], strict=True)
             )
-            selected = torch.multinomial(probabilities, 1, generator=generator).squeeze(
-                0
+            if should_sample and temperature != 0.0
+        ]
+        if sampled:
+            temperatures = torch.as_tensor(
+                values["temperatures"], dtype=torch.float32, device=logits.device
             )
-            result[row] = token_ids[selected]
+            top_ps = torch.as_tensor(
+                values["top_ps"], dtype=torch.float32, device=logits.device
+            )
+            for row in sampled:
+                probabilities, token_ids = _sampling_distribution(
+                    logits[row],
+                    temperatures[row],
+                    top_ps[row],
+                    values["top_ks"][row],
+                    values["top_ps"][row] < 1.0,
+                )
+                generator = torch.Generator(device=logits.device)
+                generator.manual_seed(
+                    sampling_seed(values["seeds"][row], values["offsets"][row])
+                )
+                selected = torch.multinomial(
+                    probabilities, 1, generator=generator
+                ).squeeze(0)
+                result[row] = token_ids[selected]
 
         if out is None:
             return result
@@ -470,4 +519,6 @@ __all__ = [
     "batch_sampling_inputs",
     "format_output",
     "prompt_scores",
+    "sampling_seed",
+    "token_output",
 ]

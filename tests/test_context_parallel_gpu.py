@@ -14,10 +14,13 @@ import torch.multiprocessing as mp
 from resin import BatchPhase
 from resin.backend.cuda.context_parallel import (
     ContextParallelTokens,
+)
+from resin.backend.topology import RankGroup
+from resin_models_cuda.gpt_oss.paged_kv import (
+    DeviceAttentionBatch,
+    PagedKvTable,
     context_parallel_query_batch,
 )
-from resin.backend.cuda.paged_kv import DevicePagedAttentionBatch, PagedKvTable
-from resin.backend.topology import RankGroup
 
 pytestmark = pytest.mark.skipif(
     not dist.is_nccl_available() or torch.cuda.device_count() < 2,
@@ -114,7 +117,7 @@ def _rank(rank, rendezvous):
             keys.view(-1, 2, 64).index_copy_(0, append_slots, gathered_keys)
             values.view(-1, 2, 64).index_copy_(0, append_slots, gathered_values)
             cache_lengths = tuple(a + b for a, b in zip(lengths, prefixes, strict=True))
-            batch = DevicePagedAttentionBatch(
+            batch = DeviceAttentionBatch(
                 BatchPhase.PREFILL,
                 torch.arange(total, device=device),
                 torch.arange(rows, device=device),

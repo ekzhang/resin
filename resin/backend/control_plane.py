@@ -3,21 +3,11 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from enum import IntEnum
 from hashlib import blake2b
 
 import torch
 
 from resin.backend.topology import RankGroup
-
-
-class ControlOperation(IntEnum):
-    WORK = 1
-    PHASE = 2
-    PREPARE = 3
-    VALIDATE = 4
-    FORWARD = 5
-    COMMIT = 6
 
 
 class ControlPlaneError(RuntimeError):
@@ -50,7 +40,7 @@ class ControlPlane:
     def gather(
         self,
         group: RankGroup,
-        operation: ControlOperation | str,
+        operation: str,
         values=(),
         *,
         error: str | None = None,
@@ -58,15 +48,12 @@ class ControlPlane:
         values = tuple(map(int, values))
         if len(values) > self._fields:
             raise ValueError(f"control records accept at most {self._fields} integers")
-        if isinstance(operation, str):
-            if operation not in self._tags:
-                self._tags[operation] = (
-                    int.from_bytes(blake2b(operation.encode(), digest_size=8).digest())
-                    & ((1 << 62) - 1)
-                ) | (1 << 62)
-            tag = self._tags[operation]
-        else:
-            tag = int(operation)
+        if operation not in self._tags:
+            self._tags[operation] = (
+                int.from_bytes(blake2b(operation.encode(), digest_size=8).digest())
+                & ((1 << 62) - 1)
+            ) | (1 << 62)
+        tag = self._tags[operation]
         if group.size == 1:
             return [values], [error]
 

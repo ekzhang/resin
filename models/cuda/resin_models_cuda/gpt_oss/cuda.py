@@ -31,7 +31,6 @@ from resin import (
 from resin.backend.capacity import CacheCapacityPlan, plan_cache_capacity
 from resin.backend.cuda.context_parallel import (
     ContextParallelTokens,
-    context_parallel_query_batch,
 )
 from resin.backend.cuda.failures import GraphInputError
 from resin.backend.cuda.graphs import (
@@ -42,15 +41,6 @@ from resin.backend.cuda.graphs import (
     resolve_decode_graph_shapes,
 )
 from resin.backend.cuda.metrics import observe_execution
-from resin.backend.cuda.paged_kv import (
-    DevicePagedAttentionBatch,
-    PagedKvArena,
-    empty_decode_paged_attention_batch,
-    pad_paged_attention_table,
-    paged_attention_graph_inputs,
-    paged_attention_host_inputs,
-    stage_paged_attention_batch,
-)
 from resin.backend.cuda.parallel import TensorParallelContext, TensorParallelLayout
 from resin.backend.cuda.runner import (
     CudaRunner,
@@ -59,8 +49,6 @@ from resin.backend.cuda.runner import (
 )
 from resin.backend.cuda.staging import TensorStager
 from resin.backend.cuda.tensor_graphs import CudaGraphTensorRegion, TensorSpec
-from resin.backend.paged_attention import PagedAttentionBatch
-from resin.backend.quantization import QuantizationConfig
 from resin.backend.sampling import format_output, prompt_scores
 from resin.backend.topology import ParallelGroups, ParallelismCapabilities
 from resin.backend.torch import benchmark_expert_indices
@@ -71,6 +59,7 @@ from resin.models.gpt_oss.plan import (
     SLIDING_WINDOW,
     WINDOW_RETENTION_TOKENS,
     WINDOW_TABLE_WIDTH,
+    AttentionBatch,
     build_attention_batches,
 )
 from resin_models_cuda.gpt_oss.checkpoint import (
@@ -80,6 +69,15 @@ from resin_models_cuda.gpt_oss.checkpoint import (
 )
 from resin_models_cuda.gpt_oss.cutile import top4_softmax
 from resin_models_cuda.gpt_oss.model import MLP, TopKRouter
+from resin_models_cuda.gpt_oss.paged_kv import (
+    DeviceAttentionBatch,
+    PagedKvArena,
+    context_parallel_query_batch,
+    empty_decode_paged_attention_batch,
+    paged_attention_graph_inputs,
+    paged_attention_host_inputs,
+    stage_paged_attention_batch,
+)
 
 if TYPE_CHECKING:
     from resin import BatchPlan, ForwardOutput
@@ -88,7 +86,7 @@ if TYPE_CHECKING:
 
 _BF16_BYTES = 2
 _TINYGEMM_MAX_TOKENS = 128
-_AttentionBatches = tuple[tuple[PagedAttentionBatch, ...], PagedAttentionBatch | None]
+_AttentionBatches = tuple[tuple[AttentionBatch, ...], AttentionBatch | None]
 
 
 class _EmptyFa4AuxData:
@@ -193,7 +191,6 @@ class GptOssCudaRunner(CudaRunner):
         revision: str | None = None,
         device: str | torch.device,
         dtype=None,
-        quantization: QuantizationConfig | None = None,
         kernel_attention=None,
         kernel_moe=None,
         cuda_graph_prefill: str = "breakable",
@@ -261,14 +258,12 @@ class GptOssCudaRunner(CudaRunner):
         self.model_path = resolve_model_path(
             selected_model,
             revision,
-            quantization=quantization,
             kernel_moe=kernel_moe,
         )
         self._model, self.config = load_model(
             self.model_path,
             device=self.device,
             dtype=torch.bfloat16,
-            quantization=quantization,
             kernel_moe=kernel_moe,
             tensor_parallel=self.tensor_parallel.layout,
             parallel_groups=parallel_groups,
@@ -522,8 +517,8 @@ class GptOssCudaRunner(CudaRunner):
         return inputs
 
     def _tensorize(
-        self, batch: PagedAttentionBatch, staging: TensorStager, prefix: str
-    ) -> DevicePagedAttentionBatch:
+        self, batch: AttentionBatch, staging: TensorStager, prefix: str
+    ) -> DeviceAttentionBatch:
         return stage_paged_attention_batch(batch, staging, prefix)
 
     def _apply_yarn_rotary(self, hidden, cos, sin):
@@ -549,10 +544,10 @@ class GptOssCudaRunner(CudaRunner):
         attention,
         hidden,
         position_embeddings,
-        batch: DevicePagedAttentionBatch,
+        batch: DeviceAttentionBatch,
         *,
         context_parallel: ContextParallelTokens | None = None,
-        query_batch: DevicePagedAttentionBatch | None = None,
+        query_batch: DeviceAttentionBatch | None = None,
     ):
         token_count = hidden.shape[1]
         flat = hidden.reshape(token_count, self.hidden_size)
@@ -601,10 +596,10 @@ class GptOssCudaRunner(CudaRunner):
         layer_index: int,
         attention,
         projected: Tensor,
-        batch: DevicePagedAttentionBatch,
+        batch: DeviceAttentionBatch,
         *,
         context_parallel: ContextParallelTokens | None = None,
-        query_batch: DevicePagedAttentionBatch | None = None,
+        query_batch: DeviceAttentionBatch | None = None,
     ) -> Tensor:
         """Append actual K/V rows and attend with the current request metadata."""
 
@@ -751,7 +746,7 @@ class GptOssCudaRunner(CudaRunner):
         self,
         token_ids,
         positions,
-        batch: DevicePagedAttentionBatch,
+        batch: DeviceAttentionBatch,
         *,
         context_parallel: ContextParallelTokens | None = None,
         full_hidden: bool = False,
@@ -816,15 +811,6 @@ class GptOssCudaRunner(CudaRunner):
             if full_hidden
             else final_hidden.index_select(0, batch.last_token_indices)
         )
-
-    @staticmethod
-    def _pad_page_table(batch: PagedAttentionBatch, width: int):
-        """Pad each row by repeating one page already owned by that row."""
-
-        try:
-            return pad_paged_attention_table(batch.group("full"), width)
-        except ValueError as error:
-            raise GraphInputError(str(error)) from error
 
     def _new_decode_graph_step(self, shape: GraphShape) -> CudaGraphStep:
         batch_size, full_width = shape
@@ -893,7 +879,7 @@ class GptOssCudaRunner(CudaRunner):
     def _graph_forward(
         self,
         plan: BatchPlan,
-        host: PagedAttentionBatch,
+        host: AttentionBatch,
         *,
         shape: GraphShape | None = None,
     ) -> ForwardOutput | None:

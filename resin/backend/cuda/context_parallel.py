@@ -3,19 +3,17 @@
 from __future__ import annotations
 
 from collections.abc import Iterable
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from itertools import accumulate
 
 import torch
 import torch.distributed as dist
 
-from resin import BatchPhase
-from resin.backend.cuda.paged_kv import DevicePagedAttentionBatch
 from resin.backend.topology import RankGroup
 
 
 @dataclass(frozen=True, slots=True)
-class ContextParallelPlan:
+class _ContextParallelPlan:
     """Partition one packed token axis; each sequence has one segment per rank."""
 
     rank: int
@@ -32,7 +30,7 @@ class ContextParallelPlan:
     @classmethod
     def build(
         cls, query_lengths: Iterable[int], *, rank: int, size: int
-    ) -> ContextParallelPlan:
+    ) -> _ContextParallelPlan:
         lengths = tuple(query_lengths)
         if type(size) is not int or size <= 0:
             raise ValueError("context-parallel size must be a positive integer")
@@ -93,7 +91,7 @@ class ContextParallelTokens:
         device: str | torch.device,
         distributed=dist,
     ) -> None:
-        self.plan = ContextParallelPlan.build(
+        self.plan = _ContextParallelPlan.build(
             query_lengths, rank=group.local_rank, size=group.size
         )
         self.group, self.distributed = group, distributed
@@ -148,48 +146,6 @@ class ContextParallelTokens:
         return gathered.index_select(0, self.gather_indices)
 
 
-def context_parallel_query_batch(
-    batch: DevicePagedAttentionBatch, tokens: ContextParallelTokens
-) -> DevicePagedAttentionBatch:
-    """Lower local Q metadata against globally reconstructed paged K/V.
-
-    FlashAttention aligns causal queries to the end of each K sequence. Trim
-    K lengths by the global query suffix following this rank's segment, so
-    that local queries retain their original causal positions. Exclude rows
-    with no local query. Page tables and append slots still refer to global
-    cache storage; callers write gathered K/V with the original batch first.
-    """
-
-    if batch.phase != BatchPhase.PREFILL:
-        raise ValueError("context-parallel query sharding is only used for prefill")
-    if batch.token_indices.shape[0] != tokens.plan.total_tokens:
-        raise ValueError("attention batch does not match its context token plan")
-    groups = tuple(
-        (
-            name,
-            replace(
-                group,
-                page_table=group.page_table.index_select(0, tokens.active_rows),
-                lengths=(group.lengths - tokens.suffix_tokens).index_select(
-                    0, tokens.active_rows
-                ),
-                min_length=0,
-            ),
-        )
-        for name, group in batch.groups
-    )
-    return replace(
-        batch,
-        token_indices=tokens.select(batch.token_indices),
-        sequence_indices=batch.sequence_indices.index_select(0, tokens.active_rows),
-        cu_seqlens_q=tokens.cu_seqlens_q,
-        max_seqlen_q=tokens.max_seqlen_q,
-        groups=groups,
-    )
-
-
 __all__ = [
-    "ContextParallelPlan",
     "ContextParallelTokens",
-    "context_parallel_query_batch",
 ]

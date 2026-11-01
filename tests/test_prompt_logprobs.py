@@ -232,7 +232,7 @@ def test_invalid_prompt_columns_leave_scores_unpublished(bad_scores, monkeypatch
     assert request.prompt_logprobs == [None, None]
 
 
-def test_projection_and_normalization_are_shared_and_bounded(monkeypatch):
+def test_projection_is_bounded_and_score_views_share_the_distribution():
     count = 513
     plan = BatchPlan(
         sequence_ids=[1],
@@ -250,14 +250,6 @@ def test_projection_and_normalization_are_shared_and_bounded(monkeypatch):
     hidden = torch.randn(count, 4)
     weight = torch.randn(4, 7)
     expected = (hidden @ weight).log_softmax(-1)
-    normalizations = []
-    original = torch.Tensor.log_softmax
-
-    def normalize(values, *args, **kwargs):
-        normalizations.append(len(values))
-        return original(values, *args, **kwargs)
-
-    monkeypatch.setattr(torch.Tensor, "log_softmax", normalize)
 
     def project(values):
         rows.append(len(values))
@@ -265,7 +257,7 @@ def test_projection_and_normalization_are_shared_and_bounded(monkeypatch):
 
     actual = prompt_scores(plan, hidden, project)
     assert isinstance(actual, PromptScores)
-    assert rows == normalizations == [128, 128, 128, 128, 1]
+    assert rows == [128, 128, 128, 128, 1]
     torch.testing.assert_close(actual.logprobs, expected[:, 1])
     assert actual.top is not None and actual.targets is not None
     np.testing.assert_array_equal(actual.top.counts, np.full(count, 7, np.uint32))

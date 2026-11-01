@@ -222,14 +222,17 @@ def rows_from_completion(completion):
 
 
 def enqueue(harness, data, rows):
-    from resin.backend.cuda.completion import DeviceCompletion, accepted_block
+    from resin.backend.cuda.completion import DeviceAcceptance, DeviceCompletion
 
     shape = (len(data["positions"]), 16384)
     result = harness.cache.run(shape, {k: v for k, v in data.items() if k != "storage"})
     positions = torch.as_tensor(data["positions"], device="cuda")
     output, storage = result
-    tokens, counts, feedback = accepted_block(output, positions, harness.draft)
-    pending = DeviceCompletion(tokens, counts, feedback, rows=rows, device="cuda:0")
+    samples = output if harness.draft else output.reshape(-1, 1)
+    acceptance = DeviceAcceptance.from_samples(
+        samples[:, : harness.draft], samples[:, harness.draft :], positions
+    )
+    pending = DeviceCompletion.from_acceptance(acceptance, rows=rows, device="cuda:0")
     # Match externally consumed state: copy before another graph may reuse scratch.
     snapshot = storage.clone()
     return pending, snapshot

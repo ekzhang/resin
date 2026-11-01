@@ -203,7 +203,7 @@ class ParallelEngramEmbedding(nn.Module):
 
     def local(self, indices, output=None):
         if indices.is_cuda:
-            from resin.backend.cuda.embedding import fp8_embedding
+            from resin_models_cuda.deepseek_v41.embedding_cuda import fp8_embedding
 
             return fp8_embedding(
                 indices, self.weight, self.scale, self.start, self.stop, output

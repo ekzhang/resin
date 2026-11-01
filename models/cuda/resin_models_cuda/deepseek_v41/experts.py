@@ -11,7 +11,6 @@ import torch
 from torch import Tensor, nn
 from torch.nn import functional as F
 
-from resin.backend.cuda.mega_moe import MegaMoe, prepare_weights
 from resin.backend.cuda.parallel import TensorParallelContext, TensorParallelLayout
 from resin.backend.expert_parallel import ExpertParallelDispatch
 from resin.backend.topology import ParallelGroups
@@ -19,6 +18,7 @@ from resin.backend.torch import benchmark_expert_indices
 from resin_models_cuda.deepseek_v41.gemm import fp4_fused_moe
 from resin_models_cuda.deepseek_v41.kernels import act_quant
 from resin_models_cuda.deepseek_v41.linear import weight_scale_rows
+from resin_models_cuda.mega_moe import MegaMoe, prepare_weights
 
 
 class ExpertProjection(nn.Module):

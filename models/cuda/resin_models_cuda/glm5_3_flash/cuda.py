@@ -26,7 +26,6 @@ from resin.backend.cuda.metrics import observe_execution
 from resin.backend.cuda.runner import (
     CudaRunner,
     capture_sampling_inputs,
-    graph_sample_block,
     pad_sampling_inputs,
     validate_hybrid_plan,
 )
@@ -299,7 +298,7 @@ class Glm53FlashCudaRunner(CudaRunner):
                     )
 
                     def sample(logits):
-                        return graph_sample_block(self._sampler, logits, sampling)
+                        return self._sampler.sample_block(logits, sampling)
 
                     def capacity(width):
                         return self._parallel_graph_capacity(

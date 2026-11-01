@@ -41,7 +41,7 @@ class SpeculativeStats:
         target_rows: Sequence[Sequence[int]],
     ) -> SpeculativeAcceptance:
         fixed = self.validated_benchmark_accepted_drafts
-        acceptance = accept_speculative_tokens(
+        acceptance = _accept_speculative_tokens(
             draft_rows, target_rows, benchmark_accepted_drafts=fixed
         )
         self.blocks += len(draft_rows)
@@ -72,7 +72,7 @@ class SpeculativeStats:
         return values
 
 
-def accept_speculative_tokens(
+def _accept_speculative_tokens(
     draft_rows: Sequence[Sequence[int]],
     target_rows: Sequence[Sequence[int]],
     *,
@@ -113,4 +113,4 @@ def accept_speculative_tokens(
     return SpeculativeAcceptance(token_rows, accepted_counts)
 
 
-__all__ = ["SpeculativeAcceptance", "SpeculativeStats", "accept_speculative_tokens"]
+__all__ = ["SpeculativeAcceptance", "SpeculativeStats"]

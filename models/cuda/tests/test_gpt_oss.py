@@ -192,27 +192,6 @@ class TestGptOssTorch:
         ):
             load_model(path, device="cpu")
 
-    def test_quantization_plan_validates_semantics_without_selecting_a_kernel(
-        self,
-    ) -> None:
-        from resin.backend.quantization import (
-            BF16,
-            MXFP4,
-            QuantizationConfig,
-        )
-        from resin_models_cuda.gpt_oss.checkpoint import _check_quantization
-
-        config = _config(self.args, quantization={"quant_method": "mxfp4"})
-        plan = QuantizationConfig({"transformer.experts": MXFP4})
-
-        _check_quantization(config, quantization=plan, kernel_moe=object())
-        with pytest.raises(ValueError, match="quantization config selected"):
-            _check_quantization(
-                config,
-                quantization=QuantizationConfig(default=BF16),
-                kernel_moe=object(),
-            )
-
     def test_loader_rejects_non_mxfp4_checkpoints(self, tmp_path: Path) -> None:
         from resin_models_cuda.gpt_oss.checkpoint import load_model
 

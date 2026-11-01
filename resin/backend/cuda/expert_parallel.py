@@ -16,7 +16,7 @@ if TYPE_CHECKING:
 _MAX_DESTINATIONS_PER_PASS = 22
 
 
-class SparseExpertTransport:
+class _SparseExpertTransport:
     """Fixed receive storage with device-resident, sparse dispatch/combine counts.
 
     FlashInfer writes each token only to its selected destination ranks. Static
@@ -167,7 +167,7 @@ class SparseExpertTransport:
         return result
 
 
-_TRANSPORTS: WeakValueDictionary[tuple, SparseExpertTransport] = WeakValueDictionary()
+_TRANSPORTS: WeakValueDictionary[tuple, _SparseExpertTransport] = WeakValueDictionary()
 
 
 def sparse_expert_transport(
@@ -177,13 +177,13 @@ def sparse_expert_transport(
     dtype: torch.dtype,
     top_k: int,
     device: torch.device,
-) -> SparseExpertTransport:
+) -> _SparseExpertTransport:
     """Share layer workspaces without retaining closed models or process groups."""
     key = group, capacity, width, dtype, top_k, device
     transport = _TRANSPORTS.get(key)
     if transport is None:
         with torch.cuda.device(device):
-            transport = SparseExpertTransport(
+            transport = _SparseExpertTransport(
                 group, capacity, width, dtype, top_k, device
             )
         _TRANSPORTS[key] = transport

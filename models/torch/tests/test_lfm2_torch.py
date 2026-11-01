@@ -282,6 +282,45 @@ class TestLfm2Torch:
         assert runner.forward_calls == (len(tokens) + chunk - 1) // chunk
         assert runner.live_cache_count == 0
 
+    @pytest.mark.parametrize(
+        "context,token,message",
+        [
+            (3, 3, "non-contiguous positions for request 11"),
+            (2, 64, "token id is out of range for request 11"),
+        ],
+    )
+    def test_runner_validates_all_rows_before_mutating_caches(
+        self, context, token, message
+    ) -> None:
+        from resin import BatchPlan
+        from resin_models_torch.lfm2 import Lfm2TorchRunner
+
+        runner = Lfm2TorchRunner.__new__(Lfm2TorchRunner)
+        runner.device = torch.device("cpu")
+        runner._model = self.model
+        runner.vocab_size = self.args.vocab_size
+        runner._cache = {}
+        runner.forward_calls = 0
+        runner.forward(
+            BatchPlan(
+                sequence_ids=[11],
+                context_lengths=[0],
+                token_ids=[1, 2],
+                token_indptr=[0, 2],
+            )
+        )
+        with pytest.raises(ValueError, match=message):
+            runner.forward(
+                BatchPlan(
+                    sequence_ids=[10, 11],
+                    context_lengths=[0, context],
+                    token_ids=[1, 2, token],
+                    token_indptr=[0, 2, 3],
+                )
+            )
+        assert list(runner._cache) == [11]
+        assert runner._cache[11].length == 2
+
     def test_runner_consumes_batch_plan_and_releases_per_request_cache(self) -> None:
         from resin import BatchPhase, BatchPlan
         from resin_models_torch.lfm2 import Lfm2TorchRunner

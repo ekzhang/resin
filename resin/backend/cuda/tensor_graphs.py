@@ -35,7 +35,7 @@ class CudaGraphTensorRegion:
     output: TensorSpec | tuple[TensorSpec, ...]
 
 
-class PrefillTensorGraphs:
+class _PrefillTensorGraphs:
     """Bucket tensor operations using the runner's existing graph executor.
 
     Matching layouts share buffers across layers. Results are views of these

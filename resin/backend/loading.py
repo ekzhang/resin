@@ -3,15 +3,14 @@
 from __future__ import annotations
 
 import json
-from collections.abc import Callable, Collection, Mapping
+from collections.abc import Callable, Collection
 from pathlib import Path
-from typing import Any, TypeVar, cast
+from typing import Any, cast
 from weakref import WeakKeyDictionary
 
 import torch
 
 MODEL_FILES = ("config.json", "model*.safetensors", "model.safetensors.index.json")
-_ModelT = TypeVar("_ModelT", bound=torch.nn.Module)
 
 
 def prepare_model(
@@ -85,15 +84,11 @@ def load_safetensor_weights(
     device: str | torch.device,
     dtype: str | torch.dtype | None = None,
     checkpoint_keys: Collection[str] | None = None,
-    name_replacements: Mapping[str, str] | None = None,
     transform_tensor: Callable[[str, torch.Tensor], torch.Tensor] | None = None,
     require_index: bool = False,
 ) -> None:
     """Stream safetensors directly into a model's parameters and buffers.
 
-    ``name_replacements`` maps checkpoint-name fragments to model-name
-    fragments. Replacements apply in mapping order, so the same mechanism
-    handles full names, prefixes, suffixes, and interior substrings.
     ``checkpoint_keys`` selects a partial checkpoint load when a model owns
     non-state tensors such as packed expert weights.
     """
@@ -110,12 +105,6 @@ def load_safetensor_weights(
     if resolved_dtype is not None and not resolved_dtype.is_floating_point:
         raise ValueError("model dtype must be floating point")
 
-    replacements = tuple((name_replacements or {}).items())
-    if any(not isinstance(old, str) or not old for old, _ in replacements):
-        raise ValueError("safetensor name replacement keys must be non-empty strings")
-    if any(not isinstance(new, str) for _, new in replacements):
-        raise TypeError("safetensor name replacement values must be strings")
-
     tensor_files = indexed_tensor_files(root, require_index=require_index)
     if checkpoint_keys is None:
         selected_keys = tuple(tensor_files)
@@ -124,17 +113,8 @@ def load_safetensor_weights(
         if missing := set(selected_keys) - tensor_files.keys():
             raise ValueError(f"checkpoint is missing tensors: {sorted(missing)[:8]}")
 
-    mapped: dict[str, tuple[str, Path]] = {}
-    for checkpoint_name in selected_keys:
-        model_name = checkpoint_name
-        for old, new in replacements:
-            model_name = model_name.replace(old, new)
-        if model_name in mapped:
-            raise ValueError(f"multiple checkpoint tensors map to {model_name!r}")
-        mapped[model_name] = (checkpoint_name, tensor_files[checkpoint_name])
-
     model_names = set(model.state_dict())
-    loaded_names = set(mapped)
+    loaded_names = set(selected_keys)
     if checkpoint_keys is None and (missing := model_names - loaded_names):
         raise ValueError(f"checkpoint is missing tensors: {sorted(missing)[:8]}")
     if unexpected := loaded_names - model_names:
@@ -142,56 +122,23 @@ def load_safetensor_weights(
 
     # Visit each shard once. Index files commonly order tensors by name rather
     # than by shard, which would otherwise reopen the same mmap repeatedly.
-    by_file: dict[Path, list[tuple[str, str]]] = {}
-    for model_name, (checkpoint_name, path) in mapped.items():
-        by_file.setdefault(path, []).append((model_name, checkpoint_name))
+    by_file: dict[Path, list[str]] = {}
+    for name in selected_keys:
+        by_file.setdefault(tensor_files[name], []).append(name)
 
     with SafetensorReader() as reader:
         for path, names in by_file.items():
-            for model_name, checkpoint_name in names:
-                tensor = reader.read(path, checkpoint_name)
+            for name in names:
+                tensor = reader.read(path, name)
                 if transform_tensor is not None:
-                    tensor = transform_tensor(checkpoint_name, tensor)
+                    tensor = transform_tensor(name, tensor)
                 assign_model_tensor(
                     model,
-                    model_name,
+                    name,
                     tensor,
                     device=target,
                     dtype=resolved_dtype,
                 )
-
-
-def materialize_safetensor_model(
-    model_path: Path,
-    *,
-    device: str | torch.device,
-    dtype: str | torch.dtype | None,
-    build: Callable[[], _ModelT],
-    after_cast: Callable[[_ModelT], None] | None = None,
-) -> _ModelT:
-    """Build a meta model, assign safetensors, and finalize inference buffers."""
-
-    target = torch.device(device)
-    load_target = target if target.type in {"cpu", "cuda"} else torch.device("cpu")
-    with torch.device("meta"):
-        model = build()
-    load_safetensor_weights(model_path, model, device=load_target)
-    cast(Callable[[torch.device], None], model.materialize_buffers)(load_target)
-    if target != load_target:
-        model.to(target)
-
-    resolved_dtype = resolve_dtype(dtype)
-    if resolved_dtype is not None:
-        if not resolved_dtype.is_floating_point:
-            raise ValueError("model dtype must be floating point")
-        model.to(dtype=resolved_dtype)
-    if after_cast is not None:
-        after_cast(model)
-    # Module.to(dtype=...) casts floating-point buffers too. Each model's
-    # materializer restores computed buffers such as RoPE frequencies.
-    cast(Callable[[torch.device], None], model.materialize_buffers)(target)
-    model.eval()
-    return model
 
 
 def assign_model_tensor(

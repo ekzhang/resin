@@ -89,7 +89,7 @@ class RankRunner:
         if self.cancel_requests.intersection(map(int, ids)):
             Path(self.directory, f"canceled-{self.groups.rank}").touch()
 
-    def forward_distributed(self, plan, context):
+    def forward_distributed(self, plan, context, *, prepared=None):
         # Every replica and follower participates, even when another replica
         # owns all requests. A rank-stamped output proves actual placement.
         marker = torch.tensor(1)

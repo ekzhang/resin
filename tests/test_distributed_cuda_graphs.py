@@ -114,7 +114,7 @@ def _prefill_rounds(groups):
         hidden += groups.rank
         with runner._distributed_prefill_graphs(context):
             assert runner._distributed_prefill_bucket == capacity
-            if context.placeholder:
+            if context.num_sequences == 0:
                 runner._empty_prefill_regions()
             else:
                 expected = hidden
@@ -180,7 +180,7 @@ def _compact_prefill_rounds(groups):
                 2: capacities[1],
                 3: capacities[1],
             }
-            if context.placeholder:
+            if context.num_sequences == 0:
                 runner._empty_prefill_regions()
             else:
                 expected = hidden

@@ -8,8 +8,8 @@ import pytest
 import torch
 from torch import nn
 
-from resin.backend.cuda.mega_moe import MegaMoe, MegaMoeCollective, shared_scale_rows
 from resin.backend.topology import RankGroup
+from resin_models_cuda.mega_moe import MegaMoe, MegaMoeCollective, shared_scale_rows
 
 
 def _mhc_reference(inputs):

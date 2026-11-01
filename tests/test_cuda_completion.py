@@ -7,9 +7,8 @@ import torch
 from resin.backend.cuda.completion import (
     CudaContinuation,
     DeviceAcceptance,
-    accepted_block,
 )
-from resin.backend.speculative import accept_speculative_tokens
+from resin.backend.speculative import _accept_speculative_tokens
 
 
 @pytest.mark.parametrize("draft_tokens", [0, 1, 3, 4, 8])
@@ -23,14 +22,11 @@ def test_device_acceptance_matches_shared_reference(draft_tokens, fixed):
         targets[row, :prefix] = drafts[row, :prefix]
     positions = torch.arange(128, dtype=torch.int64) * 7
     fixed_depth = draft_tokens // 2 if fixed else None
-    output = torch.cat((drafts, targets), dim=1) if draft_tokens else targets
     decision = DeviceAcceptance.from_samples(
         drafts, targets, positions, fixed_acceptance=fixed_depth
     )
-    tokens, counts, feedback = accepted_block(
-        output, positions, draft_tokens, fixed_acceptance=fixed_depth
-    )
-    expected = accept_speculative_tokens(
+    tokens, counts, feedback = decision.tokens, decision.counts, decision.feedback()
+    expected = _accept_speculative_tokens(
         drafts.tolist(), targets.tolist(), benchmark_accepted_drafts=fixed_depth
     )
     actual = [
@@ -39,8 +35,6 @@ def test_device_acceptance_matches_shared_reference(draft_tokens, fixed):
     assert actual == expected.token_rows
     assert counts.tolist() == expected.processed_counts
     assert decision.accepted_drafts.tolist() == expected.accepted_counts
-    torch.testing.assert_close(decision.tokens, tokens, rtol=0, atol=0)
-    torch.testing.assert_close(decision.counts, counts, rtol=0, atol=0)
     assert feedback.token_ids.tolist() == [row[-1] for row in actual]
     assert feedback.positions.tolist() == (positions + counts).tolist()
     assert (
@@ -48,7 +42,8 @@ def test_device_acceptance_matches_shared_reference(draft_tokens, fixed):
         == ((positions + counts + 1) * 32).tolist()
     )
     # Next replay is allowed to overwrite its source output immediately.
-    output.fill_(-1)
+    targets.fill_(-1)
+    drafts.fill_(-1)
     assert feedback.token_ids.tolist() == [row[-1] for row in actual]
 
 
@@ -56,7 +51,9 @@ def test_padded_feedback_never_advances_outside_reserved_scratch_positions():
     positions = torch.ones(8, dtype=torch.int64)
     output = torch.tensor([[3, 4, 5, 3, 4, 5, 6]] * 8, dtype=torch.int64)
     for _ in range(256):
-        _, _, feedback = accepted_block(output, positions, 3)
+        feedback = DeviceAcceptance.from_samples(
+            output[:, :3], output[:, 3:], positions
+        ).feedback()
         feedback.restrict(5)
         positions = feedback.positions
         assert positions[5:].tolist() == [1, 1, 1]
@@ -249,7 +246,7 @@ def test_runtime_fixed_acceptance_replay_shares_state_output_and_feedback():
         anchors = positions.cpu().tolist()
         fixed.fill_(depth)
         graph.replay()
-        expected = accept_speculative_tokens(
+        expected = _accept_speculative_tokens(
             drafts.cpu().tolist(),
             targets.cpu().tolist(),
             benchmark_accepted_drafts=None if depth < 0 else depth,
@@ -286,7 +283,9 @@ def test_feedback_fits_the_captured_decode_token_column_and_metadata_buffers():
     from resin.backend.cuda.staging import TensorStager
 
     output = torch.tensor([[3, 4, 5, 3, 9, 7, 6]] * 12, dtype=torch.int64)
-    _, _, feedback = accepted_block(output, torch.ones(12, dtype=torch.int64), 3)
+    feedback = DeviceAcceptance.from_samples(
+        output[:, :3], output[:, 3:], torch.ones(12, dtype=torch.int64)
+    ).feedback()
     feedback.restrict(8)
     # These are the actual shapes/dtypes allocated by the shared CUDA runner.
     targets = {
@@ -365,9 +364,10 @@ def test_scored_completion_preserves_speculative_outputs_across_replay(monkeypat
             [0, 0, 0, 0, 0, 0, 0],
         ]
     )
-    tokens, counts, feedback = accepted_block(
-        output, torch.ones(5, dtype=torch.int64), 3
+    decision = DeviceAcceptance.from_samples(
+        output[:, :3], output[:, 3:], torch.ones(5, dtype=torch.int64)
     )
+    tokens, counts, feedback = decision.tokens, decision.counts, decision.feedback()
     logits = torch.randn(5, 4, 7, generator=torch.Generator().manual_seed(42)) + 1e4
     accepted = [
         row[:count]

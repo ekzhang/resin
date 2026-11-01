@@ -34,18 +34,15 @@ from resin.backend.cuda.runner import (
     CudaRunner,
     capture_sampling_inputs,
     graph_sample,
-    graph_sample_block,
     pad_sampling_inputs,
     validate_hybrid_plan,
-)
-from resin.backend.cuda.sampling import (
-    SAMPLING_OFFSET_STRIDE,
 )
 from resin.backend.cuda.staging import TensorStager
 from resin.backend.cuda.state import execute_state
 from resin.backend.cuda.vision_cache import VisionFeatureCache
 from resin.backend.plans import PagedCachePlan
 from resin.backend.sampling import (
+    SAMPLING_OFFSET_STRIDE,
     PromptScores,
     format_output,
     prompt_scores,
@@ -690,8 +687,8 @@ class Qwen3_5CudaRunner(CudaRunner):
                 ),
                 recurrent_pool=pool,
             )
-            targets = graph_sample_block(
-                self._sampler, self._model.logits(verify_hidden), sampling, start_step=0
+            targets = self._sampler.sample_block(
+                self._model.logits(verify_hidden), sampling, start_step=0
             )
             acceptance = DeviceAcceptance.from_samples(
                 drafts,
@@ -768,8 +765,8 @@ class Qwen3_5CudaRunner(CudaRunner):
                 rotary_positions=pair_rotary,
                 recurrent_pool=pool,
             )
-            targets = graph_sample_block(
-                self._sampler, self._model.logits(hidden), sampling, start_step=0
+            targets = self._sampler.sample_block(
+                self._model.logits(hidden), sampling, start_step=0
             )
             acceptance = DeviceAcceptance.from_samples(
                 draft_ids[:, None],

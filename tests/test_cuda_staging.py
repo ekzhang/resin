@@ -194,8 +194,8 @@ def test_graph_cache_queued_replays_preserve_each_host_input(runtime, monkeypatc
         entry.captured = True
         runtime.drain()
 
-    monkeypatch.setattr(graphs.CudaGraphCache, "_capture", capture)
-    cache = graphs.CudaGraphCache(
+    monkeypatch.setattr(graphs._CudaGraphCache, "_capture", capture)
+    cache = graphs._CudaGraphCache(
         "cuda",
         ((1, 1),),
         build=lambda _shape: graphs.CudaGraphStep(

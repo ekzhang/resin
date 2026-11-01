@@ -98,10 +98,12 @@ class DeviceAcceptance:
         columns = torch.arange(draft_tokens + 1, device=targets.device)[None, :]
         candidate = torch.cat((drafts, targets[:, -1:]), dim=1)
         tokens = torch.where(columns < accepted[:, None], candidate, bonus[:, None])
-        return cls.from_accepted(tokens, accepted, positions, draft_tokens=draft_tokens)
+        return cls._from_accepted(
+            tokens, accepted, positions, draft_tokens=draft_tokens
+        )
 
     @classmethod
-    def from_accepted(
+    def _from_accepted(
         cls,
         tokens: torch.Tensor,
         accepted_drafts: torch.Tensor,
@@ -129,25 +131,6 @@ class DeviceAcceptance:
     def feedback(self) -> DeviceFeedback:
         bonus = self.tokens.gather(1, self.accepted_drafts[:, None]).squeeze(1)
         return DeviceFeedback(bonus.clone(), self.positions + self.counts)
-
-
-def accepted_block(
-    output: torch.Tensor,
-    positions: torch.Tensor,
-    draft_tokens: int,
-    *,
-    fixed_acceptance: int | torch.Tensor | None = None,
-) -> tuple[torch.Tensor, torch.Tensor, DeviceFeedback]:
-    """Compatibility wrapper for runners adopting DeviceAcceptance separately."""
-    if not draft_tokens:
-        output = output.reshape(-1, 1)
-    accepted = DeviceAcceptance.from_samples(
-        output[:, :draft_tokens],
-        output[:, draft_tokens:],
-        positions,
-        fixed_acceptance=fixed_acceptance,
-    )
-    return accepted.tokens, accepted.counts, accepted.feedback()
 
 
 @dataclass(frozen=True, slots=True)

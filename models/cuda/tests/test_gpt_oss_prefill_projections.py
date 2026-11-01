@@ -5,8 +5,8 @@ from types import SimpleNamespace
 import torch
 
 from resin import BatchPhase
-from resin.backend.cuda.paged_kv import DevicePagedAttentionBatch, PagedKvTable
 from resin_models_cuda.gpt_oss.cuda import GptOssCudaRunner
+from resin_models_cuda.gpt_oss.paged_kv import DeviceAttentionBatch, PagedKvTable
 
 
 def _runner():
@@ -64,7 +64,7 @@ def _batch(slots, lengths):
         min_length=min(lengths),
         max_length=max(lengths),
     )
-    return DevicePagedAttentionBatch(
+    return DeviceAttentionBatch(
         phase=BatchPhase.PREFILL,
         token_indices=torch.arange(len(slots)),
         sequence_indices=torch.tensor([0]),

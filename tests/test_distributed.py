@@ -66,7 +66,7 @@ class CollectiveRunner:
     def validate_distributed(self, plan, context):
         if self.case == "preflight_failure" and self.groups.rank == 1:
             raise ValueError("injected preflight failure")
-        assert context.placeholder == (plan is None)
+        assert (context.num_sequences == 0) == (plan is None)
         if plan is not None:
             assert plan.phase == context.phase
             assert plan.num_sequences <= context.max_num_sequences
@@ -139,7 +139,7 @@ class CollectiveRunner:
             {
                 "step": context.step_id,
                 "phase": str(context.phase),
-                "placeholder": context.placeholder,
+                "placeholder": (context.num_sequences == 0),
                 "rows": context.num_sequences,
                 "max_rows": context.max_num_sequences,
             }
@@ -387,11 +387,11 @@ def _distributed_process(rank, world_size, rendezvous, directory):
         divergent = CollectiveRunner(groups, "normal")
         divergent.runner_config = RunnerConfig(
             cache_layout=CacheLayout(parent_capacity=64, groups=[CacheGroupLayout(2)]),
-            max_accepted_per_step=max_accepted[
-                groups.topology.coordinates(rank)[0]
-            ],
+            max_accepted_per_step=max_accepted[groups.topology.coordinates(rank)[0]],
         )
-        with pytest.raises(DistributedExecutionError, match="max_accepted_per_step must agree"):
+        with pytest.raises(
+            DistributedExecutionError, match="max_accepted_per_step must agree"
+        ):
             DistributedWorker(divergent, groups)
         assert divergent.calls == []
 

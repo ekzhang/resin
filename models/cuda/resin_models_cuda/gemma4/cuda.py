@@ -37,7 +37,6 @@ from resin.backend.cuda.parallel import (
 from resin.backend.cuda.runner import (
     CudaRunner,
     capture_sampling_inputs,
-    graph_sample_block,
     pad_sampling_inputs,
 )
 from resin.backend.cuda.vision_cache import VisionFeatureCache
@@ -1212,7 +1211,7 @@ class Gemma4CudaRunner(CudaRunner):
                 phase_timing.mark(2)
             output_ids[:, : self.speculative_draft_tokens].copy_(drafts)
             output_ids[:, self.speculative_draft_tokens :].copy_(
-                graph_sample_block(self._sampler, verify_logits, sampling)
+                self._sampler.sample_block(verify_logits, sampling)
             )
             self._graph_acceptance[shape] = DeviceAcceptance.from_samples(
                 drafts,

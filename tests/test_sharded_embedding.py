@@ -13,8 +13,8 @@ from torch import nn
 
 from resin import Parallelism
 from resin.backend.collectives import close_layer_collectives, layer_collectives
-from resin.backend.embedding import ShardedEmbeddingLookup
 from resin.backend.topology import ParallelGroups
+from resin_models_cuda.deepseek_v41.embedding import ShardedEmbeddingLookup
 from resin_models_cuda.deepseek_v41.engram import ParallelEngramEmbedding
 
 

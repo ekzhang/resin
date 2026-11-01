@@ -11,11 +11,12 @@ import torch
 from resin import RunnerConfig
 from resin.backend.loading import (
     MODEL_FILES,
-    materialize_safetensor_model,
+    load_safetensor_weights,
     read_config,
+    resolve_dtype,
     resolve_model,
 )
-from resin.backend.plans import plan_rows
+from resin.backend.plans import BatchView
 from resin.backend.sampling import (
     PromptScores,
     TorchSampler,
@@ -59,12 +60,22 @@ def load_model(model_path: Path, *, device, dtype=None):
             "quantized safetensors use a different physical format"
         )
     args = Lfm2Config.from_dict(config)
-    model = materialize_safetensor_model(
-        model_path,
-        device=device,
-        dtype=dtype,
-        build=lambda: Lfm2ForCausalLM(args),
-    )
+    target = torch.device(device)
+    load_target = target if target.type in {"cpu", "cuda"} else torch.device("cpu")
+    with torch.device("meta"):
+        model = Lfm2ForCausalLM(args)
+    load_safetensor_weights(model_path, model, device=load_target)
+    model.materialize_buffers(load_target)
+    if target != load_target:
+        model.to(target)
+    resolved_dtype = resolve_dtype(dtype)
+    if resolved_dtype is not None:
+        if not resolved_dtype.is_floating_point:
+            raise ValueError("model dtype must be floating point")
+        model.to(dtype=resolved_dtype)
+    # Restore computed RoPE buffers after Module.to casts floating-point buffers.
+    model.materialize_buffers(target)
+    model.eval()
     return model, config
 
 
@@ -97,24 +108,39 @@ class Lfm2TorchRunner(Runner):
         logits_rows = []
         prompt_rows = []
         self.forward_calls += 1
-        rows = plan_rows(plan, self._cache, self.vocab_size)
+        batch = BatchView.from_plan(plan)
+        for index, sequence_id in enumerate(batch.sequence_ids):
+            sequence_id = int(sequence_id)
+            cache = self._cache.get(sequence_id)
+            offset = 0 if cache is None else cache.length
+            token_slice = batch.token_slice(index)
+            positions = batch.positions[token_slice]
+            if int(batch.context_lengths[index]) != offset:
+                expected = np.arange(offset, offset + len(positions), dtype=np.uint32)
+                raise ValueError(
+                    f"non-contiguous positions for request {sequence_id}: "
+                    f"expected {expected.tolist()}, got {positions.tolist()}"
+                )
+            if np.any(batch.token_ids[token_slice] >= self.vocab_size):
+                raise ValueError(f"token id is out of range for request {sequence_id}")
 
         with torch.inference_mode():
-            if len(rows) > 1 and all(len(row.token_ids) == 1 for row in rows):
+            if batch.num_sequences > 1 and np.all(batch.query_lengths == 1):
                 caches = []
-                for row in rows:
-                    cache = row.cache
+                for sequence_id in batch.sequence_ids:
+                    sequence_id = int(sequence_id)
+                    cache = self._cache.get(sequence_id)
                     if cache is None:
                         cache = self._model.make_cache()
-                        self._cache[row.request_id] = cache
+                        self._cache[sequence_id] = cache
                     caches.append(cache)
                 inputs = torch.tensor(
-                    np.stack([row.token_ids for row in rows]),
+                    batch.token_ids[:, None],
                     dtype=torch.long,
                     device=self.device,
                 )
                 position_tensor = torch.tensor(
-                    np.stack([row.positions for row in rows]),
+                    batch.positions[:, None],
                     dtype=torch.long,
                     device=self.device,
                 )
@@ -123,7 +149,7 @@ class Lfm2TorchRunner(Runner):
                 if plan.needs_prompt_logprobs:
                     prompt_rows.append(prompt_scores(plan, logits[:, 0]))
             else:
-                self._forward_rows(rows, logits_rows, plan, prompt_rows)
+                self._forward_rows(batch, logits_rows, plan, prompt_rows)
         sampler = getattr(self, "_sampler", None)
         if sampler is None:
             sampler = self._sampler = TorchSampler()
@@ -133,18 +159,19 @@ class Lfm2TorchRunner(Runner):
             logits, sampler(logits, plan), plan, prompt_logprobs=scores
         )
 
-    def _forward_rows(self, rows, logits_rows, plan, prompt_rows) -> None:
-        token_start = 0
-        for row in rows:
-            cache = row.cache
+    def _forward_rows(self, batch, logits_rows, plan, prompt_rows) -> None:
+        for index, sequence_id in enumerate(batch.sequence_ids):
+            sequence_id = int(sequence_id)
+            token_slice = batch.token_slice(index)
+            cache = self._cache.get(sequence_id)
             if cache is None:
                 cache = self._model.make_cache()
-                self._cache[row.request_id] = cache
+                self._cache[sequence_id] = cache
             inputs = torch.tensor(
-                row.token_ids[None], dtype=torch.long, device=self.device
+                batch.token_ids[token_slice][None], dtype=torch.long, device=self.device
             )
             position_tensor = torch.tensor(
-                row.positions[None], dtype=torch.long, device=self.device
+                batch.positions[token_slice][None], dtype=torch.long, device=self.device
             )
             logits = self._model(
                 inputs,
@@ -156,12 +183,14 @@ class Lfm2TorchRunner(Runner):
             if plan.needs_prompt_logprobs:
                 prompt_rows.append(
                     prompt_scores(
-                        plan, logits[0], self._model.logits, token_start=token_start
+                        plan,
+                        logits[0],
+                        self._model.logits,
+                        token_start=token_slice.start,
                     )
                 )
                 logits = self._model.logits(logits[:, -1:])
             logits_rows.append(logits[:, -1, :])
-            token_start += len(row.token_ids)
 
     def release(self, request_ids: list[int]) -> None:
         for request_id in request_ids:

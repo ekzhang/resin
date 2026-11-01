@@ -104,7 +104,6 @@ def test_decode_lookahead_leases_the_second_attention_block() -> None:
         ],
     )
     cache = PagedCachePlan.from_plan(plan, layout, decode_lookahead=5)
-    assert cache.groups[0].address(0, 1) == (1, 1)
-    assert cache.groups[1].address(0, 1) == (2, 1)
-    assert cache.groups[2].address(0, 1) == (3, 1)
-    assert cache.groups[3].address(0, 0) == (4, 0)
+    for index, group in enumerate(cache.groups):
+        assert group.block_slabs(0).tolist() == [index + 1] * (2 if index < 3 else 1)
+        assert group.block_slots(0).tolist() == ([0, 1] if index < 3 else [0])

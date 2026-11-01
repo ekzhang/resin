@@ -6,7 +6,7 @@ from types import ModuleType
 import pytest
 import torch
 
-from resin.backend.cuda.expert_parallel import SparseExpertTransport
+from resin.backend.cuda.expert_parallel import _SparseExpertTransport
 from resin.backend.topology import RankGroup
 
 
@@ -115,7 +115,7 @@ def test_sparse_transport_restores_router_dtype_masks_padding_and_combines_fp32(
         api, "moe_a2a_sanitize_expert_ids", lambda *args: None, raising=False
     )
     monkeypatch.setitem(sys.modules, api.__name__, api)
-    transport = SparseExpertTransport.__new__(SparseExpertTransport)
+    transport = _SparseExpertTransport.__new__(_SparseExpertTransport)
     transport.capacity, transport.group = capacity, RankGroup((0, 1), None, 0)
     transport.workspace = transport.metainfo = torch.empty(0)
     hidden = torch.arange(1, 9).reshape(capacity, 4).bfloat16()

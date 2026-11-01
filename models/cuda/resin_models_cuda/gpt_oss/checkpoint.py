@@ -16,7 +16,6 @@ from resin.backend.loading import (
     resolve_dtype,
     resolve_model,
 )
-from resin.backend.quantization import MXFP4, QuantizationConfig
 from resin.models.gpt_oss.config import GptOssConfig
 from resin_models_cuda.gpt_oss.flashinfer import MXFP4Config
 from resin_models_cuda.gpt_oss.model import MoEForCausalLM
@@ -44,7 +43,6 @@ def _download_model(
     repo_id: str,
     revision: str | None,
     *,
-    quantization: QuantizationConfig | None = None,
     kernel_moe=None,
 ) -> Path:
     from huggingface_hub import hf_hub_download, snapshot_download
@@ -56,7 +54,6 @@ def _download_model(
     )
     _check_quantization(
         json.loads(config_file.read_text()),
-        quantization=quantization,
         kernel_moe=kernel_moe,
     )
     return Path(
@@ -72,7 +69,6 @@ def resolve_model_path(
     model: str | Path,
     revision: str | None,
     *,
-    quantization: QuantizationConfig | None = None,
     kernel_moe=None,
 ) -> Path:
     repo_id = str(model)
@@ -83,7 +79,6 @@ def resolve_model_path(
         lambda repository, selected: _download_model(
             repository,
             selected,
-            quantization=quantization,
             kernel_moe=kernel_moe,
         ),
     )
@@ -92,15 +87,12 @@ def resolve_model_path(
 def _check_quantization(
     config: dict[str, Any],
     *,
-    quantization: QuantizationConfig | None = None,
     kernel_moe=None,
 ) -> None:
     checkpoint_config = config.get("quantization_config") or config.get("quantization")
     method = checkpoint_config.get("quant_method") if checkpoint_config else None
     if method != "mxfp4":
         raise ValueError("GPT-OSS CUDA inference requires an MXFP4 checkpoint")
-    if quantization is not None:
-        quantization.require("transformer.experts", MXFP4)
     if kernel_moe is None:
         raise NotImplementedError(
             "the released GPT-OSS checkpoint uses MXFP4 expert weights; "
@@ -113,7 +105,6 @@ def load_model(
     *,
     device: str | torch.device,
     dtype: str | torch.dtype | None = None,
-    quantization: QuantizationConfig | None = None,
     kernel_moe=None,
     tensor_parallel: TensorParallelLayout | None = None,
     parallel_groups: ParallelGroups | None = None,
@@ -123,7 +114,6 @@ def load_model(
     args = GptOssConfig.from_dict(config)
     _check_quantization(
         config,
-        quantization=quantization,
         kernel_moe=kernel_moe,
     )
     if parallel_groups is not None:

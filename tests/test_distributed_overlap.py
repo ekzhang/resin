@@ -53,9 +53,9 @@ class ParallelRunner:
             codes, (context.step_id, asynchronous), group=self.groups.domain.handle
         )
         assert all(code == codes[0] for code in codes)
-        self.calls.append((context.step_id, asynchronous, context.placeholder))
+        self.calls.append((context.step_id, asynchronous, (context.num_sequences == 0)))
 
-    def forward_distributed(self, plan, context):
+    def forward_distributed(self, plan, context, *, prepared=None):
         self._join(context, False)
         if plan is None:
             return None

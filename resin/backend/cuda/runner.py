@@ -28,17 +28,17 @@ from resin.backend.cuda.graphs import (
 )
 from resin.backend.cuda.metrics import CudaMetrics, GraphPhaseTiming
 from resin.backend.cuda.sampling import (
-    SAMPLING_OFFSET_STRIDE,
     FusedSampler,
     SamplingTensors,
 )
 from resin.backend.cuda.tensor_graphs import (
     CudaGraphTensorRegion,
-    PrefillTensorGraphs,
     TensorSpec,
+    _PrefillTensorGraphs,
 )
 from resin.backend.metrics import RunnerMetrics
 from resin.backend.resources import CachePoolBinding
+from resin.backend.sampling import SAMPLING_OFFSET_STRIDE
 from resin.backend.topology import ParallelismCapabilities
 from resin.protocols import Runner
 
@@ -51,7 +51,7 @@ class _PrefillCallback(Protocol):
     ) -> torch.Tensor: ...
 
 
-def resolve_kv_cache_dtype(value: str) -> torch.dtype:
+def _resolve_kv_cache_dtype(value: str) -> torch.dtype:
     """Resolve the cache precision shared by CUDA model runners."""
 
     if value == "fp8":
@@ -95,7 +95,7 @@ class CudaRunner(Runner):
         self._prefill_graph_active = False
         self._prefill_operations = ()
         self._prefill_tensor_graphs = {}
-        cache_dtype = resolve_kv_cache_dtype(kv_cache_dtype)
+        cache_dtype = _resolve_kv_cache_dtype(kv_cache_dtype)
         if not torch.cuda.is_available():
             raise RuntimeError(f"{label} requires CUDA")
         self.device = torch.device(device)
@@ -504,7 +504,7 @@ class CudaRunner(Runner):
     def _configure_prefill_tensor_graphs(self, regions, **options):
         """Capture pure tensor regions while keeping attention metadata eager."""
 
-        graphs = PrefillTensorGraphs(self, tuple(regions), **options)
+        graphs = _PrefillTensorGraphs(self, tuple(regions), **options)
         if not hasattr(self, "_prefill_tensor_graphs"):
             self._prefill_tensor_graphs = {}
         self._prefill_tensor_graphs[graphs.mode] = graphs
@@ -612,18 +612,6 @@ class CudaRunner(Runner):
                 group=self._parallel_graph_groups.domain.handle
             )
             close_layer_collectives(self._parallel_graph_model)
-
-    def capture_cuda_graph(self, mode: str, shape: GraphShape) -> CudaGraphStats:
-        """Capture one mode shape while honoring model-state hooks."""
-
-        self._validate_distributed_graph_catalogs((mode, shape))
-        executor = self._require_cuda_graph_executor()
-        self._before_cuda_graph_capture()
-        try:
-            executor.capture(mode, shape)
-        finally:
-            self._after_cuda_graph_capture()
-        return self.cuda_graph_stats[mode]
 
     def _check_cuda_graphs(self, phase: BatchPhase | None = None) -> None:
         """Reject poisoned graphs and missing prefill capture before model work."""
@@ -739,18 +727,6 @@ def graph_sample(
     )
 
 
-def graph_sample_block(
-    sampler: FusedSampler,
-    logits: torch.Tensor,
-    sampling: SamplingTensors,
-    *,
-    out: torch.Tensor | None = None,
-    start_step: int = 0,
-) -> torch.Tensor:
-    """Sample a complete verification block with request-local column offsets."""
-    return sampler.sample_block(logits, sampling, out=out, start_step=start_step)
-
-
 def validate_hybrid_plan(
     plan: BatchPlan,
     *,
@@ -782,8 +758,6 @@ __all__ = [
     "CudaRunner",
     "capture_sampling_inputs",
     "graph_sample",
-    "graph_sample_block",
     "pad_sampling_inputs",
-    "resolve_kv_cache_dtype",
     "validate_hybrid_plan",
 ]

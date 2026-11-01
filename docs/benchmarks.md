@@ -761,9 +761,8 @@ The first two dimensions flatten as a view, including padded vocabulary strides;
 non-viewable storage is rejected instead of silently copied. One small kernel
 expands all request metadata and sets each column's offset to
 `base + (start_step + column) * SAMPLING_OFFSET_STRIDE`. The filtering and draw
-kernels then process the complete block. `graph_sample_block` exposes this at the
-shared runner boundary. GLM, DeepSeek, Gemma, Inkling, and Qwen verification
-callers use the block path in eager execution and CUDA graphs. Draft calls that
+kernels then process the complete block. GLM, DeepSeek, Gemma, Inkling, and Qwen
+verification callers use the block path in eager execution and CUDA graphs. Draft calls that
 depend on previously sampled tokens still run sequentially. Qwen verification
 begins at `start_step=1`; the other verification blocks begin at zero. Qwen
 retains the states produced during verification and selects the accepted prefix

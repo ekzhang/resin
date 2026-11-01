@@ -257,7 +257,7 @@ def test_request_reordering_cancellation_and_padding_preserve_stream(
 @torch.inference_mode()
 def test_graph_replay_reads_changed_values_and_reuses_owned_workspace(fused, dtype):
     data = _inputs(8, 154880, dtype=dtype, strided=True)
-    workspace = fused.prepare_workspace(data[0])
+    workspace = fused._prepare_workspace(data[0])
     output = torch.empty(8, device="cuda", dtype=torch.int64)
     source = [value.clone() for value in data]
     stream = torch.cuda.Stream()
@@ -393,7 +393,7 @@ def test_request_values_rows_and_strides_do_not_add_jit_variants(fused):
 
     shifted_data = tuple(shifted(value) for value in initial)
     expected, margins = _reference(initial)
-    workspace = fused.prepare_workspace(initial[0])
+    workspace = fused._prepare_workspace(initial[0])
     workspace = replace(
         workspace,
         **{
@@ -439,7 +439,7 @@ def test_empty_batch_and_workspace_validation(fused):
     result = fused.sample_logits(*empty)
     assert result.shape == (0,) and result.dtype == torch.int64
     data = _inputs(2, 17)
-    workspace = fused.prepare_workspace(data[0])
+    workspace = fused._prepare_workspace(data[0])
     with pytest.raises(ValueError, match="geometry"):
         fused.sample_logits(*data, workspace=replace(workspace, shape=(2, 18)))
     with pytest.raises(ValueError):
@@ -464,7 +464,7 @@ def test_empty_batch_and_workspace_validation(fused):
 def test_real_vocabulary_tiled_greedy_partials_and_final_winner(fused, vocab, capture):
     data = _inputs(64, vocab)
     data[-1].zero_()
-    workspace = fused.prepare_workspace(data[0])
+    workspace = fused._prepare_workspace(data[0])
     actual = fused.sample_logits(*data, workspace=workspace)
     if capture:
         torch.cuda.synchronize()
@@ -513,7 +513,7 @@ def test_partial_tail_mask_preserves_the_first_128_tokens_in_every_tile(
     parts = (vocab + 1023) // 1024
     ids = torch.arange(parts, device="cuda")[None, :] * 1024 + offsets[:, None]
     logits[rows[:, None], ids] = 10 + rows[:, None].float()
-    workspace = fused.prepare_workspace(logits)
+    workspace = fused._prepare_workspace(logits)
     actual = fused.sample_logits(*data, workspace=workspace)
     expected_max = (10 + rows[:, None].float()).expand(-1, parts)
     torch.testing.assert_close(workspace.maxima, expected_max, atol=0, rtol=0)
@@ -552,7 +552,7 @@ def test_opposite_sign_finite_logits_preserve_high_temperature_distribution(fuse
 @torch.inference_mode()
 def test_output_and_scratch_may_not_alias_inputs_or_each_other(fused):
     data = _inputs(8, 2051)
-    workspace = fused.prepare_workspace(data[0])
+    workspace = fused._prepare_workspace(data[0])
     for output in (data[2], data[3]):
         with pytest.raises(ValueError):
             fused.sample_logits(*data, out=output)

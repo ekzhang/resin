@@ -61,14 +61,6 @@ class TensorStager:
         tensor.copy_(source, non_blocking=True)
         return tensor
 
-    def tensors(
-        self, fields: Mapping[str, tuple[object, torch.dtype]], *, device: bool
-    ) -> dict[str, torch.Tensor]:
-        stage = self.device if device else self.host
-        return {
-            name: stage(name, values, dtype) for name, (values, dtype) in fields.items()
-        }
-
     def copy_into(
         self,
         targets: Mapping[str, torch.Tensor],

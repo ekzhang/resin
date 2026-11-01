@@ -7,7 +7,7 @@ from typing import TYPE_CHECKING
 
 import torch
 
-from resin.backend.sampling import SAMPLING_OFFSET_STRIDE, batch_sampling_inputs
+from resin.backend.sampling import batch_sampling_inputs
 
 if TYPE_CHECKING:
     from resin import BatchPlan
@@ -260,6 +260,5 @@ class FusedSampler:
 
 __all__ = [
     "FusedSampler",
-    "SAMPLING_OFFSET_STRIDE",
     "SamplingTensors",
 ]

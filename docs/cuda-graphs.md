@@ -119,8 +119,8 @@ host token lists. Synchronous output helpers return owned `ForwardOutput`
 columns. Deferred `DeviceCompletion` stages accepted tokens and counts, records
 an event, and constructs those columns after that event completes.
 
-`PrefillTensorGraphs` owns buffer allocation, padding and replay for both
-feed-forward and projection regions. Feed-forward regions use coordinated
+The internal tensor graph manager owns buffer allocation, padding and replay
+for both feed-forward and projection regions. Feed-forward regions use coordinated
 capacities and valid-row counts across the execution mesh, including idle
 replicas. Projection regions select local buckets.
 

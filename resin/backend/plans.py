@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any
 
 import numpy as np
 import numpy.typing as npt
@@ -146,29 +145,6 @@ class CacheGroupView:
 
     def block_slots(self, row: int) -> npt.NDArray[np.uint32]:
         return self.block_slotnums[self.block_slice(row)]
-
-    def row_addresses(self, row: int) -> tuple[tuple[int, int], ...]:
-        """Return the ordered physical addresses in one logical table row."""
-
-        return tuple(
-            zip(
-                map(int, self.block_slabs(row)),
-                map(int, self.block_slots(row)),
-            )
-        )
-
-    def address(self, row: int, logical_block: int) -> tuple[int, int]:
-        """Resolve one covered logical block to its physical slab and slot."""
-
-        column = (
-            0
-            if self.state is not None
-            else logical_block - int(self.block_table_start_indices[row])
-        )
-        addresses = self.row_addresses(row)
-        if not 0 <= column < len(addresses):
-            raise ValueError("cache row does not cover the logical block")
-        return addresses[column]
 
     @property
     def packed_block_ids(self) -> npt.NDArray[np.uint64]:
@@ -363,37 +339,3 @@ class PagedCachePlan:
     @property
     def context_lengths(self) -> npt.NDArray[np.uint32]:
         return self.batch.context_lengths
-
-
-@dataclass(frozen=True, slots=True)
-class PlanRow:
-    request_id: int
-    token_ids: npt.NDArray[np.uint32]
-    positions: npt.NDArray[np.uint32]
-    cache: Any
-
-
-def plan_rows(
-    plan: BatchPlan, caches: dict[int, Any], vocab_size: int
-) -> list[PlanRow]:
-    """Validate and split one native plan into request-local rows."""
-
-    batch = BatchView.from_plan(plan)
-    rows = []
-    for index, sequence_id in enumerate(batch.sequence_ids):
-        token_slice = batch.token_slice(index)
-        sequence_id = int(sequence_id)
-        cache = caches.get(sequence_id)
-        offset = 0 if cache is None else cache.length
-        positions = batch.positions[token_slice]
-        if int(batch.context_lengths[index]) != offset:
-            expected = np.arange(offset, offset + len(positions), dtype=np.uint32)
-            raise ValueError(
-                f"non-contiguous positions for request {sequence_id}: "
-                f"expected {expected.tolist()}, got {positions.tolist()}"
-            )
-        row_tokens = batch.token_ids[token_slice]
-        if np.any(row_tokens >= vocab_size):
-            raise ValueError(f"token id is out of range for request {sequence_id}")
-        rows.append(PlanRow(sequence_id, row_tokens, positions, cache))
-    return rows

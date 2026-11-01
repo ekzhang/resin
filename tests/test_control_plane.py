@@ -10,7 +10,6 @@ import torch.distributed as dist
 import torch.multiprocessing as mp
 
 from resin.backend.control_plane import (
-    ControlOperation,
     ControlPlane,
     ControlPlaneError,
 )
@@ -21,17 +20,17 @@ from resin.backend.topology import RankGroup
 def test_single_rank_control_vote_needs_no_initialized_transport():
     control = ControlPlane(None)
     group = RankGroup((7,), None, 0)
-    assert control.gather(group, ControlOperation.WORK, (1, -3)) == (
+    assert control.gather(group, "work", (1, -3)) == (
         [(1, -3)],
         [None],
     )
-    assert control.gather(group, ControlOperation.COMMIT, error="failed") == (
+    assert control.gather(group, "commit", error="failed") == (
         [()],
         ["failed"],
     )
     assert not control._buffers
     with pytest.raises(ValueError, match="at most 6"):
-        control.gather(group, ControlOperation.WORK, range(7))
+        control.gather(group, "work", range(7))
 
 
 def _control_worker(rank, rendezvous, output):
@@ -65,7 +64,7 @@ def _control_worker(rank, rendezvous, output):
     control = ControlPlane(transport)
     group = RankGroup((0, 1), dist.group.WORLD, rank)
     saved = None
-    for operation in ControlOperation:
+    for operation in ("work", "phase", "prepare", "validate", "forward", "commit"):
         records, errors = control.gather(
             group, operation, (rank * 3, -rank - 1, 2**40 + rank)
         )
@@ -76,7 +75,7 @@ def _control_worker(rank, rendezvous, output):
     assert transport.objects == 0
     records, errors = control.gather(
         group,
-        ControlOperation.VALIDATE,
+        "validate",
         (rank,),
         error="rank one failed before launch" if rank == 1 else None,
     )
@@ -87,8 +86,8 @@ def _control_worker(rank, rendezvous, output):
     # Different logical operations still use identical collective type/shape.
     # Both ranks detect the mismatch, rather than one entering model execution.
     with pytest.raises(ControlPlaneError, match="different orders"):
-        control.gather(group, "http output" if rank else ControlOperation.PREPARE)
-    assert control.gather(group, ControlOperation.COMMIT) == (
+        control.gather(group, "http output" if rank else "prepare")
+    assert control.gather(group, "commit") == (
         [(), ()],
         [None, None],
     )
@@ -221,7 +220,7 @@ def _subgroup_worker(rank, rendezvous):
         if rank in ranks:
             group = RankGroup(ranks, handle, ranks.index(rank))
             control = ControlPlane(dist)
-            for operation in (ControlOperation.PREPARE, "HTTP configuration"):
+            for operation in ("prepare", "HTTP configuration"):
                 records, errors = control.gather(
                     group,
                     operation,
@@ -234,7 +233,7 @@ def _subgroup_worker(rank, rendezvous):
                 assert errors == [None] * len(ranks)
             records, errors = control.gather(
                 group,
-                ControlOperation.FORWARD,
+                "forward",
                 (rank,),
                 error="middle rank failed" if rank == 2 else None,
             )
@@ -243,9 +242,9 @@ def _subgroup_worker(rank, rendezvous):
             with pytest.raises(ControlPlaneError, match="different orders"):
                 control.gather(
                     group,
-                    ControlOperation.PREPARE if rank == group.source else "HTTP output",
+                    "prepare" if rank == group.source else "HTTP output",
                 )
-            assert control.gather(group, ControlOperation.COMMIT) == (
+            assert control.gather(group, "commit") == (
                 [(), (), ()],
                 [None, None, None],
             )

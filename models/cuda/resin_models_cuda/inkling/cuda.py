@@ -23,18 +23,15 @@ from resin.backend.cuda.runner import (
     CudaRunner,
     capture_sampling_inputs,
     graph_sample,
-    graph_sample_block,
     pad_sampling_inputs,
     validate_hybrid_plan,
-)
-from resin.backend.cuda.sampling import (
-    SAMPLING_OFFSET_STRIDE,
 )
 from resin.backend.cuda.staging import TensorStager
 from resin.backend.cuda.state import execute_state
 from resin.backend.cuda.vision_cache import VisionFeatureCache
 from resin.backend.plans import PagedCachePlan
 from resin.backend.sampling import (
+    SAMPLING_OFFSET_STRIDE,
     PromptScores,
     format_output,
     prompt_scores,
@@ -300,7 +297,7 @@ class InklingCudaRunner(CudaRunner):
                 )
                 if phase_timing is not None:
                     phase_timing.mark(2)
-                targets = graph_sample_block(self._sampler, logits, sampling)
+                targets = self._sampler.sample_block(logits, sampling)
                 matches = drafts == targets[:, : self.speculative_draft_tokens]
                 accepted = torch.cumprod(matches.to(torch.int32), dim=1).sum(1)
                 processed = accepted.to(torch.long) + 1

@@ -8,7 +8,7 @@ import resin
 from resin import BatchPlan, Engine, SamplingParams
 from resin.backend.cuda.sampling import FusedSampler
 from resin.backend.sampling import TorchSampler, batch_sampling_inputs
-from resin.backend.speculative import SpeculativeStats, accept_speculative_tokens
+from resin.backend.speculative import SpeculativeStats, _accept_speculative_tokens
 
 
 class RecordingRunner:
@@ -22,7 +22,7 @@ class RecordingRunner:
 
 class TestSamplingContract:
     def test_speculative_acceptance_returns_prefix_plus_one_bonus(self) -> None:
-        acceptance = accept_speculative_tokens(
+        acceptance = _accept_speculative_tokens(
             [[10, 11, 12], [20, 21, 22]],
             [[10, 11, 13, 14], [31, 30, 29, 28]],
         )
@@ -215,6 +215,31 @@ class TestSharedSampler:
         )
 
         assert sampler(logits, plan).tolist() == [1, 1, 1]
+
+    def test_torch_sampler_draws_are_independent_of_batch_composition(self) -> None:
+        sampler = TorchSampler()
+        logits = torch.randn(4, 17, generator=torch.Generator().manual_seed(31))
+        params = [
+            SamplingParams(temperature=0.7, top_p=0.8, top_k=5, seed=7),
+            SamplingParams(temperature=1.5, top_p=0.95, seed=19),
+            SamplingParams(temperature=0.9, top_k=7, seed=41),
+            SamplingParams(temperature=0.0),
+        ]
+        expected = sampler(logits, self._plan(params))
+        separate = torch.cat(
+            [
+                sampler(logits[row : row + 1], self._plan([policy]))
+                for row, policy in enumerate(params)
+            ]
+        )
+        order = [2, 0, 3, 1]
+        reordered = sampler(logits[order], self._plan([params[row] for row in order]))
+
+        torch.testing.assert_close(separate, expected)
+        torch.testing.assert_close(reordered, expected[order])
+        output = torch.empty_like(expected)
+        assert sampler(logits, self._plan(params), out=output) is output
+        torch.testing.assert_close(output, expected)
 
     @pytest.mark.parametrize(
         ("top_p", "top_k", "expected"),

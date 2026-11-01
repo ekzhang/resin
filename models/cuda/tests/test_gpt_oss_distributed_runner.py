@@ -14,9 +14,9 @@ from resin.backend.cuda.parallel import TensorParallelContext
 from resin.backend.cuda.runner import CudaRunner
 from resin.backend.cuda.sampling import FusedSampler
 from resin.backend.distributed import StepContext
-from resin.backend.paged_attention import PagedAttentionBatch, PagedAttentionGroup
 from resin.backend.sampling import token_output
 from resin.backend.topology import RankGroup
+from resin.models.gpt_oss.plan import AttentionBatch, AttentionGroup
 from resin_models_cuda.gpt_oss.cuda import GptOssCudaRunner
 
 
@@ -554,15 +554,14 @@ def test_idle_prefill_replica_joins_captured_ffns(monkeypatch):
 
 def _decode_host(runner, plan):
     rows = plan.num_sequences
-    return PagedAttentionBatch(
+    return AttentionBatch(
         phase=BatchPhase.DECODE,
         token_indices=np.arange(rows, dtype=np.int64),
         sequence_indices=tuple(range(rows)),
         query_lengths=(1,) * rows,
         groups=tuple(
-            PagedAttentionGroup(
+            AttentionGroup(
                 name=name,
-                page_size=runner.page_size,
                 width=width,
                 page_table=np.ones(rows * width, dtype=np.uint64),
                 lengths=tuple(int(value) + 1 for value in plan.context_lengths),

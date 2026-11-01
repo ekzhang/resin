@@ -23,6 +23,7 @@ from resin import BatchPhase, RunnerConfig
 from resin.backend.capacity import plan_cache_capacity
 from resin.backend.cuda.completion import (
     CudaContinuation,
+    DeviceAcceptance,
     DeviceCompletion,
     GraphDeviceFeedback,
 )
@@ -43,17 +44,14 @@ from resin.backend.cuda.parallel import (
 from resin.backend.cuda.runner import (
     CudaRunner,
     capture_sampling_inputs,
-    graph_sample_block,
     pad_sampling_inputs,
-)
-from resin.backend.cuda.sampling import (
-    SAMPLING_OFFSET_STRIDE,
 )
 from resin.backend.cuda.staging import TensorStager
 from resin.backend.cuda.tensor_graphs import CudaGraphTensorRegion, TensorSpec
 from resin.backend.cuda.vision_cache import VisionFeatureCache
 from resin.backend.plans import BatchView, PagedCachePlan
 from resin.backend.sampling import (
+    SAMPLING_OFFSET_STRIDE,
     PromptScores,
     format_output,
     prompt_scores,
@@ -964,7 +962,7 @@ class DeepSeekV41CudaRunner(CudaRunner):
                 )
                 output_ids[:, :block_size].copy_(drafts)
                 targets = self._broadcast_tokens(
-                    graph_sample_block(self._sampler, verify_logits, sampling)
+                    self._sampler.sample_block(verify_logits, sampling)
                 )
                 output_ids[:, block_size:].copy_(targets)
                 if phase_timing is not None:
@@ -1077,8 +1075,6 @@ class DeepSeekV41CudaRunner(CudaRunner):
         return token_output(accepted)
 
     def _enqueue_graph_output(self, plan, shape, inputs, feedback):
-        from resin.backend.cuda.completion import accepted_block
-
         self._last_dspark_phase_ms = {}
         ids = () if plan is None else tuple(map(int, plan.sequence_ids))
         state = (
@@ -1094,12 +1090,16 @@ class DeepSeekV41CudaRunner(CudaRunner):
                 inputs["positions"], device=self.device, dtype=torch.long
             )
         output = self._run_cuda_graph("decode", shape, inputs)
-        tokens, counts, base = accepted_block(
-            output,
+        draft_tokens = self.speculative_draft_tokens
+        samples = output if draft_tokens else output.reshape(-1, 1)
+        acceptance = DeviceAcceptance.from_samples(
+            samples[:, :draft_tokens],
+            samples[:, draft_tokens:],
             positions,
-            self.speculative_draft_tokens,
             fixed_acceptance=self._speculation.validated_benchmark_accepted_drafts,
         )
+        counts = acceptance.counts
+        base = acceptance.feedback()
         if self.speculative_draft_tokens:
             self._model.clear_rejected_speculative_state(
                 positions,
@@ -1107,10 +1107,9 @@ class DeepSeekV41CudaRunner(CudaRunner):
                 self.speculative_draft_tokens + 1,
                 cache=self._graph_device_caches[shape],
             )
-        completion = DeviceCompletion(
-            tokens,
-            counts,
-            GraphDeviceFeedback(base.token_ids, base.positions, state),
+        completion = DeviceCompletion.from_acceptance(
+            acceptance,
+            feedback=GraphDeviceFeedback(base.token_ids, base.positions, state),
             rows=0 if plan is None else plan.num_sequences,
             stats=self._speculation
             if self.speculative_draft_tokens and plan is not None

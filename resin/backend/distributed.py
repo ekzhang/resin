@@ -17,7 +17,7 @@ import torch
 from resin import BatchPhase, BatchPlan, Engine, ForwardOutput, Runner, RunnerConfig
 from resin._resin import _HistogramAccumulator
 from resin.backend.command_transport import CommandTransport
-from resin.backend.control_plane import ControlOperation, ControlPlane
+from resin.backend.control_plane import ControlPlane
 from resin.backend.metrics import RunnerMetrics
 from resin.backend.plan_transport import PlanTransport
 from resin.backend.topology import ParallelGroups, RankGroup
@@ -87,10 +87,6 @@ class StepContext:
     num_tokens: int
 
     @property
-    def placeholder(self) -> bool:
-        return self.num_sequences == 0
-
-    @property
     def max_num_sequences(self) -> int:
         return max(rows for rows, _ in self.replica_sizes)
 
@@ -105,7 +101,7 @@ class DistributedRunner(Protocol):
     runner_config: RunnerConfig
 
     def forward_distributed(
-        self, plan: BatchPlan | None, context: StepContext
+        self, plan: BatchPlan | None, context: StepContext, *, prepared=None
     ) -> ForwardOutput | None: ...
 
 
@@ -282,7 +278,7 @@ class DistributedWorker:
         return tuple(snapshots)
 
     def _consensus(self, group: RankGroup, error: str | None):
-        _, errors = self._vote(group, ControlOperation.VALIDATE, error=error)
+        _, errors = self._vote(group, "validate", error=error)
         failure = _first_error(group, errors)
         if failure:
             raise DistributedExecutionError(failure)

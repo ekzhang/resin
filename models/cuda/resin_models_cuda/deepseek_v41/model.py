@@ -743,7 +743,7 @@ class Transformer(nn.Module):
             None,
         )
         if args.engram_layer_ids:
-            from resin.backend.embedding import ShardedEmbeddingLookup
+            from resin_models_cuda.deepseek_v41.embedding import ShardedEmbeddingLookup
             from resin_models_cuda.deepseek_v41.engram import (
                 Engram,
                 EngramRuntime,
@@ -786,7 +786,7 @@ class Transformer(nn.Module):
 
         collective = None
         if expert_backend == "deepgemm":
-            from resin.backend.cuda.mega_moe import MegaMoeCollective
+            from resin_models_cuda.mega_moe import MegaMoeCollective
 
             if self.parallel_groups is None:
                 raise ValueError("DeepGEMM requires explicit parallel groups")

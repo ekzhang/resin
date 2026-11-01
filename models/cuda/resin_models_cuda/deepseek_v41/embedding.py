@@ -1,4 +1,4 @@
-"""Bounded owner lookups across a device group, independent of model format."""
+"""Bounded Engram owner lookups across a DeepSeek device group."""
 
 from collections.abc import Callable, Sequence
 

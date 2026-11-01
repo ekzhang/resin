@@ -1,22 +1,24 @@
-"""Per-layer K/V storage and dense paged-attention device metadata."""
+"""GPT-OSS per-layer K/V storage and dense FA4 metadata."""
 
 from __future__ import annotations
 
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, Any, cast
 
 import numpy as np
 import numpy.typing as npt
 import torch
 
+from resin import BatchPhase
 from resin.backend.cache_storage import byte_regions, live_rows
+from resin.backend.cuda.context_parallel import ContextParallelTokens
 from resin.backend.resources import CachePoolBinding
 
 if TYPE_CHECKING:
-    from resin import BatchPhase, CacheLayout
+    from resin import CacheLayout
     from resin.backend.cuda.staging import TensorStager
-    from resin.backend.paged_attention import PagedAttentionBatch, PagedAttentionGroup
+    from resin.models.gpt_oss.plan import AttentionBatch, AttentionGroup
 
 
 class PagedKvArena:
@@ -87,7 +89,7 @@ class PagedKvTable:
 
 
 @dataclass(frozen=True, slots=True)
-class DevicePagedAttentionBatch:
+class DeviceAttentionBatch:
     """Dense named attention tables and token metadata staged for CUDA."""
 
     phase: BatchPhase
@@ -108,8 +110,8 @@ class DevicePagedAttentionBatch:
 
 
 def stage_paged_attention_batch(
-    batch: PagedAttentionBatch, staging: TensorStager, prefix: str
-) -> DevicePagedAttentionBatch:
+    batch: AttentionBatch, staging: TensorStager, prefix: str
+) -> DeviceAttentionBatch:
     """Copy one semantic paged-attention batch to CUDA tensors."""
 
     def device(name: str, values: object, dtype: torch.dtype) -> torch.Tensor:
@@ -142,7 +144,7 @@ def stage_paged_attention_batch(
                 ),
             )
         )
-    return DevicePagedAttentionBatch(
+    return DeviceAttentionBatch(
         phase=batch.phase,
         token_indices=device("token_indices", batch.token_indices, torch.long),
         sequence_indices=device("sequence_indices", batch.sequence_indices, torch.long),
@@ -161,7 +163,7 @@ def empty_decode_paged_attention_batch(
     device: str | torch.device,
     batch_size: int,
     group_shapes: Mapping[str, tuple[int, int]],
-) -> DevicePagedAttentionBatch:
+) -> DeviceAttentionBatch:
     """Allocate one fixed-address decode batch for CUDA graph capture."""
 
     if (
@@ -201,9 +203,7 @@ def empty_decode_paged_attention_batch(
         )
         for name, (width, page_size) in group_shapes.items()
     )
-    from resin import BatchPhase
-
-    return DevicePagedAttentionBatch(
+    return DeviceAttentionBatch(
         phase=BatchPhase.DECODE,
         token_indices=empty(torch.long, batch_size),
         sequence_indices=empty(torch.long, batch_size),
@@ -215,7 +215,7 @@ def empty_decode_paged_attention_batch(
 
 
 def paged_attention_graph_inputs(
-    batch: DevicePagedAttentionBatch,
+    batch: DeviceAttentionBatch,
 ) -> dict[str, torch.Tensor]:
     """Expose stable graph input names for one device batch."""
 
@@ -230,8 +230,8 @@ def paged_attention_graph_inputs(
     return inputs
 
 
-def pad_paged_attention_table(
-    group: PagedAttentionGroup, width: int
+def _pad_paged_attention_table(
+    group: AttentionGroup, width: int
 ) -> npt.NDArray[np.uint64]:
     """Pad each host row by repeating one page already owned by that row."""
 
@@ -246,7 +246,7 @@ def pad_paged_attention_table(
 
 
 def paged_attention_host_inputs(
-    batch: PagedAttentionBatch, group_widths: Mapping[str, int]
+    batch: AttentionBatch, group_widths: Mapping[str, int]
 ) -> dict[str, Any]:
     """Build named host values matching :func:`paged_attention_graph_inputs`."""
 
@@ -257,7 +257,7 @@ def paged_attention_host_inputs(
     if set(group_widths) != {group.name for group in batch.groups}:
         raise ValueError("CUDA graph group widths do not match attention groups")
     for group in batch.groups:
-        inputs[f"{group.name}_page_table"] = pad_paged_attention_table(
+        inputs[f"{group.name}_page_table"] = _pad_paged_attention_table(
             group, group_widths[group.name]
         )
         inputs[f"{group.name}_seqused_k"] = group.lengths
@@ -265,12 +265,52 @@ def paged_attention_host_inputs(
     return inputs
 
 
+def context_parallel_query_batch(
+    batch: DeviceAttentionBatch, tokens: ContextParallelTokens
+) -> DeviceAttentionBatch:
+    """Lower local Q metadata against globally reconstructed paged K/V.
+
+    FlashAttention aligns causal queries to the end of each K sequence. Trim
+    K lengths by the global query suffix following this rank's segment, so
+    that local queries retain their original causal positions. Exclude rows
+    with no local query. Page tables and append slots still refer to global
+    cache storage; callers write gathered K/V with the original batch first.
+    """
+
+    if batch.phase != BatchPhase.PREFILL:
+        raise ValueError("context-parallel query sharding is only used for prefill")
+    if batch.token_indices.shape[0] != tokens.plan.total_tokens:
+        raise ValueError("attention batch does not match its context token plan")
+    groups = tuple(
+        (
+            name,
+            replace(
+                group,
+                page_table=group.page_table.index_select(0, tokens.active_rows),
+                lengths=(group.lengths - tokens.suffix_tokens).index_select(
+                    0, tokens.active_rows
+                ),
+                min_length=0,
+            ),
+        )
+        for name, group in batch.groups
+    )
+    return replace(
+        batch,
+        token_indices=tokens.select(batch.token_indices),
+        sequence_indices=batch.sequence_indices.index_select(0, tokens.active_rows),
+        cu_seqlens_q=tokens.cu_seqlens_q,
+        max_seqlen_q=tokens.max_seqlen_q,
+        groups=groups,
+    )
+
+
 __all__ = [
-    "DevicePagedAttentionBatch",
+    "DeviceAttentionBatch",
+    "context_parallel_query_batch",
     "PagedKvArena",
     "PagedKvTable",
     "empty_decode_paged_attention_batch",
-    "pad_paged_attention_table",
     "paged_attention_graph_inputs",
     "paged_attention_host_inputs",
     "stage_paged_attention_batch",

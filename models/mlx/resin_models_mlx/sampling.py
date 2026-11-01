@@ -12,7 +12,7 @@ from __future__ import annotations
 import mlx.core as mx
 import numpy as np
 
-from resin.backend.sampling import TorchSampler, batch_sampling_inputs
+from resin.backend.sampling import batch_sampling_inputs, sampling_seed
 
 
 def filtered_probabilities(
@@ -65,9 +65,7 @@ class MlxSampler:
                 mx.random.uniform(
                     shape=(1,),
                     key=mx.random.key(
-                        TorchSampler._mixed_seed(
-                            values["seeds"][row], values["offsets"][row]
-                        )
+                        sampling_seed(values["seeds"][row], values["offsets"][row])
                     ),
                 )
                 for row in sampled

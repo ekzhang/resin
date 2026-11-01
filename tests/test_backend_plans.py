@@ -17,11 +17,7 @@ from resin import (
     CacheRetention,
     CacheStatePlan,
 )
-from resin.backend.paged_attention import (
-    PagedAttentionGroupSpec,
-    build_paged_attention_batch,
-)
-from resin.backend.plans import BatchView, CacheGroupView, PagedCachePlan, plan_rows
+from resin.backend.plans import BatchView, CacheGroupView, PagedCachePlan
 
 
 def _plan() -> BatchPlan:
@@ -118,121 +114,6 @@ def test_cache_group_view_cannot_select_from_forged_batch_arrays():
         CacheGroupView.from_plan(cast(BatchView, fake), group_index=0)
 
 
-def test_request_local_rows_check_cache_progress_and_vocabulary():
-    plan = _plan()
-    caches = {11: SimpleNamespace(length=2)}
-    rows = plan_rows(plan, caches, vocab_size=4)
-    assert rows[1].cache is caches[11]
-    assert rows[0].token_ids.tolist() == [1, 2]
-    assert rows[1].positions.tolist() == [2]
-    with pytest.raises(ValueError, match="non-contiguous positions for request 11"):
-        plan_rows(plan, {}, vocab_size=4)
-    with pytest.raises(ValueError, match="token id is out of range for request 11"):
-        plan_rows(plan, caches, vocab_size=3)
-
-
-def test_paged_attention_names_semantics_and_preserves_packed_addresses() -> None:
-    plan = BatchPlan(
-        sequence_ids=[10],
-        context_lengths=[0],
-        token_ids=[1, 2, 3],
-        token_indptr=[0, 3],
-        cache_groups=[
-            CacheGroupPlan(
-                group_index=0,
-                block_indptr=[0, 2],
-                block_slab_ids=[1, 2],
-                block_slotnums=[0, 1],
-                block_table_start_indices=[0],
-                append_slab_ids=[1, 1, 2],
-                append_slotnums=[0, 0, 1],
-                append_block_offsets=[0, 1, 0],
-                blocks_per_slab=2,
-            )
-        ],
-    )
-    batch = build_paged_attention_batch(
-        plan,
-        CacheLayout(parent_capacity=2, groups=[CacheGroupLayout(2, blocks_per_slab=2)]),
-        (PagedAttentionGroupSpec("history", 0, minimum_table_width=3),),
-        max_query_tokens=3,
-    )
-    history = batch.group("history")
-
-    assert batch.query_lengths == (3,)
-    assert history.width == 3
-    assert history.page_table.tolist() == [2, 5, 2]
-    assert history.lengths == (3,)
-    assert history.append_slots.tolist() == [4, 5, 10]
-
-
-def test_paged_attention_lowers_unequal_rows_and_window_origins():
-    offsets = [0, 1, 2, 1, 1, 2]
-    plan = BatchPlan(
-        sequence_ids=[10, 11, 12],
-        context_lengths=[0, 5, 17],
-        token_ids=[1, 2, 3, 4, 5, 6],
-        token_indptr=[0, 3, 4, 6],
-        cache_groups=[
-            CacheGroupPlan(
-                group_index=0,
-                block_indptr=[0, 1, 3, 8],
-                block_slab_ids=list(range(1, 9)),
-                block_slotnums=[0, 1, 1, 0, 0, 0, 0, 0],
-                block_table_start_indices=[0, 0, 0],
-                append_slab_ids=[1, 1, 1, 3, 8, 8],
-                append_slotnums=[0, 0, 0, 1, 0, 0],
-                append_block_offsets=offsets,
-                blocks_per_slab=2,
-            ),
-            CacheGroupPlan(
-                group_index=1,
-                block_indptr=[0, 1, 3, 6],
-                block_slab_ids=list(range(9, 15)),
-                block_slotnums=[0] * 6,
-                block_table_start_indices=[0, 0, 2],
-                append_slab_ids=[9, 9, 9, 11, 14, 14],
-                append_slotnums=[0] * 6,
-                append_block_offsets=offsets,
-            ),
-        ],
-    )
-    layout = CacheLayout(
-        parent_capacity=14,
-        groups=[
-            CacheGroupLayout(4, blocks_per_slab=2),
-            CacheGroupLayout(
-                4,
-                retention=CacheRetention.WINDOW,
-                window_tokens=8,
-                read_window_tokens=4,
-            ),
-        ],
-    )
-    batch = build_paged_attention_batch(
-        plan,
-        layout,
-        (PagedAttentionGroupSpec("history", 0), PagedAttentionGroupSpec("window", 1)),
-        max_query_tokens=3,
-    )
-    assert batch.query_lengths == (3, 1, 2)
-    history, window = batch.group("history"), batch.group("window")
-    assert history.page_table.reshape(3, -1).tolist() == [
-        [2, 2, 2, 2, 2],
-        [5, 7, 5, 5, 5],
-        [8, 10, 12, 14, 16],
-    ]
-    assert window.page_table.reshape(3, -1).tolist() == [
-        [9, 9, 9],
-        [10, 11, 10],
-        [12, 13, 14],
-    ]
-    assert history.lengths == (3, 6, 19)
-    assert window.lengths == (3, 6, 11)
-    assert history.append_slots.tolist() == [8, 9, 10, 29, 65, 66]
-    assert window.append_slots.tolist() == [36, 37, 38, 45, 57, 58]
-
-
 def test_paged_cache_plan_validates_exact_leased_tables() -> None:
     layout = CacheLayout(parent_capacity=2, groups=[CacheGroupLayout(2)])
     plan = BatchPlan(
@@ -256,7 +137,8 @@ def test_paged_cache_plan_validates_exact_leased_tables() -> None:
     )
     cache = PagedCachePlan.from_plan(plan, layout, decode_lookahead=1)
     assert cache.rows == 1
-    assert cache.groups[0].address(0, 1) == (2, 0)
+    assert cache.groups[0].block_slabs(0).tolist() == [1, 2]
+    assert cache.groups[0].block_slots(0).tolist() == [0, 0]
 
 
 def test_paged_cache_plan_addresses_private_state_across_boundaries() -> None:
@@ -283,8 +165,8 @@ def test_paged_cache_plan_addresses_private_state_across_boundaries() -> None:
         ],
     )
     cache = PagedCachePlan.from_plan(plan, layout)
-    assert cache.groups[0].address(0, 2) == (2, 0)
-    assert cache.groups[0].address(0, 3) == (2, 0)
+    assert cache.groups[0].block_slabs(0).tolist() == [2]
+    assert cache.groups[0].block_slots(0).tolist() == [0]
 
 
 @pytest.mark.parametrize(
@@ -416,7 +298,9 @@ def test_frozen_window_lease_keeps_the_current_read_history(first):
     )
     if first == 4:
         cache = PagedCachePlan.from_plan(plan, layout)
-        assert cache.groups[0].address(0, 8) == (5, 0)
+        assert cache.groups[0].block_table_start_indices.tolist() == [4]
+        assert cache.groups[0].block_slabs(0).tolist() == [1, 2, 3, 4, 5]
+        assert cache.groups[0].block_slots(0).tolist() == [0] * 5
     else:
         # Current query 12 still reads token 9, which lies in logical block 4.
         with pytest.raises(ValueError, match="active range"):
@@ -651,8 +535,13 @@ def test_paged_cache_plan_keeps_decode_leases_wider_than_u32() -> None:
     )
     layout = CacheLayout(parent_capacity=3, groups=[CacheGroupLayout(block_tokens)])
     cache = PagedCachePlan.from_plan(plan, layout, decode_lookahead=3)
-    assert cache.groups[0].address(0, 2) == (3, 0)
-    assert PagedCachePlan.from_plan(plan, layout).groups[0].address(0, 2) == (3, 0)
+    assert cache.groups[0].block_slabs(0).tolist() == [1, 2, 3]
+    assert cache.groups[0].block_slots(0).tolist() == [0, 0, 0]
+    assert PagedCachePlan.from_plan(plan, layout).groups[0].block_slabs(0).tolist() == [
+        1,
+        2,
+        3,
+    ]
 
 
 @pytest.mark.parametrize("lookahead", [2**63, 2**64, 10**100])

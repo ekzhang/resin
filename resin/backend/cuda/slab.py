@@ -72,7 +72,7 @@ def slab_locations(
     )
 
 
-class SlabGeometry(Protocol):
+class _SlabGeometry(Protocol):
     @property
     def slab_units(self) -> int: ...
 
@@ -81,7 +81,7 @@ class SlabGeometry(Protocol):
 class SlabDeviceCache:
     """Device cache tables with layers packed into physical page indices."""
 
-    geometry: SlabGeometry
+    geometry: _SlabGeometry
     groups: tuple[DevicePageGroup, ...]
     page_tokens = 128
 
@@ -153,7 +153,7 @@ def stage_page_groups(
     return tuple(groups)
 
 
-def graph_page_widths(layout: CacheLayout, sequence_capacity: int) -> tuple[int, ...]:
+def _graph_page_widths(layout: CacheLayout, sequence_capacity: int) -> tuple[int, ...]:
     if sequence_capacity <= 0:
         raise ValueError("graph sequence capacity must be positive")
     widths = []
@@ -167,7 +167,7 @@ def graph_page_widths(layout: CacheLayout, sequence_capacity: int) -> tuple[int,
     return tuple(widths)
 
 
-def empty_page_groups(
+def _empty_page_groups(
     device: str | torch.device, batch_size: int, widths: Sequence[int]
 ) -> tuple[DevicePageGroup, ...]:
     def empty(*shape: int) -> torch.Tensor:
@@ -196,7 +196,7 @@ def graph_scratch_address(
     return parent_capacity + preceding + parent + 1, slot
 
 
-def page_group_device_inputs(
+def _page_group_device_inputs(
     groups: Sequence[DevicePageGroup], *, names: tuple[str, str, str] = _SLAB_NAMES
 ) -> dict[str, torch.Tensor]:
     return {
@@ -208,7 +208,7 @@ def page_group_device_inputs(
     }
 
 
-def page_group_capture_inputs(
+def _page_group_capture_inputs(
     widths: Sequence[int],
     batch_size: int,
     *,
@@ -229,7 +229,7 @@ def page_group_capture_inputs(
     return inputs
 
 
-def page_group_plan_inputs(
+def _page_group_plan_inputs(
     groups: Sequence[DevicePageGroup],
     plan: PagedCachePlan,
     *,
@@ -280,7 +280,7 @@ class GraphPageTableArena:
         return 0, 0
 
     def _graph_widths(self, sequence_capacity: int) -> tuple[int, ...]:
-        return graph_page_widths(self.layout, sequence_capacity)
+        return _graph_page_widths(self.layout, sequence_capacity)
 
     def graph_can_fit_plan(self, plan: PagedCachePlan, shape: tuple[int, ...]) -> bool:
         """Fit the complete native lease, including currently unreadable tail pages."""
@@ -292,7 +292,7 @@ class GraphPageTableArena:
         )
 
     def graph_cache(self, batch_size: int, sequence_capacity: int):
-        groups = empty_page_groups(
+        groups = _empty_page_groups(
             self.device,
             batch_size,
             self._graph_widths(sequence_capacity),
@@ -304,12 +304,12 @@ class GraphPageTableArena:
         return self._make_graph_cache(groups)
 
     def graph_device_inputs(self, cache) -> dict[str, torch.Tensor]:
-        return page_group_device_inputs(cache.groups, names=self.graph_input_names)
+        return _page_group_device_inputs(cache.groups, names=self.graph_input_names)
 
     def graph_shape_capture_inputs(
         self, batch_size: int, sequence_capacity: int
     ) -> dict[str, object]:
-        return page_group_capture_inputs(
+        return _page_group_capture_inputs(
             self._graph_widths(sequence_capacity),
             batch_size,
             names=self.graph_input_names,
@@ -317,7 +317,7 @@ class GraphPageTableArena:
         )
 
     def graph_plan_inputs(self, cache, plan: PagedCachePlan) -> dict[str, object]:
-        return page_group_plan_inputs(
+        return _page_group_plan_inputs(
             cache.groups,
             plan,
             label=self.graph_label,
@@ -331,13 +331,8 @@ __all__ = [
     "GraphPageTableArena",
     "PARENT_PAGE_NAMES",
     "SlabDeviceCache",
-    "empty_page_groups",
-    "graph_page_widths",
     "graph_scratch_address",
     "graph_scratch_parent_count",
-    "page_group_capture_inputs",
-    "page_group_device_inputs",
-    "page_group_plan_inputs",
     "slab_locations",
     "slice_page_groups",
     "stage_page_groups",

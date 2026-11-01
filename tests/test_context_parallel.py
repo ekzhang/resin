@@ -15,19 +15,23 @@ import torch.distributed as dist
 
 from resin import BatchPhase
 from resin.backend.cuda.context_parallel import (
-    ContextParallelPlan,
     ContextParallelTokens,
+    _ContextParallelPlan,
+)
+from resin.backend.topology import RankGroup
+from resin_models_cuda.gpt_oss.paged_kv import (
+    DeviceAttentionBatch,
+    PagedKvTable,
     context_parallel_query_batch,
 )
-from resin.backend.cuda.paged_kv import DevicePagedAttentionBatch, PagedKvTable
-from resin.backend.topology import RankGroup
 
 
 @pytest.mark.parametrize("lengths", [(5, 3, 1), (1,), (), (0, 2, 0, 1)])
 @pytest.mark.parametrize("size", [1, 2, 4])
 def test_balanced_shards_cover_global_tokens_and_preserve_each_sequence(lengths, size):
     plans = [
-        ContextParallelPlan.build(lengths, rank=rank, size=size) for rank in range(size)
+        _ContextParallelPlan.build(lengths, rank=rank, size=size)
+        for rank in range(size)
     ]
     total = sum(lengths)
     assert [index for plan in plans for index in plan.token_indices] == list(
@@ -63,7 +67,7 @@ def _batch(lengths, prefixes):
         min_length=min(a + b for a, b in zip(lengths, prefixes, strict=True)),
         max_length=max(a + b for a, b in zip(lengths, prefixes, strict=True)),
     )
-    return DevicePagedAttentionBatch(
+    return DeviceAttentionBatch(
         BatchPhase.PREFILL,
         torch.arange(sum(lengths)),
         torch.arange(len(lengths)),

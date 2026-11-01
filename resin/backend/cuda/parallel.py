@@ -131,12 +131,6 @@ class TensorParallelContext:
             dist.all_reduce(tensor, group=self.process_group)
         return tensor
 
-    def barrier(self) -> None:
-        """Wait until every rank reaches the same host-side phase boundary."""
-
-        if self.process_group is not None:
-            dist.barrier(group=self.process_group)
-
 
 def replicated_cache_capacity(capacity: int, group: RankGroup | None) -> int:
     """Agree on cache capacity before ranks allocate the same logical slots.

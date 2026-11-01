@@ -221,7 +221,7 @@ def test_e2b_rejects_unsupported_checkpoint_computations(field, value):
 def test_edge_default_mtp_uses_matching_assistant_and_supported_bf16_cache(monkeypatch):
     import torch
 
-    from resin.backend.cuda.runner import resolve_kv_cache_dtype
+    from resin.backend.cuda.runner import _resolve_kv_cache_dtype
     from resin_models_cuda.gemma4.cuda import Gemma4CudaRunner
     from resin_models_cuda.gemma4.edge_assistant import (
         DEFAULT_ASSISTANT,
@@ -238,7 +238,7 @@ def test_edge_default_mtp_uses_matching_assistant_and_supported_bf16_cache(monke
     Gemma4EdgeCudaRunner(device="cuda", speculative_draft_tokens=3)
     assert received["assistant_model"] == DEFAULT_ASSISTANT
     assert received["assistant_revision"] == DEFAULT_ASSISTANT_REVISION
-    assert resolve_kv_cache_dtype(received["kv_cache_dtype"]) == torch.bfloat16
+    assert _resolve_kv_cache_dtype(received["kv_cache_dtype"]) == torch.bfloat16
     with pytest.raises(ValueError, match="explicit assistant_model"):
         Gemma4EdgeCudaRunner(
             "/local/custom-edge-target", device="cuda", speculative_draft_tokens=3

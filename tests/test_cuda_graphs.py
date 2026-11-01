@@ -14,17 +14,17 @@ from resin.backend.cuda.failures import GraphInputError, PostAcceptCudaError
 from resin.backend.cuda.graphs import (
     DEFAULT_DECODE_GRAPH_MAX_BATCH_SIZE,
     DEFAULT_MAX_NUM_SEQS,
-    CudaGraphCache,
     CudaGraphExecutor,
     CudaGraphMode,
     CudaGraphProgram,
     CudaGraphRegion,
     CudaGraphStep,
+    _CudaGraphCache,
+    _graph_shapes,
     default_decode_graph_shapes,
-    graph_shapes,
     resolve_decode_graph_shapes,
 )
-from resin.backend.cuda.runner import CudaRunner, resolve_kv_cache_dtype
+from resin.backend.cuda.runner import CudaRunner, _resolve_kv_cache_dtype
 from resin.backend.expert_parallel import ExpertParallelDispatch
 from resin.backend.resources import CachePoolBinding
 from resin.backend.topology import RankGroup
@@ -219,9 +219,9 @@ class _Torch:
 
 
 def _cache(shapes, build, synchronize_failure=lambda: None):
-    return CudaGraphCache(
+    return _CudaGraphCache(
         "cuda:0",
-        graph_shapes(shapes, dimensions=2),
+        _graph_shapes(shapes, dimensions=2),
         build=build,
         synchronize_failure=synchronize_failure,
     )
@@ -422,10 +422,10 @@ class TestCudaGraph:
     def test_kv_cache_dtype_is_one_shared_runner_option(self) -> None:
         import torch
 
-        assert resolve_kv_cache_dtype("fp8") is torch.float8_e4m3fn
-        assert resolve_kv_cache_dtype("bfloat16") is torch.bfloat16
+        assert _resolve_kv_cache_dtype("fp8") is torch.float8_e4m3fn
+        assert _resolve_kv_cache_dtype("bfloat16") is torch.bfloat16
         with pytest.raises(ValueError, match="kv_cache_dtype"):
-            resolve_kv_cache_dtype("float16")
+            _resolve_kv_cache_dtype("float16")
 
     def test_runner_reuses_one_mechanism_across_execution_modes(
         self, monkeypatch
@@ -542,16 +542,16 @@ class TestCudaGraph:
             )
 
     def test_shapes_are_frozen_sorted_and_validated(self) -> None:
-        assert graph_shapes(None, dimensions=2) == ()
-        assert graph_shapes({2: 8, 1: 4}, dimensions=2) == ((1, 4), (2, 8))
-        assert graph_shapes(((2, 8), (1, 8)), dimensions=2) == ((1, 8), (2, 8))
+        assert _graph_shapes(None, dimensions=2) == ()
+        assert _graph_shapes({2: 8, 1: 4}, dimensions=2) == ((1, 4), (2, 8))
+        assert _graph_shapes(((2, 8), (1, 8)), dimensions=2) == ((1, 8), (2, 8))
         for invalid in ("1x4", ((0, 4),), ((True, 4),), ((1,),)):
             with (
                 pytest.raises((TypeError, ValueError)),
             ):
-                graph_shapes(invalid, dimensions=2)
+                _graph_shapes(invalid, dimensions=2)
         with pytest.raises(ValueError, match="duplicate"):
-            graph_shapes(((1, 4), (1, 4)), dimensions=2)
+            _graph_shapes(((1, 4), (1, 4)), dimensions=2)
 
     def test_matches_the_first_compatible_physical_shape(self) -> None:
         graphs = _cache(
@@ -760,7 +760,7 @@ class TestCudaGraph:
                 initialized.add(stream)
             events.append((name, stream))
 
-        cache = CudaGraphCache(
+        cache = _CudaGraphCache(
             "cuda:0",
             ((1, 4), (2, 4)),
             build=lambda _: CudaGraphProgram(
@@ -809,7 +809,7 @@ class TestCudaGraph:
                 ),
             )
 
-        cache = CudaGraphCache(
+        cache = _CudaGraphCache(
             "cuda:0",
             ((1, 4), (2, 4)),
             build=build,
@@ -895,7 +895,6 @@ class TestCudaGraph:
             executor.check,
             lambda: executor.mode("decode"),
             lambda: executor.add_mode("other", mode()),
-            lambda: executor.capture("decode", (1, 4)),
             executor.capture_all,
             *(
                 lambda cache=cache: cache.run((1, 4), {"value": [1]})
@@ -926,7 +925,7 @@ class TestCudaGraph:
             synchronize_failure=lambda: None,
         )
         cache = executor.mode("decode")
-        executor.capture("decode", (1, 4))
+        cache.capture((1, 4), {"value": [1]})
         assert cache.runtime_counts["replay_count"] == 0
         cache.run((1, 4), {"value": [2]})
         cache.run((1, 4), {"value": [3]})

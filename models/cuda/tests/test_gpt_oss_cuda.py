@@ -19,7 +19,6 @@ from resin import (
     SamplingParams,
 )
 from resin.backend.cuda.graphs import default_decode_graph_shapes
-from resin.backend.cuda.paged_kv import paged_attention_host_inputs
 from resin.backend.cuda.runner import CudaRunner
 from resin.backend.cuda.sampling import FusedSampler
 from resin.backend.resources import CachePoolBinding
@@ -43,6 +42,7 @@ from resin_models_cuda.gpt_oss.cuda import (
     plan_gpt_oss_kv_capacity,
 )
 from resin_models_cuda.gpt_oss.model import SinkAttention, TopKRouter
+from resin_models_cuda.gpt_oss.paged_kv import paged_attention_host_inputs
 
 
 def build_attention_batches(plan, *, parent_capacity: int = 2048):
@@ -291,7 +291,6 @@ class TestGptOssCudaNativePlan:
     def test_kernels_are_flat_explicit_constructor_arguments(self) -> None:
         parameters = inspect.signature(GptOssCudaRunner.__init__).parameters
 
-        assert "quantization" in parameters
         assert "kernel_attention" in parameters
         assert "kernel_moe" in parameters
         assert "kernels" not in parameters
@@ -536,7 +535,10 @@ class TestGptOssCudaNativePlan:
     def test_graph_padding_repeats_only_pages_owned_by_each_row(self) -> None:
         _, batch = build_attention_batches(_decode_plan())
         assert batch is not None
-        assert GptOssCudaRunner._pad_page_table(batch, 4).tolist() == [
+        inputs = paged_attention_host_inputs(
+            batch, {"full": 4, "sliding": WINDOW_TABLE_WIDTH}
+        )
+        assert inputs["full_page_table"].tolist() == [
             1,
             2,
             1,
@@ -633,7 +635,7 @@ class TestGptOssCudaNativePlan:
         assert "_sequence_cache" not in source
 
     def test_one_zeroed_parent_allocation_backs_both_group_views(self) -> None:
-        from resin.backend.cuda.paged_kv import PagedKvArena
+        from resin_models_cuda.gpt_oss.paged_kv import PagedKvArena
 
         source = inspect.getsource(GptOssCudaRunner.__init__)
         arena_source = inspect.getsource(PagedKvArena.__init__)

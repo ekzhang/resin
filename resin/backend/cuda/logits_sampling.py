@@ -243,7 +243,7 @@ def _finish(
 
 
 @dataclass(frozen=True)
-class LogitsSamplingWorkspace:
+class _LogitsSamplingWorkspace:
     """Private scratch and output storage, optionally retained across replays."""
 
     shape: tuple[int, int]
@@ -264,11 +264,11 @@ def _geometry(logits: torch.Tensor) -> tuple[int, int]:
     return rows, vocab
 
 
-def prepare_workspace(logits: torch.Tensor) -> LogitsSamplingWorkspace:
+def _prepare_workspace(logits: torch.Tensor) -> _LogitsSamplingWorkspace:
     """Allocate fixed scratch outside capture when explicitly managing lifetime."""
     rows, vocab = _geometry(logits)
     shape = (rows, triton.cdiv(vocab, 1024))
-    return LogitsSamplingWorkspace(
+    return _LogitsSamplingWorkspace(
         (rows, vocab),
         torch.empty(shape, device=logits.device, dtype=torch.float32),
         torch.empty(shape, device=logits.device, dtype=torch.int32),
@@ -318,7 +318,7 @@ def sample_logits(
     stochastic_mask: torch.Tensor,
     *,
     out: torch.Tensor | None = None,
-    workspace: LogitsSamplingWorkspace | None = None,
+    workspace: _LogitsSamplingWorkspace | None = None,
     filter_state: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Sample logits using optional inclusive device filter thresholds.
@@ -363,7 +363,7 @@ def sample_logits(
             raise ValueError("filter state requires contiguous CUDA float32 [rows,3]")
         inputs += (("filter_state", filter_state),)
     if workspace is None:
-        workspace = prepare_workspace(logits)
+        workspace = _prepare_workspace(logits)
     if workspace.shape != (rows, vocab):
         raise ValueError("sampling workspace geometry differs from the input")
     parts = triton.cdiv(vocab, 1024)
@@ -444,4 +444,4 @@ def sample_logits(
     return out
 
 
-__all__ = ["LogitsSamplingWorkspace", "prepare_workspace", "sample_logits"]
+__all__ = ["sample_logits"]
