@@ -58,12 +58,15 @@ class AttentionHistory:
 class PagedHistory:
     """Decode history read in place from the arena by every attention layer.
 
-    ``units`` is the arena viewed as ``[units, 2, page, kv_heads * head_dim]``,
-    ``pages`` holds each row's int32 base unit per block (add the layer index),
-    and ``lengths`` is each row's int32 history length.
+    ``parts`` are the arena parts the batch reads, repeated to a fixed count
+    and each viewed as ``[units, 2, page, kv_heads * head_dim]``. ``pages``
+    holds each row's int32 base unit per block (add the layer index), numbered
+    ``part * part_units + unit`` into ``parts``, and ``lengths`` is each row's
+    int32 history length.
     """
 
-    units: mx.array
+    parts: tuple[mx.array, ...]
+    part_units: int
     pages: mx.array
     lengths: mx.array
 
@@ -231,7 +234,8 @@ class GatedAttention(nn.Module):
                 query[:, :, 0],
                 key[:, :, 0],
                 value[:, :, 0],
-                history.units,
+                history.parts,
+                history.part_units,
                 history.pages,
                 history.lengths,
                 layer,

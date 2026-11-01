@@ -2,19 +2,23 @@
 
 The arena stores one 128-token page of one layer as a *unit*:
 ``units[unit, 0, offset]`` holds keys and ``units[unit, 1, offset]`` values,
-each ``kv_heads * head_dim`` wide. ``pages[row, block]`` names the unit holding
-logical block ``block`` of the row's history for the current layer.
+each ``kv_heads * head_dim`` wide. The arena is split into parts of
+``part_units`` units; ``pages[row, block]`` names the unit holding logical
+block ``block`` of the row's history for the current layer, as
+``part * part_units + unit``.
 
 This is flash decoding: each threadgroup scores one partition of positions for
 one row and one group of query heads sharing a KV head, with an online softmax.
 The partitions are then merged by their log-sum-exp. The step's own key and
 value, not yet written to the arena, are the final position of every row, so
 history padding is never read. Context length, page-table width and batch
-size are runtime data; only the model geometry selects a compiled kernel.
+size are runtime data, except for a few small-batch kernel variants that each
+compile once. The model geometry and the arena's part count also select a kernel.
 """
 
 from __future__ import annotations
 
+from collections.abc import Sequence
 from functools import cache, partial
 
 import mlx.core as mx
@@ -58,10 +62,12 @@ _SOURCE = """
     const uint lane = thread_index_in_simdgroup;
     const uint group = simdgroup_index_in_threadgroup;
     const uint tid = thread_position_in_threadgroup.x;
-    // Runtime geometry: page-table width, partition count and layer offset.
+    // Runtime geometry: page-table width, partition count, layer offset and
+    // units per part.
     const int PAGES = geometry[0];
     const int PARTITIONS = geometry[1];
     const int layer = geometry[2];
+    const int part_units = geometry[3];
 
     const int work = threadgroup_position_in_grid.z;
     const int partition = work % PARTITIONS;
@@ -101,7 +107,11 @@ _SOURCE = """
     int p = first;
     while (p < cached) {
         const int page_end = min(cached, (p / PAGE + 1) * PAGE);
-        const long unit = long(pages[row * PAGES + p / PAGE]) + layer;
+        const int entry = pages[row * PAGES + p / PAGE] + layer;
+        const device T* units = units_0;
+        switch (entry / part_units) {
+PARTS        }
+        const long unit = entry % part_units;
         const device T* key = units + (unit * 2 * PAGE + p % PAGE) * width
                               + kv_head * D + lane * LANE_DIMS;
         const device T* value = key + long(PAGE) * width;
@@ -181,21 +191,25 @@ _SOURCE = """
 
 
 @cache
-def _kernel():
+def _kernel(parts: int):
+    cases = "".join(
+        f"            case {part}: units = units_{part}; break;\n"
+        for part in range(1, parts)
+    )
     return mx.fast.metal_kernel(
-        name="resin_paged_decode_attention",
+        name=f"resin_paged_decode_attention_{parts}",
         input_names=[
             "queries",
             "current_keys",
             "current_values",
-            "units",
+            *(f"units_{part}" for part in range(parts)),
             "pages",
             "lengths",
             "geometry",
             "scale",
         ],
         output_names=["partial", "maxima", "sums"],
-        source=_SOURCE,
+        source=_SOURCE.replace("PARTS", cases),
         header=_HEADER,
     )
 
@@ -204,7 +218,8 @@ def paged_decode_attention(
     queries: mx.array,
     current_keys: mx.array,
     current_values: mx.array,
-    units: mx.array,
+    parts: Sequence[mx.array],
+    part_units: int,
     pages: mx.array,
     lengths: mx.array,
     layer: int,
@@ -213,15 +228,16 @@ def paged_decode_attention(
     """Attend one new token per row over paged history plus itself.
 
     ``queries`` is ``[rows, heads, head_dim]``; ``current_keys`` and
-    ``current_values`` are ``[rows, kv_heads, head_dim]``; ``units`` is the
-    arena viewed as ``[units, 2, page, kv_heads * head_dim]``; ``pages`` is
-    ``[rows, blocks]`` int32 base units, offset by ``layer``; ``lengths`` is the
-    int32 history length of each row. Returns ``[rows, heads, head_dim]``.
+    ``current_values`` are ``[rows, kv_heads, head_dim]``; ``parts`` are arena
+    parts viewed as ``[units, 2, page, kv_heads * head_dim]``; ``pages`` is
+    ``[rows, blocks]`` int32 base units numbered ``part * part_units + unit``,
+    offset by ``layer``; ``lengths`` is the int32 history length of each row.
+    Returns ``[rows, heads, head_dim]``.
     """
 
     rows, heads, head_dim = queries.shape
     kv_heads = current_keys.shape[1]
-    page = units.shape[2]
+    page = parts[0].shape[2]
     if heads % kv_heads:
         raise ValueError("query heads must be a multiple of KV heads")
     if head_dim % 32:
@@ -241,15 +257,15 @@ def paged_decode_attention(
     longest = pages.shape[1] * page + 1
     part = PARTITION_TOKENS // (2 if rows < SMALL_BATCH_ROWS else 1)
     partitions = -(-longest // part)
-    outputs, maxima, sums = _kernel()(
+    outputs, maxima, sums = _kernel(len(parts))(
         inputs=[
             queries,
             current_keys,
             current_values,
-            units,
+            *parts,
             pages,
             lengths,
-            mx.array([pages.shape[1], partitions, layer], dtype=mx.int32),
+            mx.array([pages.shape[1], partitions, layer, part_units], dtype=mx.int32),
             mx.array([scale], dtype=mx.float32),
         ],
         template=[
@@ -262,7 +278,7 @@ def paged_decode_attention(
             ("PART", part),
             ("SIMDGROUPS", SIMDGROUPS),
             ("PREFETCH", PREFETCH),
-            ("T", units.dtype),
+            ("T", parts[0].dtype),
         ],
         grid=(32 * SIMDGROUPS, 1, rows * kv_heads * head_groups * partitions),
         threadgroup=(32 * SIMDGROUPS, 1, 1),

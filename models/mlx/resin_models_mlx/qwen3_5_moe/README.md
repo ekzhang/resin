@@ -20,10 +20,13 @@ uv run scripts/bench.py --model ornith-1.0-35b --backend local \
 The Engine sees the same two groups as the CUDA Qwen family: 128-token
 full-attention pages (all ten attention layers per block) and a STATE group
 holding each request's live slot and its 4096-token prefix snapshots.
-Physically the arena is one BF16 MLX array of 256 KiB _units_; a unit is one
+Physically the arena is BF16 MLX storage of 256 KiB _units_; a unit is one
 layer's keys and values for one page. A slab is 250 units (65.5 MB) and holds 25
 KV blocks or one STATE block (240 units of FP32 recurrent state, then the
-convolution tails of all 30 layers).
+convolution tails of all 30 layers). Whole slabs are split across up to 16
+arrays of about 1 GiB or more, because the first use of a Metal buffer left
+unused for a couple of seconds costs about 11 ms per GiB of that buffer. A step
+pays only for the parts it touches, and decode binds only those.
 
 Live DeltaNet state does not travel through the arena. `LiveStates` keeps each
 request's state in the arrays the model returned for its last step, so an
@@ -39,7 +42,7 @@ arena go unused.
 
 MLX arrays are immutable values, so in-place updates rely on buffer donation.
 Every step finishes its reads before issuing writes, and drops any live view of
-the arena, so MLX updates the buffer in place rather than copying all of it;
+the arena, so MLX updates each part in place rather than copying all of it;
 `test_cache_writes_update_the_arena_in_place` guards this.
 
 Decode implements the Engine's `enqueue` overlap. Each step samples on the GPU
@@ -51,8 +54,8 @@ continuation issues its writes when its result is collected. Prefill and steps
 that return logprobs run synchronously. Writes use the
 fastest MLX primitive for each payload: keys and values scatter single rows,
 snapshot recurrent states are contiguous slice updates per layer and row, and
-the convolution tails of a row are one padded slice. Capacity is bounded by Metal's
-maximum buffer length as well as the memory budget.
+the convolution tails of a row are one padded slice. Capacity is bounded by the
+memory budget, and by Metal's maximum buffer length for each of the 16 parts.
 
 Decode attention never gathers history. `paged_decode_attention` walks each
 row's page table inside a Metal kernel with an online softmax per partition of
@@ -88,12 +91,13 @@ about 3.5 GiB above the resident model from 32K to 98K tokens.
 - overlapped decode token-identical to synchronous steps, greedy and seeded
   sampling, including a request that stops while its next step is in flight;
 - the paged kernel against gathered attention, including NaN-poisoned padding;
+- identical tokens and in-place writes when requests span arena parts;
 - prompt logprobs of a multi-row prefill against the one-pass forward;
 - sampler filtering against `TorchSampler`, and row-stable seeded draws.
 
 ## Results on an M4 Max (128 GB)
 
-October 29 and 31 (decode), 2026, mlx 0.32.4 and mlx-lm 0.32.2, Ornith-1.0-35B
+October 29, October 31 (decode) and November 1 (prefill), 2026, mlx 0.32.4 and mlx-lm 0.32.2, Ornith-1.0-35B
 at the pinned revision. Loading the BF16 checkpoint and quantizing it takes
 4–14 s and leaves about 50 GiB resident.
 
@@ -108,7 +112,10 @@ steps, a Resin decode cell times 20 committed steps back to back, without
 synchronizing between them so overlap is kept, and reports the median of three
 such windows; an mlx-lm cell is the median of 20 synchronized steps. Rows decode
 distinct tokens. Prefill runs in 4,096-token chunks for Resin and mlx-lm's default
-2,048 for mlx-lm.
+2,048 for mlx-lm. Each prefill cell runs one prompt after the idle, then two more
+back to back, over two rounds at memory utilization 0.7; after-idle rows average
+both rounds and back-to-back rows all four runs. The prefill table and the
+paragraphs after it use the split arena; other figures predate it unless stated.
 
 | Decode, 8K context     |    1 |     2 |     4 |     8 |    16 |
 | ---------------------- | ---: | ----: | ----: | ----: | ----: |
@@ -118,10 +125,41 @@ distinct tokens. Prefill runs in 4,096-token chunks for Resin and mlx-lm's defau
 | Resin output tokens/s  | 79.1 | 125.6 | 176.6 | 235.2 | 305.0 |
 | mlx-lm output tokens/s | 79.0 | 127.8 | 190.7 | 258.0 | 317.7 |
 
-| Prefill, one request  |    4K |    8K |   16K |   32K |
-| --------------------- | ----: | ----: | ----: | ----: |
-| Resin input tokens/s  | 1,665 | 1,716 | 1,587 | 1,239 |
-| mlx-lm input tokens/s | 2,017 | 1,929 | 1,662 | 1,321 |
+| Prefill, input tokens/s |    4K |    8K |   16K |   32K |
+| ----------------------- | ----: | ----: | ----: | ----: |
+| Resin, after idle       | 1,996 | 1,881 | 1,634 | 1,255 |
+| mlx-lm, after idle      | 2,002 | 1,922 | 1,691 | 1,314 |
+| Resin / mlx-lm          |  1.00 |  0.98 |  0.97 |  0.96 |
+| Resin, back to back     | 2,036 | 1,717 | 1,420 | 1,086 |
+| mlx-lm, back to back    | 2,027 | 1,759 | 1,431 | 1,139 |
+| Resin / mlx-lm          |  1.00 |  0.98 |  0.99 |  0.95 |
+
+Both engines are slower back to back on long prompts, which we attribute to
+heat; temperature and clocks were not recorded.
+
+Before the arena was split, a separate session's after-idle rates were 1,675,
+1,684, 1,549 and 1,239. In one session at utilization 0.7 (35 GiB), the 4K prompt
+spent about 0.4 s of its 2.4 s on the first use of the arena's one buffer, and
+the split saves 0.3 s at 16K. At 0.85 (51 GiB, one prompt of each kind per round,
+median of six rounds) it takes 4K after idle from 2.70 s to 2.07 s and 16K from
+10.85 s to 10.36 s. Back to back the ranges overlap: 1.99 and 2.00 s at 4K, 11.43
+and 11.60 s at 16K. The split was slower in five of six 16K rounds, so a cost of
+about 1% is not excluded; at 0.7 the gap is 0.2%.
+
+In that comparison every request's KV pages sat in the first part, the best case.
+The Engine's free list then walks upward through the parts. One 16K request
+spanning two parts took 21.3 s among consecutive requests at 18.8–21.6 s, on a
+slow, drifting run, and an earlier single trial after other requests took 13.9 s
+against 12.4 s; neither resolves a small cost. Tokens were identical. A real step
+touching all 16 parts after idle has not been measured. In a synthetic probe,
+tiny reads of 24 separate 1 GiB buffers took about 180 ms after idle, against
+about 270 ms for one 24 GiB buffer.
+
+The split does not move overlapped decode. On the final code at 0.85, with 240 s
+idle and each process's median of three 20-step windows, one buffer against the
+split gave 12.53, 12.45 and 12.48, 12.50 ms at batch 1; 22.45, 21.82 and 22.49,
+21.95 ms at batch 4; and 53.26, 53.27 and 52.89, 52.91 ms at batch 16, where
+decode bound two parts.
 
 Without `enqueue` overlap, timed the same way, the steps are 14.7, 18.1, 24.9,
 36.6 and 55.0 ms: overlap hides 2.1–2.6 ms of host work per step (graph
@@ -153,8 +191,11 @@ snapshot, are cached.
   a 16,384-token reasoning budget; three reasoning traces exhaust it before
   answering. Rerun with `enqueue` overlap, the same checks pass and the model
   answers 91, again with three truncations. The previous runner scored 93 with
-  one truncation. Image and video
-  requests are refused.
+  one truncation. Rerun on the split arena without the MMLU questions, chat,
+  logprobs, prefix cache, concurrency, stress, robustness and recovery pass;
+  16K prompts show no first-request spike, with steady TTFT of 12.6 s, above
+  the script's default 10 s limit as before. Image and video requests are
+  refused.
 - **Memory.** Prefill holds 3.3–3.7 GiB above the resident model from 32K to
   98K tokens.
 - **Compilation.** After warmup, three sets of unseen context lengths (77 to

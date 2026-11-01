@@ -51,12 +51,17 @@ def _reference(queries, keys, values, history, scale):
     "heads,kv_heads,head_dim",
     [(16, 2, 256), (4, 2, 64), (6, 1, 64), (10, 2, 96), (3, 3, 32), (8, 2, 512)],
 )
-def test_paged_decode_matches_gathered_attention(lengths, heads, kv_heads, head_dim):
+@pytest.mark.parametrize("parts", [1, 3, 16])
+def test_paged_decode_matches_gathered_attention(
+    lengths, heads, kv_heads, head_dim, parts
+):
     rng = np.random.default_rng(len(lengths) + heads)
     rows = len(lengths)
     layers, layer = 3, 1
     width = max(1, -(-max(lengths) // PAGE))
-    unit_count = rows * width * layers + 7
+    # Parts of whole layer groups, with units to spare beyond the rows' own.
+    part_units = layers * -(-(rows * width * layers + 7) // (parts * layers))
+    unit_count = parts * part_units
     units = rng.standard_normal((unit_count, 2, PAGE, kv_heads * head_dim))
     # Poison every unit, then write real history only where rows own it, so a
     # read beyond a row's length produces NaN.
@@ -72,12 +77,20 @@ def test_paged_decode_matches_gathered_attention(lengths, heads, kv_heads, head_
             units[unit, 1, position % PAGE] = values[row, position].reshape(-1)
     queries = rng.standard_normal((rows, heads, head_dim))
     scale = head_dim**-0.5
+    # Consecutive parts number their units on from the previous part, so the
+    # same page table addresses the split arena.
+    split = [
+        as_bf16(units[first : first + part_units])
+        for first in range(0, unit_count, part_units)
+    ]
+    assert len(split) == parts
 
     actual = paged_decode_attention(
         as_bf16(queries),
         as_bf16(keys[:, -1]),
         as_bf16(values[:, -1]),
-        as_bf16(units),
+        split,
+        part_units,
         mx.array(pages),
         mx.array(np.asarray(lengths, dtype=np.int32)),
         layer,
@@ -102,7 +115,8 @@ def test_rejects_head_dims_the_lanes_cannot_cover():
             queries,
             current,
             current,
-            units,
+            [units],
+            1,
             mx.zeros((1, 1), dtype=mx.int32),
             mx.array([0], dtype=mx.int32),
             0,

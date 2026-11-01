@@ -18,6 +18,7 @@ from resin.backend.sampling import PromptScores, format_output, prompt_scores
 from resin.backend.topology import ParallelismCapabilities
 from resin.models.qwen3_5.config import Qwen35Config
 from resin_models_mlx.qwen3_5_moe.cache import (
+    MAX_PARTS,
     PREFILL_CHUNK_SIZE,
     CacheArena,
     CacheGeometry,
@@ -165,8 +166,8 @@ class Qwen3_5MoeMlxRunner:
             overhead_bytes=_WORKSPACE_BYTES
             + 2 * max_batch_size * self.cache_geometry.state_bytes,
         )
-        # The arena is one Metal buffer, including the reserved null slab.
-        buffer_slabs = (
+        # Each arena part is one Metal buffer; the reserved null slab counts.
+        buffer_slabs = MAX_PARTS * (
             int(device["max_buffer_length"]) // self.cache_geometry.slab_bytes
         )
         slab_capacity = min(self.cache_capacity_plan.parent_capacity, buffer_slabs - 1)
@@ -256,7 +257,7 @@ class Qwen3_5MoeMlxRunner:
             return
         mx.eval(*launch.reads)
         self._write(launch)
-        mx.async_eval(self._cache.storage)
+        mx.async_eval(*self._cache.parts)
 
     def _step(
         self,
@@ -279,7 +280,7 @@ class Qwen3_5MoeMlxRunner:
             # Reads of this step are complete, so the writes can update the arena
             # in place while the host samples and commits. The next step's reads
             # depend on the written arena and therefore run after them.
-            mx.async_eval(self._cache.storage)
+            mx.async_eval(*self._cache.parts)
         assert launch.receipts is not None
         return launch.output, launch.last, launch.receipts
 
@@ -374,7 +375,7 @@ class Qwen3_5MoeMlxRunner:
             tokens = self._sampler.tokens(launch.last, plan)
             if previous is not None:
                 mx.eval(*previous.reads)
-            mx.async_eval(self._cache.storage, tokens, *launch.reads)
+            mx.async_eval(*self._cache.parts, tokens, *launch.reads)
         self._pending = launch
         continues = int(np.max(cache_plan.batch.post_lengths)) < self.max_seq_len
         return _Completion(self, plan, launch, tokens, continues)
