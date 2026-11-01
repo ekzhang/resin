@@ -9,7 +9,7 @@ import torch
 from resin import BatchPlan, SamplingParams
 from resin.backend.cuda.completion import DeviceAcceptance, DeviceCompletion
 from resin.backend.cuda.sampling import FusedSampler, SamplingTensors
-from resin_models_cuda.scoring import score_completion
+from resin.backend.cuda.scoring import score_completion
 
 pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available(), reason="requires a CUDA GPU"

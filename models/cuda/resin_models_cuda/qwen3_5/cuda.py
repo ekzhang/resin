@@ -37,6 +37,7 @@ from resin.backend.cuda.runner import (
     pad_sampling_inputs,
     validate_hybrid_plan,
 )
+from resin.backend.cuda.scoring import format_output, prompt_scores, score_completion
 from resin.backend.cuda.staging import TensorStager
 from resin.backend.cuda.state import execute_state
 from resin.backend.cuda.vision_cache import VisionFeatureCache
@@ -69,7 +70,6 @@ from resin_models_cuda.qwen3_5.checkpoint import (
     resolve_model_path,
 )
 from resin_models_cuda.qwen3_5.model import Qwen35DecoderLayer
-from resin_models_cuda.scoring import format_output, prompt_scores, score_completion
 
 if TYPE_CHECKING:
     from resin import BatchPlan, ForwardOutput

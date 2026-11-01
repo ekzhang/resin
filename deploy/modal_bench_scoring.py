@@ -104,7 +104,7 @@ def execute(mode: str, compare: bool = False, test_filter: str = ""):
         )
     shutil.copy2(extensions[0], ROOT / "resin" / extensions[0].name)
     sources = [
-        *ROOT.glob("models/cuda/resin_models_cuda/*scoring*.py"),
+        *ROOT.glob("resin/backend/cuda/*scoring*.py"),
         *ROOT.glob("models/cuda/resin_models_cuda/*/cuda.py"),
         ROOT / "models/cuda/resin_models_cuda/gemma4/edge_cuda.py",
         ROOT / "resin/backend/cuda/completion.py",

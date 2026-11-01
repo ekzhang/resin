@@ -39,6 +39,7 @@ from resin.backend.cuda.runner import (
     capture_sampling_inputs,
     pad_sampling_inputs,
 )
+from resin.backend.cuda.scoring import format_output, prompt_scores, score_completion
 from resin.backend.cuda.vision_cache import VisionFeatureCache
 from resin.backend.resources import CachePoolBinding
 from resin.backend.sampling import (
@@ -75,7 +76,6 @@ from resin_models_cuda.gemma4.model import (
 )
 from resin_models_cuda.gemma4.parallel import attention_geometry
 from resin_models_cuda.nvfp4 import select_nvfp4_backend as _select_nvfp4_backend
-from resin_models_cuda.scoring import format_output, prompt_scores, score_completion
 
 if TYPE_CHECKING:
     from resin import BatchPlan, ForwardOutput

@@ -52,7 +52,7 @@ including speculative acceptance, keeps its existing behavior.
 
 ## CUDA execution
 
-CUDA runners share `resin_models_cuda.scoring`; reference runners use
+CUDA runners share `resin.backend.cuda.scoring`; reference runners use
 `resin.backend.sampling`. Scoring keeps captured model decode enabled, including
 speculative verification and overlap scheduling. A separate captured score tail
 reads existing raw-logit storage and scores the actual accepted tokens.
@@ -60,7 +60,7 @@ Completion snapshots scores into owned host buffers before later replays can
 overwrite them, then packs accepted positions and requested alternatives during
 harvest.
 
-The [CuTe DSL kernels](../models/cuda/resin_models_cuda/_scoring_cutedsl.py) reduce
+The [CuTe DSL kernels](../resin/backend/cuda/_scoring_cutedsl.py) reduce
 raw logits into stable normalization statistics and gather
 selected, top, and explicit target scores. They never materialize a full FP32
 normalized vocabulary tensor. Unscored batches launch no scoring kernels; the

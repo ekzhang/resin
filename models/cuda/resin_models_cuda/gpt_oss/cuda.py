@@ -47,6 +47,7 @@ from resin.backend.cuda.runner import (
     capture_sampling_inputs,
     pad_sampling_inputs,
 )
+from resin.backend.cuda.scoring import format_output, prompt_scores
 from resin.backend.cuda.staging import TensorStager
 from resin.backend.cuda.tensor_graphs import CudaGraphTensorRegion, TensorSpec
 from resin.backend.topology import ParallelGroups, ParallelismCapabilities
@@ -76,7 +77,6 @@ from resin_models_cuda.gpt_oss.paged_kv import (
     paged_attention_host_inputs,
     stage_paged_attention_batch,
 )
-from resin_models_cuda.scoring import format_output, prompt_scores
 
 if TYPE_CHECKING:
     from resin import BatchPlan, ForwardOutput

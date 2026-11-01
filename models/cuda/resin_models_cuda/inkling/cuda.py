@@ -27,6 +27,7 @@ from resin.backend.cuda.runner import (
     pad_sampling_inputs,
     validate_hybrid_plan,
 )
+from resin.backend.cuda.scoring import format_output, prompt_scores, score_completion
 from resin.backend.cuda.staging import TensorStager
 from resin.backend.cuda.state import execute_state
 from resin.backend.cuda.vision_cache import VisionFeatureCache
@@ -59,7 +60,6 @@ from resin_models_cuda.inkling.model import (
     select_convolution_state,
 )
 from resin_models_cuda.inkling.weights import load_draft_weights, load_target_weights
-from resin_models_cuda.scoring import format_output, prompt_scores, score_completion
 
 if TYPE_CHECKING:
     from resin import BatchPlan, ForwardOutput

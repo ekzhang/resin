@@ -172,7 +172,7 @@ def _audit(score_logits):
 
 def _metadata():
     files = [Path(__file__), ROOT / "resin/backend/cuda/completion.py"]
-    files += list((ROOT / "models/cuda/resin_models_cuda").glob("*scoring*.py"))
+    files += list((ROOT / "resin/backend/cuda").glob("*scoring*.py"))
     return {
         "hardware": subprocess.check_output(
             [
@@ -221,7 +221,7 @@ def cache_probe():
         patch.object(cute, "compile", compile_kernel),
         patch.object(cute.runtime, "load_module", load_cached),
     ):
-        from resin_models_cuda._scoring_cutedsl import score_logits
+        from resin.backend.cuda._scoring_cutedsl import score_logits
 
         for dtype in (torch.float16, torch.bfloat16, torch.float32):
             for k in (0, 32):
@@ -240,7 +240,7 @@ def cache_probe():
 
 @torch.inference_mode()
 def run(*, smoke=False, comparison: str | None = None):
-    from resin_models_cuda._scoring_cutedsl import score_logits
+    from resin.backend.cuda._scoring_cutedsl import score_logits
 
     report = {
         **_metadata(),

@@ -53,7 +53,7 @@ def _capture(device: torch.device, launch: Callable[[], None]) -> torch.cuda.CUD
 
 class _DecodeScores:
     def __init__(self, logits: torch.Tensor, width: int, capacity: int) -> None:
-        from resin_models_cuda._scoring_cutedsl import score_logits
+        from resin.backend.cuda._scoring_cutedsl import score_logits
 
         self.scores: DeviceScores
         batch = logits.shape[0]
@@ -153,7 +153,7 @@ def prompt_scores(
         from resin.backend.sampling import prompt_scores as reference
 
         return reference(plan, hidden, project, token_start=token_start)
-    from resin_models_cuda._scoring_cutedsl import score_logits
+    from resin.backend.cuda._scoring_cutedsl import score_logits
 
     indices = plan.prompt_score_indices
     keep = (indices >= token_start) & (indices < token_start + hidden.shape[0])

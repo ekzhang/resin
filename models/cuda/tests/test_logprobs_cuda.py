@@ -12,7 +12,7 @@ pytestmark = pytest.mark.skipif(
 
 def score_logits(*args, **kwargs):
     # CPU collection must not import the CUDA-only DSL runtime.
-    from resin_models_cuda._scoring_cutedsl import score_logits as implementation
+    from resin.backend.cuda._scoring_cutedsl import score_logits as implementation
 
     return implementation(*args, **kwargs)
 

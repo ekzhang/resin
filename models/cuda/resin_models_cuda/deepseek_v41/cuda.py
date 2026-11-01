@@ -46,6 +46,7 @@ from resin.backend.cuda.runner import (
     capture_sampling_inputs,
     pad_sampling_inputs,
 )
+from resin.backend.cuda.scoring import format_output, prompt_scores, score_completion
 from resin.backend.cuda.staging import TensorStager
 from resin.backend.cuda.tensor_graphs import CudaGraphTensorRegion, TensorSpec
 from resin.backend.cuda.vision_cache import VisionFeatureCache
@@ -60,7 +61,6 @@ from resin.backend.topology import ParallelGroups, ParallelismCapabilities
 from resin.backend.torch import use_default_dtype
 from resin.recipe import DeepSeekV41Media
 from resin_models_cuda.deepseek_v41.checkpoint import load_config, resolve_model_path
-from resin_models_cuda.scoring import format_output, prompt_scores, score_completion
 
 if TYPE_CHECKING:
     from resin import BatchPlan, ForwardOutput

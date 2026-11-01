@@ -29,6 +29,7 @@ from resin.backend.cuda.runner import (
     pad_sampling_inputs,
     validate_hybrid_plan,
 )
+from resin.backend.cuda.scoring import format_output, prompt_scores, score_completion
 from resin.backend.cuda.slab import graph_scratch_parent_count
 from resin.backend.cuda.staging import TensorStager
 from resin.backend.cuda.state import execute_state
@@ -39,7 +40,6 @@ from resin.backend.topology import ParallelismCapabilities
 from resin.backend.torch import use_default_dtype
 from resin_models_cuda.glm5_3_flash.cache import CacheArena, CacheGeometry
 from resin_models_cuda.glm5_3_flash.checkpoint import load_model, resolve_model_path
-from resin_models_cuda.scoring import format_output, prompt_scores, score_completion
 
 
 @dataclass(frozen=True)

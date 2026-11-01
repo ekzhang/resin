@@ -8,7 +8,7 @@ import torch
 
 from resin import BatchPlan, SamplingParams
 from resin.backend.cuda.completion import DeviceAcceptance, DeviceCompletion
-from resin_models_cuda.scoring import (
+from resin.backend.cuda.scoring import (
     _PROMPT_SCORE_CHUNK_SIZE,
     prompt_scores,
     score_completion,
@@ -133,7 +133,7 @@ def test_captured_mixed_scores_survive_replay_and_changed_acceptance(monkeypatch
 
 @torch.inference_mode()
 def test_prompt_projection_scores_and_duplicate_targets_use_cuda(monkeypatch):
-    from resin_models_cuda import scoring
+    from resin.backend.cuda import scoring
 
     count, hidden_size, vocab = 2 * _PROMPT_SCORE_CHUNK_SIZE + 1, 32, 2051
     hidden = torch.randn((count, hidden_size), device="cuda", dtype=torch.float32)
@@ -217,7 +217,7 @@ def test_prompt_projection_scores_and_duplicate_targets_use_cuda(monkeypatch):
 
 @torch.inference_mode()
 def test_ordinary_inference_scores_reuse_the_original_logits_owner(monkeypatch):
-    from resin_models_cuda import scoring
+    from resin.backend.cuda import scoring
 
     logits = torch.randn((4, 2051), device="cuda", dtype=torch.bfloat16)
     sampled = torch.tensor([7, 8, 9, 0], device="cuda")

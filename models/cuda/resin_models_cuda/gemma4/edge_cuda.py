@@ -19,6 +19,7 @@ from resin.backend.cuda.completion import (
 from resin.backend.cuda.failures import GraphInputError
 from resin.backend.cuda.metrics import observe_execution
 from resin.backend.cuda.runner import pad_sampling_inputs
+from resin.backend.cuda.scoring import score_completion
 from resin.backend.cuda.tensor_graphs import CudaGraphTensorRegion, TensorSpec
 from resin.backend.sampling import SAMPLING_OFFSET_STRIDE
 from resin.models.gemma4.config import SLIDING_ATTENTION
@@ -34,7 +35,6 @@ from resin_models_cuda.gemma4.edge_checkpoint import (
     load_edge_model,
 )
 from resin_models_cuda.gemma4.edge_kernels import norm_residual
-from resin_models_cuda.scoring import score_completion
 
 
 class _EdgeHiddenLease:
