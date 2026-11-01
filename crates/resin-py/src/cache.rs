@@ -136,11 +136,6 @@ impl CacheGroupLayout {
         Self { inner }
     }
 
-    #[cfg(test)]
-    pub(crate) const fn inner(&self) -> KvGroupLayout {
-        self.inner
-    }
-
     fn repr_string(&self) -> String {
         group_repr(self.inner)
     }
@@ -258,11 +253,6 @@ impl CacheLayout {
 
     pub(crate) const fn inner_native(&self) -> &KvLayout {
         &self.inner
-    }
-
-    #[cfg(test)]
-    pub(crate) fn groups_native(&self) -> &[KvGroupLayout] {
-        self.inner.groups()
     }
 
     fn repr_string(&self) -> String {
@@ -700,7 +690,7 @@ mod tests {
         Python::attach(|py| {
             let group = Py::new(py, history(16, 2)).unwrap();
             let layout = CacheLayout::new(py, 4, vec![group], 0, 0).unwrap();
-            assert_eq!(layout.groups_native(), &[history(16, 2).inner()]);
+            assert_eq!(layout.inner.groups(), &[history(16, 2).inner]);
             assert_eq!(layout.groups(py).unwrap().bind(py).len(), 1);
             assert_eq!(layout.group_kernel_page_capacity(0).unwrap(), 8);
         });

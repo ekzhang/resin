@@ -20,7 +20,10 @@ use tokio::sync::{mpsc, oneshot};
 
 use crate::{
     AppState,
-    protocol::{ConversationRequest, GenerationEvent, ResponseAccumulator, json_error},
+    protocol::{
+        ConversationRequest, FinishReason, GenerationEvent, ResponseAccumulator, ResponseOutput,
+        json_error,
+    },
     ui::index_html,
 };
 
@@ -529,41 +532,47 @@ async fn responses_response(
 }
 
 fn response_object(request: &ConversationRequest, response: &ResponseAccumulator) -> Value {
-    let mut output = Vec::new();
-    if !response.reasoning.is_empty() {
-        output.push(json!({
+    let (status, incomplete_details) = match response.reason {
+        Some(FinishReason::Length) => ("incomplete", json!({"reason": "max_output_tokens"})),
+        _ => ("completed", Value::Null),
+    };
+    let mut order = response.output_order.clone();
+    if response.tool_calls.is_empty() && !order.contains(&ResponseOutput::Text) {
+        order.push(ResponseOutput::Text);
+    }
+    let output = order.into_iter().map(|item| match item {
+        ResponseOutput::Reasoning => json!({
             "id": format!("rs_{}", &request.id[5..]),
             "type": "reasoning",
             "status": "completed",
             "summary": [{"type": "summary_text", "text": response.reasoning}],
-        }));
-    }
-    for (index, tool) in response.tool_calls.iter().enumerate() {
-        output.push(json!({
-            "id": format!("fc_{}_{index}", &request.id[5..]),
-            "type": "function_call",
-            "status": "completed",
-            "call_id": tool.id,
-            "name": tool.name,
-            "arguments": tool.arguments,
-        }));
-    }
-    if !response.text.is_empty() || response.tool_calls.is_empty() {
-        output.push(json!({
+        }),
+        ResponseOutput::Tool(index) => {
+            let tool = &response.tool_calls[index];
+            json!({
+                "id": format!("fc_{}_{index}", &request.id[5..]),
+                "type": "function_call",
+                "status": "completed",
+                "call_id": tool.id,
+                "name": tool.name,
+                "arguments": tool.arguments,
+            })
+        },
+        ResponseOutput::Text => json!({
             "id": format!("msg_{}", &request.id[5..]),
             "type": "message",
             "status": "completed",
             "role": "assistant",
             "content": [{"type": "output_text", "text": response.text, "annotations": [], "logprobs": response.content_logprobs}],
-        }));
-    }
+        }),
+    }).collect::<Vec<_>>();
     json!({
         "id": request.id,
         "object": "response",
         "created_at": unix_seconds(),
-        "status": "completed",
+        "status": status,
         "error": null,
-        "incomplete_details": null,
+        "incomplete_details": incomplete_details,
         "instructions": null,
         "max_output_tokens": request.max_output_tokens,
         "model": request.model,
@@ -600,7 +609,6 @@ fn responses_stream(
         let mut accumulator = ResponseAccumulator::default();
         let mut text_open = false;
         let mut reasoning_open = false;
-        let mut tool_open = Vec::<bool>::new();
         let skeleton = json!({"id": request.id, "object": "response", "created_at": unix_seconds(), "status": "in_progress", "model": request.model, "output": []});
         yield Ok(Event::default().data(event_json("response.created", sequence, json!({"response": skeleton})).to_string())); sequence += 1;
         while let Some(event) = receiver.recv().await {
@@ -610,31 +618,30 @@ fn responses_stream(
                     yield Ok(Event::default().data(event_json("response.in_progress", sequence, json!({"response": {"id": request.id, "status": "in_progress"}})).to_string())); sequence += 1;
                 }
                 GenerationEvent::ReasoningDelta(delta) => {
+                    let output_index = accumulator.output_index(ResponseOutput::Reasoning);
                     if !reasoning_open {
                         reasoning_open = true;
-                        yield Ok(Event::default().data(event_json("response.output_item.added", sequence, json!({"output_index": 0, "item": {"id": format!("rs_{}", &request.id[5..]), "type": "reasoning", "status": "in_progress", "summary": []}})).to_string())); sequence += 1;
-                        yield Ok(Event::default().data(event_json("response.reasoning_summary_part.added", sequence, json!({"item_id": format!("rs_{}", &request.id[5..]), "output_index": 0, "summary_index": 0, "part": {"type": "summary_text", "text": ""}})).to_string())); sequence += 1;
+                        yield Ok(Event::default().data(event_json("response.output_item.added", sequence, json!({"output_index": output_index, "item": {"id": format!("rs_{}", &request.id[5..]), "type": "reasoning", "status": "in_progress", "summary": []}})).to_string())); sequence += 1;
+                        yield Ok(Event::default().data(event_json("response.reasoning_summary_part.added", sequence, json!({"item_id": format!("rs_{}", &request.id[5..]), "output_index": output_index, "summary_index": 0, "part": {"type": "summary_text", "text": ""}})).to_string())); sequence += 1;
                     }
-                    yield Ok(Event::default().data(event_json("response.reasoning_summary_text.delta", sequence, json!({"item_id": format!("rs_{}", &request.id[5..]), "output_index": 0, "summary_index": 0, "delta": delta})).to_string())); sequence += 1;
+                    yield Ok(Event::default().data(event_json("response.reasoning_summary_text.delta", sequence, json!({"item_id": format!("rs_{}", &request.id[5..]), "output_index": output_index, "summary_index": 0, "delta": delta})).to_string())); sequence += 1;
                 }
                 GenerationEvent::TextDelta { delta, logprobs } => {
                     if !text_open {
                         text_open = true;
-                        let output_index = usize::from(reasoning_open) + tool_open.len();
+                        let output_index = accumulator.output_index(ResponseOutput::Text);
                         yield Ok(Event::default().data(event_json("response.output_item.added", sequence, json!({"output_index": output_index, "item": {"id": format!("msg_{}", &request.id[5..]), "type": "message", "status": "in_progress", "role": "assistant", "content": []}})).to_string())); sequence += 1;
                         yield Ok(Event::default().data(event_json("response.content_part.added", sequence, json!({"item_id": format!("msg_{}", &request.id[5..]), "output_index": output_index, "content_index": 0, "part": {"type": "output_text", "text": "", "annotations": [], "logprobs": []}})).to_string())); sequence += 1;
                     }
-                    let output_index = usize::from(reasoning_open) + tool_open.len();
+                    let output_index = accumulator.output_index(ResponseOutput::Text);
                     yield Ok(Event::default().data(event_json("response.output_text.delta", sequence, json!({"item_id": format!("msg_{}", &request.id[5..]), "output_index": output_index, "content_index": 0, "delta": delta, "logprobs": logprobs})).to_string())); sequence += 1;
                 }
                 GenerationEvent::ToolCallStart { index, id, name } => {
-                    if tool_open.len() <= index { tool_open.resize(index + 1, false); }
-                    tool_open[index] = true;
-                    let output_index = usize::from(reasoning_open) + index;
+                    let output_index = accumulator.output_index(ResponseOutput::Tool(index));
                     yield Ok(Event::default().data(event_json("response.output_item.added", sequence, json!({"output_index": output_index, "item": {"id": format!("fc_{}_{index}", &request.id[5..]), "type": "function_call", "status": "in_progress", "call_id": id, "name": name, "arguments": ""}})).to_string())); sequence += 1;
                 }
                 GenerationEvent::ToolCallArgumentsDelta { index, delta } => {
-                    let output_index = usize::from(reasoning_open) + index;
+                    let output_index = accumulator.output_index(ResponseOutput::Tool(index));
                     yield Ok(Event::default().data(event_json("response.function_call_arguments.delta", sequence, json!({"item_id": format!("fc_{}_{index}", &request.id[5..]), "output_index": output_index, "delta": delta})).to_string())); sequence += 1;
                 }
                 GenerationEvent::Logprobs(tokens) => {
@@ -644,28 +651,34 @@ fn responses_stream(
                 GenerationEvent::PromptLogprobs(tokens) => {
                     yield Ok(Event::default().data(event_json("resin.prompt_logprobs", sequence, json!({"logprobs": tokens})).to_string())); sequence += 1;
                 }
-                GenerationEvent::Finished { .. } => {
+                GenerationEvent::Finished { reason, .. } => {
                     terminated = true;
                     if reasoning_open {
+                        let output_index = accumulator.output_index(ResponseOutput::Reasoning);
                         let id = format!("rs_{}", &request.id[5..]);
-                        yield Ok(Event::default().data(event_json("response.reasoning_summary_text.done", sequence, json!({"item_id": id, "output_index": 0, "summary_index": 0, "text": accumulator.reasoning})).to_string())); sequence += 1;
-                        yield Ok(Event::default().data(event_json("response.reasoning_summary_part.done", sequence, json!({"item_id": id, "output_index": 0, "summary_index": 0, "part": {"type": "summary_text", "text": accumulator.reasoning}})).to_string())); sequence += 1;
-                        yield Ok(Event::default().data(event_json("response.output_item.done", sequence, json!({"output_index": 0, "item": {"id": id, "type": "reasoning", "status": "completed", "summary": [{"type": "summary_text", "text": accumulator.reasoning}]}})).to_string())); sequence += 1;
+                        yield Ok(Event::default().data(event_json("response.reasoning_summary_text.done", sequence, json!({"item_id": id, "output_index": output_index, "summary_index": 0, "text": accumulator.reasoning})).to_string())); sequence += 1;
+                        yield Ok(Event::default().data(event_json("response.reasoning_summary_part.done", sequence, json!({"item_id": id, "output_index": output_index, "summary_index": 0, "part": {"type": "summary_text", "text": accumulator.reasoning}})).to_string())); sequence += 1;
+                        yield Ok(Event::default().data(event_json("response.output_item.done", sequence, json!({"output_index": output_index, "item": {"id": id, "type": "reasoning", "status": "completed", "summary": [{"type": "summary_text", "text": accumulator.reasoning}]}})).to_string())); sequence += 1;
                     }
-                    for (index, tool) in accumulator.tool_calls.iter().enumerate() {
-                        let output_index = usize::from(reasoning_open) + index;
+                    for index in accumulator.output_order.iter().filter_map(|item| match item { ResponseOutput::Tool(index) => Some(*index), _ => None }) {
+                        let tool = &accumulator.tool_calls[index];
+                        let output_index = accumulator.output_index(ResponseOutput::Tool(index));
                         let item_id = format!("fc_{}_{index}", &request.id[5..]);
                         yield Ok(Event::default().data(event_json("response.function_call_arguments.done", sequence, json!({"item_id": item_id, "output_index": output_index, "arguments": tool.arguments})).to_string())); sequence += 1;
                         yield Ok(Event::default().data(event_json("response.output_item.done", sequence, json!({"output_index": output_index, "item": {"id": item_id, "type": "function_call", "status": "completed", "call_id": tool.id, "name": tool.name, "arguments": tool.arguments}})).to_string())); sequence += 1;
                     }
                     if text_open {
-                        let output_index = usize::from(reasoning_open) + accumulator.tool_calls.len();
+                        let output_index = accumulator.output_index(ResponseOutput::Text);
                         let id = format!("msg_{}", &request.id[5..]);
                         yield Ok(Event::default().data(event_json("response.output_text.done", sequence, json!({"item_id": id, "output_index": output_index, "content_index": 0, "text": accumulator.text, "logprobs": accumulator.content_logprobs})).to_string())); sequence += 1;
                         yield Ok(Event::default().data(event_json("response.content_part.done", sequence, json!({"item_id": id, "output_index": output_index, "content_index": 0, "part": {"type": "output_text", "text": accumulator.text, "annotations": [], "logprobs": accumulator.content_logprobs}})).to_string())); sequence += 1;
                         yield Ok(Event::default().data(event_json("response.output_item.done", sequence, json!({"output_index": output_index, "item": {"id": id, "type": "message", "status": "completed", "role": "assistant", "content": [{"type": "output_text", "text": accumulator.text, "annotations": [], "logprobs": accumulator.content_logprobs}]}})).to_string())); sequence += 1;
                     }
-                    yield Ok(Event::default().data(event_json("response.completed", sequence, json!({"response": response_object(&request, &accumulator)})).to_string()));
+                    let event_type = match reason {
+                        FinishReason::Stop => "response.completed",
+                        FinishReason::Length => "response.incomplete",
+                    };
+                    yield Ok(Event::default().data(event_json(event_type, sequence, json!({"response": response_object(&request, &accumulator)})).to_string()));
                     break;
                 }
                 GenerationEvent::Error { message } => {

@@ -347,7 +347,7 @@ fn run_server(
     let stop_actor = shutdown.clone();
     let server_result = runtime.block_on(resin_http::serve_router_with_shutdown(
         listener,
-        resin_http::router_with_token_counter(model, jobs, Some(counter), routes, metrics),
+        resin_http::router(model, jobs, Some(counter), routes, metrics),
         async move {
             if !*stopping.borrow() {
                 tokio::select! {

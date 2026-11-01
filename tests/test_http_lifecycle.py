@@ -15,7 +15,7 @@ from test_recipe import _byte_tokenizer, _FastTokenizer, _token_ids
 import resin
 from resin import BatchPhase, Engine
 from resin.backend.cuda.failures import PostAcceptCudaError
-from resin.recipe import InklingResponseParser, RenderedPrompt, Tokenizer
+from resin.recipe import RenderedPrompt, Tokenizer, get_native_recipe
 from resin.server import HttpServer
 
 
@@ -517,26 +517,14 @@ def test_native_parser_flushes_partial_utf8_in_http_actor(stream):
     markers = _token_ids(backend)
     # The final two UTF-8 bytes never arrive because generation reaches its
     # token limit. Only parser finalization can emit the replacement character.
-    output = backend.encode("A🦀", add_special_tokens=False).ids[:3]
+    output = [
+        markers["<|content_text|>"],
+        *backend.encode("A🦀", add_special_tokens=False).ids[:3],
+    ]
     tokenizer = Tokenizer(_FastTokenizer(backend))
     assert tokenizer.is_native
 
-    class NativeRecipe:
-        tokenizer = None
-        stop_token_ids = []
-
-        def render(self, messages, *, tools=(), options=None):
-            return RenderedPrompt(
-                [
-                    markers["<|message_model|>"],
-                    markers["<|content_text|>"],
-                ],
-            )
-
-        def create_parser(self, prompt):
-            return InklingResponseParser(
-                tokenizer, markers, prompt_ids=prompt.token_ids
-            )
+    native_recipe = get_native_recipe("inkling", tokenizer)
 
     class ByteRunner:
         def __init__(self):
@@ -548,7 +536,7 @@ def test_native_parser_flushes_partial_utf8_in_http_actor(stream):
             self.step += 1
             return forward_output([token])
 
-    with running_server(ByteRunner(), NativeRecipe()) as (
+    with running_server(ByteRunner(), native_recipe) as (
         _server,
         engine,
         _thread,

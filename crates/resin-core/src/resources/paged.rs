@@ -159,10 +159,6 @@ pub struct CachedGroupTable {
 }
 
 impl CachedGroupTable {
-    pub const fn group(&self) -> GroupId {
-        self.group
-    }
-
     pub fn len(&self) -> usize {
         self.tail.as_ref().map_or(0, |tail| tail.len())
     }

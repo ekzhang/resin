@@ -1,4 +1,3 @@
-use aho_corasick::{AhoCorasick, MatchKind};
 use std::sync::Arc;
 
 use crate::{Error, Tokenizer};
@@ -133,25 +132,10 @@ pub trait Encoder: Send + Sync {
 pub struct TokenizerEncoder {
     tokenizer: Arc<Tokenizer>,
     ordinary: Tokenizer,
-    format_tokens: AhoCorasick,
 }
 
 impl TokenizerEncoder {
     pub fn new(tokenizer: Arc<Tokenizer>) -> Result<Self, Error> {
-        let format_tokens = AhoCorasick::builder()
-            .match_kind(MatchKind::LeftmostLongest)
-            .build(
-                tokenizer
-                    .get_added_tokens_decoder()
-                    .into_values()
-                    .filter(|token| {
-                        token.special
-                            || token.content.starts_with('<')
-                            || token.content.starts_with('｜')
-                    })
-                    .map(|token| token.content),
-            )
-            .map_err(|error| Error::new(error.to_string()))?;
         let mut ordinary = (*tokenizer).clone();
         // Some checkpoints mark format delimiters (e.g. LFM's <think>) as
         // ordinary added tokens. They still require the same provenance rule.
@@ -168,20 +152,7 @@ impl TokenizerEncoder {
         Ok(Self {
             tokenizer,
             ordinary,
-            format_tokens,
         })
-    }
-
-    /// Append trusted processor output while coalescing its text boundaries.
-    pub fn append_format(&self, prompt: &mut Prompt, text: &str) {
-        let mut previous = 0;
-        for found in self.format_tokens.find_iter(text) {
-            prompt
-                .text(&text[previous..found.start()])
-                .special(&text[found.start()..found.end()]);
-            previous = found.end();
-        }
-        prompt.text(&text[previous..]);
     }
 }
 

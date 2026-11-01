@@ -114,14 +114,6 @@ impl Config {
         Ok(((best_h / patch) as usize, (best_w / patch) as usize))
     }
 
-    pub fn token_count(&self, width: usize, height: usize) -> Result<usize, Error> {
-        let (h, w) = self.grid(width, height)?;
-        h.div_ceil(3)
-            .checked_mul(w.div_ceil(3) + 1)
-            .and_then(|n| n.checked_add(2))
-            .ok_or_else(|| Error::new("image token count overflows"))
-    }
-
     pub fn process(&self, images: &[RgbImage]) -> Result<Prepared, Error> {
         self.validate()?;
         Ok(Prepared {
@@ -256,7 +248,10 @@ mod tests {
                     case["grid"][1].as_u64().unwrap()
                 )
             );
-            assert!(config.token_count(w, h).unwrap() <= config.max_image_tokens);
+            assert!(
+                image_token_types(grid.0.div_ceil(3), grid.1.div_ceil(3)).len()
+                    <= config.max_image_tokens
+            );
         }
     }
 
@@ -277,7 +272,6 @@ mod tests {
             (43, 13, 202),
         ] {
             let (h, w) = config.grid(width, height).unwrap();
-            assert_eq!(config.token_count(width, height).unwrap(), expected);
             assert_eq!(
                 image_token_types(h.div_ceil(3), w.div_ceil(3)).len(),
                 expected

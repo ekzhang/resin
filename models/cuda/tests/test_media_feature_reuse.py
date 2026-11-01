@@ -18,7 +18,6 @@ from resin.recipe import (
     Glm53FlashMedia,
     InklingMedia,
     Qwen35Media,
-    image_token_types,
 )
 
 
@@ -88,7 +87,7 @@ def _case(name):
         suffix = (6, 5) if followup else (6,)
         if name == "deepseek":
             h, w = (2, 1) if geometry else (1, 2)
-            types = image_token_types(1, 1)
+            types = (0, 1, 2, 3)
             image = DeepSeekV41Image(
                 start=len(prefix),
                 patches=np.full((2, 3, 14, 14), value, dtype=np.float32),

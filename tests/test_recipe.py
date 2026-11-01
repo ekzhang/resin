@@ -12,7 +12,6 @@ from tokenizers.pre_tokenizers import ByteLevel
 import resin
 from resin.protocols import FinalizingResponseParser
 from resin.recipe import (
-    InklingResponseParser,
     ParserEvent,
     Tokenizer,
     get_native_recipe,
@@ -27,6 +26,9 @@ MARKERS = (
     "<|content_tool_error|>",
     "<|content_model_end_sampling|>",
     "<|end_message|>",
+    "<|message_system|>",
+    "<|message_user|>",
+    "<|message_tool|>",
 )
 
 
@@ -58,6 +60,14 @@ def _token_ids(tokenizer: HuggingFaceTokenizer) -> dict[str, int]:
         assert token_id is not None
         result[marker] = token_id
     return result
+
+
+def _inkling_parser(tokenizer, *, content: bool = False) -> FinalizingResponseParser:
+    recipe = get_native_recipe("inkling", tokenizer)
+    parser = recipe.create_parser(recipe.render([]))
+    if content:
+        assert parser.feed(recipe.tokenizer.encode("<|content_text|>")) == []
+    return parser
 
 
 def _coalesce(events: list[ParserEvent]) -> list[ParserEvent]:
@@ -114,7 +124,6 @@ def test_complete_response_uses_actual_generation_prefix() -> None:
 def test_native_decode_is_equivalent_for_every_chunk_boundary() -> None:
     backend = _byte_tokenizer()
     tokenizer = Tokenizer(_FastTokenizer(backend))
-    markers = _token_ids(backend)
     text = (
         "<|content_thinking|>想一想 🧠"
         "<|end_message|><|message_model|><|content_text|>Hi café! \ufffd"
@@ -125,9 +134,7 @@ def test_native_decode_is_equivalent_for_every_chunk_boundary() -> None:
     ids = backend.encode(text, add_special_tokens=False).ids
 
     def parse(chunks: Sequence[Sequence[int]]) -> list[ParserEvent]:
-        parser: FinalizingResponseParser = InklingResponseParser(
-            tokenizer, markers, prompt_ids=[markers["<|message_model|>"]]
-        )
+        parser = _inkling_parser(tokenizer)
         events: list[ParserEvent] = []
         for chunk in chunks:
             events.extend(parser.feed(chunk))
@@ -151,11 +158,7 @@ def test_native_decoder_buffers_partial_utf8_between_feeds() -> None:
     ids = backend.encode("🦀", add_special_tokens=False).ids
     assert len(ids) == 4
     markers = _token_ids(backend)
-    parser = InklingResponseParser(
-        Tokenizer(_FastTokenizer(backend)),
-        markers,
-        prompt_ids=[markers["<|content_text|>"]],
-    )
+    parser = _inkling_parser(Tokenizer(_FastTokenizer(backend)))
 
     assert parser.feed([markers["<|content_text|>"]]) == []
     for token_id in ids[:-1]:
@@ -172,18 +175,13 @@ def test_native_decoder_buffers_partial_utf8_between_feeds() -> None:
 
 def test_native_decoder_flushes_incomplete_utf8_at_finish() -> None:
     backend = _byte_tokenizer()
-    markers = _token_ids(backend)
-    parser = InklingResponseParser(
-        Tokenizer(_FastTokenizer(backend)),
-        markers,
-        prompt_ids=[markers["<|content_text|>"]],
-    )
+    parser = _inkling_parser(Tokenizer(_FastTokenizer(backend)), content=True)
     incomplete = backend.encode("🦀", add_special_tokens=False).ids[:2]
 
     assert parser.feed(incomplete) == []
     assert parser.finish("length") == [
         resin.recipe.TextDelta(
-            "�", token_spans=[(index, 0, 1, 0, 3) for index in range(2)]
+            "�", token_spans=[(index, 0, 1, 0, 3) for index in range(1, 3)]
         )
     ]
     assert parser.finish("length") == []
@@ -191,15 +189,13 @@ def test_native_decoder_flushes_incomplete_utf8_at_finish() -> None:
 
 def test_native_tokenizer_is_a_snapshot_and_parsers_have_independent_state() -> None:
     backend = _byte_tokenizer()
-    markers = _token_ids(backend)
     tokenizer = Tokenizer(_FastTokenizer(backend))
+    recipe = get_native_recipe("inkling", tokenizer)
+    prompt = recipe.render([])
     backend.decoder = None
-    parsers = [
-        InklingResponseParser(
-            tokenizer, markers, prompt_ids=[markers["<|content_text|>"]]
-        )
-        for _ in range(2)
-    ]
+    parsers = [recipe.create_parser(prompt) for _ in range(2)]
+    for parser in parsers:
+        assert parser.feed(tokenizer.encode("<|content_text|>")) == []
     ids = backend.encode("café", add_special_tokens=False).ids
 
     def expected(offset: int) -> list[ParserEvent]:
@@ -216,10 +212,10 @@ def test_native_tokenizer_is_a_snapshot_and_parsers_have_independent_state() -> 
             )
         ]
 
-    assert parsers[0].feed(ids) == expected(0)
-    assert parsers[1].feed(ids) == expected(0)
+    assert parsers[0].feed(ids) == expected(1)
+    assert parsers[1].feed(ids) == expected(1)
     assert parsers[0].finish("stop") == []
-    assert parsers[1].feed(ids) == expected(5)
+    assert parsers[1].feed(ids) == expected(6)
 
 
 def test_native_parser_rejects_an_unsupported_decoder_chain() -> None:
@@ -228,27 +224,23 @@ def test_native_parser_rejects_an_unsupported_decoder_chain() -> None:
     backend = _byte_tokenizer()
     backend.decoder = WordPiece()
     with pytest.raises(ValueError, match="decoder"):
-        InklingResponseParser(Tokenizer(backend), _token_ids(backend))
+        _inkling_parser(Tokenizer(backend))
 
 
 def test_custom_tokenizer_with_no_native_backend_uses_decode() -> None:
     calls: list[list[int]] = []
 
-    class CustomTokenizer:
+    class CustomTokenizer(_CallbackTokenizer):
         backend_tokenizer = None
 
-        @staticmethod
-        def decode(ids: list[int], *, skip_special_tokens: bool) -> str:
+        def decode(self, ids: list[int], *, skip_special_tokens: bool = False) -> str:
             assert not skip_special_tokens
             calls.append(list(ids))
             return "".join(chr(token_id) for token_id in ids)
 
     tokenizer = Tokenizer(CustomTokenizer())
     assert not tokenizer.is_native
-    markers = _token_ids(_byte_tokenizer())
-    parser = InklingResponseParser(
-        tokenizer, markers, prompt_ids=[markers["<|content_text|>"]]
-    )
+    parser = _inkling_parser(tokenizer, content=True)
 
     assert parser.feed([ord("x")]) == [resin.recipe.TextDelta("x")]
     assert calls == [[ord("x")]]
@@ -258,12 +250,7 @@ def test_custom_tokenizer_with_no_native_backend_uses_decode() -> None:
 class _CallbackTokenizer:
     """A tokenizer with explicit ordinary encoding and reversible markers."""
 
-    markers = {
-        marker: index + 1000
-        for index, marker in enumerate(
-            (*MARKERS, "<|message_user|>", "<|message_system|>", "<|message_tool|>")
-        )
-    }
+    markers = {marker: index + 1000 for index, marker in enumerate(MARKERS)}
 
     def __init__(self):
         self.raw_encodes = []
@@ -364,7 +351,7 @@ def test_inkling_tool_float_preserves_original_value() -> None:
     import json
 
     backend = _byte_tokenizer()
-    parser = InklingResponseParser(Tokenizer(backend), _token_ids(backend))
+    parser = _inkling_parser(Tokenizer(backend))
     # TML 0.2.0 rounds this to 0.9999899864196776; the generated JSON and
     # native parser must retain the exact Python value.
     ids = backend.encode(

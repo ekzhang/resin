@@ -6,12 +6,11 @@
 pub use crate::logprobs::{LogprobView, TokenLogprobs};
 use crate::metrics::{EngineMetricsSnapshot, EngineMetricsState, RequestMetricsState};
 pub use crate::output::{OwnedTokenRows, TokenRows};
-use crate::resources::RequestResourceRef;
 use crate::resources::kv::{KvGroupPlan, KvLayout};
 use crate::resources::paged::{CachePoolError, RequestPages, WriterAccessLease};
 use crate::resources::paged_kv::{
-    CacheMetrics, PagedKvBatchView, PagedKvError, PagedKvResources, PrefixKey, PrefixStorage,
-    PrefixStoragePolicy,
+    CacheMetrics, PagedKvError, PagedKvResources, PrefixKey, PrefixStorage, PrefixStoragePolicy,
+    RequestResourceRef,
 };
 use crate::{
     Phase, PlanningConfig, PlanningError, RequestId, RequestProgress, Schedulable, Scheduler,
@@ -437,7 +436,7 @@ impl<P> Request<P> {
     }
 
     /// Check the frozen row both before execution and before committing progress.
-    fn validate_step(&self, scheduled: ScheduledRow) -> Result<u32> {
+    fn validate_step(&self, scheduled: SequenceStep) -> Result<u32> {
         if scheduled.phase != self.phase() || scheduled.token_start() != self.logical_context()? {
             return Err(Error::internal(format!(
                 "request {} progress changed after its row was scheduled",
@@ -510,11 +509,9 @@ impl<P> Schedulable for Request<P> {
     }
 }
 
-type ScheduledRow = SequenceStep;
-
 struct BatchRow<P> {
     request: Request<P>,
-    scheduled: ScheduledRow,
+    scheduled: SequenceStep,
     // Logical completion may precede the already-enqueued step's retirement.
     // Keep its physical row and cache ownership until that step is harvested.
     terminal: bool,
@@ -1515,7 +1512,7 @@ impl<P: Clone> EngineCore<P> {
                 batch_id,
                 &scheduled,
                 &scheduled_rows,
-                acquired_kv.as_mut().map(|acquired| &mut acquired.view),
+                acquired_kv.as_mut().map(|acquired| &mut acquired.groups),
             )
         }))
         .unwrap_or_else(|_| {
@@ -1778,9 +1775,7 @@ impl<P: Clone> EngineCore<P> {
             // Runner cleanup proves physical execution is terminal. Only now
             // may its writer lease return and cache pages become reusable.
             self.release_kv_access(batch.resources.take());
-            if let Err(error) =
-                self.publish_batch_prefixes(&mut batch, &prepared_progress, output_token_ids)
-            {
+            if let Err(error) = self.publish_batch_prefixes(&mut batch, &prepared_progress) {
                 return self.quarantine(batch, "native prefix publication failed", error);
             }
         }
@@ -1962,7 +1957,6 @@ impl<P: Clone> EngineCore<P> {
         &mut self,
         batch: &mut Batch<P>,
         progress: &[PreparedProgress],
-        _physical_output: TokenRows<'_>,
     ) -> Result<()> {
         let Some(alignment) = self.prefix_alignment() else {
             return Ok(());
@@ -2423,8 +2417,8 @@ impl<P: Clone> EngineCore<P> {
 fn build_plan<P: Clone>(
     batch_id: u64,
     requests: &[Request<P>],
-    scheduled_rows: &[ScheduledRow],
-    kv_view: Option<&mut PagedKvBatchView>,
+    scheduled_rows: &[SequenceStep],
+    kv_groups: Option<&mut Vec<KvGroupPlan>>,
 ) -> Result<ExecutionPlan<P>> {
     if requests.len() != scheduled_rows.len() {
         return Err(Error::internal(
@@ -2436,7 +2430,7 @@ fn build_plan<P: Clone>(
     }
     if requests
         .iter()
-        .any(|request| request.cache.is_some() != kv_view.is_some())
+        .any(|request| request.cache.is_some() != kv_groups.is_some())
     {
         return Err(Error::internal(
             "scheduled request and KV resource view ownership disagree",
@@ -2522,7 +2516,7 @@ fn build_plan<P: Clone>(
 
     // Transfer the already-frozen vectors after every fallible validation and
     // payload clone. The batch keeps the independent lease through execution.
-    let cache_groups = kv_view.map_or_else(Vec::new, |view| std::mem::take(&mut view.groups));
+    let cache_groups = kv_groups.map_or_else(Vec::new, std::mem::take);
     Ok(ExecutionPlan {
         prompt_score_indices,
         prompt_score_token_ids,
@@ -2713,17 +2707,17 @@ mod tests {
             state: managed.cache.as_ref().unwrap(),
         }];
         let mut acquired = resources.acquire(&resource_refs, &rows, 0).unwrap();
-        let groups_ptr = acquired.view.groups.as_ptr();
-        let block_ids_ptr = acquired.view.groups[0].block_slab_ids.as_ptr();
+        let groups_ptr = acquired.groups.as_ptr();
+        let block_ids_ptr = acquired.groups[0].block_slab_ids.as_ptr();
         let plan = build_plan(
             9,
             std::slice::from_ref(&managed),
             &rows,
-            Some(&mut acquired.view),
+            Some(&mut acquired.groups),
         )
         .unwrap();
 
-        assert!(acquired.view.groups.is_empty());
+        assert!(acquired.groups.is_empty());
         assert_eq!(plan.cache_groups.as_ptr(), groups_ptr);
         assert_eq!(plan.cache_groups[0].block_slab_ids.as_ptr(), block_ids_ptr);
 
@@ -2782,7 +2776,7 @@ mod tests {
             10,
             std::slice::from_ref(&managed),
             &rows,
-            Some(&mut acquired.view),
+            Some(&mut acquired.groups),
         )
         .unwrap();
         let window = &plan.cache_groups[0];

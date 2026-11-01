@@ -15,7 +15,6 @@ from resin.backend.cuda.vision_cache import VisionFeatureCache
 from resin.recipe import (
     DeepSeekV41Image,
     DeepSeekV41Media,
-    image_token_types,
 )
 from resin_models_cuda.deepseek_v41.cuda import DeepSeekV41CudaRunner
 from resin_models_cuda.deepseek_v41.vision import Aligner, ViT, get_vision_cos_sin
@@ -62,7 +61,7 @@ def test_vision_rope_and_aligner_match_checkpoint_spatial_order():
 
 
 def media_fixture():
-    types = image_token_types(2, 2)
+    types = (0, 1, 1, 2, 1, 1, 2, 3)
     image = DeepSeekV41Image(
         start=2,
         patches=np.zeros((16, 3, 14, 14), dtype=np.float32),

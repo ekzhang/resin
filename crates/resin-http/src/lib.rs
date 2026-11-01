@@ -100,15 +100,6 @@ impl AppState {
 pub fn router(
     model: impl Into<Arc<str>>,
     jobs: mpsc::Sender<GenerationJob>,
-    routes: RouteConfig,
-    metrics: Option<MetricsEndpoint>,
-) -> Router {
-    router_with_token_counter(model, jobs, None, routes, metrics)
-}
-
-pub fn router_with_token_counter(
-    model: impl Into<Arc<str>>,
-    jobs: mpsc::Sender<GenerationJob>,
     token_counter: Option<TokenCounter>,
     routes: RouteConfig,
     metrics: Option<MetricsEndpoint>,
@@ -151,33 +142,9 @@ pub fn router_with_token_counter(
         .with_state(state)
 }
 
-pub async fn serve(
-    listener: tokio::net::TcpListener,
-    model: impl Into<Arc<str>>,
-    jobs: mpsc::Sender<GenerationJob>,
-    routes: RouteConfig,
-    metrics: Option<MetricsEndpoint>,
-) -> std::io::Result<()> {
-    serve_with_shutdown(listener, model, jobs, routes, metrics, async {
-        let _ = tokio::signal::ctrl_c().await;
-    })
-    .await
-}
-
 /// Stop accepting connections when requested and bound the time spent draining
 /// existing HTTP connections. The hosting runtime may then be dropped even if
 /// a client has stopped reading its response.
-pub async fn serve_with_shutdown(
-    listener: tokio::net::TcpListener,
-    model: impl Into<Arc<str>>,
-    jobs: mpsc::Sender<GenerationJob>,
-    routes: RouteConfig,
-    metrics: Option<MetricsEndpoint>,
-    shutdown: impl Future<Output = ()>,
-) -> std::io::Result<()> {
-    serve_router_with_shutdown(listener, router(model, jobs, routes, metrics), shutdown).await
-}
-
 pub async fn serve_router_with_shutdown(
     listener: tokio::net::TcpListener,
     app: Router,

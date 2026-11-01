@@ -256,7 +256,7 @@ def import_edits(
         for alias in node.names
     }
     for module, name in (
-        ("collections.abc", "Mapping"),
+        ("resin.cache_storage", "CacheStorage"),
         ("typing", "Literal"),
         ("resin.recipe", "Recipe"),
         ("resin.recipe", "ContentBlock"),

@@ -1,3 +1,4 @@
+use resin_recipe::ResponseParser;
 use resin_recipe::{Recipe, lfm2::Lfm2Recipe};
 mod common;
 use common::SemanticParser;
@@ -40,7 +41,7 @@ impl Decoder for Bytes {
 }
 
 fn parser() -> Lfm2Parser {
-    Lfm2Parser::new(TOKENS, Box::<Bytes>::default(), &[]).unwrap()
+    Lfm2Parser::new(TOKENS, Box::<Bytes>::default()).unwrap()
 }
 fn ids(text: &str) -> Vec<u32> {
     text.bytes().map(u32::from).collect()
@@ -195,5 +196,34 @@ fn python_repr_uses_pinned_unicode_15_1_printability() {
         prompt
             .rendered_text()
             .contains("[f(xs=['\\U00013460\u{2ebf0}\\x00'])]")
+    );
+}
+
+#[test]
+fn message_end_is_terminal_across_batches() {
+    let mut parser = parser();
+    let mut response = ids("answer");
+    response.extend([TOKENS.message_end, TOKENS.thinking_start]);
+    response.extend(ids("ignored reasoning"));
+    response.extend([TOKENS.thinking_end, TOKENS.message_start]);
+    response.extend(ids("assistant\nignored text"));
+    assert_eq!(
+        parser.semantic_feed(&response).unwrap(),
+        vec![Event::TextDelta {
+            delta: "answer".into()
+        }]
+    );
+    assert!(
+        parser
+            .semantic_feed(&[TOKENS.thinking_start, u32::from(b'x'), TOKENS.message_start])
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(parser.token_channel(u32::from(b'x')), None);
+    assert!(
+        parser
+            .semantic_finish(FinishReason::Stop)
+            .unwrap()
+            .is_empty()
     );
 }

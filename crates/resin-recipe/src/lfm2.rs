@@ -85,11 +85,7 @@ pub struct Lfm2Grammar {
 }
 
 impl Lfm2Parser {
-    pub fn new(
-        tokens: Lfm2Tokens,
-        decoder: Box<dyn Decoder>,
-        _prompt_ids: &[u32],
-    ) -> Result<Self, Error> {
+    pub fn new(tokens: Lfm2Tokens, decoder: Box<dyn Decoder>) -> Result<Self, Error> {
         tokens.validate()?;
         Ok(Self::with_grammar(
             Lfm2Grammar {
@@ -115,6 +111,9 @@ impl Grammar for Lfm2Grammar {
 
     fn is_control(&self, id: u32) -> bool {
         self.tokens.ids().contains(&id)
+    }
+    fn ended(&self) -> bool {
+        self.stage == Stage::Done
     }
     fn text(&mut self, text: AttributedText, events: &mut EventSink) -> Result<(), Error> {
         if !text.is_empty() {
@@ -286,12 +285,11 @@ impl crate::Recipe for Lfm2Recipe {
         encoder: &dyn crate::Encoder,
         decoder: Box<dyn crate::Decoder>,
         _request: &Value,
-        prompt_ids: &[u32],
+        _prompt_ids: &[u32],
     ) -> Result<Box<dyn crate::ResponseParser>, crate::Error> {
         Ok(Box::new(Lfm2Parser::new(
             Lfm2Tokens::resolve(encoder)?,
             decoder,
-            prompt_ids,
         )?))
     }
     fn stop_token_ids(&self, encoder: &dyn crate::Encoder) -> Result<Vec<u32>, crate::Error> {

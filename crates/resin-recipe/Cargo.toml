@@ -6,7 +6,6 @@ license = "Apache-2.0"
 description = "Model conversation formats and incremental response parsing for Resin"
 
 [dependencies]
-aho-corasick = "1.1"
 base64 = "0.22"
 half = "2"
 image = { version = "0.25", default-features = false, features = ["bmp", "gif", "jpeg", "png", "tiff", "webp"] }

@@ -1,4 +1,3 @@
-use resin_http::router_with_token_counter;
 use std::sync::Arc;
 
 use axum::{
@@ -40,7 +39,7 @@ fn test_router() -> axum::Router {
             });
         }
     });
-    router("test-model", jobs, RouteConfig::default(), None)
+    router("test-model", jobs, None, RouteConfig::default(), None)
 }
 
 #[tokio::test]
@@ -52,7 +51,7 @@ async fn token_count_routes_normalize_prompts_without_generation_limits() {
         assert_eq!(request.tools[0]["name"], "weather");
         let _ = result.send(Ok(17));
     });
-    let app = router_with_token_counter(
+    let app = router(
         "test-model",
         jobs,
         Some(counter),
@@ -105,7 +104,7 @@ async fn token_count_routes_follow_protocol_flags_and_bypass_generation_queue() 
         let counter: TokenCounter = Arc::new(|_, result| {
             let _ = result.send(Ok(17));
         });
-        let app = router_with_token_counter(
+        let app = router(
             "test-model",
             jobs.clone(),
             Some(counter),
@@ -116,12 +115,19 @@ async fn token_count_routes_follow_protocol_flags_and_bypass_generation_queue() 
         assert_eq!(status, StatusCode::OK);
         assert_eq!(body["input_tokens"], 17);
         drop(permit);
-        let app = router("test-model", jobs.clone(), RouteConfig::default(), None);
+        let app = router(
+            "test-model",
+            jobs.clone(),
+            None,
+            RouteConfig::default(),
+            None,
+        );
         let (status, _) = json_response(app, request()).await;
         assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
         let app = router(
             "test-model",
             jobs,
+            None,
             RouteConfig {
                 enable_openai: false,
                 enable_anthropic: false,
@@ -170,7 +176,7 @@ fn tool_router() -> axum::Router {
             });
         }
     });
-    router("test-model", jobs, RouteConfig::default(), None)
+    router("test-model", jobs, None, RouteConfig::default(), None)
 }
 
 async fn json_response(app: axum::Router, request: Request<Body>) -> (StatusCode, Value) {
@@ -236,7 +242,7 @@ fn scored_router() -> axum::Router {
             }
         }
     });
-    router("test-model", jobs, RouteConfig::default(), None)
+    router("test-model", jobs, None, RouteConfig::default(), None)
 }
 
 #[tokio::test]
@@ -255,7 +261,7 @@ async fn cache_salts_are_typed_and_forwarded_by_every_protocol() {
         };
         for salt in [Value::Null, json!(""), json!("alice"), json!("λ")] {
             let (jobs, mut receiver) = mpsc::channel(1);
-            let app = router("test-model", jobs, RouteConfig::default(), None);
+            let app = router("test-model", jobs, None, RouteConfig::default(), None);
             let response = app.oneshot(request(salt.clone())).await.unwrap();
             assert_eq!(response.status(), StatusCode::OK);
             let job = receiver.try_recv().unwrap();
@@ -496,6 +502,7 @@ fn recording_router(ranks: usize) -> axum::Router {
     router(
         "test-model",
         jobs,
+        None,
         RouteConfig {
             routed_dp_size: ranks,
             ..RouteConfig::default()
@@ -807,6 +814,114 @@ async fn responses_api_returns_reasoning_and_message_items() {
 }
 
 #[tokio::test]
+async fn responses_report_token_limit_endings() {
+    for (reason, expected_status, details, terminal_event) in [
+        (
+            FinishReason::Stop,
+            "completed",
+            Value::Null,
+            "response.completed",
+        ),
+        (
+            FinishReason::Length,
+            "incomplete",
+            json!({"reason": "max_output_tokens"}),
+            "response.incomplete",
+        ),
+    ] {
+        for tool_call in [false, true] {
+            let (jobs, mut receiver) = mpsc::channel::<GenerationJob>(2);
+            tokio::spawn(async move {
+                while let Some(job) = receiver.recv().await {
+                    let mut events = vec![GenerationEvent::Started { input_tokens: 3 }];
+                    if tool_call {
+                        events.extend([
+                            GenerationEvent::ToolCallStart {
+                                index: 0,
+                                id: "call_weather".into(),
+                                name: "weather".into(),
+                            },
+                            GenerationEvent::ToolCallArgumentsDelta {
+                                index: 0,
+                                delta: r#"{"city":"Pa"#.into(),
+                            },
+                        ]);
+                    } else {
+                        events.push(GenerationEvent::TextDelta {
+                            delta: "partial output".into(),
+                            logprobs: vec![],
+                        });
+                    }
+                    events.push(GenerationEvent::Finished {
+                        reason,
+                        input_tokens: 3,
+                        cached_tokens: 1,
+                        output_tokens: 2,
+                        elapsed_ms: 2.0,
+                        generation_elapsed_ms: 1.0,
+                        time_to_first_token_ms: 1.0,
+                    });
+                    for event in events {
+                        if job.events.send(event).await.is_err() {
+                            break;
+                        }
+                    }
+                }
+            });
+            let app = router("test-model", jobs, None, RouteConfig::default(), None);
+            // The engine can hit its context limit even without an explicit output limit.
+            for limit in [None, Some(2)] {
+                for stream in [false, true] {
+                    let mut body = json!({
+                        "model": "test-model", "input": "hi", "stream": stream,
+                    });
+                    if let Some(limit) = limit {
+                        body["max_output_tokens"] = json!(limit);
+                    }
+                    let request = Request::post("/v1/responses")
+                        .header(header::CONTENT_TYPE, "application/json")
+                        .body(Body::from(body.to_string()))
+                        .unwrap();
+                    let response = if stream {
+                        let events = stream_events(app.clone(), request).await;
+                        assert_eq!(events.last().unwrap()["type"], terminal_event);
+                        assert_eq!(
+                            events
+                                .iter()
+                                .filter(|event| matches!(
+                                    event["type"].as_str(),
+                                    Some("response.completed" | "response.incomplete")
+                                ))
+                                .count(),
+                            1
+                        );
+                        events.last().unwrap()["response"].clone()
+                    } else {
+                        let (status, response) = json_response(app.clone(), request).await;
+                        assert_eq!(status, StatusCode::OK);
+                        response
+                    };
+                    assert_eq!(response["status"], expected_status);
+                    assert_eq!(response["incomplete_details"], details);
+                    assert!(response["error"].is_null());
+                    assert_eq!(response["max_output_tokens"], json!(limit));
+                    assert_eq!(response["usage"]["output_tokens"], 2);
+                    assert_eq!(response["usage"]["total_tokens"], 5);
+                    if tool_call {
+                        assert_eq!(response["output"][0]["arguments"], r#"{"city":"Pa"#);
+                    } else {
+                        assert_eq!(
+                            response["output"][0]["content"][0]["text"],
+                            "partial output"
+                        );
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[tokio::test]
 async fn anthropic_messages_returns_thinking_and_text_blocks() {
     let request = Request::post("/v1/messages")
         .header(header::CONTENT_TYPE, "application/json")
@@ -835,6 +950,7 @@ async fn route_flags_remove_disabled_apis_and_demo() {
     let app = router(
         "test-model",
         jobs,
+        None,
         RouteConfig {
             enable_openai: false,
             enable_anthropic: false,
@@ -979,7 +1095,7 @@ fn generation_request(path: &str, stream: bool) -> Request<Body> {
 async fn full_admission_queue_rejects_each_api_without_waiting() {
     for path in ["/v1/chat/completions", "/v1/responses", "/v1/messages"] {
         let (jobs, receiver) = mpsc::channel(1);
-        let app = router("test-model", jobs, RouteConfig::default(), None);
+        let app = router("test-model", jobs, None, RouteConfig::default(), None);
         let first = app
             .clone()
             .oneshot(generation_request(path, true))
@@ -1006,7 +1122,7 @@ async fn full_admission_queue_rejects_each_api_without_waiting() {
 #[tokio::test]
 async fn stopped_actor_fails_health_and_generation_admission() {
     let (jobs, receiver) = mpsc::channel(1);
-    let app = router("test-model", jobs, RouteConfig::default(), None);
+    let app = router("test-model", jobs, None, RouteConfig::default(), None);
     drop(receiver);
     let (status, _) = json_response(
         app.clone(),
@@ -1021,7 +1137,7 @@ async fn stopped_actor_fails_health_and_generation_admission() {
 #[tokio::test]
 async fn slow_stream_has_a_bounded_queue_and_does_not_block_another_response() {
     let (jobs, mut receiver) = mpsc::channel(2);
-    let app = router("test-model", jobs, RouteConfig::default(), None);
+    let app = router("test-model", jobs, None, RouteConfig::default(), None);
     let slow = app
         .clone()
         .oneshot(generation_request("/v1/chat/completions", true))
@@ -1088,7 +1204,7 @@ async fn failed_requests_never_return_partial_success() {
         for streaming in [false, true] {
             for explicit_error in [false, true] {
                 let (jobs, mut receiver) = mpsc::channel(1);
-                let app = router("test-model", jobs, RouteConfig::default(), None);
+                let app = router("test-model", jobs, None, RouteConfig::default(), None);
                 let pending = tokio::spawn(app.oneshot(generation_request(path, streaming)));
                 let job = receiver.recv().await.unwrap();
                 job.events
@@ -1148,12 +1264,9 @@ async fn programmatic_shutdown_closes_the_listener() {
     let address = listener.local_addr().unwrap();
     let (jobs, _receiver) = mpsc::channel(1);
     let (stop, stopped) = tokio::sync::oneshot::channel();
-    let server = tokio::spawn(resin_http::serve_with_shutdown(
+    let server = tokio::spawn(resin_http::serve_router_with_shutdown(
         listener,
-        "test-model",
-        jobs,
-        RouteConfig::default(),
-        None,
+        router("test-model", jobs, None, RouteConfig::default(), None),
         async {
             let _ = stopped.await;
         },
@@ -1210,6 +1323,7 @@ async fn priority_validates_i32_and_is_separate_from_recipe_extras() {
             let app = router(
                 "test-model",
                 jobs,
+                None,
                 RouteConfig {
                     enable_priority_scheduling: enabled,
                     ..RouteConfig::default()
@@ -1252,6 +1366,7 @@ async fn priority_validates_i32_and_is_separate_from_recipe_extras() {
             let app = router(
                 "test-model",
                 jobs,
+                None,
                 RouteConfig {
                     enable_priority_scheduling: true,
                     ..RouteConfig::default()
@@ -1278,5 +1393,98 @@ async fn priority_validates_i32_and_is_separate_from_recipe_extras() {
             );
             assert!(receiver.try_recv().is_err());
         }
+    }
+}
+
+#[tokio::test]
+async fn responses_keep_output_indices_when_text_precedes_multiple_tool_calls() {
+    let (jobs, mut receiver) = mpsc::channel::<GenerationJob>(2);
+    tokio::spawn(async move {
+        while let Some(job) = receiver.recv().await {
+            for event in [
+                GenerationEvent::TextDelta {
+                    delta: "Checking ".into(),
+                    logprobs: vec![],
+                },
+                GenerationEvent::ToolCallStart {
+                    index: 0,
+                    id: "call_first".into(),
+                    name: "first".into(),
+                },
+                GenerationEvent::ToolCallArgumentsDelta {
+                    index: 0,
+                    delta: "{}".into(),
+                },
+                GenerationEvent::ToolCallStart {
+                    index: 1,
+                    id: "call_second".into(),
+                    name: "second".into(),
+                },
+                GenerationEvent::ToolCallArgumentsDelta {
+                    index: 1,
+                    delta: "{}".into(),
+                },
+                GenerationEvent::TextDelta {
+                    delta: "both".into(),
+                    logprobs: vec![],
+                },
+                GenerationEvent::Finished {
+                    reason: FinishReason::Stop,
+                    input_tokens: 1,
+                    cached_tokens: 0,
+                    output_tokens: 6,
+                    elapsed_ms: 1.0,
+                    generation_elapsed_ms: 1.0,
+                    time_to_first_token_ms: 0.0,
+                },
+            ] {
+                if job.events.send(event).await.is_err() {
+                    break;
+                }
+            }
+        }
+    });
+    let app = router("test-model", jobs, None, RouteConfig::default(), None);
+    let events = stream_events(app.clone(), generation_request("/v1/responses", true)).await;
+    let added = events
+        .iter()
+        .filter(|event| event["type"] == "response.output_item.added")
+        .collect::<Vec<_>>();
+    assert_eq!(added.len(), 3);
+    for (index, event) in added.iter().enumerate() {
+        assert_eq!(event["output_index"], index);
+    }
+    let types = ["message", "function_call", "function_call"];
+    for (event, kind) in added.iter().zip(types) {
+        assert_eq!(event["item"]["type"], kind);
+    }
+    for event in &events {
+        let expected = match event["type"].as_str().unwrap() {
+            "response.output_text.delta"
+            | "response.output_text.done"
+            | "response.content_part.added"
+            | "response.content_part.done" => Some(0),
+            "response.function_call_arguments.delta" | "response.function_call_arguments.done" => {
+                Some(if event["item_id"].as_str().unwrap().ends_with("_0") {
+                    1
+                } else {
+                    2
+                })
+            }
+            _ => None,
+        };
+        if let Some(index) = expected {
+            assert_eq!(event["output_index"], index);
+        }
+    }
+    let completed = &events.last().unwrap()["response"]["output"];
+    assert_eq!(completed.as_array().unwrap().len(), 3);
+    for (item, kind) in completed.as_array().unwrap().iter().zip(types) {
+        assert_eq!(item["type"], kind);
+    }
+    assert_eq!(completed[0]["content"][0]["text"], "Checking both");
+    let (_, full) = json_response(app, generation_request("/v1/responses", false)).await;
+    for (item, kind) in full["output"].as_array().unwrap().iter().zip(types) {
+        assert_eq!(item["type"], kind);
     }
 }

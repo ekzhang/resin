@@ -21,6 +21,7 @@ enum State {
     Content,
     Reasoning,
     Tool,
+    Done,
 }
 
 /// Inkling's token-delimited text, reasoning, and JSON tool-call blocks.
@@ -79,10 +80,13 @@ impl Grammar for InklingGrammar {
     fn is_control(&self, id: u32) -> bool {
         self.tokens.ids().contains(&id)
     }
+    fn ended(&self) -> bool {
+        matches!(self.state, State::Done)
+    }
     fn text(&mut self, text: AttributedText, events: &mut EventSink) -> Result<(), Error> {
         if !text.is_empty() {
             match self.state {
-                State::Header => {}
+                State::Header | State::Done => {}
                 State::Content => events.text(text, false),
                 State::Reasoning => events.text(text, true),
                 State::Tool => self.tool.push_str(&text),
@@ -109,7 +113,9 @@ impl Grammar for InklingGrammar {
             emit_tool(&mut self.tool_index, name, arguments.to_string(), events);
         }
         self.tool.clear();
-        self.state = if id == self.tokens.message_model {
+        self.state = if id == self.tokens.content_model_end_sampling {
+            State::Done
+        } else if id == self.tokens.message_model {
             State::Header
         } else if id == self.tokens.content_thinking {
             State::Reasoning

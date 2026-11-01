@@ -21,7 +21,7 @@ async fn scrape_negotiates_native_histograms_across_accept_headers() {
     endpoint.observe_completed(0.1);
     endpoint.observe_completed(3.0);
     endpoint.publish(vec![]).unwrap();
-    let app = router("test", jobs, RouteConfig::default(), Some(endpoint));
+    let app = router("test", jobs, None, RouteConfig::default(), Some(endpoint));
     let response = app
         .clone()
         .oneshot(

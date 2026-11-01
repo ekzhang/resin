@@ -142,10 +142,10 @@ struct Published {
 ///
 /// Publishing encodes complete per-rank snapshots before swapping both formats.
 /// Scrapes clone cached bytes without invoking inference, Python, or collectives.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug)]
 pub struct MetricsEndpoint {
     published: Arc<RwLock<Published>>,
-    http: Option<Arc<HttpMetrics>>,
+    http: Arc<HttpMetrics>,
 }
 
 impl MetricsEndpoint {
@@ -153,39 +153,33 @@ impl MetricsEndpoint {
     /// are singleton observations, independent of the distributed rank mesh.
     pub fn new(model_name: impl Into<String>) -> Self {
         Self {
-            http: Some(Arc::new(HttpMetrics::new(model_name.into()))),
-            ..Self::default()
+            published: Arc::new(RwLock::new(Published::default())),
+            http: Arc::new(HttpMetrics::new(model_name.into())),
         }
     }
 
     /// Observe HTTP admission through the first raw committed output token.
     /// Called before parser buffering or stream-interval coalescing.
     pub fn observe_first_token(&self, seconds: f64) {
-        if let Some(http) = &self.http {
-            http.first_token.observe(seconds);
-        }
+        self.http.first_token.observe(seconds);
     }
 
     /// Observe a successful HTTP generation request's completion time, measured
     /// from initial queue admission. Aborted requests do not enter this histogram.
     pub fn observe_completed(&self, seconds: f64) {
-        if let Some(http) = &self.http {
-            http.latency.observe(seconds);
-        }
+        self.http.latency.observe(seconds);
     }
 
     /// Observe time in the frontend queue before recipe rendering starts.
     pub fn observe_queue_time(&self, seconds: f64) {
-        if let Some(http) = &self.http {
-            http.queue_time.observe(seconds);
-        }
+        self.http.queue_time.observe(seconds);
     }
 
     /// Publish the current frontend admission queue length.
     pub fn set_queue_size(&self, requests: usize) {
-        if let Some(http) = &self.http {
-            http.queue_size.set(requests.min(i64::MAX as usize) as i64);
-        }
+        self.http
+            .queue_size
+            .set(requests.min(i64::MAX as usize) as i64);
     }
 
     /// Replace the complete snapshot, preserving rank labels and grouping all
@@ -218,12 +212,10 @@ impl MetricsEndpoint {
                 merge(family)?;
             }
         }
-        if let Some(http) = &self.http {
-            for family in
-                prometheus_protobuf::encode(&http.registry).map_err(MetricsPublishError::Encode)?
-            {
-                merge(family)?;
-            }
+        for family in
+            prometheus_protobuf::encode(&self.http.registry).map_err(MetricsPublishError::Encode)?
+        {
+            merge(family)?;
         }
         let families: Vec<_> = families.into_values().collect();
         let published = Published {
@@ -464,7 +456,7 @@ mod tests {
 
     #[test]
     fn merges_rank_samples_under_single_descriptors() {
-        let endpoint = MetricsEndpoint::default();
+        let endpoint = MetricsEndpoint::new("test");
         endpoint
             .publish(
                 (0..2)
@@ -478,13 +470,16 @@ mod tests {
             assert!(merged.contains(&format!("resin:requests_total{{rank=\"{rank}\"}} 2.0\n")));
         }
         let families = decode_metrics(&endpoint.published.read().unwrap().protobuf).unwrap();
-        assert_eq!(families.len(), 1);
-        assert_eq!(families[0].metric.len(), 2);
+        let requests = families
+            .iter()
+            .find(|family| family.name == "resin:requests_total")
+            .unwrap();
+        assert_eq!(requests.metric.len(), 2);
     }
 
     #[test]
     fn text_escapes_labels_without_changing_protobuf_values() {
-        let endpoint = MetricsEndpoint::default();
+        let endpoint = MetricsEndpoint::new("test");
         let mut family = requests(0, 2.0);
         let model_name = "model\"\\line\nnext λ";
         family.metric[0].label.push(LabelPair {
@@ -496,12 +491,12 @@ mod tests {
             .unwrap();
         assert!(text(&endpoint).contains(r#"model_name="model\"\\line\nnext λ""#));
         let decoded = decode_metrics(&endpoint.published.read().unwrap().protobuf).unwrap();
-        assert_eq!(decoded, [family]);
+        assert!(decoded.contains(&family));
     }
 
     #[test]
     fn failed_publications_preserve_both_previous_formats() {
-        let endpoint = MetricsEndpoint::default();
+        let endpoint = MetricsEndpoint::new("test");
         endpoint
             .publish(vec![encode_metrics(&[requests(0, 2.0)])])
             .unwrap();
@@ -527,6 +522,6 @@ mod tests {
         assert_eq!(current.text, previous.text);
         assert_eq!(current.protobuf, previous.protobuf);
         endpoint.publish(vec![]).unwrap();
-        assert_eq!(text(&endpoint), "");
+        assert!(!text(&endpoint).contains("resin:requests_total"));
     }
 }

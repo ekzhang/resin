@@ -14,7 +14,6 @@ use super::paged::{
 };
 use super::prefix::PrefixCache;
 pub use super::prefix::PrefixKey;
-use super::{BatchAccess, RequestResourceRef};
 
 /// A point-in-time inventory of the shared physical cache pool.
 ///
@@ -710,13 +709,6 @@ impl PagedKvResources {
         self.pool.clear_request(state)
     }
 
-    /// Physical-parent budget for a set of estimated request contexts.
-    pub fn estimated_parent_count(&self, contexts: &[u32]) -> Result<u64, CachePoolError> {
-        self.layout
-            .estimated_parent_count(contexts)
-            .map_err(|_| CachePoolError::DemandOverflow)
-    }
-
     /// Accumulate admission demand, crediting only pages physically shared by
     /// the selected requests. Merely equal token prefixes receive no credit.
     pub(crate) fn admission_estimate(&self) -> AdmissionEstimate<'_> {
@@ -927,10 +919,10 @@ impl PagedKvResources {
 
     pub fn acquire(
         &mut self,
-        requests: &[RequestResourceRef<'_, RequestPages>],
+        requests: &[RequestResourceRef<'_>],
         steps: &[SequenceStep],
         decode_write_lookahead: u32,
-    ) -> Result<BatchAccess<PagedKvBatchView, WriterAccessLease>, PagedKvError> {
+    ) -> Result<PagedKvBatch, PagedKvError> {
         if self.batch_active {
             return Err(Self::invalid(
                 "cannot acquire a KV batch before the current batch is released",
@@ -1120,18 +1112,12 @@ impl PagedKvResources {
         let prepared = self.pool.prepare_writer_access(claims)?;
         let lease = self.pool.acquire_writer_access(prepared)?;
         self.batch_active = true;
-        Ok(BatchAccess {
-            view: PagedKvBatchView {
-                pool_id: self.pool.id(),
-                groups,
-            },
-            lease,
-        })
+        Ok(PagedKvBatch { groups, lease })
     }
 
     fn reserve_state_snapshots(
         &mut self,
-        requests: &[RequestResourceRef<'_, RequestPages>],
+        requests: &[RequestResourceRef<'_>],
         steps: &[SequenceStep],
         lookahead: u32,
     ) -> Result<(), PagedKvError> {
@@ -1268,10 +1254,19 @@ fn prefix_alignment(layout: &KvLayout) -> Result<u32, CachePoolError> {
     })
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct PagedKvBatchView {
-    pub pool_id: u64,
+/// One request owner selected for a cache batch.
+#[derive(Clone, Copy, Debug)]
+pub struct RequestResourceRef<'a> {
+    pub request_id: RequestId,
+    pub state: &'a RequestPages,
+}
+
+/// Frozen executor tables and the writer lease keeping their pages valid.
+#[derive(Debug)]
+#[must_use = "KV batch access must be released or quarantined"]
+pub struct PagedKvBatch {
     pub groups: Vec<KvGroupPlan>,
+    pub lease: WriterAccessLease,
 }
 
 #[derive(Debug)]
@@ -1315,12 +1310,11 @@ fn page_index(group: KvGroupLayout, page_count: usize, logical: u32) -> Option<u
         return Some(0);
     }
     let logical = logical as usize;
-    let index =
-        if group.is_recurrent() || matches!(group.retention(), KvRetention::SlidingWindow { .. }) {
-            logical % page_count
-        } else {
-            logical
-        };
+    let index = if matches!(group.retention(), KvRetention::SlidingWindow { .. }) {
+        logical % page_count
+    } else {
+        logical
+    };
     (index < page_count).then_some(index)
 }
 
@@ -1519,7 +1513,7 @@ mod tests {
         let expected = layout.estimated_parent_count(&contexts).unwrap();
         let mut resources = PagedKvResources::new(layout).unwrap();
         assert_eq!(
-            resources.estimated_parent_count(&contexts).unwrap(),
+            resources.layout.estimated_parent_count(&contexts).unwrap(),
             expected
         );
         let states: Vec<_> = contexts
@@ -1602,7 +1596,7 @@ mod tests {
         // Three immutable child handles count once, but pin three parents.
         // Each request also owns one private child and a second-group parent.
         assert_eq!(estimate.blocks, [5, 2]);
-        assert_eq!(resources.estimated_parent_count(&[4, 4]).unwrap(), 3);
+        assert_eq!(resources.layout.estimated_parent_count(&[4, 4]).unwrap(), 3);
         assert_eq!(8 - resources.pool().free_parent_count(), 5);
         drop(estimate);
         for request in requests {
@@ -1647,7 +1641,7 @@ mod tests {
             state: &state,
         }];
         let access = resources.acquire(&requests, &[step], 0).unwrap();
-        assert_eq!(access.view.groups.len(), 2);
+        assert_eq!(access.groups.len(), 2);
         assert!(resources.acquire(&requests, &[step], 0).is_err());
         resources.release(access.lease);
         resources.retire(state).unwrap();
@@ -1712,7 +1706,7 @@ mod tests {
                 3,
             )
             .unwrap();
-        let group = &access.view.groups[0];
+        let group = &access.groups[0];
         assert_eq!(group.block_slab_ids.len(), 2);
         assert_eq!(group.block_slotnums.len(), 2);
         assert_eq!(group.append_slab_ids, vec![group.block_slab_ids[1]]);
@@ -1785,7 +1779,7 @@ mod tests {
                 0,
             )
             .unwrap();
-        assert_eq!(access.view.groups[0].block_slab_ids.len(), 3);
+        assert_eq!(access.groups[0].block_slab_ids.len(), 3);
         resources.release(access.lease);
         assert_eq!(
             resources.prefix_metrics(),
@@ -1844,8 +1838,8 @@ mod tests {
             })
             .collect::<Vec<_>>();
         let access = resources.acquire(&requests, &steps, 0).unwrap();
-        assert_eq!(access.view.groups[0].block_indptr, [0, 3, 6]);
-        let addresses = &access.view.groups[0].block_slab_ids;
+        assert_eq!(access.groups[0].block_indptr, [0, 3, 6]);
+        let addresses = &access.groups[0].block_slab_ids;
         assert_eq!(&addresses[..2], &addresses[3..5]);
         assert_ne!(addresses[2], addresses[5]);
         assert_eq!(access.lease.len(), 4); // Two shared reads, two distinct writers.
@@ -2062,7 +2056,7 @@ mod tests {
                 0,
             )
             .unwrap();
-        let plan = &access.view.groups[0];
+        let plan = &access.groups[0];
         assert_eq!(plan.block_table_start_indices, vec![1]);
         let addresses = plan
             .block_slab_ids
@@ -2157,11 +2151,11 @@ mod tests {
                 0,
             )
             .unwrap();
-        let state_plan = access.view.groups[1].state.as_ref().unwrap();
+        let state_plan = access.groups[1].state.as_ref().unwrap();
         assert_eq!(state_plan.restore_copies[0].source_slab_id, 0);
         let live = (
-            access.view.groups[1].block_slab_ids[0],
-            access.view.groups[1].block_slotnums[0],
+            access.groups[1].block_slab_ids[0],
+            access.groups[1].block_slotnums[0],
         );
         let slot = &state_plan.checkpoint_slots[0];
         let snapshot_address = (slot.destination_slab_id, slot.destination_slotnum);
@@ -2246,7 +2240,7 @@ mod tests {
                 0,
             )
             .unwrap();
-        let state = &access.view.groups[1];
+        let state = &access.groups[1];
         assert_eq!(state.block_slab_ids.len(), 1);
         assert_eq!(state.block_slotnums.len(), 1);
         assert_eq!(state.append_slab_ids, vec![state.block_slab_ids[0]]);
@@ -2340,7 +2334,7 @@ mod tests {
                     0,
                 )
                 .unwrap();
-            let copies = &access.view.groups[0].state.as_ref().unwrap().restore_copies;
+            let copies = &access.groups[0].state.as_ref().unwrap().restore_copies;
             assert_eq!(copies.len(), usize::from(attempt < 2));
             if attempt == 1 {
                 resources.finish_state_initialization(&[id.get()]);
@@ -2388,11 +2382,7 @@ mod tests {
                 0,
             )
             .unwrap();
-        let slot = &access.view.groups[0]
-            .state
-            .as_ref()
-            .unwrap()
-            .checkpoint_slots[0];
+        let slot = &access.groups[0].state.as_ref().unwrap().checkpoint_slots[0];
         let receipt = slot.reservation_id;
         resources
             .accept_state_checkpoints(&[(first_id.get(), 2, 2, false)], &[receipt])
@@ -2481,11 +2471,7 @@ mod tests {
                     lookahead,
                 )
                 .unwrap();
-            let slot = &access.view.groups[1]
-                .state
-                .as_ref()
-                .unwrap()
-                .checkpoint_slots[0];
+            let slot = &access.groups[1].state.as_ref().unwrap().checkpoint_slots[0];
             let receipt = slot.reservation_id;
             // Reset cannot drop pending copies/snapshots while the lease is live.
             assert!(matches!(

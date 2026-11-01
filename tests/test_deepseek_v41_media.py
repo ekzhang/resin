@@ -20,7 +20,6 @@ from resin.recipe import (
     DeepSeekV41Image,
     DeepSeekV41Media,
     get_native_recipe,
-    image_token_types,
 )
 
 IMAGE_TOKEN = "<｜deepseek_image｜>"
@@ -67,7 +66,8 @@ def test_native_pixels_preserve_published_geometry(case, recipe):
     assert isinstance(media, DeepSeekV41Media)
     image = media.images[0]
     assert (image.n_vit_h, image.n_vit_w) == tuple(case["grid"])
-    assert image.types == image_token_types(*case["llm_grid"])
+    height, width = case["llm_grid"]
+    assert image.types == (0, *((1,) * width + (2,)) * height, 3)
     if case["max_wh_ratio"] is None:
         expected_tokens = (
             MultiModalData(

@@ -34,7 +34,6 @@ pub struct ConversationRequest {
 pub enum FinishReason {
     Stop,
     Length,
-    Cancelled,
 }
 
 impl FinishReason {
@@ -45,7 +44,6 @@ impl FinishReason {
             match self {
                 Self::Stop => "stop",
                 Self::Length => "length",
-                Self::Cancelled => "stop",
             }
         }
     }
@@ -57,7 +55,6 @@ impl FinishReason {
             match self {
                 Self::Stop => "end_turn",
                 Self::Length => "max_tokens",
-                Self::Cancelled => "end_turn",
             }
         }
     }
@@ -133,6 +130,13 @@ pub struct GenerationJob {
     pub enqueued_at: Instant,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ResponseOutput {
+    Reasoning,
+    Text,
+    Tool(usize),
+}
+
 #[derive(Debug, Default)]
 pub(crate) struct ResponseAccumulator {
     pub input_tokens: usize,
@@ -141,6 +145,7 @@ pub(crate) struct ResponseAccumulator {
     pub reasoning: String,
     pub text: String,
     pub tool_calls: Vec<ToolCall>,
+    pub output_order: Vec<ResponseOutput>,
     pub logprobs: Vec<GeneratedTokenLogprob>,
     pub content_logprobs: Vec<GeneratedTokenLogprob>,
     pub prompt_logprobs: Vec<Option<TokenLogprob>>,
@@ -175,11 +180,28 @@ impl ResponseAccumulator {
         Err("the inference engine ended the request without a result".to_owned())
     }
 
+    fn register_output(&mut self, item: ResponseOutput) {
+        if !self.output_order.contains(&item) {
+            self.output_order.push(item);
+        }
+    }
+
+    pub fn output_index(&self, item: ResponseOutput) -> usize {
+        self.output_order
+            .iter()
+            .position(|value| *value == item)
+            .expect("output event was accumulated")
+    }
+
     pub fn apply(&mut self, event: &GenerationEvent) {
         match event {
             GenerationEvent::Started { input_tokens } => self.input_tokens = *input_tokens,
-            GenerationEvent::ReasoningDelta(delta) => self.reasoning.push_str(delta),
+            GenerationEvent::ReasoningDelta(delta) => {
+                self.register_output(ResponseOutput::Reasoning);
+                self.reasoning.push_str(delta);
+            }
             GenerationEvent::TextDelta { delta, logprobs } => {
+                self.register_output(ResponseOutput::Text);
                 self.text.push_str(delta);
                 self.content_logprobs.extend_from_slice(logprobs);
             }
@@ -187,6 +209,7 @@ impl ResponseAccumulator {
             GenerationEvent::PromptLogprobs(tokens) => self.prompt_logprobs.clone_from(tokens),
             GenerationEvent::StopSequence(sequence) => self.stop_sequence = Some(sequence.clone()),
             GenerationEvent::ToolCallStart { index, id, name } => {
+                self.register_output(ResponseOutput::Tool(*index));
                 if self.tool_calls.len() <= *index {
                     self.tool_calls.resize_with(*index + 1, ToolCall::default);
                 }
@@ -194,6 +217,7 @@ impl ResponseAccumulator {
                 self.tool_calls[*index].name.clone_from(name);
             }
             GenerationEvent::ToolCallArgumentsDelta { index, delta } => {
+                self.register_output(ResponseOutput::Tool(*index));
                 if self.tool_calls.len() <= *index {
                     self.tool_calls.resize_with(*index + 1, ToolCall::default);
                 }

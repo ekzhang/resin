@@ -1,3 +1,4 @@
+use resin_recipe::ResponseParser;
 mod common;
 use common::SemanticParser;
 
@@ -301,4 +302,28 @@ fn duplicate_markers_are_rejected_and_events_match_python_dictionary_shapes() {
         serde_json::json!({"type": "tool_call_start", "index": 2, "id": "call_2", "name": "weather"})
     );
     assert_eq!(serde_json::from_value::<Event>(value).unwrap(), event);
+}
+
+#[test]
+fn sampling_end_is_terminal_across_batches() {
+    let mut parser = parser(&[TOKENS.content_text]);
+    let mut ids = text_ids("answer");
+    ids.push(TOKENS.content_model_end_sampling);
+    ids.extend(text_ids("ignored text"));
+    ids.extend([TOKENS.message_model, TOKENS.content_thinking]);
+    ids.extend(text_ids("ignored reasoning"));
+    assert_eq!(parser.semantic_feed(&ids).unwrap(), vec![text("answer")]);
+    assert!(
+        parser
+            .semantic_feed(&[TOKENS.content_text, u32::from(b'x')])
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(parser.token_channel(u32::from(b'x')), None);
+    assert!(
+        parser
+            .semantic_finish(FinishReason::Stop)
+            .unwrap()
+            .is_empty()
+    );
 }

@@ -1,4 +1,4 @@
-//! Dependency-free request lifecycle and resource ownership for Resin.
+//! Native request lifecycle and resource ownership for Resin.
 //!
 //! [`engine::EngineCore`] owns synchronous execution transactions and request
 //! progress. Runners receive frozen plans carrying opaque frontend payloads.

@@ -17,9 +17,8 @@ use pyo3::{
 };
 use pythonize::{depythonize, pythonize};
 use resin_recipe::{
-    AttributedEvent, AttributedText, Decoder, Encoder, Error, FinishReason, InklingParser,
-    InklingTokens, MediaConfig, ResponseParser, Tokenizer, TokenizerDecoder, TokenizerEncoder,
-    ToolScope,
+    AttributedEvent, AttributedText, Decoder, Encoder, Error, FinishReason, MediaConfig,
+    ResponseParser, Tokenizer, TokenizerDecoder, TokenizerEncoder, ToolScope,
 };
 use serde::de::DeserializeOwned;
 use serde_json::{Map, Value, json};
@@ -256,48 +255,6 @@ impl Decoder for PythonDecoder {
 
 pub(crate) type SharedParser = Arc<Mutex<Box<dyn ResponseParser>>>;
 
-/// Parse Inkling response blocks into the events accepted by HttpServer.
-#[pyclass(name = "InklingResponseParser", extends=NativeResponseParser, frozen, module = "resin._resin")]
-pub(crate) struct NativeInklingParser;
-
-#[pymethods]
-impl NativeInklingParser {
-    #[new]
-    #[pyo3(signature = (tokenizer, token_ids: "Mapping[str, int]", *, prompt_ids: "Sequence[int] | npt.NDArray[np.uint32]" = Vec::new()))]
-    fn new(
-        tokenizer: &RecipeTokenizer,
-        token_ids: HashMap<String, u32>,
-        prompt_ids: Vec<u32>,
-    ) -> PyResult<PyClassInitializer<Self>> {
-        let get = |name: &str| {
-            token_ids
-                .get(name)
-                .copied()
-                .ok_or_else(|| PyValueError::new_err(format!("missing Inkling token {name}")))
-        };
-        let tokens = InklingTokens {
-            message_model: get("<|message_model|>")?,
-            content_text: get("<|content_text|>")?,
-            content_thinking: get("<|content_thinking|>")?,
-            content_invoke_tool_json: get("<|content_invoke_tool_json|>")?,
-            content_invoke_tool_text: get("<|content_invoke_tool_text|>")?,
-            content_tool_error: get("<|content_tool_error|>")?,
-            content_model_end_sampling: get("<|content_model_end_sampling|>")?,
-            end_message: get("<|end_message|>")?,
-        };
-        let parser = InklingParser::new(
-            tokens,
-            tokenizer.decoder().map_err(recipe_error)?,
-            &prompt_ids,
-        )
-        .map_err(recipe_error)?;
-        Ok(PyClassInitializer::from(NativeResponseParser {
-            inner: Arc::new(Mutex::new(Box::new(parser))),
-        })
-        .add_subclass(Self))
-    }
-}
-
 pub(crate) fn feed(parser: &SharedParser, ids: &[u32]) -> PyResult<Vec<AttributedEvent>> {
     parser
         .lock()
@@ -392,12 +349,7 @@ impl Encoder for PythonEncoder {
 }
 
 /// Common native handle recognized directly by the HTTP actor.
-#[pyclass(
-    name = "_NativeResponseParser",
-    frozen,
-    subclass,
-    module = "resin._resin"
-)]
+#[pyclass(name = "_NativeResponseParser", frozen, module = "resin._resin")]
 pub(crate) struct NativeResponseParser {
     pub(crate) inner: SharedParser,
 }

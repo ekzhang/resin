@@ -529,29 +529,6 @@ pub(crate) fn sources(py: Python<'_>, sources: MediaSources) -> PyResult<Vec<Sou
         .collect()
 }
 
-#[pyfunction]
-#[pyo3(signature = (height, width) -> "tuple[int, ...]")]
-pub(crate) fn image_token_types(
-    py: Python<'_>,
-    height: usize,
-    width: usize,
-) -> PyResult<Py<PyTuple>> {
-    // Each cell yields one type, each row a separator, plus image boundaries.
-    if height == 0
-        || width == 0
-        || width
-            .checked_add(1)
-            .and_then(|w| height.checked_mul(w))
-            .and_then(|n| n.checked_add(2))
-            .is_none_or(|n| n > 1_048_576)
-    {
-        return Err(error(
-            "image grid must be positive and contain at most 1048576 tokens",
-        ));
-    }
-    Ok(PyTuple::new(py, media::deepseek::image_token_types(height, width))?.unbind())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

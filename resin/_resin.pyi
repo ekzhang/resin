@@ -1,8 +1,7 @@
 from collections.abc import Sequence
 from typing import Any, Final, final
-from collections.abc import Mapping
-from typing import Literal
 from resin.cache_storage import CacheStorage
+from typing import Literal
 from resin.recipe import Recipe
 from resin.recipe import ContentBlock
 import numpy as np
@@ -504,11 +503,9 @@ class Engine:
         context_length: int = 32768,
         scheduler_config: SchedulerConfig | None = None,
         prefix_cache: bool = False,
-        prefix_cache_storage: CacheStorage | None = None,
+        prefix_cache_storage: "CacheStorage | None" = None,
         prefix_cache_max_inflight: int | None = None,
-        prefix_cache_storage_policy: Literal[
-            "write_through", "write_through_selective"
-        ] = "write_through_selective",
+        prefix_cache_storage_policy: 'Literal["write_through", "write_through_selective"]' = "write_through_selective",
         enable_overlap: bool = True,
         enable_metrics: bool = True,
     ) -> Engine: ...
@@ -561,7 +558,7 @@ class Engine:
     def new_token_ratio(self, /) -> float: ...
     def next_phase(self, /) -> BatchPhase | None:
         """
-        Poll storage completions and propose the next runnable phase.
+        Poll storage completions before proposing the next runnable phase.
         """
     @property
     def overlap(self, /) -> bool: ...
@@ -797,20 +794,6 @@ class InklingMedia:
     def token_ids(self, /) -> tuple[int, ...]: ...
     @property
     def token_spans(self, /) -> tuple[MediaTokenSpan, ...]: ...
-
-@final
-class InklingResponseParser(_NativeResponseParser):
-    """
-    Parse Inkling response blocks into the events accepted by HttpServer.
-    """
-    def __new__(
-        cls,
-        /,
-        tokenizer: RecipeTokenizer,
-        token_ids: "Mapping[str, int]",
-        *,
-        prompt_ids: "Sequence[int] | npt.NDArray[np.uint32]" = ...,
-    ) -> InklingResponseParser: ...
 
 @final
 class Message:
@@ -1532,6 +1515,7 @@ class _HttpSession:
     def close(self, /) -> None: ...
     def process(self, /, events: Sequence[TokenEvent]) -> _HttpEvents: ...
 
+@final
 class _NativeResponseParser(FinalizingResponseParser):
     """
     Common native handle recognized directly by the HTTP actor.
@@ -1574,5 +1558,3 @@ def get_native_recipe(
     """
     Construct a native recipe from a canonical name and typed family parameters.
     """
-
-def image_token_types(height: int, width: int) -> "tuple[int, ...]": ...

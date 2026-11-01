@@ -1166,7 +1166,19 @@ struct PythonRunner<'a, 'py> {
     prompt_logprobs: Option<BorrowedLogprobs<'py>>,
     state_checkpoints: Vec<u64>,
 }
-impl PythonRunner<'_, '_> {
+impl<'a, 'py> PythonRunner<'a, 'py> {
+    fn new(py: Python<'py>, forward: &'a Py<PyAny>, release: Option<&'a Py<PyAny>>) -> Self {
+        Self {
+            py,
+            forward,
+            release,
+            error: None,
+            logprobs: None,
+            prompt_logprobs: None,
+            state_checkpoints: Vec::new(),
+        }
+    }
+
     fn failed(&mut self, error: PyErr, accepted: bool) -> core::Error {
         let message = error.to_string();
         self.error = Some(error);
@@ -1355,15 +1367,7 @@ impl Engine {
             .runner_release
             .as_ref()
             .map(|value| value.clone_ref(py));
-        let mut runner = PythonRunner {
-            py,
-            forward: &forward,
-            release: release.as_ref(),
-            error: None,
-            logprobs: None,
-            prompt_logprobs: None,
-            state_checkpoints: Vec::new(),
-        };
+        let mut runner = PythonRunner::new(py, &forward, release.as_ref());
         let overlap_admission = self.overlap && allow_overlap && self.runner_enqueue.is_some();
         let prepared = if overlap_admission {
             self.core
@@ -1434,15 +1438,7 @@ impl Engine {
             .runner_release
             .as_ref()
             .map(|value| value.clone_ref(py));
-        let mut runner = PythonRunner {
-            py,
-            forward: &forward,
-            release: release.as_ref(),
-            error: None,
-            logprobs: None,
-            prompt_logprobs: None,
-            state_checkpoints: Vec::new(),
-        };
+        let mut runner = PythonRunner::new(py, &forward, release.as_ref());
         let tokens;
         let output = match extract_runner_output(output) {
             Ok(output) => {
@@ -1503,15 +1499,7 @@ impl Engine {
             .runner_release
             .as_ref()
             .map(|value| value.clone_ref(py));
-        let mut runner = PythonRunner {
-            py,
-            forward: &forward,
-            release: release.as_ref(),
-            error: None,
-            logprobs: None,
-            prompt_logprobs: None,
-            state_checkpoints: Vec::new(),
-        };
+        let mut runner = PythonRunner::new(py, &forward, release.as_ref());
         let accepted = accepted || runner_error_is_post_accept(py, &error);
         let failure = runner.failed(error, accepted);
         let result = self.core.complete_step_with(&mut runner, Err(failure), Ok);
@@ -1540,7 +1528,7 @@ impl Engine {
 #[pymethods]
 impl Engine {
     #[new]
-    #[pyo3(signature = (runner: "Runner", *, max_running_requests = 32, context_length = 32768, scheduler_config = None, prefix_cache = false, prefix_cache_storage = None, prefix_cache_max_inflight = None, prefix_cache_storage_policy = "write_through_selective", enable_overlap = true, enable_metrics = true))]
+    #[pyo3(signature = (runner: "Runner", *, max_running_requests = 32, context_length = 32768, scheduler_config = None, prefix_cache = false, prefix_cache_storage: "CacheStorage | None" = None, prefix_cache_max_inflight = None, prefix_cache_storage_policy: r#"Literal["write_through", "write_through_selective"]"# = "write_through_selective", enable_overlap = true, enable_metrics = true))]
     #[allow(
         clippy::too_many_arguments,
         reason = "Python constructor exposes keyword configuration"
@@ -1851,15 +1839,7 @@ impl Engine {
         }
         self.deferred_events
             .retain(|event| event.borrow(py).request_id != request.inner.id());
-        let mut runner = PythonRunner {
-            py,
-            forward: &self.runner_forward,
-            release: self.runner_release.as_ref(),
-            error: None,
-            logprobs: None,
-            prompt_logprobs: None,
-            state_checkpoints: Vec::new(),
-        };
+        let mut runner = PythonRunner::new(py, &self.runner_forward, self.runner_release.as_ref());
         let result = self.core.cancel(&mut runner, &request.inner);
         runner.result(result)
     }
@@ -1868,15 +1848,7 @@ impl Engine {
             self.harvest(py, false)?;
         }
         self.deferred_events.clear();
-        let mut runner = PythonRunner {
-            py,
-            forward: &self.runner_forward,
-            release: self.runner_release.as_ref(),
-            error: None,
-            logprobs: None,
-            prompt_logprobs: None,
-            state_checkpoints: Vec::new(),
-        };
+        let mut runner = PythonRunner::new(py, &self.runner_forward, self.runner_release.as_ref());
         let result = self.core.close(&mut runner);
         runner.result(result)
     }
@@ -2122,8 +2094,7 @@ mod _resin {
 
     #[pymodule_export]
     use crate::recipe::{
-        NativeInklingParser, NativeRecipe, NativeResponseParser, RecipeTokenizer, RenderedPrompt,
-        get_native_recipe,
+        NativeRecipe, NativeResponseParser, RecipeTokenizer, RenderedPrompt, get_native_recipe,
     };
 
     #[pymodule_export]
@@ -2136,9 +2107,6 @@ mod _resin {
         _media_from_buffers, _media_to_buffers, DeepSeekV41Image, DeepSeekV41Media, Gemma4Media,
         Glm53FlashMedia, InklingMedia, Qwen35Media,
     };
-
-    #[pymodule_export]
-    use crate::media_preprocess::image_token_types;
 
     #[pymodule_export]
     use crate::recipe_types::{

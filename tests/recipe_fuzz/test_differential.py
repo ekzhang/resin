@@ -27,7 +27,7 @@ from recipe_fuzz.harness import (
 from recipe_fuzz.inputs import native_inputs
 from recipe_fuzz.lfm2 import Lfm2Adapter
 from recipe_fuzz.qwen import OrnithAdapter, QwenAdapter
-from resin.recipe import InklingResponseParser, Tokenizer, get_native_recipe
+from resin.recipe import get_native_recipe
 
 MARKERS = (
     "message_system",
@@ -85,8 +85,7 @@ class InklingAdapter:
         }
         assert all(token_id is not None for token_id in self.ids.values())
         self.recipe = get_native_recipe("inkling", backend)
-        self.tokenizer = Tokenizer(backend)
-        assert self.tokenizer.is_native
+        assert self.recipe.tokenizer.is_native
         self.reference = tokenizers.O200kBaseChatTokenizer()
         _, self.reference_parser = v0.Renderer(self.reference).render_for_completion(
             chat.OpenAIMessage.from_oss_messages([{"role": "user", "content": "hi"}])
@@ -214,7 +213,7 @@ class InklingAdapter:
         return normalize(parts)
 
     def parser(self):
-        return InklingResponseParser(self.tokenizer, self.ids)
+        return self.recipe.create_parser(self.recipe.render([]))
 
     def tool_truncation(self, case):
         prefix = Case(case.parts[:-1])
@@ -223,9 +222,9 @@ class InklingAdapter:
         return ids, payload_start, len(ids) - 1
 
     def text_parser(self):
-        return InklingResponseParser(
-            self.tokenizer, self.ids, prompt_ids=[self.ids["<|content_text|>"]]
-        )
+        parser = self.parser()
+        assert parser.feed([self.ids["<|content_text|>"]]) == []
+        return parser
 
 
 # Each additional format supplies encoding, its real oracle, and parser setup;
