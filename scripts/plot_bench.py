@@ -21,7 +21,6 @@ FIXED_METADATA = (
 )
 FIXED_CASE = (
     "draft_tokens",
-    "accepted_drafts",
     "balanced_experts",
     "shared_prefix_tokens",
 )
@@ -78,7 +77,8 @@ def _validate(record):
         raise ValueError("step_seconds must contain measure_steps measurements")
     for value in steps:
         _number(value, "step_seconds", minimum=math.nextafter(0, 1))
-    accepted = record["accepted_drafts"]
+    # Older schema-1 results can contain a fixed acceptance workload.
+    accepted = record.get("accepted_drafts")
     if (
         accepted is not None
         and _number(accepted, "accepted_drafts", integer=True) > record["draft_tokens"]
@@ -137,6 +137,8 @@ def _topology(record):
 
 def _configuration(record):
     fixed = {name: record[name] for name in FIXED_CASE}
+    # Keep historical forced-acceptance runs separate from natural measurements.
+    fixed["accepted_drafts"] = record.get("accepted_drafts")
     fixed.update({name: record["metadata"][name] for name in FIXED_METADATA})
     for name in ("prefill_chunk_size", "max_batch_tokens"):
         fixed[name] = record["metadata"].get(name)
@@ -420,7 +422,7 @@ def plot(
             )
             fixed = (
                 "natural"
-                if first["accepted_drafts"] is None
+                if first.get("accepted_drafts") is None
                 else f"fixed {first['accepted_drafts']}/{first['draft_tokens']}"
             )
             if accept_rate is None:

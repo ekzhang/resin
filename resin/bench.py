@@ -1,4 +1,4 @@
-"""Resident-engine benchmarks with explicit synthetic routing/verification modes.
+"""Resident-engine benchmarks with optional synthetic expert routing.
 
 Install BenchmarkRunner before constructing the Engine and capturing graphs.
 Each point owns an uncached request cohort; loading, capture, and admission
@@ -21,7 +21,6 @@ from pathlib import Path
 from typing import Any, Literal
 
 from resin import BatchPhase, BatchPlan, SamplingParams
-from resin.backend.speculative import SpeculativeStats
 
 _TRACE_HOST_SCOPES = ContextVar("resin_benchmark_trace_host_scopes", default=False)
 
@@ -206,42 +205,24 @@ class _ObservedCompletion:
 class BenchmarkRunner:
     """Delegate the runner contract while observing actual scheduled input rows.
 
-    Synthetic options affect the real router or speculative acceptance boundary;
-    they must be configured before graph capture and never imply model quality.
+    Synthetic routing must be configured before graph capture and never implies
+    model quality. Speculative acceptance follows the model's sampled tokens.
     """
 
-    def __init__(
-        self, runner, *, accepted_drafts: int | None = None, balanced_experts=False
-    ):
+    def __init__(self, runner, *, balanced_experts=False):
         self.runner = runner
         self.draft_tokens = int(getattr(runner, "speculative_draft_tokens", 0))
-        if accepted_drafts is not None:
-            if (
-                type(accepted_drafts) is not int
-                or not 0 <= accepted_drafts <= self.draft_tokens
-            ):
-                raise ValueError(
-                    "accepted_drafts must be between zero and draft_tokens"
-                )
-            stats = getattr(runner, "_speculation", None)
-            if self.draft_tokens and not isinstance(stats, SpeculativeStats):
-                raise ValueError("fixed acceptance requires a speculative model runner")
-            if isinstance(stats, SpeculativeStats):
-                stats.benchmark_accepted_drafts = accepted_drafts
-        self.accepted_drafts = accepted_drafts
         if type(balanced_experts) is not bool:
             raise ValueError("balanced_experts must be a bool")
         self.balanced_experts = balanced_experts
         if balanced_experts:
+            from resin.backend.balanced_routing import BalancedRoutingMixin
+
             model = getattr(runner, "_model", None)
             routers = (
                 []
                 if model is None
-                else [
-                    m
-                    for m in model.modules()
-                    if hasattr(m, "benchmark_balanced_experts")
-                ]
+                else [m for m in model.modules() if isinstance(m, BalancedRoutingMixin)]
             )
             if not routers:
                 raise ValueError(
@@ -249,12 +230,10 @@ class BenchmarkRunner:
                 )
             groups = getattr(runner, "parallel_groups", None)
             for router in routers:
-                router.benchmark_balanced_experts = True
-                router.benchmark_replica = (
-                    0 if groups is None else groups.attn_dp.local_rank
+                router.enable_balanced_routing(
+                    replica=0 if groups is None else groups.attn_dp.local_rank,
+                    expert_parallel_size=None if groups is None else groups.ep.size,
                 )
-                if groups is not None:
-                    router.benchmark_expert_parallel_size = groups.ep.size
         self._plan: BatchPlan | None = None
         self._completed_positions = None
 
@@ -809,7 +788,6 @@ def run_sweep(
                     "prefill_tokens": inputs / len(samples),
                     "input_tokens": inputs,
                     "draft_tokens": runner.draft_tokens,
-                    "accepted_drafts": runner.accepted_drafts,
                     "measured_accept_rate": sum(s["accepted"] for s in samples) / drafts
                     if drafts
                     else None,

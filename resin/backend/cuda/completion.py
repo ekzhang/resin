@@ -62,38 +62,13 @@ class DeviceAcceptance:
         drafts: torch.Tensor,
         targets: torch.Tensor,
         positions: torch.Tensor,
-        *,
-        fixed_acceptance: int | torch.Tensor | None = None,
     ) -> Self:
         if drafts.ndim != 2 or targets.shape != (len(drafts), drafts.shape[1] + 1):
             raise ValueError(
                 "target samples must contain one bonus after the draft block"
             )
         draft_tokens = drafts.shape[1]
-        dynamic_fixed = isinstance(fixed_acceptance, torch.Tensor)
-        if dynamic_fixed and (
-            fixed_acceptance.ndim != 0
-            or fixed_acceptance.dtype not in (torch.int32, torch.int64)
-        ):
-            raise ValueError(
-                "runtime fixed acceptance must be an integer scalar tensor"
-            )
-        if (
-            fixed_acceptance is not None
-            and not dynamic_fixed
-            and (
-                type(fixed_acceptance) is not int
-                or not 0 <= fixed_acceptance <= draft_tokens
-            )
-        ):
-            raise ValueError("fixed acceptance must fit the verified draft block")
-        accepted = (
-            (drafts == targets[:, :draft_tokens]).int().cumprod(1).sum(1)
-            if fixed_acceptance is None or dynamic_fixed
-            else torch.full_like(positions, fixed_acceptance)
-        )
-        if dynamic_fixed:
-            accepted = torch.where(fixed_acceptance >= 0, fixed_acceptance, accepted)
+        accepted = (drafts == targets[:, :draft_tokens]).int().cumprod(1).sum(1)
         bonus = targets.gather(1, accepted[:, None]).squeeze(1)
         columns = torch.arange(draft_tokens + 1, device=targets.device)[None, :]
         candidate = torch.cat((drafts, targets[:, -1:]), dim=1)

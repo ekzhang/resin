@@ -50,7 +50,6 @@ from resin.backend.cuda.runner import (
 from resin.backend.cuda.staging import TensorStager
 from resin.backend.cuda.tensor_graphs import CudaGraphTensorRegion, TensorSpec
 from resin.backend.topology import ParallelGroups, ParallelismCapabilities
-from resin.backend.torch import benchmark_expert_indices
 from resin.models.gpt_oss.config import GptOssConfig
 from resin.models.gpt_oss.plan import (
     PAGE_SIZE,
@@ -1156,13 +1155,8 @@ def _router_logits(router: TopKRouter, hidden: Tensor) -> Tensor:
 
 
 def _route(router: TopKRouter, logits: Tensor) -> tuple[Tensor, Tensor]:
-    if router.benchmark_balanced_experts:
-        indices = benchmark_expert_indices(
-            logits,
-            router.top_k,
-            router.benchmark_replica,
-            router.benchmark_expert_parallel_size,
-        )
+    if router.balanced_routing is not None:
+        indices = router.balanced_routing.indices(logits, router.top_k)
         return indices, torch.softmax(logits.gather(1, indices), dim=-1)
     if router.top_k == 4 and logits.shape[-1] in (32, 128):
         return top4_softmax(logits)

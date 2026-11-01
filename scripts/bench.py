@@ -318,7 +318,6 @@ def _rank(
     cases, capacity_skips = _cache_preflight(raw, cases, options, groups)
     observed = BenchmarkRunner(
         raw,
-        accepted_drafts=options["accepted_drafts"],
         balanced_experts=options["balanced_experts"],
     )
     synchronize()
@@ -469,7 +468,6 @@ def _validate_configuration(model, cases, topology, options):
     ):
         raise ValueError("synthetic prompts cannot be combined with a ShareGPT corpus")
     draft_tokens = options["draft_tokens"]
-    accepted_drafts = options["accepted_drafts"]
     expert_backend = options["expert_backend"]
     prefill_chunk_size = options["prefill_chunk_size"]
     numa = options["numa"]
@@ -492,8 +490,6 @@ def _validate_configuration(model, cases, topology, options):
         )
         if type(value) is not int or value < minimum:
             raise ValueError(f"{name} must be an integer >= {minimum}")
-    if accepted_drafts is not None and type(accepted_drafts) is not int:
-        raise ValueError("accepted_drafts must be an integer or None")
     if not 0 < options["gpu_memory_utilization"] < 1:
         raise ValueError("gpu_memory_utilization must be between zero and one")
     if options["balanced_experts"] and spec.family not in {
@@ -559,12 +555,6 @@ def _validate_configuration(model, cases, topology, options):
             raise ValueError(
                 f"{model} decode graph batch capacity is {graph_capacity}; disable decode graphs for larger cohorts"
             )
-    if (
-        draft_tokens < 0
-        or accepted_drafts is not None
-        and not 0 <= accepted_drafts <= draft_tokens
-    ):
-        raise ValueError("accepted drafts must be between zero and draft tokens")
     if model.startswith("gpt-oss") and draft_tokens:
         raise ValueError("GPT-OSS has no draft model; pass --draft-tokens 0")
     if model.startswith("gpt-oss") and topology.world_size == 1:
@@ -586,7 +576,6 @@ def run_benchmark(
     *,
     parallelism: Parallelism | None = None,
     draft_tokens: int | None = None,
-    accepted_drafts: int | None = None,
     balanced_experts: bool = False,
     warmup_steps: int = 5,
     measure_steps: int = 20,
@@ -626,7 +615,6 @@ def run_benchmark(
     expert_backend = spec.expert_backend if expert_backend is None else expert_backend
     options = dict(
         draft_tokens=draft_tokens,
-        accepted_drafts=accepted_drafts,
         balanced_experts=balanced_experts,
         warmup_steps=warmup_steps,
         measure_steps=measure_steps,
@@ -825,11 +813,6 @@ def argument_parser() -> argparse.ArgumentParser:
         help="draft positions; defaults to model configuration",
     )
     parser.add_argument(
-        "--accepted-drafts",
-        type=int,
-        help="force this many accepted drafts per step; omit for natural acceptance",
-    )
-    parser.add_argument(
         "--balanced-experts",
         action="store_true",
         help="use synthetic balanced MoE routing (off by default)",
@@ -972,7 +955,6 @@ def _configuration(args):
         draft_tokens=spec.draft_tokens
         if args.draft_tokens is None
         else args.draft_tokens,
-        accepted_drafts=args.accepted_drafts,
         balanced_experts=args.balanced_experts,
         warmup_steps=args.warmup_steps,
         measure_steps=args.measure_steps,

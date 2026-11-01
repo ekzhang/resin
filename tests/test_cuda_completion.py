@@ -12,8 +12,7 @@ from resin.backend.speculative import _accept_speculative_tokens
 
 
 @pytest.mark.parametrize("draft_tokens", [0, 1, 3, 4, 8])
-@pytest.mark.parametrize("fixed", [False, True])
-def test_device_acceptance_matches_shared_reference(draft_tokens, fixed):
+def test_device_acceptance_matches_shared_reference(draft_tokens):
     generator = torch.Generator().manual_seed(15)
     drafts = torch.randint(0, 5, (128, draft_tokens), generator=generator)
     targets = torch.randint(0, 5, (128, draft_tokens + 1), generator=generator)
@@ -21,14 +20,9 @@ def test_device_acceptance_matches_shared_reference(draft_tokens, fixed):
         prefix = row % (draft_tokens + 1)
         targets[row, :prefix] = drafts[row, :prefix]
     positions = torch.arange(128, dtype=torch.int64) * 7
-    fixed_depth = draft_tokens // 2 if fixed else None
-    decision = DeviceAcceptance.from_samples(
-        drafts, targets, positions, fixed_acceptance=fixed_depth
-    )
+    decision = DeviceAcceptance.from_samples(drafts, targets, positions)
     tokens, counts, feedback = decision.tokens, decision.counts, decision.feedback()
-    expected = _accept_speculative_tokens(
-        drafts.tolist(), targets.tolist(), benchmark_accepted_drafts=fixed_depth
-    )
+    expected = _accept_speculative_tokens(drafts.tolist(), targets.tolist())
     actual = [
         row[:count] for row, count in zip(tokens.tolist(), counts.tolist(), strict=True)
     ]
@@ -210,7 +204,7 @@ def test_state_report_extends_completion_fence_and_attaches_once(monkeypatch):
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 @torch.inference_mode()
-def test_runtime_fixed_acceptance_replay_shares_state_output_and_feedback():
+def test_runtime_acceptance_replay_shares_state_output_and_feedback():
     from resin.backend.cuda.completion import DeviceCompletion
 
     drafts = torch.tensor([[1, 2, 3]] * 4, device="cuda")
@@ -219,13 +213,11 @@ def test_runtime_fixed_acceptance_replay_shares_state_output_and_feedback():
     )
     positions = torch.tensor([63, 127, 511, 8191], device="cuda")
     hidden = torch.arange(4 * 4 * 8, device="cuda").reshape(4, 4, 8)
-    fixed = torch.tensor(-1, device="cuda")
+    initial_targets = targets.clone()
     state = {}
 
     def launch():
-        accepted = DeviceAcceptance.from_samples(
-            drafts, targets, positions, fixed_acceptance=fixed
-        )
+        accepted = DeviceAcceptance.from_samples(drafts, targets, positions)
         state["accepted"] = accepted
         state["selected"] = hidden.gather(
             1, accepted.accepted_drafts[:, None, None].expand(-1, 1, 8)
@@ -242,14 +234,16 @@ def test_runtime_fixed_acceptance_replay_shares_state_output_and_feedback():
         launch()
     torch.cuda.current_stream().wait_stream(stream)
     decision = state["accepted"]
-    for depth in (-1, 0, 3):
+    for depth in (None, 0, 3):
         anchors = positions.cpu().tolist()
-        fixed.fill_(depth)
+        targets.copy_(initial_targets)
+        if depth is not None:
+            targets[:, :depth].copy_(drafts[:, :depth])
+            targets[:, depth].fill_(9)
         graph.replay()
         expected = _accept_speculative_tokens(
             drafts.cpu().tolist(),
             targets.cpu().tolist(),
-            benchmark_accepted_drafts=None if depth < 0 else depth,
         )
         selected = hidden[
             torch.arange(4, device="cuda"),
@@ -259,7 +253,7 @@ def test_runtime_fixed_acceptance_replay_shares_state_output_and_feedback():
         pending = DeviceCompletion.from_acceptance(decision, rows=4)
         feedback = pending.feedback
         # The next replay may replace every graph-owned decision tensor.
-        fixed.fill_(0 if depth else 3)
+        targets.fill_(-1)
         positions.add_(4)
         graph.replay()
         result = pending.result()

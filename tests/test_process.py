@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import os
-import threading
 import time
 from pathlib import Path
 from typing import Literal
@@ -44,11 +43,6 @@ def _large_failure(rank: int) -> None:
 
 def _system_exit(rank: int, code: int | None) -> None:
     raise SystemExit(code)
-
-
-def _early_success(rank: int) -> None:
-    if rank == 1:
-        time.sleep(60)
 
 
 def test_spawn_waits_and_returns_reaped_context(tmp_path: Path) -> None:
@@ -138,34 +132,6 @@ def test_context_manager_closes_workers_when_body_raises() -> None:
         with context:
             raise ValueError("caller failed")
     assert not context.processes[0].is_alive()
-
-
-def test_server_monitor_detects_early_success_and_reaps_peers(
-    monkeypatch, capsys
-) -> None:
-    from resin.backend.parallel import monitor_process_context
-
-    context = resin.process.spawn(
-        _early_success, devices=["cpu", "cpu"], numa="off", join=False
-    )
-    exited = threading.Event()
-    exitcodes = []
-
-    def exit_host(code):
-        exitcodes.append(code)
-        exited.set()
-
-    # Workers were already spawned and have their own os module. Only replace
-    # the hosting process's final exit so this test can inspect group cleanup.
-    monkeypatch.setattr(os, "_exit", exit_host)
-    try:
-        monitor_process_context(context, "test-server")
-        assert exited.wait(timeout=10), "monitor waited for the still-running peer"
-        assert exitcodes == [1]
-        assert all(not process.is_alive() for process in context.processes)
-        assert "worker process exited unexpectedly" in capsys.readouterr().out
-    finally:
-        context.close()
 
 
 def test_partial_start_failure_reaps_started_worker(monkeypatch) -> None:

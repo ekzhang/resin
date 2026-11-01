@@ -24,7 +24,6 @@ def record(phase="decode", **changes):
         "prefill_tokens": 0,
         "input_tokens": 0,
         "draft_tokens": 4,
-        "accepted_drafts": 1,
         "measured_accept_rate": 0.25,
         "balanced_experts": True,
         "warmup_steps": 1,
@@ -71,6 +70,20 @@ def test_decode_projects_steps_without_relabeling_measured_acceptance(tmp_path):
     assert rows == before
     assert rows[0]["measured_accept_rate"] == 0.25
     assert rows[0]["committed_tokens"] / 0.4 / 8 == 40
+
+
+def test_legacy_natural_records_mix_with_current_measurements(tmp_path):
+    path = write(tmp_path / "compatible.jsonl", record(accepted_drafts=None), record())
+    rows = load_records([path])
+    assert len(rows) == 1
+    assert "accepted_drafts" not in rows[0]
+
+
+def test_legacy_forced_acceptance_remains_labeled(tmp_path):
+    source = write(tmp_path / "forced.jsonl", record(accepted_drafts=1))
+    output = tmp_path / "plots"
+    main([str(source), "--mode", "decode", "--output-dir", str(output)])
+    assert "(fixed 1/4)" in (output / "decode.svg").read_text()
 
 
 def test_prefill_uses_actual_input_counts_and_measured_step_latency(tmp_path):
@@ -256,7 +269,7 @@ def test_projection_options_are_validated(options):
 
 
 def test_natural_acceptance_measurements_allow_an_explicit_projection(tmp_path):
-    row = record(accepted_drafts=None, measured_accept_rate=0.6)
+    row = record(measured_accept_rate=0.6)
     rows = load_records([write(tmp_path / "natural.jsonl", row)])
     assert axes(rows, "decode") == {4096: [(10, 40, "8")]}
     assert axes(rows, "decode", accept_rate=0.75) == {4096: [(20, 80, "8")]}
@@ -322,7 +335,6 @@ def topology_record(*, world=1, tp=1, ep=1, **changes):
         attn_dp=1,
         global_batch_size=8,
         draft_tokens=0,
-        accepted_drafts=0,
         measured_accept_rate=None,
         committed_tokens=16,
         **changes,

@@ -239,7 +239,6 @@ class InklingCudaRunner(CudaRunner):
         return {
             "token_ids": (0,) * batch_size,
             "positions": (1,) * batch_size,
-            "fixed_acceptance": -1,
             **capture_sampling_inputs(batch_size, vocab_size, unique_seeds=True),
         }
 
@@ -259,7 +258,6 @@ class InklingCudaRunner(CudaRunner):
         token_ids = torch.empty(batch_size, dtype=torch.long, device=self.device)
         positions = torch.empty(batch_size, dtype=torch.long, device=self.device)
         sampling = self._sampler.empty(batch_size, self.device)
-        fixed_acceptance = torch.tensor(-1, dtype=torch.long, device=self.device)
         output_width = 2 * self.speculative_draft_tokens + 1
         output_ids = torch.empty(
             (batch_size, output_width), dtype=torch.long, device=self.device
@@ -307,7 +305,6 @@ class InklingCudaRunner(CudaRunner):
                     drafts,
                     targets,
                     positions,
-                    fixed_acceptance=fixed_acceptance,
                 )
                 self._graph_acceptance[shape] = acceptance
                 processed = acceptance.counts.long()
@@ -328,7 +325,6 @@ class InklingCudaRunner(CudaRunner):
         inputs = {
             "token_ids": token_ids,
             "positions": positions,
-            "fixed_acceptance": fixed_acceptance,
         }
         inputs.update(self._cache.graph_device_inputs(cache))
         inputs.update(self._sampler.graph_inputs(sampling))
@@ -357,9 +353,6 @@ class InklingCudaRunner(CudaRunner):
         inputs: dict[str, object] = {
             "token_ids": np.pad(plan.token_ids, (0, padding)),
             "positions": np.pad(plan.positions, (0, padding), constant_values=1),
-            "fixed_acceptance": -1
-            if self._speculation.validated_benchmark_accepted_drafts is None
-            else self._speculation.validated_benchmark_accepted_drafts,
         }
         inputs.update(
             self._cache.graph_plan_inputs(self._graph_device_caches[shape], cache_plan)
@@ -592,7 +585,6 @@ class InklingCudaRunner(CudaRunner):
                 drafts,
                 targets,
                 positions,
-                fixed_acceptance=self._speculation.validated_benchmark_accepted_drafts,
             )
             processed = decision.counts.long()
         else:

@@ -1088,7 +1088,6 @@ class DeepSeekV41CudaRunner(CudaRunner):
             samples[:, :draft_tokens],
             samples[:, draft_tokens:],
             positions,
-            fixed_acceptance=self._speculation.validated_benchmark_accepted_drafts,
         )
         counts = acceptance.counts
         base = acceptance.feedback()
@@ -1344,7 +1343,6 @@ class DeepSeekV41CudaRunner(CudaRunner):
             drafts,
             targets,
             positions,
-            fixed_acceptance=self._speculation.validated_benchmark_accepted_drafts,
         )
         self._model.clear_rejected_speculative_state(
             positions,

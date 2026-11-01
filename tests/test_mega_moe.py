@@ -8,6 +8,7 @@ import pytest
 import torch
 from torch import nn
 
+from resin.backend.balanced_routing import BalancedRoutingMixin
 from resin.backend.topology import RankGroup
 from resin_models_cuda.mega_moe import MegaMoe, MegaMoeCollective, shared_scale_rows
 
@@ -136,7 +137,7 @@ def deepgemm(monkeypatch):
     return module
 
 
-class Gate(nn.Module):
+class Gate(BalancedRoutingMixin, nn.Module):
     def __init__(self):
         super().__init__()
         self.weight = nn.Parameter(torch.zeros(2, 128))
@@ -144,8 +145,6 @@ class Gate(nn.Module):
         self.bias_vl, self.image_token_id = None, 129264
         self.temperature, self.score_func, self.normalized = 1, "sqrtsoftplus", True
         self.topk, self.route_scale = 2, 1.5
-        self.benchmark_balanced_experts = False
-        self.benchmark_replica, self.benchmark_expert_parallel_size = 0, 1
 
     def forward(self, hidden, ids):
         return hidden.new_ones((len(hidden), 1)), torch.zeros(
@@ -349,7 +348,6 @@ def test_v41_factory_preserves_gate_up_order_values_and_adopts_down_storage(
 def test_mega_gate_writes_workspace_masks_rows_and_preserves_fp32_weights(
     deepgemm, monkeypatch, balanced
 ):
-    from resin.backend.torch import benchmark_expert_indices
     from resin_models_cuda.deepseek_v41.experts import mega_gate
 
     torch.manual_seed(31)
@@ -357,12 +355,12 @@ def test_mega_gate_writes_workspace_masks_rows_and_preserves_fp32_weights(
     gate.weight = nn.Parameter(torch.randn(8, 256) * 0.1)
     gate.bias = nn.Parameter(torch.linspace(-0.3, 0.3, 8))
     gate.topk = 3
-    gate.benchmark_balanced_experts = balanced
-    gate.benchmark_replica, gate.benchmark_expert_parallel_size = 1, 2
+    if balanced:
+        gate.enable_balanced_routing(replica=1, expert_parallel_size=2)
     hidden = torch.randn(4, 256).bfloat16()
     scores = torch.nn.functional.softplus(hidden.float() @ gate.weight.T).sqrt()
     expected_indices = (
-        benchmark_expert_indices(scores, 3, 1, 2)
+        torch.tensor([[2, 6, 3], [7, 0, 4], [1, 5, 2], [6, 3, 7]])
         if balanced
         else (scores + gate.bias).topk(3, dim=-1).indices
     )

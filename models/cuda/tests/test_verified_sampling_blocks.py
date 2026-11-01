@@ -73,12 +73,14 @@ def _fixture(runner_type, *, scored=False):
 
 
 @pytest.mark.parametrize("runner_type", [DeepSeekV41CudaRunner, InklingCudaRunner])
-@pytest.mark.parametrize("scored,fixed", [(False, None), (True, 0)])
+@pytest.mark.parametrize("scored", [False, True])
+@pytest.mark.parametrize("all_rejected", [False, True])
 def test_eager_verification_routes_scores_and_rolls_back_accepted_state(
-    monkeypatch, runner_type, scored, fixed
+    monkeypatch, runner_type, scored, all_rejected
 ):
-    runner, plan, logits, drafts, _ = _fixture(runner_type, scored=scored)
-    runner._speculation.benchmark_accepted_drafts = fixed
+    runner, plan, logits, drafts, targets = _fixture(runner_type, scored=scored)
+    if all_rejected:
+        targets[:, 0].fill_(9)
     positions = torch.tensor(plan.positions, dtype=torch.int64)
     counts, stored = [], []
     if runner_type is DeepSeekV41CudaRunner:
@@ -128,24 +130,23 @@ def test_eager_verification_routes_scores_and_rolls_back_accepted_state(
     output = runner._speculative_decode(
         plan, object(), torch.tensor(plan.token_ids, dtype=torch.int64), positions
     )
-    expected = [1, 1] if scored else [2, 3]
+    expected = [1, 1] if all_rejected else [2, 3]
     assert counts == [expected]
     if stored:
         torch.testing.assert_close(stored[0], positions + torch.tensor(expected) - 1)
     if scored:
         assert output is result
     else:
-        assert output.token_ids.tolist() == [2, 4, 3, 4, 5]
+        expected_tokens = [9, 9] if all_rejected else [2, 4, 3, 4, 5]
+        assert output.token_ids.tolist() == expected_tokens
     assert runner._sampler.calls == [(2, 3, 10)]
 
 
-@pytest.mark.parametrize("fixed", [None, 1])
-def test_deepseek_unscored_graph_harvests_directly_and_rolls_back(monkeypatch, fixed):
+def test_deepseek_unscored_graph_harvests_directly_and_rolls_back(monkeypatch):
     from resin.backend.speculative import _accept_speculative_tokens
     from resin_models_cuda.deepseek_v41 import cuda as runtime
 
     runner, plan, _logits, drafts, targets = _fixture(DeepSeekV41CudaRunner)
-    runner._speculation.benchmark_accepted_drafts = fixed
     runner.parallel_groups = None
     runner._graph_device_caches = {(2, 128): object()}
     runner._dspark_phase_events = {}
@@ -164,9 +165,7 @@ def test_deepseek_unscored_graph_harvests_directly_and_rolls_back(monkeypatch, f
     runner._enqueue_graph_output = forbid_completion
     monkeypatch.setattr(runtime, "pad_sampling_inputs", lambda *_args: {})
     result = runner._graph_forward(plan, object(), shape=(2, 128))
-    expected = _accept_speculative_tokens(
-        drafts.tolist(), targets.tolist(), benchmark_accepted_drafts=fixed
-    )
+    expected = _accept_speculative_tokens(drafts.tolist(), targets.tolist())
     assert result is not None
     assert result.token_ids.tolist() == sum(expected.token_rows, [])
     assert processed == [expected.processed_counts]
@@ -209,11 +208,13 @@ def test_deepseek_graph_verification_samples_and_broadcasts_one_block():
     assert runner._graph_logits[(2, 128)] is logits
 
 
-@pytest.mark.parametrize("fixed", [-1, 0])
+@pytest.mark.parametrize("all_rejected", [False, True])
 def test_inkling_graph_keeps_target_logits_and_one_device_acceptance(
-    monkeypatch, fixed
+    monkeypatch, all_rejected
 ):
     runner, plan, logits, drafts, targets = _fixture(InklingCudaRunner)
+    if all_rejected:
+        targets[:, 0].fill_(9)
     runner._graph_device_caches = {}
     runner._cache = SimpleNamespace(
         graph_cache=lambda *_args: object(),
@@ -246,11 +247,10 @@ def test_inkling_graph_keeps_target_logits_and_one_device_acceptance(
     step.inputs["token_ids"].copy_(torch.tensor(plan.token_ids, dtype=torch.int64))
     positions = torch.tensor(plan.positions, dtype=torch.int64)
     step.inputs["positions"].copy_(positions)
-    step.inputs["fixed_acceptance"].fill_(fixed)
     step.launch()
 
     acceptance = runner._graph_acceptance[(2, 128)]
-    expected = [2, 3] if fixed < 0 else [fixed + 1] * 2
+    expected = [1, 1] if all_rejected else [2, 3]
     assert acceptance.counts.tolist() == expected
     assert state_counts[0].tolist() == expected
     torch.testing.assert_close(state_positions[0], positions + acceptance.counts - 1)

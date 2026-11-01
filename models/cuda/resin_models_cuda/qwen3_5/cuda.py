@@ -505,7 +505,6 @@ class Qwen3_5CudaRunner(CudaRunner):
             "positions": (1,) * batch_size,
             "rope_deltas": (0,) * batch_size,
             "draft_ids": (0,) * batch_size,
-            "fixed_acceptance": -1,
             **capture_sampling_inputs(batch_size, vocab_size, unique_seeds=True),
         }
 
@@ -582,7 +581,6 @@ class Qwen3_5CudaRunner(CudaRunner):
         positions = torch.empty(batch_size, dtype=torch.long, device=self.device)
         rope_deltas = torch.empty(batch_size, dtype=torch.long, device=self.device)
         draft_ids = torch.empty(batch_size, dtype=torch.long, device=self.device)
-        fixed_acceptance = torch.empty((), dtype=torch.long, device=self.device)
         sampling = self._sampler.empty(batch_size, self.device)
         output_width = (
             2 * self.speculative_draft_tokens + 2
@@ -693,7 +691,6 @@ class Qwen3_5CudaRunner(CudaRunner):
                 drafts,
                 targets,
                 positions,
-                fixed_acceptance=fixed_acceptance,
             )
             self._graph_acceptance[shape] = acceptance
             accepted = acceptance.accepted_drafts
@@ -771,7 +768,6 @@ class Qwen3_5CudaRunner(CudaRunner):
                 draft_ids[:, None],
                 targets,
                 positions,
-                fixed_acceptance=fixed_acceptance,
             )
             self._graph_acceptance[shape] = acceptance
             accepted = acceptance.accepted_drafts
@@ -815,7 +811,6 @@ class Qwen3_5CudaRunner(CudaRunner):
             "token_ids": token_ids,
             "positions": positions,
             "rope_deltas": rope_deltas,
-            "fixed_acceptance": fixed_acceptance,
         }
         if self.speculative_draft_tokens:
             inputs["draft_ids"] = draft_ids
@@ -875,11 +870,6 @@ class Qwen3_5CudaRunner(CudaRunner):
             "token_ids": np.pad(plan.token_ids, (0, padding)),
             "positions": np.pad(plan.positions, (0, padding), constant_values=1),
             "rope_deltas": np.pad(self._host_rope_deltas(plan), (0, padding)),
-            "fixed_acceptance": (
-                -1
-                if self._speculation.validated_benchmark_accepted_drafts is None
-                else self._speculation.validated_benchmark_accepted_drafts
-            ),
         }
         inputs.update(
             self._cache.graph_plan_inputs(self._graph_device_caches[shape], cache_plan)
@@ -1370,7 +1360,6 @@ class Qwen3_5CudaRunner(CudaRunner):
             draft_ids,
             targets,
             positions,
-            fixed_acceptance=self._speculation.validated_benchmark_accepted_drafts,
         )
         if phase_timing is not None:
             phase_timing.mark(2)

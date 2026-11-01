@@ -16,6 +16,7 @@ from test_deepseek_v41_model import implementation as implementation
 from torch import nn
 from torch.nn import functional as F
 
+from resin.backend.balanced_routing import BalancedExpertRouting
 from resin.backend.cuda.slab import DevicePageGroup
 from resin.bench import BenchmarkRunner
 from resin_models_cuda.deepseek_v41.cache import CacheArena, CacheGeometry
@@ -49,8 +50,9 @@ def test_benchmark_router_permutation_uses_actual_ep_and_adp(implementation):
     )
     weights, indices = gate(hidden, torch.tensor([0]))
     assert indices.tolist() == [[193, 289, 2, 98, 194, 290]]
-    assert gate.benchmark_expert_parallel_size == 4
-    assert gate.benchmark_replica == 1
+    assert gate.balanced_routing == BalancedExpertRouting(
+        replica=1, expert_parallel_size=4
+    )
     torch.testing.assert_close(
         weights.sum(-1), torch.tensor([1.5], dtype=weights.dtype)
     )
@@ -73,10 +75,11 @@ def test_prepared_expert_owner_count_is_preserved(implementation):
         module.SharedExpert(module.ModelArgs(dim=8, moe_inter_dim=128)),
         expert_parallel=TensorParallelLayout(rank=0, size=2),
     )
-    assert weights.gate.benchmark_expert_parallel_size == 2
+    assert weights.gate.expert_parallel_size == 2
     BenchmarkRunner(SimpleNamespace(_model=weights), balanced_experts=True)
-    assert weights.gate.benchmark_expert_parallel_size == 2
-    assert weights.gate.benchmark_replica == 0
+    assert weights.gate.balanced_routing == BalancedExpertRouting(
+        expert_parallel_size=2
+    )
 
 
 def test_router_retains_official_fp32_probabilities(implementation):

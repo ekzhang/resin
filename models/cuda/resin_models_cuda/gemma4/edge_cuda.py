@@ -693,7 +693,6 @@ class Gemma4EdgeCudaRunner(Gemma4CudaRunner):
             context = gemma4_assistant_context(
                 batch, local_window_tokens=self.sliding_window
             )
-            fixed = self._speculation.validated_benchmark_accepted_drafts
             verify = expand_gemma4_decode_batch(
                 batch,
                 np.zeros((rows, self.speculative_draft_tokens), dtype=np.int64),
@@ -704,7 +703,6 @@ class Gemma4EdgeCudaRunner(Gemma4CudaRunner):
                 hidden = feedback.target_hidden
             inputs.update(
                 target_hidden=hidden,
-                fixed_acceptance=-1 if fixed is None else fixed,
                 verify_qo_indptr=np.arange(
                     0, (graph_rows + 1) * width, width, dtype=np.int32
                 ),

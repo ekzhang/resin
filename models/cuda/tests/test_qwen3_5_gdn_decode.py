@@ -259,19 +259,16 @@ def _tiny_runner_config():
     reason="the real Qwen runner requires Hopper or newer",
 )
 @pytest.mark.parametrize(
-    "draft_tokens,forced,temperature",
+    "draft_tokens,temperature",
     [
-        (0, None, 0.0),
-        (1, None, 0.0),
-        (1, 1, 0.0),
-        (3, None, 0.0),
-        (3, 0, 0.0),
-        (3, 3, 0.0),
-        (3, None, 1.0),
+        (0, 0.0),
+        (1, 0.0),
+        (3, 0.0),
+        (3, 1.0),
     ],
 )
 def test_tiny_runner_overlap_matches_sync(
-    monkeypatch, tmp_path, draft_tokens, forced, temperature
+    monkeypatch, tmp_path, draft_tokens, temperature
 ):
     """Compare real decode paths using a small model and a padded graph batch."""
     import gc
@@ -300,9 +297,9 @@ def test_tiny_runner_overlap_matches_sync(
         ("full", False, draft_tokens, False),
         ("full", True, draft_tokens, False),
     ]
-    if forced is None and draft_tokens and temperature == 0.0:
+    if draft_tokens and temperature == 0.0:
         modes.append(("full", False, 0, False))
-    if forced is None and draft_tokens in (0, 3):
+    if draft_tokens in (0, 3):
         modes.append(("full", True, draft_tokens, True))
     outputs, statistics, cached_outputs = [], [], None
     for graph_mode, overlap, mode_drafts, prefix_cache in modes:
@@ -320,7 +317,6 @@ def test_tiny_runner_overlap_matches_sync(
                 [(4, config.max_position_embeddings)] if graph_mode == "full" else []
             ),
         )
-        runner._speculation.benchmark_accepted_drafts = forced
         runner.capture_cuda_graphs()
         engine = Engine(
             runner,
@@ -382,8 +378,6 @@ def test_tiny_runner_overlap_matches_sync(
                 assert stats["drafts"] == mode_drafts * stats["blocks"]
                 assert stats["emitted"] == stats["blocks"] + stats["accepted"]
                 assert 0 <= stats["accepted"] <= stats["drafts"]
-                if forced is not None:
-                    assert stats["accepted"] == forced * stats["blocks"]
                 if mode_drafts:
                     # Each final raw block can exceed the requested output by
                     # at most K tokens; prefill contributed one token per row.
@@ -408,7 +402,7 @@ def test_tiny_runner_overlap_matches_sync(
             gc.collect()
             torch.cuda.empty_cache()
     assert outputs[1] == outputs[2]
-    if temperature == 0.0 and forced in (None, 0):
+    if temperature == 0.0:
         assert all(output == outputs[0] for output in outputs[1:])
     # Identical physical graph geometry must make exactly the same decisions.
     # The smaller eager batch can round an assistant logit tie differently;
@@ -417,8 +411,6 @@ def test_tiny_runner_overlap_matches_sync(
     # target-logit or nucleus-cutoff ties can change seeded categorical draws
     # between eager/graph shapes or single-token/block verification.
     assert statistics[1] == statistics[2]
-    if forced is not None:
-        assert statistics[0] == statistics[1]
     if cached_outputs is not None:
         assert cached_outputs == outputs[1][-1]
 

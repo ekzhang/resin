@@ -17,8 +17,8 @@ controls, and keep those results separate from ShareGPT measurements.
 
 Sampling defaults to greedy. Set `--temperature`, `--top-p`, `--top-k` and `--seed`
 explicitly for sampled runs, for example `--temperature 1.0 --top-p 0.95
---top-k 64 --seed 41`. Resin applies top-p before top-k. Natural draft acceptance
-remains the default.
+--top-k 64 --seed 41`. Resin applies top-p before top-k. Draft acceptance uses
+normal verification.
 
 Gemma models default to 8,192-token prefill chunks with breakable prefill graphs
 and full decode graphs. Override these with `--prefill-chunk-size`,
@@ -131,23 +131,24 @@ case that cannot fit fails before timing rather than benchmarking a smaller
 admitted batch. Each completed point is printed as `[bench-result] {json}` for
 recovery from logs if a later case fails.
 
-Natural draft acceptance and model expert routing are the defaults. To measure
-a controlled speculative workload, explicitly select the number of draft
-positions and accepted drafts:
+Draft acceptance always uses normal verification. Choose the number of draft
+positions with `--draft-tokens`, and use the plotter's `--accept-rate` to project
+other acceptance rates from the measured cycle time. `--draft-tokens 0` measures
+ordinary decode when the model supports disabling its draft path.
+
+Model expert routing is the default. For a synthetic balanced routing workload:
 
 ```bash
 uv run scripts/bench.py --model deepseek-v41 --backend modal \
   --phases decode --context-lengths 8192 --batch-sizes 1,4,16 \
-  --draft-tokens 4 --accepted-drafts 3 --balanced-experts \
-  --output bench/deepseek-v41-fixed.jsonl
+  --draft-tokens 4 --balanced-experts \
+  --output bench/deepseek-v41-balanced.jsonl
 ```
 
-`--accepted-drafts` changes actual verification/commit and rollback behavior;
 `--balanced-experts` changes routing while retaining router computation and
 weights. These are synthetic performance workloads, not model-quality results.
-Their settings and observed acceptance are recorded. Use separate result files
-for natural and synthetic policies. `--draft-tokens 0` measures ordinary decode
-when the model supports disabling its draft path.
+The routing policy and observed acceptance are recorded. Use separate result
+files for natural and balanced routing policies.
 
 To reuse a long prefix within each attention replica:
 
@@ -226,7 +227,7 @@ An explicit `--accept-rate` instead projects throughput from measured step
 latency at an assumed acceptance rate:
 
 ```bash
-uv run scripts/plot_bench.py bench/deepseek-v41-fixed.jsonl \
+uv run scripts/plot_bench.py bench/deepseek-v41-balanced.jsonl \
   --mode decode --accept-rate 0.75
 ```
 
@@ -237,10 +238,12 @@ output tokens/s/GPU = per-user tokens/s * global_batch_size / gpu_count
 ```
 
 The draft width is read from the measurements; `--draft-tokens` can optionally
-assert that width. Projection rescales the same timings and does not rerun
-verification or change observed acceptance. Its footer identifies projected
-and observed acceptance. Conditional work, such as accepted-prefix rollback, may
-cost more at higher acceptance; a fixed-cycle-time projection does not simulate
+assert that width. Projection scales both interactivity and throughput by the
+ratio of projected to measured tokens per step, moving each point toward or
+away from the origin. It does not rerun verification or change observed
+acceptance. Its footer identifies projected and observed acceptance. Conditional
+work, such as accepted-prefix rollback, may cost more at higher acceptance; a
+fixed-cycle-time projection does not simulate
 that additional work. The chart conventions follow
 [DeepInfer's sweep plotter](https://github.com/deepseek-ai/DeepInfer/blob/774ce244b87cc0eb8d4b94ab9f5de2ab22049f01/examples/sweep/plot_pareto.py).
 
@@ -265,9 +268,10 @@ for complete cohorts. `input_tokens` counts actual unique prefill inputs;
 `prefill_tokens` remains their per-step mean for compatibility.
 `committed_tokens` counts generated output.
 
-`draft_tokens`, `accepted_drafts`, `measured_accept_rate`, and
-`balanced_experts` describe the workload. Null `accepted_drafts` means natural
-verification. Shared-prefix fields record requested and observed cached tokens.
+`draft_tokens`, `measured_accept_rate`, and `balanced_experts` describe the
+workload. Older records may contain `accepted_drafts` for retired forced
+acceptance workloads; the plotter keeps these separate from natural verification.
+Shared-prefix fields record requested and observed cached tokens.
 `graph_counts` and `overlap_counts` exclude warmup/tracing. Distributed timings
 use the slowest replica driver and sum tokens over unique drivers. Actual
 context bounds are retained as `measured_context_start_min/max` and

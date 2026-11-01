@@ -185,9 +185,9 @@ prompt length; each prefill timing must include the complete prompt.
 Deliver both complete-cohort prefill latency versus input tokens/s/GPU and decode
 interactivity (output tokens/s/user) versus output tokens/s/GPU. Batch counts are
 per attention-DP replica; normalization includes every TP/CP GPU. Cover target-only
-and natural speculative execution. Optionally use `--accepted-drafts K` for fixed
-acceptance, or the plotter's `--accept-rate` for an analytical projection, labeling
-each separately from observed natural acceptance.
+and natural speculative execution. Optionally use the plotter's `--accept-rate`
+for an analytical projection, labeling it separately from observed natural
+acceptance.
 
 Capture and inspect Perfetto traces for both phases: normally two untimed complete
 prefill passes and two decode completions after measurement. The existing profiler

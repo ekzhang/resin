@@ -175,23 +175,28 @@ def test_speculation_verifies_once_and_repairs_first_middle_all_acceptance():
     torch.testing.assert_close(previous, rms_norm(verified, model.norm, 1e-6))
 
 
-@pytest.mark.parametrize("depth", [-1, 0, 1, 3])
-def test_fixed_acceptance_is_runtime_data_and_commits_matching_state(depth):
+@pytest.mark.parametrize("depth", [0, 1, 3])
+def test_sampled_prefix_commits_matching_state(depth):
     model, cache = _ToyModel(), _ToyCache()
     positions = torch.tensor([3, 6, 10])
+    anchors = torch.tensor([1, 8, 16])
+
+    def sample(logits):
+        targets = logits.argmax(-1)
+        targets[:, :depth] = anchors[:, None] + torch.arange(1, depth + 1)
+        targets[:, depth] = 0
+        return targets
+
     acceptance, _ = speculative_step(
         model,
         cache,
         torch.tensor([1, 8, 16]),
         positions,
         3,
-        lambda logits: logits.argmax(-1),
+        sample,
         projection_rows=64,
-        fixed_acceptance=torch.tensor(depth),
     )
-    expected_counts = (
-        torch.tensor([1, 2, 4]) if depth < 0 else torch.full((3,), depth + 1)
-    )
+    expected_counts = torch.full((3,), depth + 1)
     torch.testing.assert_close(cache.committed_lengths, positions + expected_counts)
     torch.testing.assert_close(acceptance.counts.long(), expected_counts)
     torch.testing.assert_close(acceptance.feedback().positions, cache.committed_lengths)

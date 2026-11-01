@@ -225,8 +225,6 @@ class Glm53FlashCudaRunner(CudaRunner):
         }
         if self.parallel_groups is not None:
             inputs["ep_valid_rows"] = shape[0]
-        if self.speculative_draft_tokens:
-            inputs["fixed_acceptance"] = -1
         return inputs
 
     def _projection_rows_for_bucket(self, batch_bucket):
@@ -268,11 +266,6 @@ class Glm53FlashCudaRunner(CudaRunner):
             else None
         )
 
-        fixed_acceptance = (
-            torch.empty((), dtype=torch.long, device=self.device)
-            if draft_tokens
-            else None
-        )
         phase_timing = (
             self._new_phase_timing("draft", "target_verify", "decode")
             if draft_tokens
@@ -306,7 +299,6 @@ class Glm53FlashCudaRunner(CudaRunner):
                         draft_tokens,
                         sample,
                         capacity=capacity,
-                        fixed_acceptance=fixed_acceptance,
                         phase_timing=phase_timing,
                         projection_rows=projection_rows,
                     )
@@ -341,8 +333,6 @@ class Glm53FlashCudaRunner(CudaRunner):
         }
         if valid is not None:
             inputs["ep_valid_rows"] = valid
-        if fixed_acceptance is not None:
-            inputs["fixed_acceptance"] = fixed_acceptance
         self._graph_inputs[shape] = inputs
         return CudaGraphStep(
             inputs=inputs,
@@ -416,9 +406,6 @@ class Glm53FlashCudaRunner(CudaRunner):
         }
         if self.parallel_groups is not None:
             inputs["ep_valid_rows"] = batch_size
-        if self.speculative_draft_tokens:
-            fixed = self._speculation.validated_benchmark_accepted_drafts
-            inputs["fixed_acceptance"] = -1 if fixed is None else fixed
         if enqueue:
             return self._enqueue_graph_output(plan, shape, inputs, feedback)
         self._run_cuda_graph("decode", shape, inputs)
@@ -488,7 +475,6 @@ class Glm53FlashCudaRunner(CudaRunner):
         if plan.phase == BatchPhase.DECODE and self.speculative_draft_tokens:
             from resin_models_cuda.glm5_3_flash.speculative import speculative_step
 
-            fixed = self._speculation.validated_benchmark_accepted_drafts
             acceptance, logits = speculative_step(
                 self._model,
                 cache,
@@ -496,9 +482,6 @@ class Glm53FlashCudaRunner(CudaRunner):
                 positions,
                 self.speculative_draft_tokens,
                 lambda values: self._sampler(values, plan),
-                fixed_acceptance=torch.tensor(
-                    -1 if fixed is None else fixed, device=self.device
-                ),
                 phase_timing=self._eager_phase_timing(
                     "draft", "target_verify", "decode"
                 ),
@@ -712,9 +695,6 @@ class Glm53FlashCudaRunner(CudaRunner):
             )
         inputs = self._decode_graph_capture_inputs(shape)
         inputs["ep_valid_rows"] = 0
-        if self.speculative_draft_tokens:
-            fixed = self._speculation.validated_benchmark_accepted_drafts
-            inputs["fixed_acceptance"] = -1 if fixed is None else fixed
         if enqueue:
             return True, self._enqueue_graph_output(None, shape, inputs, None)
         self._run_cuda_graph("decode", shape, inputs)

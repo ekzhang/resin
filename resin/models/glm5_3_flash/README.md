@@ -63,9 +63,9 @@ with batch one, and decode at 8K with batches 1/2/4/8/16/32/64. The example narr
 the first run to 8K and batches through eight. For a separate trace-free prefill
 comparison, use `--phases prefill --prefill-context-lengths 4096,8192`, omit
 `--trace-dir`, and choose a distinct output file. Larger grids require explicit capacity checks; the default grid is
-not a qualification claim. The shared CLI uses seeded synthetic prompts. Omit
-`--accepted-drafts` to measure actual speculative acceptance; specifying it simulates acceptance and must be
-labeled separately. Controlled-prompt results below use retained recipe-rendered
+not a qualification claim. The shared CLI measures actual speculative acceptance;
+use the plotter's `--accept-rate` for separately labeled projections.
+Controlled-prompt results below use retained recipe-rendered
 inputs. See the [benchmark protocol](../../../docs/benchmarks.md). A local CUDA
 host uses `--backend local --checkpoint /path/to/checkpoint` with the same topology.
 
@@ -87,8 +87,7 @@ This is a plot-only projection using the measured iteration timing and
 `τ = 1 + 3 × 0.75 = 3.25` output tokens per iteration. It does not rewrite raw
 timing, observed accepted-token counts, measured acceptance, or measured
 throughput. Label the figure **“Projected MTP3, 75% acceptance (τ=3.25)”** and
-retain measured-output results beside it. This differs from forcing acceptance
-inside a benchmark with `--accepted-drafts`. Prefill figures use measured data
+retain measured-output results beside it. Prefill figures use measured data
 without an acceptance projection.
 
 The parameterized serving app uses the same registry:

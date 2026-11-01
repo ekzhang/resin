@@ -34,21 +34,19 @@ def _decode_plan(tops, *, mask=(True, True, False)):
 
 
 @pytest.mark.parametrize("rows", [1, 32])
-@pytest.mark.parametrize("fixed", [None, 0, 3])
+@pytest.mark.parametrize("depth", [None, 0, 3])
 @pytest.mark.parametrize("scored", [False, True])
 @torch.inference_mode()
 def test_eager_acceptance_completion_owns_scored_and_unscored_blocks(
-    rows, fixed, scored
+    rows, depth, scored
 ):
     from resin.backend.speculative import SpeculativeStats, _accept_speculative_tokens
 
     drafts = torch.arange(rows * 3).view(rows, 3).remainder(31)
     targets = torch.cat((drafts.clone(), torch.full((rows, 1), 32)), dim=1)
     for row in range(rows):
-        targets[row, row % 4 :] = 33
-    expected = _accept_speculative_tokens(
-        drafts.tolist(), targets.tolist(), benchmark_accepted_drafts=fixed
-    )
+        targets[row, (row % 4 if depth is None else depth) :] = 33
+    expected = _accept_speculative_tokens(drafts.tolist(), targets.tolist())
     drafts, targets = drafts.cuda(), targets.cuda()
     positions = torch.arange(rows, device="cuda") * 7
     logits = torch.randn((rows, 4, 65), device="cuda", dtype=torch.bfloat16)
@@ -59,17 +57,13 @@ def test_eager_acceptance_completion_owns_scored_and_unscored_blocks(
         token_indptr=list(range(rows + 1)),
         sampling_params=[SamplingParams(logprobs=scored)] * rows,
     )
-    acceptance = DeviceAcceptance.from_samples(
-        drafts, targets, positions, fixed_acceptance=fixed
-    )
+    acceptance = DeviceAcceptance.from_samples(drafts, targets, positions)
     score_completion(logits, acceptance, plan)
     stats = SpeculativeStats(3)
     previous = torch.cuda.get_sync_debug_mode()
     try:
         torch.cuda.set_sync_debug_mode("error")
-        acceptance = DeviceAcceptance.from_samples(
-            drafts, targets, positions, fixed_acceptance=fixed
-        )
+        acceptance = DeviceAcceptance.from_samples(drafts, targets, positions)
         pending = DeviceCompletion.from_acceptance(
             acceptance,
             rows=rows,
@@ -94,14 +88,12 @@ def test_eager_acceptance_completion_owns_scored_and_unscored_blocks(
 
 
 @torch.inference_mode()
-def test_captured_mixed_scores_survive_replay_and_forced_acceptance(monkeypatch):
+def test_captured_mixed_scores_survive_replay_and_changed_acceptance(monkeypatch):
     logits = torch.randn((3, 4, 8193), device="cuda", dtype=torch.bfloat16)
     positions = torch.tensor([8, 8, 8], device="cuda")
     drafts = torch.tensor([[4, 7, 9], [2, 4, 8], [3, 1, 7]], device="cuda")
-    targets = torch.tensor([[1, 2, 3, 4], [2, 7, 8, 1], [8, 4, 1, 2]], device="cuda")
-    acceptance = DeviceAcceptance.from_samples(
-        drafts, targets, positions, fixed_acceptance=2
-    )
+    targets = torch.tensor([[4, 7, 3, 4], [2, 4, 7, 1], [3, 1, 1, 2]], device="cuda")
+    acceptance = DeviceAcceptance.from_samples(drafts, targets, positions)
     plan = _decode_plan([5, 0, 32])
     # Warm capture before sync-debug; hot scoring must not read device scalars.
     score_completion(logits, acceptance, plan)
@@ -122,6 +114,7 @@ def test_captured_mixed_scores_survive_replay_and_forced_acceptance(monkeypatch)
             acceptance, rows=3, plan=plan, scores=scores
         )
         logits.mul_(-0.3)
+        targets.zero_()
         next_acceptance = DeviceAcceptance.from_samples(drafts, targets, positions)
         changed = _decode_plan([32, 1, 9], mask=(True, False, True))
         score_completion(logits, next_acceptance, changed)

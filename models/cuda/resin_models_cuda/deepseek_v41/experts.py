@@ -14,7 +14,6 @@ from torch.nn import functional as F
 from resin.backend.cuda.parallel import TensorParallelContext, TensorParallelLayout
 from resin.backend.expert_parallel import ExpertParallelDispatch
 from resin.backend.topology import ParallelGroups
-from resin.backend.torch import benchmark_expert_indices
 from resin_models_cuda.deepseek_v41.gemm import fp4_fused_moe
 from resin_models_cuda.deepseek_v41.kernels import act_quant
 from resin_models_cuda.deepseek_v41.linear import weight_scale_rows
@@ -119,7 +118,7 @@ class MoEWeights(nn.Module):
         self.experts_start_idx = owned.start
         self.experts_end_idx = owned.stop
         self.gate = gate
-        self.gate.benchmark_expert_parallel_size = expert_parallel.size
+        self.gate.expert_parallel_size = expert_parallel.size
         expert_dtype = torch.float4_e2m1fn_x2 if args.expert_dtype == "fp4" else None
         self._fused_fp4 = expert_dtype == torch.float4_e2m1fn_x2
         if self._fused_fp4:
@@ -373,7 +372,7 @@ def mega_gate(gate, hidden, input_ids, active, out, *, ep_rank):
     """Fuse the released gate into the FFN workspace, retaining BF16 weights."""
     import deep_gemm
 
-    fixed = gate.benchmark_balanced_experts
+    routing = gate.balanced_routing
     image_mask = (
         input_ids == gate.image_token_id
         if input_ids is not None and gate.bias_vl is not None
@@ -393,17 +392,15 @@ def mega_gate(gate, hidden, input_ids, active, out, *, ep_rank):
         image_token_mask=image_mask,
         fix_routing_mask=(
             torch.ones(len(hidden), dtype=torch.bool, device=hidden.device)
-            if fixed
+            if routing is not None
             else None
         ),
         unmapped_topk_idx=(
-            benchmark_expert_indices(
+            routing.indices(
                 gate.weight[:, 0].expand(len(hidden), -1),
                 gate.topk,
-                gate.benchmark_replica,
-                gate.benchmark_expert_parallel_size,
             )
-            if fixed
+            if routing is not None
             else None
         ),
         out=out,

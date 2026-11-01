@@ -835,7 +835,6 @@ class Gemma4CudaRunner(CudaRunner):
             width = self.speculative_draft_tokens + 1
             inputs.update(
                 {
-                    "fixed_acceptance": -1,
                     "target_hidden": torch.linspace(
                         -1.0,
                         1.0,
@@ -1151,7 +1150,6 @@ class Gemma4CudaRunner(CudaRunner):
         output_ids = empty(
             torch.int64, batch_size, 2 * self.speculative_draft_tokens + 1
         )
-        fixed_acceptance = empty(torch.int64)
         verify_hidden_output = empty(
             torch.bfloat16, batch_size, width, self.config.hidden_size
         )
@@ -1216,7 +1214,6 @@ class Gemma4CudaRunner(CudaRunner):
                 drafts,
                 output_ids[:, self.speculative_draft_tokens :],
                 positions,
-                fixed_acceptance=fixed_acceptance,
             )
 
             if phase_timing is not None:
@@ -1226,7 +1223,6 @@ class Gemma4CudaRunner(CudaRunner):
             "token_ids": token_ids,
             "positions": positions,
             "target_hidden": target_hidden,
-            "fixed_acceptance": fixed_acceptance,
             "assistant_local_kv_indptr": assistant_local.kv_indptr,
             "assistant_local_page_indices": assistant_local.page_indices,
             "assistant_local_last_page_lengths": assistant_local.last_page_lengths,
@@ -1475,12 +1471,10 @@ class Gemma4CudaRunner(CudaRunner):
             np.zeros((active_rows, self.speculative_draft_tokens), dtype=np.int64),
         )
         hidden = self._gather_target_hidden(sequence_ids, graph_rows)
-        fixed = self._speculation.validated_benchmark_accepted_drafts
         inputs: dict[str, object] = {
             "token_ids": np.pad(batch.token_ids, (0, padding_rows)),
             "positions": np.pad(batch.positions, (0, padding_rows), constant_values=1),
             "target_hidden": hidden,
-            "fixed_acceptance": -1 if fixed is None else fixed,
             "verify_qo_indptr": np.arange(
                 0, (graph_rows + 1) * width, width, dtype=np.int32
             ),
@@ -1733,7 +1727,6 @@ class Gemma4CudaRunner(CudaRunner):
             drafts,
             targets,
             positions,
-            fixed_acceptance=self._speculation.validated_benchmark_accepted_drafts,
         )
         self._store_accepted_hidden(
             sequence_ids, accepted.accepted_drafts, verify_hidden_rows

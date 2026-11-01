@@ -13,6 +13,7 @@ import torch
 from torch import nn
 from torch.nn import functional as F
 
+from resin.backend.balanced_routing import BalancedRoutingMixin
 from resin.backend.cuda.context_parallel import ContextParallelTokens
 from resin.backend.cuda.parallel import (
     TensorParallelContext,
@@ -21,7 +22,6 @@ from resin.backend.cuda.parallel import (
 )
 from resin.backend.layers import RMSNorm
 from resin.backend.loading import prepare_model
-from resin.backend.torch import benchmark_expert_indices
 from resin_models_cuda.deepseek_v41.attention import (
     fused_attention,
     pack_kv,
@@ -136,7 +136,7 @@ class ModelArgs:
         )
 
 
-class Gate(nn.Module):
+class Gate(BalancedRoutingMixin, nn.Module):
     def __init__(self, args):
         super().__init__()
         self.topk, self.dim = args.n_activated_experts, args.dim
@@ -152,9 +152,6 @@ class Gate(nn.Module):
         self.image_token_id = args.image_token_id
         self.temperature, self.route_scale = args.gate_temp, args.route_scale
         self.normalized, self.score_func = args.norm_topk_prob, args.score_func
-        self.benchmark_balanced_experts = False
-        self.benchmark_replica = 0
-        self.benchmark_expert_parallel_size = 1
 
     def forward(self, hidden, input_ids):
         scores = F.linear(hidden.float(), self.weight.float()) / self.temperature
@@ -165,13 +162,8 @@ class Gate(nn.Module):
             if self.score_func == "sigmoid"
             else F.softplus(scores).sqrt()
         )
-        if self.benchmark_balanced_experts:
-            indices = benchmark_expert_indices(
-                scores,
-                self.topk,
-                self.benchmark_replica,
-                self.benchmark_expert_parallel_size,
-            )
+        if self.balanced_routing is not None:
+            indices = self.balanced_routing.indices(scores, self.topk)
         else:
             bias = self.bias
             if self.bias_vl is not None and input_ids is not None:
@@ -561,7 +553,6 @@ class Block(nn.Module):
             expert_parallel=ep,
             expert_tensor_parallel=etp,
         )
-        self.ffn.gate.benchmark_expert_parallel_size = ep.size
         self.engram = engram
         self.attn_norm, self.ffn_norm = (
             RMSNorm(args.dim, args.norm_eps),

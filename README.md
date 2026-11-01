@@ -134,9 +134,10 @@ local backend is the default. Modal submits the repository's source into the
 shared CUDA image, so the client machine does not need CUDA installed.
 
 Prefill charts compare complete-context latency with input tokens/s/GPU; decode
-charts compare per-user output tokens/s with output tokens/s/GPU. Natural draft
-acceptance and model routing are the defaults. `--accepted-drafts K` and
-`--balanced-experts` explicitly enable synthetic workloads. See
+charts compare per-user output tokens/s with output tokens/s/GPU. Draft acceptance
+uses normal verification; the plotter's `--accept-rate` projects other acceptance
+rates. Model routing is the default; `--balanced-experts` enables synthetic
+balanced routing. See
 [benchmarking](docs/benchmarks.md) for the timing protocol and trace scope.
 
 For an already running endpoint, `scripts/check_server.py URL --output REPORT`

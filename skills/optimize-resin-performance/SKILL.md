@@ -23,7 +23,7 @@ instructions to recreate retired probes. Inspect the cited commits with
 Record source commit and dirty changes, checkpoint/kernel revisions, exact GPU
 model/count, precision/layouts, TP/attention-DP/CP/EP, graph policy, overlap, context
 and shared-prefix lengths, batch per attention replica, chunk size, sampling,
-draft width and natural/forced acceptance, routing policy and timing boundaries.
+draft width and observed acceptance, routing policy and timing boundaries.
 Include CPU quota/affinity, NUMA placement and NCCL settings when investigating
 host or communication behavior. Prefer paired A/B on the same allocation; if the
 machine or environment changes, label the comparison accordingly.
@@ -63,10 +63,11 @@ Get 8K decode fast before expanding to 32K or 131K when useful and feasible. Kee
 contexts and nearby boundaries for correctness checks; avoid redundant 128/512/2K
 performance traces unless they expose a distinct bottleneck or reproduce a bug.
 
-Primary throughput counts actual committed output tokens. Natural acceptance,
-forced `--accepted-drafts`, and plot-only `--accept-rate` projections answer
-different questions; keep them labeled and in separate comparisons. Batch is per
-attention-DP replica and GPU normalization includes TP/CP workers. For external
+Primary throughput counts actual committed output tokens with natural acceptance.
+Plot-only `--accept-rate` projections estimate other acceptance rates from measured
+cycle time; label them separately from measured throughput. Historical forced
+acceptance runs used a retired runtime option and require separate comparisons.
+Batch is per attention-DP replica and GPU normalization includes TP/CP workers. For external
 baselines, read current primary sources and match actual computation, hardware,
 precision, routing, sampling and timing. A digitized curve with mismatched policy
 is indicative, not proof of parity or state-of-the-art performance.

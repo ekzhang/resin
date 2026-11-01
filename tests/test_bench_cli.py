@@ -17,7 +17,7 @@ def test_model_defaults_build_valid_natural_sweeps(name):
     assert {case["phase"] for case in cases} == {"prefill", "decode"}
     assert topology.world_size == spec.world_size
     assert options["draft_tokens"] == spec.draft_tokens
-    assert options["accepted_drafts"] is None
+    assert "accepted_drafts" not in options
     assert options["balanced_experts"] is False
     assert [
         (case["context_length"], case["batch_size"])
@@ -115,21 +115,20 @@ def test_deepseek_world_override_scales_replica_and_expert_axes():
             "8",
             "--draft-tokens",
             "4",
-            "--accepted-drafts",
-            "3",
             "--balanced-experts",
         ]
     )
     _, _, topology, options = bench._configuration(args)
     assert topology.world_size == topology.attn_dp == topology.ep == 8
     assert topology.attn_tp == topology.cp == 1
-    assert options["accepted_drafts"] == 3 and options["balanced_experts"]
+    assert options["draft_tokens"] == 4 and options["balanced_experts"]
 
 
 @pytest.mark.parametrize(
     "arguments,fragment",
     [
-        (["--accepted-drafts", "4", "--draft-tokens", "3"], "accepted drafts"),
+        (["--accepted-drafts", "3"], "unrecognized arguments: --accepted-drafts"),
+        (["--draft-tokens", "-1"], "draft_tokens"),
         (["--measure-steps", "0"], "measure_steps"),
         (["--warmup-steps", "-1"], "warmup_steps"),
         (["--prefill-chunk-size", "0"], "prefill_chunk_size"),
@@ -142,7 +141,6 @@ def test_invalid_options_fail_before_remote_dispatch(arguments, fragment, capsys
         bench.main(["--model", "deepseek-v41", "--backend", "modal", *arguments])
     assert error.value.code == 2
     assert fragment in capsys.readouterr().err
-
 
 
 @pytest.mark.parametrize("action", ["--download-only", "--publish-only"])
@@ -167,6 +165,7 @@ def test_local_preset_prefill_chunk_is_checked_before_loading(capsys):
         )
     assert error.value.code == 2
     assert "4096-token chunks" in capsys.readouterr().err
+
 
 def test_local_requires_explicit_checkpoint(capsys):
     with pytest.raises(SystemExit):
@@ -255,7 +254,7 @@ def test_modal_prefill_dispatch_and_trace_download_use_remote_paths(
         assert {case["phase"] for case in cases} == {"prefill"}
         assert options["trace_dir"].startswith("/bench-traces/")
         assert str(tmp_path) not in options["trace_dir"]
-        assert options["accepted_drafts"] is None
+        assert "accepted_drafts" not in options
         seen.update(options)
         return [{"phase": "prefill"}]
 

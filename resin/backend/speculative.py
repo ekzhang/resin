@@ -29,7 +29,6 @@ class SpeculativeStats:
     drafts: int = 0
     accepted: int = 0
     emitted: int = 0
-    benchmark_accepted_drafts: int | None = None
 
     def __post_init__(self) -> None:
         if self.draft_tokens < 0:
@@ -40,24 +39,12 @@ class SpeculativeStats:
         draft_rows: Sequence[Sequence[int]],
         target_rows: Sequence[Sequence[int]],
     ) -> SpeculativeAcceptance:
-        fixed = self.validated_benchmark_accepted_drafts
-        acceptance = _accept_speculative_tokens(
-            draft_rows, target_rows, benchmark_accepted_drafts=fixed
-        )
+        acceptance = _accept_speculative_tokens(draft_rows, target_rows)
         self.blocks += len(draft_rows)
         self.drafts += sum(map(len, draft_rows))
         self.accepted += sum(acceptance.accepted_counts)
         self.emitted += sum(map(len, acceptance.token_rows))
         return acceptance
-
-    @property
-    def validated_benchmark_accepted_drafts(self) -> int | None:
-        fixed = self.benchmark_accepted_drafts
-        if fixed is not None and (
-            type(fixed) is not int or not 0 <= fixed <= self.draft_tokens
-        ):
-            raise ValueError("benchmark accepted drafts must fit the draft block")
-        return fixed
 
     def snapshot(self, *, include_draft_tokens: bool = False) -> dict[str, int | float]:
         values: dict[str, int | float] = {
@@ -75,21 +62,15 @@ class SpeculativeStats:
 def _accept_speculative_tokens(
     draft_rows: Sequence[Sequence[int]],
     target_rows: Sequence[Sequence[int]],
-    *,
-    benchmark_accepted_drafts: int | None = None,
 ) -> SpeculativeAcceptance:
     """Accept each matching draft prefix and append one target bonus token.
 
     A target row contains one sample per verified input: one for every draft
-    comparison plus the final bonus/correction token. Explicit benchmark mode
-    substitutes a fixed acceptance depth while retaining that target correction.
+    comparison plus the final bonus/correction token.
     """
 
     if len(draft_rows) != len(target_rows):
         raise ValueError("draft and target batches must contain the same rows")
-    fixed = benchmark_accepted_drafts
-    if fixed is not None and (type(fixed) is not int or fixed < 0):
-        raise ValueError("benchmark accepted drafts must be a nonnegative integer")
 
     token_rows: list[list[int]] = []
     accepted_counts: list[int] = []
@@ -98,15 +79,9 @@ def _accept_speculative_tokens(
             raise ValueError(
                 f"target row {row} must contain one more token than its drafts"
             )
-        if fixed is not None:
-            if fixed > len(drafts):
-                raise ValueError("benchmark accepted drafts exceed a verified row")
-            # Synthetic acceptance still determines real state rollback depth.
-            accepted = fixed
-        else:
-            accepted = 0
-            while accepted < len(drafts) and targets[accepted] == drafts[accepted]:
-                accepted += 1
+        accepted = 0
+        while accepted < len(drafts) and targets[accepted] == drafts[accepted]:
+            accepted += 1
         token_rows.append([*drafts[:accepted], targets[accepted]])
         accepted_counts.append(accepted)
 

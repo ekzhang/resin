@@ -16,8 +16,8 @@ from resin import (
     SamplingParams,
     SchedulerConfig,
 )
+from resin.backend.balanced_routing import BalancedExpertRouting
 from resin.backend.speculative import SpeculativeStats
-from resin.backend.torch import benchmark_expert_indices
 from resin.bench import (
     BenchCase,
     BenchmarkRunner,
@@ -29,7 +29,7 @@ from resin.bench import (
 class Runner:
     vocab_size = 1024
 
-    def __init__(self, *, chunked=False, drafts=0):
+    def __init__(self, *, chunked=False, drafts=0, matching_drafts=0):
         self.runner_config = RunnerConfig(
             max_batch_tokens=5 if chunked else None,
             prefill_chunk_size=3 if chunked else None,
@@ -40,6 +40,7 @@ class Runner:
             else None,
         )
         self.speculative_draft_tokens = drafts
+        self.matching_drafts = matching_drafts
         self._speculation = SpeculativeStats(drafts)
         self.plans = []
         self.processed_counts = []
@@ -52,7 +53,9 @@ class Runner:
         if plan.phase == BatchPhase.DECODE and self.speculative_draft_tokens:
             drafts = [[2] * self.speculative_draft_tokens for _ in plan.sequence_ids]
             targets = [
-                [9] * (self.speculative_draft_tokens + 1) for _ in plan.sequence_ids
+                [2] * self.matching_drafts
+                + [9] * (self.speculative_draft_tokens + 1 - self.matching_drafts)
+                for _ in plan.sequence_ids
             ]
             acceptance = self._speculation.accept(drafts, targets)
             self.processed_counts.append(acceptance.processed_counts)
@@ -211,7 +214,6 @@ def test_gpt_single_gpu_prefill_budget_respects_normal_kernel_capacity(
             [dict(phase="prefill", context_length=128, batch_size=batch)],
             parallelism=Parallelism(world_size=world),
             draft_tokens=0,
-            accepted_drafts=0,
             prefill_chunk_size=4096,
         )
 
@@ -323,8 +325,8 @@ def test_decode_trace_uses_live_full_cohort_without_changing_measurements(
             }
 
     def run(traced):
-        raw = GraphRunner(drafts=4)
-        runner = BenchmarkRunner(raw, accepted_drafts=4)
+        raw = GraphRunner(drafts=4, matching_drafts=4)
+        runner = BenchmarkRunner(raw)
         # Reserve the prompt, prefill sample and five maximum-acceptance
         # steps: warmup, two measured, then two traced completions.
         engine = Engine(runner, max_running_requests=batch_size, context_length=30)
@@ -444,7 +446,7 @@ def test_zero_measure_steps_fail_before_any_work_or_tracing(traced):
 
 @pytest.mark.parametrize("phase", ["prefill", "decode"])
 def test_trace_failure_cleans_up_requests(phase):
-    runner = BenchmarkRunner(Runner(drafts=4), accepted_drafts=0)
+    runner = BenchmarkRunner(Runner(drafts=4))
     engine = Engine(runner, max_running_requests=2, context_length=64)
     completed = []
 
@@ -472,9 +474,9 @@ def test_trace_failure_cleans_up_requests(phase):
 
 
 @pytest.mark.parametrize("accepted", [0, 3, 4])
-def test_fixed_acceptance_changes_engine_commit_and_model_rollback_depth(accepted):
-    raw = Runner(drafts=4)
-    runner = BenchmarkRunner(raw, accepted_drafts=accepted)
+def test_natural_acceptance_drives_engine_commit_and_model_rollback_depth(accepted):
+    raw = Runner(drafts=4, matching_drafts=accepted)
+    runner = BenchmarkRunner(raw)
     engine = Engine(runner, max_running_requests=2, context_length=128)
     record = run_sweep(
         engine,
@@ -486,6 +488,7 @@ def test_fixed_acceptance_changes_engine_commit_and_model_rollback_depth(accepte
     )[0]
     assert record["committed_tokens"] == 2 * 2 * (accepted + 1)
     assert record["measured_accept_rate"] == accepted / 4
+    assert "accepted_drafts" not in record
     assert record["measured_context_start_min"] == 4 + accepted + 1
     assert record["measured_context_end_max"] == 4 + 3 * (accepted + 1)
     assert raw.processed_counts == [[accepted + 1] * 2] * 3
@@ -497,14 +500,18 @@ def test_fixed_acceptance_changes_engine_commit_and_model_rollback_depth(accepte
 
 def test_balanced_routes_are_distinct_per_token_and_globally_even():
     scores = torch.randn(13, 8)
-    indices = benchmark_expert_indices(scores, 3)
+    routing = BalancedExpertRouting()
+    indices = routing.indices(scores, 3)
     assert indices.shape == (13, 3)
     assert all(len(set(row)) == 3 for row in indices.tolist())
     counts = indices.flatten().bincount(minlength=8)
     assert int(counts.max() - counts.min()) <= 1
-    assert benchmark_expert_indices(scores[:0], 3).shape == (0, 3)
+    assert routing.indices(scores[:0], 3).shape == (0, 3)
     routes = torch.cat(
-        [benchmark_expert_indices(scores[:1], 3, rank) for rank in range(3)]
+        [
+            BalancedExpertRouting(replica=rank).indices(scores[:1], 3)
+            for rank in range(3)
+        ]
     )
     counts = routes.flatten().bincount(minlength=8)
     assert int(counts.max() - counts.min()) <= 1
@@ -526,7 +533,7 @@ def test_balanced_routes_cover_contiguous_owners_before_their_experts(
     scores = torch.zeros(batch, experts)
     routes = torch.cat(
         [
-            benchmark_expert_indices(scores, top_k, replica, ep)
+            BalancedExpertRouting(replica, ep).indices(scores, top_k)
             for replica in range(replicas)
         ]
     )
@@ -648,24 +655,18 @@ def test_partial_admission_is_canceled_on_failure():
 
 
 @pytest.mark.parametrize(
-    "drafts,targets", [([[1, 2]], [[3, 4, 5]]), ([[1, 2, 3]], [[4]])]
+    "drafts,targets", [([[1, 2]], [[3, 4]]), ([[1, 2, 3]], [[4]]), ([], [[4]])]
 )
-def test_fixed_acceptance_retains_shape_validation_without_updating_stats(
-    drafts, targets
-):
-    stats = SpeculativeStats(4, benchmark_accepted_drafts=3)
+def test_acceptance_retains_shape_validation_without_updating_stats(drafts, targets):
+    stats = SpeculativeStats(4)
     with pytest.raises(ValueError):
         stats.accept(drafts, targets)
     assert stats.blocks == stats.drafts == stats.accepted == stats.emitted == 0
 
 
 def test_rejects_unsupported_or_incomplete_measurements():
-    assert BenchmarkRunner(Runner(), accepted_drafts=0).accepted_drafts == 0
     with pytest.raises(ValueError, match="balanced experts"):
         BenchmarkRunner(Runner(), balanced_experts=True)
-    for kwargs in ({"accepted_drafts": -1}, {"accepted_drafts": 5}):
-        with pytest.raises(ValueError, match="accepted_drafts"):
-            BenchmarkRunner(Runner(drafts=4), **kwargs)
     runner = BenchmarkRunner(Runner())
     engine = Engine(runner, max_running_requests=1, context_length=16)
     case = BenchCase(phase="decode", context_length=10, batch_size=1)

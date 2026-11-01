@@ -763,9 +763,7 @@ class TestGptOssCudaTinyOracle:
 
     @pytest.mark.parametrize("top_k,experts", [(4, 32), (4, 128), (2, 16)])
     def test_router_selects_fused_or_generic_topk(self, monkeypatch, top_k, experts):
-        router = cast(
-            TopKRouter, SimpleNamespace(top_k=top_k, benchmark_balanced_experts=False)
-        )
+        router = cast(TopKRouter, SimpleNamespace(top_k=top_k, balanced_routing=None))
         logits = torch.randn(3, experts, dtype=torch.bfloat16)
         fused = (object(), object())
         monkeypatch.setattr(gpt_oss_runtime, "top4_softmax", lambda value: fused)

@@ -301,7 +301,6 @@ def speculative_step(
     sample,
     *,
     capacity=None,
-    fixed_acceptance: Tensor | None = None,
     phase_timing=None,
     projection_rows=0,
 ):
@@ -311,9 +310,6 @@ def speculative_step(
     block with deterministic per-position RNG offsets. Greedy proposals are accepted only
     when they equal those target samples, preserving the target distribution.
     ``capacity(width)`` optionally enters the runner's EP dispatch graph context.
-    ``fixed_acceptance`` is an optional scalar tensor: -1 selects natural
-    acceptance; [0,draft_tokens] selects a synthetic benchmark depth. It is
-    runtime data so changing the depth does not capture or compile a new graph.
     Returns the shared accepted block and target logits.
     """
     if not 1 <= draft_tokens <= 7:
@@ -373,9 +369,7 @@ def speculative_step(
     if phase_timing is not None:
         phase_timing.mark(2)
     targets = sample(logits)
-    acceptance = DeviceAcceptance.from_samples(
-        drafts, targets, positions, fixed_acceptance=fixed_acceptance
-    )
+    acceptance = DeviceAcceptance.from_samples(drafts, targets, positions)
     accepted, counts = acceptance.accepted_drafts, acceptance.counts
     selected_hidden = tape.commit(counts, verified_hidden)
     # Rebuild the native MTP cache using verified target states, replacing the
