@@ -79,7 +79,7 @@ class SlabGeometry(Protocol):
 
 @dataclass(frozen=True)
 class SlabDeviceCache:
-    """Common addressing for model-specific views over a fungible slab."""
+    """Device cache tables with layers packed into physical page indices."""
 
     geometry: SlabGeometry
     groups: tuple[DevicePageGroup, ...]
@@ -105,14 +105,21 @@ class SlabDeviceCache:
             group.slab_ids * self.slab_units + group.slotnums * layer_count + layer
         ).to(torch.int32)
 
-    def rows(
+    def page_locations(
         self, group_index: int, layer: int, layer_count: int, positions: torch.Tensor
-    ) -> torch.Tensor:
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Resolve logical token positions to physical pages and in-page offsets."""
         slabs, slots, offsets = self.locations(
             group_index, positions, block_tokens=self.page_tokens
         )
         pages = slabs * self.slab_units + slots * layer_count + layer
-        return (pages * self.page_tokens + offsets).long()
+        return pages.long(), offsets.long()
+
+    def rows(
+        self, group_index: int, layer: int, layer_count: int, positions: torch.Tensor
+    ) -> torch.Tensor:
+        pages, offsets = self.page_locations(group_index, layer, layer_count, positions)
+        return pages * self.page_tokens + offsets
 
 
 def stage_page_groups(

@@ -11,7 +11,6 @@ import pytest
 import torch
 from torch.nn import functional as F
 
-from resin.backend.cuda.paged_kv import SlabPagedKvCache
 from resin.backend.cuda.slab import DevicePageGroup
 from resin.models.qwen3_5.config import Qwen35Config
 from resin_models_cuda.qwen3_5 import model as qwen
@@ -20,6 +19,7 @@ from resin_models_cuda.qwen3_5.attention import (
     GraphPagedAttentionRuntime,
     PreparedPagedAttention,
 )
+from resin_models_cuda.qwen3_5.cache import DeviceCache
 
 pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 
@@ -215,7 +215,7 @@ def _paged_attention():
     # disjoint, nonmonotonic page lists, including partial final pages.
     keys = torch.randn(18, 16, 2, 64, device="cuda", dtype=torch.bfloat16)
     values = torch.randn_like(keys)
-    cache = cast(SlabPagedKvCache, SimpleNamespace(keys=keys, values=values))
+    cache = cast(DeviceCache, SimpleNamespace(keys=keys, values=values))
     base = torch.tensor([9, 3, 15], device="cuda", dtype=torch.int32)
     physical = base.clone()
     indptr = torch.tensor([0, 2, 3], device="cuda", dtype=torch.int32)
@@ -370,7 +370,7 @@ def test_graph_attention_refreshes_exact_csr_across_reserved_pages(tokens, rows)
     keys[:slab_units].zero_()
     values[:slab_units].zero_()
     cache = cast(
-        SlabPagedKvCache,
+        DeviceCache,
         SimpleNamespace(
             keys=keys,
             values=values,

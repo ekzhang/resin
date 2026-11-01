@@ -16,9 +16,7 @@ from resin import (
 )
 from resin.backend.cache_storage import byte_regions, live_rows
 from resin.backend.cuda.slab import (
-    DevicePageGroup as DeviceGroup,
-)
-from resin.backend.cuda.slab import (
+    DevicePageGroup,
     GraphPageTableArena,
     SlabDeviceCache,
     stage_page_groups,
@@ -111,7 +109,7 @@ class DeviceCache(SlabDeviceCache):
     """Graph-stable cache tables over one slab arena."""
 
     geometry: CacheGeometry
-    groups: tuple[DeviceGroup, DeviceGroup, DeviceGroup, DeviceGroup]
+    groups: tuple[DevicePageGroup, DevicePageGroup, DevicePageGroup, DevicePageGroup]
     keys: Tensor
     values: Tensor
     states: Tensor
@@ -220,7 +218,9 @@ class CacheArena(GraphPageTableArena):
         return DeviceCache(
             self.geometry,
             cast(
-                tuple[DeviceGroup, DeviceGroup, DeviceGroup, DeviceGroup],
+                tuple[
+                    DevicePageGroup, DevicePageGroup, DevicePageGroup, DevicePageGroup
+                ],
                 stage_page_groups(plan, staging),
             ),
             self.keys,
@@ -242,7 +242,6 @@ __all__ = [
     "CacheArena",
     "CacheGeometry",
     "DeviceCache",
-    "DeviceGroup",
     "DRAFT_GROUP",
     "GLOBAL_GROUP",
     "GROUP_COUNT",

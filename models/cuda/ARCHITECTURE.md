@@ -16,8 +16,8 @@ table addressing. Concrete CUDA, cuTile, TileLang, FlashInfer, and model-
 specific fused kernels remain directly importable from
 `resin_models_cuda.<family>`; they are never moved into `resin.backend.cuda` or
 selected through a registry. A small cross-model CUDA primitive may live as a
-root module, such as `paged_kv.py`, when it has multiple model
-owners and does not justify another package layer.
+root module when it has multiple model owners and does not justify another
+package layer.
 
 For example, `RMSNorm` lives in `resin.backend.layers` and selects Quack on
 SM90+ or FlashInfer on older CUDA devices, with compiled PyTorch math for

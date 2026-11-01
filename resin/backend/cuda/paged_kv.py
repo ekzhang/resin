@@ -1,10 +1,10 @@
-"""Physical paged-KV storage and common device metadata views."""
+"""Per-layer K/V storage and dense paged-attention device metadata."""
 
 from __future__ import annotations
 
-from collections.abc import Iterable, Mapping
+from collections.abc import Mapping
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, Protocol, cast
+from typing import TYPE_CHECKING, Any, cast
 
 import numpy as np
 import numpy.typing as npt
@@ -19,77 +19,8 @@ if TYPE_CHECKING:
     from resin.backend.paged_attention import PagedAttentionBatch, PagedAttentionGroup
 
 
-class SlabPageGroup(Protocol):
-    """The page-table fields shared by slab-packed model caches."""
-
-    @property
-    def slab_ids(self) -> torch.Tensor: ...
-
-    @property
-    def slotnums(self) -> torch.Tensor: ...
-
-    @property
-    def first_blocks(self) -> torch.Tensor: ...
-
-
-class SlabPagedKvCache(Protocol):
-    """Narrow cache interface consumed by importable attention kernels."""
-
-    @property
-    def page_tokens(self) -> int: ...
-
-    @property
-    def slab_units(self) -> int: ...
-
-    @property
-    def groups(self) -> tuple[SlabPageGroup, ...]: ...
-
-    @property
-    def keys(self) -> torch.Tensor: ...
-
-    @property
-    def values(self) -> torch.Tensor: ...
-
-    def rows(
-        self, group_index: int, layer: int, layer_count: int, positions: torch.Tensor
-    ) -> torch.Tensor: ...
-
-    def pages(self, group_index: int, layer: int, layer_count: int) -> torch.Tensor: ...
-
-
-class PagedCacheMapping(Protocol):
-    """Physical address mapping accepted by fused cache-aware kernels."""
-
-    @property
-    def parent_ids(self) -> torch.Tensor: ...
-
-    @property
-    def child_slots(self) -> torch.Tensor: ...
-
-    @property
-    def first_blocks(self) -> torch.Tensor: ...
-
-    @property
-    def block_tokens(self) -> int: ...
-
-    @property
-    def divisor(self) -> int: ...
-
-    @property
-    def parent_rows(self) -> int: ...
-
-    @property
-    def packing(self) -> int: ...
-
-    @property
-    def row_scale(self) -> int: ...
-
-    @property
-    def layer_offset(self) -> int: ...
-
-
 class PagedKvArena:
-    """One zero-initialized K/V allocation backed by a native cache pool."""
+    """Per-layer K/V storage with one block per slab (slot zero only)."""
 
     def __init__(
         self,
@@ -112,10 +43,6 @@ class PagedKvArena:
         self.keys = self.storage[0]
         self.values = self.storage[1]
         self._cache_storage_views: dict[int, dict[str, torch.Tensor]] = {}
-
-    def check_pages(self, page_ids: Iterable[int | np.integer]) -> None:
-        if any(page < 0 or page > self.capacity for page in page_ids):
-            raise ValueError("BatchPlan cache block ID is outside the physical slab")
 
     def cache_storage_buffers(self, groups, *, prefix_length):
         buffers = []
@@ -160,22 +87,10 @@ class PagedKvTable:
 
 
 @dataclass(frozen=True, slots=True)
-class PagedKvCsr:
-    """CSR page metadata shared by paged append and decode kernels."""
-
-    indptr: torch.Tensor
-    page_ids: torch.Tensor
-    last_page_lengths: torch.Tensor
-    append_batch_indices: torch.Tensor
-    append_positions: torch.Tensor
-
-
-@dataclass(frozen=True, slots=True)
 class DevicePagedAttentionBatch:
-    """CUDA tensors for one backend-neutral named paged-attention batch."""
+    """Dense named attention tables and token metadata staged for CUDA."""
 
     phase: BatchPhase
-    round_index: int
     token_indices: torch.Tensor
     sequence_indices: torch.Tensor
     last_token_indices: torch.Tensor
@@ -229,7 +144,6 @@ def stage_paged_attention_batch(
         )
     return DevicePagedAttentionBatch(
         phase=batch.phase,
-        round_index=0,
         token_indices=device("token_indices", batch.token_indices, torch.long),
         sequence_indices=device("sequence_indices", batch.sequence_indices, torch.long),
         last_token_indices=device(
@@ -291,7 +205,6 @@ def empty_decode_paged_attention_batch(
 
     return DevicePagedAttentionBatch(
         phase=BatchPhase.DECODE,
-        round_index=0,
         token_indices=empty(torch.long, batch_size),
         sequence_indices=empty(torch.long, batch_size),
         last_token_indices=torch.arange(batch_size, dtype=torch.long, device=device),
@@ -355,11 +268,7 @@ def paged_attention_host_inputs(
 __all__ = [
     "DevicePagedAttentionBatch",
     "PagedKvArena",
-    "PagedCacheMapping",
-    "PagedKvCsr",
     "PagedKvTable",
-    "SlabPageGroup",
-    "SlabPagedKvCache",
     "empty_decode_paged_attention_batch",
     "pad_paged_attention_table",
     "paged_attention_graph_inputs",

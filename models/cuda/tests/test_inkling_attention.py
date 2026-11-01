@@ -164,7 +164,13 @@ def test_global_attention_reuses_or_skips_the_target_log_scale(monkeypatch, maxi
     positions = torch.tensor([[maximum - 3, maximum - 2, maximum - 1], [10, 11, 12]])
     state = torch.zeros(2, 3, 8, dtype=torch.bfloat16)
     metadata = PagedAttentionBatch({}, {}, {}, torch.arange(3))
-    monkeypatch.setattr(model, "append_kv", lambda *_args, **_kwargs: None)
+    cache = _cache()
+    cache.keys = torch.empty(1, positions.numel(), 2, 4, dtype=hidden.dtype)
+    cache.values = torch.empty_like(cache.keys)
+    cache.page_locations = lambda *, positions, **_kwargs: (
+        torch.zeros_like(positions),
+        torch.arange(positions.numel()).reshape_as(positions),
+    )
     monkeypatch.setattr(model, "paged_attention", lambda queries, **_kwargs: queries)
 
     def invoke(batch, maximum_length=maximum):
@@ -173,7 +179,7 @@ def test_global_attention_reuses_or_skips_the_target_log_scale(monkeypatch, maxi
             positions,
             positions[:, -1] + 1,
             maximum_length,
-            _cache(),
+            cache,
             batch,
             state,
             state,

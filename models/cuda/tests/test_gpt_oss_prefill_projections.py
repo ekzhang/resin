@@ -66,7 +66,6 @@ def _batch(slots, lengths):
     )
     return DevicePagedAttentionBatch(
         phase=BatchPhase.PREFILL,
-        round_index=0,
         token_indices=torch.arange(len(slots)),
         sequence_indices=torch.tensor([0]),
         last_token_indices=torch.tensor([len(slots) - 1]),

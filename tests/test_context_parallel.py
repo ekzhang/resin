@@ -65,7 +65,6 @@ def _batch(lengths, prefixes):
     )
     return DevicePagedAttentionBatch(
         BatchPhase.PREFILL,
-        0,
         torch.arange(sum(lengths)),
         torch.arange(len(lengths)),
         torch.tensor([end - 1 for end in offsets[1:]]),

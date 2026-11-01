@@ -12,9 +12,7 @@ from torch import Tensor
 from resin import CacheGroupFamily, CacheGroupLayout, CacheLayout
 from resin.backend.cache_storage import byte_regions
 from resin.backend.cuda.slab import (
-    DevicePageGroup as DeviceGroup,
-)
-from resin.backend.cuda.slab import (
+    DevicePageGroup,
     GraphPageTableArena,
     SlabDeviceCache,
     stage_page_groups,
@@ -190,7 +188,7 @@ class DeviceCache(SlabDeviceCache):
     """Tensorized cache tables and typed views over the shared byte arena."""
 
     geometry: CacheGeometry
-    groups: tuple[DeviceGroup, ...]
+    groups: tuple[DevicePageGroup, ...]
     keys: Tensor
     values: Tensor
     recurrent_states: Tensor
@@ -467,7 +465,6 @@ __all__ = [
     "CacheArena",
     "CacheGeometry",
     "DeviceCache",
-    "DeviceGroup",
     "MTP_GROUP",
     "PAGE_TOKENS",
     "PREFILL_CHUNK_SIZE",

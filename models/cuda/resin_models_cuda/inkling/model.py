@@ -13,7 +13,6 @@ from resin.backend.layers import RMSNorm
 from resin.models.inkling.config import InklingConfig
 from resin_models_cuda.inkling.attention import (
     PagedAttentionBatch,
-    append_kv,
     log_scaling_tau,
     paged_attention,
     prepare_paged_attention_batch,
@@ -467,15 +466,14 @@ class InklingAttention(nn.Module):
             v, v_state = self.v_sconv(v_input, v_state)
             k = self.k_norm(k.view(batch, tokens, self.kv_heads, self.head_dim))
             v = v.view(batch, tokens, self.kv_heads, self.head_dim)
-            append_kv(
-                cache,
+            pages, offsets = cache.page_locations(
                 group_index=self.group,
                 layer=self.cache_layer,
                 layer_count=self.cache_layers,
                 positions=positions,
-                keys=k,
-                values=v,
             )
+            cache.keys[pages, offsets] = k.to(cache.keys.dtype)
+            cache.values[pages, offsets] = v.to(cache.values.dtype)
         else:
             from resin_models_cuda.inkling.cutile import kv_sconv_norm_store
 

@@ -8,10 +8,7 @@ from typing import Any
 import torch
 from torch import Tensor
 
-from resin.backend.cuda.paged_kv import SlabPagedKvCache
-from resin_models_cuda.paged_kv import append_slab_kv
-
-append_kv = append_slab_kv
+from resin_models_cuda.qwen3_5.cache import DeviceCache
 
 
 def _mtp_jit_args(head_dim: int, kv_dtype: torch.dtype) -> list[Any]:
@@ -90,7 +87,7 @@ class PreparedPagedAttention:
     """One FlashInfer plan shared by every physical layer in a cache group."""
 
     wrapper: Any
-    cache: SlabPagedKvCache
+    cache: DeviceCache
     base_pages: Tensor
     physical_pages: Tensor
     layer_count: int
@@ -140,7 +137,7 @@ class PagedAttentionRuntime:
 
     def prepare(
         self,
-        cache: SlabPagedKvCache,
+        cache: DeviceCache,
         *,
         group_index: int,
         layer_count: int,
@@ -163,11 +160,9 @@ class PagedAttentionRuntime:
         if bool(torch.any(required_pages > width)):
             raise ValueError("Qwen3.5 paged attention exceeds its cache lease")
 
-        pages_per_slab = cache.slab_units // layer_count
-        page_table = group.slab_ids * pages_per_slab + group.slotnums
+        page_table = cache.pages(group_index, 0, layer_count)
         columns = torch.arange(width, device=self.device)[None]
-        logical_pages = page_table[columns < required_pages[:, None]].to(torch.int32)
-        base_pages = logical_pages * layer_count
+        base_pages = page_table[columns < required_pages[:, None]]
         physical_pages = base_pages.clone()
         kv_indptr = torch.zeros(
             len(used_lengths) + 1, dtype=torch.int32, device=self.device
@@ -259,7 +254,7 @@ class GraphPagedAttentionRuntime:
     def __init__(
         self,
         device: torch.device,
-        cache: SlabPagedKvCache,
+        cache: DeviceCache,
         specs: tuple[GraphAttentionSpec, ...],
         *,
         num_attention_heads: int,
@@ -424,7 +419,7 @@ class GraphPagedAttentionRuntime:
 
     def prepare(
         self,
-        cache: SlabPagedKvCache,
+        cache: DeviceCache,
         *,
         group_index: int,
         layer_count: int,
@@ -493,5 +488,4 @@ __all__ = [
     "GraphPagedAttentionRuntime",
     "PagedAttentionRuntime",
     "PreparedPagedAttention",
-    "append_kv",
 ]

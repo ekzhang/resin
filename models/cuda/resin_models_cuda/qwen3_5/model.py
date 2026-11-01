@@ -15,7 +15,6 @@ from resin_models_cuda.nvfp4 import Nvfp4LinearWeights
 from resin_models_cuda.qwen3_5.attention import (
     PagedAttentionRuntime,
     PreparedPagedAttention,
-    append_kv,
 )
 from resin_models_cuda.qwen3_5.cache import (
     MTP_GROUP,
@@ -377,15 +376,14 @@ class Qwen35Attention(nn.Module):
         query, key = _apply_rotary(query, key, cos, sin)
 
         if cache is not None:
-            append_kv(
-                cache,
+            pages, offsets = cache.page_locations(
                 group_index=self.cache_group,
                 layer=self.cache_layer,
                 layer_count=self.cache_layer_count,
                 positions=positions + int(self.cache_group == MTP_GROUP),
-                keys=key,
-                values=value,
             )
+            cache.keys[pages, offsets] = key.to(cache.keys.dtype)
+            cache.values[pages, offsets] = value.to(cache.values.dtype)
             if attention is None:
                 raise RuntimeError("cached Qwen3.5 attention was not prepared")
             output = attention.run(query, self.cache_layer)

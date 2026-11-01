@@ -10,8 +10,7 @@ from typing import Any
 import torch
 from torch import Tensor
 
-from resin.backend.cuda.paged_kv import SlabPagedKvCache
-from resin_models_cuda.paged_kv import append_slab_kv
+from resin_models_cuda.inkling.cache import DeviceCache
 
 
 @dataclass(frozen=True, slots=True)
@@ -26,7 +25,7 @@ class PagedAttentionBatch:
 
 
 def prepare_paged_attention_batch(
-    cache: SlabPagedKvCache,
+    cache: DeviceCache,
     sequence_lengths: Tensor,
     max_sequence_length: int,
     *,
@@ -50,7 +49,7 @@ def prepare_paged_attention_batch(
     max_lengths = {}
     for index, layer_count in layer_counts.items():
         group = cache.groups[index]
-        base_pages = group.slab_ids * cache.slab_units + group.slotnums * layer_count
+        base_pages = cache.pages(index, 0, layer_count)
         layer_offsets = torch.arange(
             layer_count,
             dtype=base_pages.dtype,
@@ -118,13 +117,10 @@ def log_scaling_tau(positions: Tensor, *, n_floor: int, alpha: float) -> Tensor:
     return 1.0 + alpha * torch.log(torch.clamp(effective / float(n_floor), min=1.0))
 
 
-append_kv = append_slab_kv
-
-
 def paged_attention(
     queries: Tensor,
     *,
-    cache: SlabPagedKvCache,
+    cache: DeviceCache,
     group_index: int,
     layer: int,
     layer_count: int,
@@ -195,7 +191,6 @@ def paged_attention(
 
 __all__ = [
     "PagedAttentionBatch",
-    "append_kv",
     "log_scaling_tau",
     "paged_attention",
     "prepare_paged_attention_batch",

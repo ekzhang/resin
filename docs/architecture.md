@@ -121,11 +121,10 @@ both physical `window_tokens` and logical `read_window_tokens`. A step may write
 read the preceding window. The Engine caps prefill and checks speculative
 lookahead against this bound. See [unified paged cache](cache-pool.md).
 
-CUDA runners normally determine slab capacity after loading weights and
-capturing graphs: they reserve the configured model/static memory fraction,
-measure remaining VRAM, divide by bytes per slab, and construct the final
-layout. This mirrors TokenSpeed's geometry-first sizing rather than guessing
-separate cache ratios.
+CUDA runners normally determine slab capacity after loading weights and before
+cache allocation and graph capture. They reserve the configured model/static
+memory fraction and workspace budget, measure remaining VRAM, divide by bytes
+per slab, and construct the final layout.
 
 ## Prefix reuse
 

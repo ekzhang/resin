@@ -8,8 +8,48 @@ import pytest
 import torch
 
 from resin import CacheGroupLayout, CacheLayout
-from resin.backend.cuda.slab import GraphPageTableArena
+from resin.backend.cuda.slab import (
+    DevicePageGroup,
+    GraphPageTableArena,
+    SlabDeviceCache,
+)
 from resin.backend.plans import PagedCachePlan
+
+
+@pytest.mark.parametrize("page_size", [64, 128])
+def test_packed_layer_page_locations_follow_retained_and_null_pages(page_size):
+    class Cache(SlabDeviceCache):
+        page_tokens = page_size
+
+    cache = Cache(
+        geometry=SimpleNamespace(slab_units=12),
+        groups=(
+            DevicePageGroup(
+                slab_ids=torch.tensor([[5, 2, 9], [7, 4, 0]], dtype=torch.int32),
+                slotnums=torch.tensor([[1, 0, 2], [0, 1, 0]], dtype=torch.int32),
+                first_blocks=torch.tensor([4, 0], dtype=torch.int32),
+            ),
+        ),
+    )
+    positions = torch.tensor(
+        [
+            [5 * page_size - 1, 5 * page_size, 6 * page_size + 3, 7 * page_size, -1],
+            [0, page_size - 1, page_size, page_size + 4, 3 * page_size],
+        ]
+    )
+
+    pages, offsets = cache.page_locations(0, 2, 3, positions)
+
+    # Three layers per child slot; invalid positions target layer 2 of slab 0.
+    expected_pages = torch.tensor([[65, 26, 116, 2, 2], [86, 86, 53, 53, 2]])
+    expected_offsets = torch.tensor(
+        [[page_size - 1, 0, 3, 0, 0], [0, page_size - 1, 0, 4, 0]]
+    )
+    torch.testing.assert_close(pages, expected_pages)
+    torch.testing.assert_close(offsets, expected_offsets)
+    torch.testing.assert_close(
+        cache.rows(0, 2, 3, positions), expected_pages * page_size + expected_offsets
+    )
 
 
 @pytest.mark.parametrize("private_scratch", [False, True])

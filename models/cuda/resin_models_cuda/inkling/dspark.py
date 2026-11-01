@@ -19,7 +19,6 @@ from resin.models.inkling.config import (
 )
 from resin_models_cuda.inkling.attention import (
     PagedAttentionBatch,
-    append_kv,
     paged_attention,
     prepare_paged_attention_batch,
 )
@@ -117,15 +116,14 @@ class DSparkAttention(nn.Module):
 
     def inject(self, hidden: Tensor, positions: Tensor, cache: DeviceCache) -> None:
         keys, values = self.project_kv(hidden, positions)
-        append_kv(
-            cache,
+        pages, offsets = cache.page_locations(
             group_index=DRAFT_GROUP,
             layer=self.layer_id,
             layer_count=DRAFT_LAYERS,
             positions=positions,
-            keys=keys,
-            values=values,
         )
+        cache.keys[pages, offsets] = keys.to(cache.keys.dtype)
+        cache.values[pages, offsets] = values.to(cache.values.dtype)
 
     def forward(
         self,
@@ -140,15 +138,14 @@ class DSparkAttention(nn.Module):
         queries = self.q_proj(hidden).view(batch, tokens, self.heads, self.head_dim)
         queries = apply_neox_rope(self.q_norm(queries), positions, self.cos, self.sin)
         keys, values = self.project_kv(hidden, positions)
-        append_kv(
-            cache,
+        pages, offsets = cache.page_locations(
             group_index=DRAFT_GROUP,
             layer=self.layer_id,
             layer_count=DRAFT_LAYERS,
             positions=positions,
-            keys=keys,
-            values=values,
         )
+        cache.keys[pages, offsets] = keys.to(cache.keys.dtype)
+        cache.values[pages, offsets] = values.to(cache.values.dtype)
         output = paged_attention(
             queries,
             cache=cache,
