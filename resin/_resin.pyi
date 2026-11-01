@@ -501,6 +501,7 @@ class Engine:
         *,
         max_running_requests: int = 32,
         context_length: int = 32768,
+        max_top_logprobs: int = 32,
         scheduler_config: SchedulerConfig | None = None,
         prefix_cache: bool = False,
         prefix_cache_storage: "CacheStorage | None" = None,
@@ -547,6 +548,11 @@ class Engine:
     def has_work(self, /) -> bool: ...
     @property
     def max_running_requests(self, /) -> int: ...
+    @property
+    def max_top_logprobs(self, /) -> int:
+        """
+        Maximum top alternatives per generated or prompt token.
+        """
     @property
     def metrics_enabled(self, /) -> bool: ...
     def metrics_snapshot(self, /) -> EngineMetrics | None:

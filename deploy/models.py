@@ -246,6 +246,8 @@ MODEL_SPECS.update(
             ),
             model_mount="/models/resin-gemma4",
             model_volume="resin-gemma4-models-v1",
+            kernel_mount="/cache/resin-gemma4",
+            kernel_volume="resin-gemma4-kernels-v1",
             gpu="RTX-PRO-6000",
             label="gemma4-31b",
             app_name="resin-gemma4-nvfp4",
@@ -457,6 +459,8 @@ def require_checkpoint(
 
 def image_environment(model: str | ModelSpec) -> dict[str, str]:
     spec = get_model(model)
+    if spec.backend != "cuda":
+        return {}
     if spec.family == "gpt_oss":
         from deploy.jit_cache import KERNEL_CACHE_ENV
 
@@ -465,17 +469,32 @@ def image_environment(model: str | ModelSpec) -> dict[str, str]:
             "MAX_JOBS": "12",
             "CMAKE_BUILD_PARALLEL_LEVEL": "12",
         }
+    root = spec.kernel_mount
+    cache_env = (
+        {
+            "CUTE_DSL_CACHE_DIR": f"{root}/cute-dsl",
+            "QUACK_CACHE_ENABLED": "1",
+            "QUACK_CACHE_DIR": f"{root}/quack",
+        }
+        if root is not None
+        else {}
+    )
     if spec.family == "gemma4":
         if spec.name == "gemma4-e2b":
             return {
+                **cache_env,
                 "TORCH_CUDA_ARCH_LIST": "8.0",
                 "FLASHINFER_CUDA_ARCH_LIST": "8.0",
                 "TRITON_CACHE_DIR": f"{spec.kernel_mount}/triton",
                 "FLASHINFER_WORKSPACE_BASE": f"{spec.kernel_mount}/flashinfer",
             }
-        return {"TORCH_CUDA_ARCH_LIST": "12.0", "FLASHINFER_CUDA_ARCH_LIST": "12.0"}
-    root = spec.kernel_mount
+        return {
+            **cache_env,
+            "TORCH_CUDA_ARCH_LIST": "12.0",
+            "FLASHINFER_CUDA_ARCH_LIST": "12.0",
+        }
     env = {
+        **cache_env,
         "PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True",
         "TRITON_CACHE_DIR": f"{root}/triton",
         "CUDA_TILE_CACHE_DIR": f"{root}/cutile-python",
@@ -496,12 +515,10 @@ def image_environment(model: str | ModelSpec) -> dict[str, str]:
             "FLASH_ATTENTION_CUTE_DSL_CACHE_ENABLED": "1",
             "FLASH_ATTENTION_CUTE_DSL_CACHE_DIR": f"{root}/flash-attention-4",
             "FLASH_ATTENTION_ARCH": "sm_" + arch.replace(".", ""),
-            "CUTE_DSL_CACHE_DIR": f"{root}/cute-dsl",
-            "QUACK_CACHE_DIR": f"{root}/quack",
         }
     )
     if spec.family == "inkling":
-        env.update(CUTE_DSL_ARCH="sm_103a", QUACK_CACHE_ENABLED="1")
+        env.update(CUTE_DSL_ARCH="sm_103a")
     else:
         env.update(
             CUDA_CACHE_PATH=f"{root}/cuda",

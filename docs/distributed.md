@@ -87,8 +87,10 @@ coordinates, and reductions. The [two-B300 checkpoint run](https://modal.com/app
 exercised Gemma 4 31B NVFP4 and Qwen3.8 27B NVFP4, with attention TP1/TP2,
 FFN TP2, and speculative lengths zero/two. It covers two-request decode,
 chunked prefill, assistant/MTP verification, generation and prompt scores,
-cancellation, and cache reuse. Generation logprobs currently select eager
-decode in these two runners; separate unscored requests exercise captured decode.
+cancellation, and cache reuse. That historical run used eager decode for
+generation logprobs and captured decode for separate unscored requests. Both
+runners now retain captured decode when scores are requested; scoring uses a
+separate captured tail over the model's raw logits.
 
 The [eager/graph controls](https://modal.com/apps/ekzhang/main/ap-MScJzgLu2mX3n4eTB1KyLT)
 produce bit-exact tokens and scores at each fixed topology, including the

@@ -49,7 +49,6 @@ from resin.backend.cuda.runner import (
 )
 from resin.backend.cuda.staging import TensorStager
 from resin.backend.cuda.tensor_graphs import CudaGraphTensorRegion, TensorSpec
-from resin.backend.sampling import format_output, prompt_scores
 from resin.backend.topology import ParallelGroups, ParallelismCapabilities
 from resin.backend.torch import benchmark_expert_indices
 from resin.models.gpt_oss.config import GptOssConfig
@@ -78,6 +77,7 @@ from resin_models_cuda.gpt_oss.paged_kv import (
     paged_attention_host_inputs,
     stage_paged_attention_batch,
 )
+from resin_models_cuda.scoring import format_output, prompt_scores
 
 if TYPE_CHECKING:
     from resin import BatchPlan, ForwardOutput
@@ -270,7 +270,6 @@ class GptOssCudaRunner(CudaRunner):
         )
         self._configure_parallel_graphs(self._model, parallel_groups)
         self._graph_logits = {}
-        self._last_graph_logits = None
         args = self._model.args
         checkpoint_args = GptOssConfig.from_dict(self.config)
         expected_attention = (
@@ -830,8 +829,6 @@ class GptOssCudaRunner(CudaRunner):
         positions = empty(torch.long, batch_size)
         final_hidden = empty(torch.bfloat16, batch_size, self.hidden_size)
         output_ids = empty(torch.long, batch_size)
-        logits_buffer = empty(torch.float32, batch_size, self.vocab_size)
-        self._graph_logits[shape] = logits_buffer
         valid_rows = (
             torch.empty((), dtype=torch.int32, device=self.device)
             if self.parallel_groups is not None
@@ -848,7 +845,7 @@ class GptOssCudaRunner(CudaRunner):
                 hidden = self._forward_batch(token_ids, positions, batch)
                 final_hidden.index_copy_(0, batch.sequence_indices, hidden)
                 logits = self._model.lm_head(final_hidden)
-                logits_buffer.copy_(logits)
+                self._graph_logits[shape] = logits
                 if sampling is None:
                     self._sampler(logits, out=output_ids)
                 else:
@@ -939,9 +936,12 @@ class GptOssCudaRunner(CudaRunner):
             inputs.update(
                 pad_sampling_inputs(self._sampler, plan, self.vocab_size, padding)
             )
-        output = self._run_cuda_graph("decode", shape, inputs)[:rows]
-        self._last_graph_logits = self._graph_logits[shape][:rows]
-        return format_output(self._last_graph_logits, output, plan)
+        output = self._run_cuda_graph("decode", shape, inputs)
+        return format_output(
+            self._graph_logits[shape],
+            output if plan.needs_logprobs else output[:rows],
+            plan,
+        )
 
     @observe_execution
     def forward(self, plan: BatchPlan) -> ForwardOutput:
@@ -1094,7 +1094,6 @@ class GptOssCudaRunner(CudaRunner):
         prepared = (
             self.validate_distributed(plan, context) if prepared is None else prepared
         )
-        self._last_graph_logits = None
         with self._cuda_failure:
             if context.phase == BatchPhase.DECODE:
                 host = prepared[1]

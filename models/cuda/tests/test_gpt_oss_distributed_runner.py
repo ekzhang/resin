@@ -573,6 +573,9 @@ def _decode_host(runner, plan):
 
 
 def test_decode_graph_retains_logits_and_stages_active_row_count(monkeypatch):
+    from resin.backend.sampling import format_output as reference_output
+    from resin_models_cuda.gpt_oss import cuda as runtime
+
     groups = _groups(Parallelism(world_size=2, ep=2, attn_dp=2))
     runner = _runner(monkeypatch, groups)
     runner.vocab_size = 3
@@ -580,12 +583,13 @@ def test_decode_graph_retains_logits_and_stages_active_row_count(monkeypatch):
     runner._cuda_graph_mode_enabled = lambda mode: True
     shape = (4, 2)
     logits = torch.tensor([[1.0, 3.0, 0.0], [2.0, 1.0, 4.0], [0.0] * 3, [0.0] * 3])
+    tokens = torch.tensor([1, 2, 0, 0])
     runner._graph_logits = {shape: logits}
     replayed = []
 
     def replay(mode, shape_arg, inputs):
         replayed.append((mode, shape_arg, inputs))
-        return torch.tensor([1, 2, 0, 0])
+        return tokens
 
     runner._run_cuda_graph = replay
     plan = BatchPlan(
@@ -597,9 +601,15 @@ def test_decode_graph_retains_logits_and_stages_active_row_count(monkeypatch):
         sampling_params=[SamplingParams(logprobs=True, seed=1)] * 2,
     )
 
-    output = GptOssCudaRunner._graph_forward(
-        runner, plan, _decode_host(runner, plan), shape=shape
-    )
+    def score(raw, selected, native):
+        assert raw is logits and selected is tokens and native is plan
+        return reference_output(raw[:2], selected[:2], native)
+
+    monkeypatch.setattr(runtime, "format_output", score)
+    with torch.inference_mode():
+        output = GptOssCudaRunner._graph_forward(
+            runner, plan, _decode_host(runner, plan), shape=shape
+        )
 
     assert isinstance(output, ForwardOutput)
     assert output.logprobs is not None
@@ -609,7 +619,7 @@ def test_decode_graph_retains_logits_and_stages_active_row_count(monkeypatch):
     assert len(replayed) == 1
     assert replayed[0][2]["ep_valid_rows"] == 2
     assert replayed[0][2]["full_page_table"].tolist() == [1, 1, 1, 1, 0, 0, 0, 0]
-    torch.testing.assert_close(runner._last_graph_logits, logits[:2])
+    assert runner._graph_logits[shape] is logits
 
 
 def test_decode_capture_wraps_experts_and_replica_sampling_broadcast(monkeypatch):

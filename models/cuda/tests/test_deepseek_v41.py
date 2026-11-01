@@ -445,7 +445,6 @@ def test_runner_owns_its_graph_and_distributed_lifecycle():
         "forward_distributed",
         "_new_decode_graph_step",
         "_new_dspark_graph_step",
-        "_accept_speculative",
         "_graph_forward",
     ):
         assert name in DeepSeekV41CudaRunner.__dict__

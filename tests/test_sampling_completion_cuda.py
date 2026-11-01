@@ -9,6 +9,7 @@ import torch
 from resin import BatchPlan, SamplingParams
 from resin.backend.cuda.completion import DeviceAcceptance, DeviceCompletion
 from resin.backend.cuda.sampling import FusedSampler, SamplingTensors
+from resin_models_cuda.scoring import score_completion
 
 pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available(), reason="requires a CUDA GPU"
@@ -106,11 +107,13 @@ def test_sampled_completion_keeps_raw_logprobs_across_changed_replay(vocab, dtyp
         ],
         sampling_mask=[True, True, True, False],
     )
+    # Capture the independent score tail before enabling hot-path sync checks.
+    score_completion(logits, accepted, plan)
     debug_mode = torch.cuda.get_sync_debug_mode()
     try:
         torch.cuda.set_sync_debug_mode("error")
         pending = DeviceCompletion.from_acceptance(
-            accepted, rows=4, plan=plan, logits=logits
+            accepted, rows=4, plan=plan, scores=score_completion(logits, accepted, plan)
         )
         # Queue a different generation before harvesting any score buffers.
         logits.mul_(-0.7)

@@ -80,7 +80,7 @@ def test_http_generation_limits_use_remaining_context_or_explicit_override(
                     next(
                         item["response"]
                         for item in events(response)
-                        if item["type"] == "response.completed"
+                        if item["type"] == "response.incomplete"
                     )
                     if stream
                     else json.load(response)
@@ -93,6 +93,8 @@ def test_http_generation_limits_use_remaining_context_or_explicit_override(
                 )
                 assert value["usage"]["input_tokens"] == prompt_tokens
                 assert value["usage"]["output_tokens"] == expected_tokens
+                assert value["status"] == "incomplete"
+                assert value["incomplete_details"] == {"reason": "max_output_tokens"}
         assert text == "ok" * expected_tokens
         assert sum(runner.counts.values()) == expected_tokens
         assert not engine.has_work()

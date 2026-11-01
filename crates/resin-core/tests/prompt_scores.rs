@@ -80,6 +80,41 @@ impl Runner<()> for Model {
 }
 
 #[test]
+fn configured_prompt_top_limit_is_checked_before_admission() {
+    for limit in [0, 2, 1001] {
+        let mut engine = engine(4);
+        assert_eq!(engine.max_top_logprobs(), 32);
+        engine.set_max_top_logprobs(limit);
+        assert_eq!(engine.max_top_logprobs(), limit);
+        let mut rejected = Submission::new(vec![1, 2], ());
+        rejected.prompt_top_logprobs = limit + 1;
+        let error = engine.submit(rejected).unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            format!("prompt_top_logprobs must be between 0 and {limit}")
+        );
+        assert_eq!(engine.next_request_id(), 1);
+        assert_eq!(engine.active_request_count(), 0);
+        assert!(!engine.has_work());
+        assert!(!engine.poisoned());
+
+        let mut allowed = Submission::new(vec![1, 2], ());
+        allowed.max_output_tokens = Some(0);
+        allowed.prompt_logprobs = true;
+        allowed.prompt_top_logprobs = limit;
+        let request = engine.submit(allowed).unwrap();
+        let mut model = Model::default();
+        assert!(engine.step(&mut model).unwrap().is_empty());
+        assert!(request.done());
+        assert_eq!(model.plans[0].prompt_score_top_counts, [limit]);
+        let scores = request.prompt_logprobs().unwrap();
+        let score = scores[1].as_ref().unwrap();
+        assert_eq!(score.logprob, -0.5);
+        assert_eq!(score.top_logprobs.len(), limit as usize);
+    }
+}
+
+#[test]
 fn unscored_plans_do_not_allocate_prompt_target_metadata() {
     let mut engine = engine(4);
     let mut input = Submission::new(vec![1, 2, 3], ());

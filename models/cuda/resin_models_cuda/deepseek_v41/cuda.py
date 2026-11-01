@@ -53,8 +53,6 @@ from resin.backend.plans import BatchView, PagedCachePlan
 from resin.backend.sampling import (
     SAMPLING_OFFSET_STRIDE,
     PromptScores,
-    format_output,
-    prompt_scores,
     token_output,
 )
 from resin.backend.speculative import SpeculativeStats
@@ -62,6 +60,7 @@ from resin.backend.topology import ParallelGroups, ParallelismCapabilities
 from resin.backend.torch import use_default_dtype
 from resin.recipe import DeepSeekV41Media
 from resin_models_cuda.deepseek_v41.checkpoint import load_config, resolve_model_path
+from resin_models_cuda.scoring import format_output, prompt_scores, score_completion
 
 if TYPE_CHECKING:
     from resin import BatchPlan, ForwardOutput
@@ -816,10 +815,6 @@ class DeepSeekV41CudaRunner(CudaRunner):
         token_ids = torch.empty((batch_size, 1), dtype=torch.long, device=self.device)
         positions = torch.empty(batch_size, dtype=torch.long, device=self.device)
         output_ids = torch.empty(batch_size, dtype=torch.long, device=self.device)
-        logits_buffer = torch.empty(
-            (batch_size, self.vocab_size), dtype=torch.float32, device=self.device
-        )
-        self._graph_logits[shape] = logits_buffer
         valid_rows = (
             torch.empty((), dtype=torch.int32, device=self.device)
             if self.parallel_groups is not None
@@ -839,7 +834,7 @@ class DeepSeekV41CudaRunner(CudaRunner):
                     graph_seq_len,
                     cache=cache,
                 )
-                logits_buffer.copy_(logits)
+                self._graph_logits[shape] = logits
                 self._sampler.sample_tensors(logits, sampling, out=output_ids)
                 if self.parallel_groups is not None:
                     self._broadcast_tokens(output_ids)
@@ -898,12 +893,6 @@ class DeepSeekV41CudaRunner(CudaRunner):
             dtype=torch.long,
             device=self.device,
         )
-        logits_buffer = torch.empty(
-            (batch_size, block_size + 1, self.vocab_size),
-            dtype=torch.float32,
-            device=self.device,
-        )
-        self._graph_logits[shape] = logits_buffer
         valid_rows = (
             torch.empty((), dtype=torch.int32, device=self.device)
             if self.parallel_groups is not None
@@ -948,7 +937,7 @@ class DeepSeekV41CudaRunner(CudaRunner):
                     verify_logits, verify_hidden = self._model.forward_verify(
                         verify_ids, positions, graph_seq_len, cache=cache
                     )
-                logits_buffer.copy_(verify_logits)
+                self._graph_logits[shape] = verify_logits
                 if phase_timing is not None:
                     phase_timing.mark(2)
                 if phase_events is not None:
@@ -1041,9 +1030,30 @@ class DeepSeekV41CudaRunner(CudaRunner):
         )
         if getattr(self, "parallel_groups", None) is not None:
             inputs["ep_valid_rows"] = batch_size
-        if enqueue:
-            return self._enqueue_graph_output(plan, shape, inputs, feedback)
-        output = self._run_cuda_graph("decode", shape, inputs)[:batch_size]
+        if not enqueue and not self.speculative_draft_tokens:
+            output = self._run_cuda_graph("decode", shape, inputs)
+            if plan.needs_logprobs:
+                return format_output(self._graph_logits[shape], output, plan)
+            return token_output(output[:batch_size])
+        if enqueue or plan.needs_logprobs:
+            completion = self._enqueue_graph_output(plan, shape, inputs, feedback)
+            if enqueue:
+                return completion
+            result = completion.result()
+        else:
+            output = (
+                self._run_cuda_graph("decode", shape, inputs)[:batch_size]
+                .cpu()
+                .tolist()
+            )
+            width = self.speculative_draft_tokens
+            accepted = self._accept_speculative(
+                [row[:width] for row in output],
+                [row[width:] for row in output],
+                torch.tensor(positions, dtype=torch.long, device=self.device),
+                graph_cache,
+            )
+            result = token_output(accepted)
         phase_events = self._dspark_phase_events.get(shape)
         if phase_events is not None:
             start, draft_end, verify_end, step_end = phase_events
@@ -1054,25 +1064,7 @@ class DeepSeekV41CudaRunner(CudaRunner):
                 "commit_and_sampling": verify_end.elapsed_time(step_end),
                 "device_total": start.elapsed_time(step_end),
             }
-        if not self.speculative_draft_tokens:
-            if plan.needs_logprobs:
-                return format_output(
-                    self._graph_logits[shape][:batch_size], output, plan
-                )
-            return token_output(output)
-        output = output.cpu().tolist()
-        block_size = self.speculative_draft_tokens
-        drafts = [row[:block_size] for row in output]
-        targets = [row[block_size:] for row in output]
-        accepted = self._accept_speculative(
-            drafts,
-            targets,
-            torch.tensor(positions, dtype=torch.long, device=self.device),
-            graph_cache,
-        )
-        if plan.needs_logprobs:
-            return format_output(self._graph_logits[shape][:batch_size], accepted, plan)
-        return token_output(accepted)
+        return result
 
     def _enqueue_graph_output(self, plan, shape, inputs, feedback):
         self._last_dspark_phase_ms = {}
@@ -1116,9 +1108,7 @@ class DeepSeekV41CudaRunner(CudaRunner):
             else None,
             device=self.device,
             plan=plan,
-            logits=self._graph_logits[shape]
-            if plan is not None and plan.needs_logprobs
-            else None,
+            scores=score_completion(self._graph_logits[shape], acceptance, plan),
         )
         maximum = self.runner_config.max_accepted_per_step
         writes = maximum + self.cache_layout.decode_write_extra_tokens
@@ -1262,7 +1252,13 @@ class DeepSeekV41CudaRunner(CudaRunner):
                     return self._model.head(hidden[None], full_logits=True)[0]
 
                 prompt_rows.append(
-                    prompt_scores(plan, row_logits[0], project, token_start=start)
+                    prompt_scores(
+                        plan,
+                        row_logits[0],
+                        project,
+                        token_start=start,
+                        cache_owner=self,
+                    )
                 )
                 row_logits = self._model.head(row_logits[:, -1:])
             logits.append(row_logits)
@@ -1298,24 +1294,13 @@ class DeepSeekV41CudaRunner(CudaRunner):
             )
         )
 
-    def _accept_speculative(
-        self,
-        draft_rows: list[list[int]],
-        target_rows: list[list[int]],
-        positions: torch.Tensor,
-        cache,
-    ) -> list[list[int]]:
+    def _accept_speculative(self, draft_rows, target_rows, positions, cache):
         acceptance = self._speculation.accept(draft_rows, target_rows)
-        processed_counts = torch.tensor(
-            acceptance.processed_counts,
-            dtype=torch.int32,
-            device=self.device,
+        processed = torch.tensor(
+            acceptance.processed_counts, dtype=torch.int32, device=self.device
         )
         self._model.clear_rejected_speculative_state(
-            positions,
-            processed_counts,
-            self.speculative_draft_tokens + 1,
-            cache=cache,
+            positions, processed, self.speculative_draft_tokens + 1, cache=cache
         )
         return acceptance.token_rows
 
@@ -1349,15 +1334,35 @@ class DeepSeekV41CudaRunner(CudaRunner):
         self._model.commit_dspark_main_block(verify_hidden, positions, cache=cache)
 
         targets = self._broadcast_tokens(self._sampler(verify_logits, plan))
-        accepted = self._accept_speculative(
-            drafts.tolist(),
-            targets.tolist(),
+        if not plan.needs_logprobs:
+            accepted_rows = self._accept_speculative(
+                drafts.tolist(), targets.tolist(), positions, cache
+            )
+            if phase_timing is not None:
+                phase_timing.mark(3)
+            return token_output(accepted_rows)
+        accepted = DeviceAcceptance.from_samples(
+            drafts,
+            targets,
             positions,
-            cache,
+            fixed_acceptance=self._speculation.validated_benchmark_accepted_drafts,
+        )
+        self._model.clear_rejected_speculative_state(
+            positions,
+            accepted.counts,
+            self.speculative_draft_tokens + 1,
+            cache=cache,
         )
         if phase_timing is not None:
             phase_timing.mark(3)
-        return format_output(verify_logits, accepted, plan)
+        return DeviceCompletion.from_acceptance(
+            accepted,
+            rows=batch_size,
+            stats=self._speculation,
+            device=self.device,
+            plan=plan,
+            scores=score_completion(verify_logits, accepted, plan),
+        ).result()
 
     @observe_execution
     def enqueue(self, plan: BatchPlan, *, feedback=None):

@@ -6,6 +6,13 @@ selected token's `logprob` and a list of `(token_id, logprob)` alternatives.
 Scores describe the raw model distribution, before temperature, top-k, or top-p
 sampling; requesting them does not change token selection.
 
+`Engine(runner, max_top_logprobs=32)` sets the maximum number of top alternatives
+per generated or prompt token. The default is 32. Direct submissions and HTTP
+requests use the same Engine limit; raise it to allow more alternatives, including
+counts above 1,000. Setting it to zero disables top alternatives while retaining
+selected-token logprobs. `SamplingParams` holds request counts; the Engine rejects
+counts above its configured limit before admission.
+
 Request input scores independently with `SamplingParams(prompt_logprobs=True)`.
 Use `prompt_top_logprobs` for top alternatives at each prompt position, or pass
 `prompt_target_logprobs` to `Engine.submit` for specific token IDs at each position:
@@ -43,29 +50,40 @@ the predecessor distributions needed to score a cached prefix. They still
 publish reusable KV prefixes for ordinary requests. Generated-token scoring,
 including speculative acceptance, keeps its existing behavior.
 
-Model runners use `resin.backend.sampling.format_output(logits, tokens, plan)`
-for ordinary and speculative output. Verification positions must align with the
-returned accepted tokens. Unrequested and continuation-prefill rows carry no
-generated-token scores. Generation scores use the retained output logits after
-execution; model runners keep their existing graph eligibility and eager fallback rules.
-`BatchPlan.needs_logprobs` checks the score flag natively, so unscored graph
-replay does not create Python sampling-policy objects merely to decide whether
-scores are needed.
+## CUDA execution
 
-Generated scores also work with the default overlap scheduler when the runner's
-completion returns the requested score columns. The shared CUDA completion
-computes selected-token scores and top alternatives before the next graph replay
-can overwrite the target logits, and queues asynchronous copies into owned host
-buffers. Collection packs only accepted positions and requested score rows.
-Speculative acceptance, stop
-tokens, and output limits use the same validation and commit rules as
-synchronous decoding.
+CUDA runners share `resin_models_cuda.scoring`; reference runners use
+`resin.backend.sampling`. Scoring keeps captured model decode enabled, including
+speculative verification and overlap scheduling. A separate captured score tail
+reads existing raw-logit storage and scores the actual accepted tokens.
+Completion snapshots scores into owned host buffers before later replays can
+overwrite them, then packs accepted positions and requested alternatives during
+harvest.
 
-Scoring adds vocabulary normalization, optional top-k selection, and score
-transfers. These costs occur only for scored batches. Only requested rows are
-scored, while fixed-size buffers cover their maximum verification width and top
-count until collection. Speculative batches may compute scores for positions
-that are later rejected.
+The [CuTe DSL kernels](../models/cuda/resin_models_cuda/_scoring_cutedsl.py) reduce
+raw logits into stable normalization statistics and gather
+selected, top, and explicit target scores. They never materialize a full FP32
+normalized vocabulary tensor. Unscored batches launch no scoring kernels; the
+selected-only and common top-alternative paths skip unrequested rows and rejected
+verification positions.
+
+Counts through 32 use fused CuTe reduction and selection. Counts from 33 through
+2,048 use FlashInfer radix selection with sparse CuTe normalization; larger
+counts use repeated CuTe selection passes. Larger requests cost more work and
+output storage. Prompt scoring captures bounded output-head projections and the
+same scorer, retaining at most 128 projected predecessor rows per graph.
+
+Compiled kernels specialize for vocabulary geometry, dtype, layout, and scoring
+features. After a path's first warmup, changing batch size or requested top count
+does not compile new kernels. Score graphs bind fixed buffers, so a new storage
+shape or capacity can require graph capture. Persistent artifacts use the
+[kernel cache](kernel-cache.md); reuse does not eliminate graph capture or model
+warmup.
+
+`deploy/modal_bench_scoring.py` runs checkpoint-free correctness, replay, compilation,
+allocation, and timing checks on A100, H200, and B200. Reports go under the ignored
+`profiles/scoring/` directory. Kernel timings measure scoring independently of
+model execution, filtered sampling, and host submission overhead.
 
 ## Array boundary
 
@@ -128,7 +146,8 @@ invalid or missing scores quarantine the entire execution before progress become
 
 ## HTTP
 
-Chat Completions accepts `logprobs: true` and `top_logprobs: 0..20`. Responses
+Chat Completions accepts `logprobs: true` and `top_logprobs` from zero through the
+Engine's `max_top_logprobs`. Responses
 accepts `include: ["message.output_text.logprobs"]` and `top_logprobs`; a positive
 alternative count also enables selected-token scores. These flags reach the
 same native `SamplingParams` and NumPy score columns used by direct Engine calls.
@@ -202,26 +221,12 @@ entries carry token IDs, text, bytes, and scores. Set `max_completion_tokens: 0`
 Chat streams send one `resin.prompt_logprobs` field; Responses streams send one
 `resin.prompt_logprobs` event with a `logprobs` array before completion.
 
-## GPU validation limits
+## Full-model validation limits
 
-On the pinned GPT-OSS-20B checkpoint, an independent raw output-head
-`log_softmax` oracle matches unchunked input scores within 1.91e-6 with
-temperature/top-k/top-p enabled. Input-only requests return no generated events,
-retain the initial `None`, and complete on one H100 or with composed EP/attention
-DP/attention TP/CP and prefill graph replay. The composed full-model run retains
-nine failed strict numerical comparisons despite matching greedy probes. These
-historical full-model results have a different scope from the current
-[same-shard sparse transport tests](../tests/test_sparse_expert_transport.py)
-and [distributed prompt-score contract tests](../models/cuda/tests/test_gpt_oss_distributed_runner.py).
-
-Cross-batch numerical parity remains unqualified: the same
-[single-H100 checkpoint](https://modal.com/apps/ekzhang/main/ap-1Roe4kUsfpXJXV9f3dMY8x)
-scores a 180-token prompt differently in one chunk versus 32-token chunks
-(maximum 5.15 nats, relative L2 0.0892). This reproduces without EP or TP.
-[Actual first-layer FA4 inputs](https://modal.com/apps/ekzhang/main/ap-FasvATBT14nPXXMCnH0stM)
-pass an explicit FP32 causal/window attention oracle including the learned sink
-for all seven shapes; the cause of the full-model sensitivity is not established.
-The durable reports in `resin-gpt-oss-profiles` are
-`prompt-scoring-isolation-20261022T032541Z.json` and
-`prompt-scoring-isolation-20261022T033120Z.json`; the latter also has matching
-`.pt` attention inputs/outputs for bounded follow-up.
+Kernel qualification does not establish model parity across prefill chunk sizes
+or distributed topologies. GPT-OSS-20B unchunked scores matched an independent
+output-head oracle within 1.91e-6, but a historical single-H100 run differed by up
+to 5.15 nats between a 180-token chunk and 32-token chunks. Composed distributed
+runs also retained nine failed strict comparisons despite matching greedy probes.
+The cause remains unresolved; see [distributed validation](distributed.md) and
+the [prompt-score contract tests](../models/cuda/tests/test_gpt_oss_distributed_runner.py).

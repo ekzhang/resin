@@ -20,6 +20,7 @@ use axum::{
     http::{HeaderMap, StatusCode},
     routing::{get, post},
 };
+use resin_core::logprobs::DEFAULT_MAX_TOP_LOGPROBS;
 use tokio::sync::{mpsc, oneshot};
 
 pub use metrics::{
@@ -37,13 +38,26 @@ pub const EVENT_QUEUE_CAPACITY: usize = 64;
 pub type TokenCounter =
     Arc<dyn Fn(ConversationRequest, oneshot::Sender<Result<usize, String>>) + Send + Sync>;
 
+/// Static configuration for HTTP route handlers.
 #[derive(Clone, Copy, Debug)]
 pub struct RouteConfig {
+    /// Enable OpenAI API endpoints (/v1/responses, /v1/chat/completions).
     pub enable_openai: bool,
+
+    /// Enable Anthropic API endpoints (/v1/messages).
     pub enable_anthropic: bool,
+
+    /// Enable the demo web UI at the root path (/).
     pub enable_demo: bool,
+
+    /// Allow passing "priority" in the request to control scheduling order.
     pub enable_priority_scheduling: bool,
+
+    /// Number of attention data-parallel replicas.
     pub routed_dp_size: usize,
+
+    /// The hosting engine's shared limit on token-score alternatives.
+    pub max_top_logprobs: u32,
 }
 
 impl Default for RouteConfig {
@@ -54,6 +68,7 @@ impl Default for RouteConfig {
             enable_demo: true,
             enable_priority_scheduling: false,
             routed_dp_size: 1,
+            max_top_logprobs: DEFAULT_MAX_TOP_LOGPROBS,
         }
     }
 }
@@ -66,6 +81,7 @@ struct AppState {
     next_id: Arc<AtomicU64>,
     routed_dp_size: usize,
     enable_priority_scheduling: bool,
+    max_top_logprobs: u32,
 }
 
 impl AppState {
@@ -111,6 +127,7 @@ pub fn router(
         next_id: Arc::new(AtomicU64::new(1)),
         routed_dp_size: routes.routed_dp_size,
         enable_priority_scheduling: routes.enable_priority_scheduling,
+        max_top_logprobs: routes.max_top_logprobs,
     };
     let mut router = Router::new().route("/health", get(openai::health));
     if let Some(metrics) = metrics {

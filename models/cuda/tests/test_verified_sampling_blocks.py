@@ -7,7 +7,8 @@ from typing import Any
 import pytest
 import torch
 
-from resin import BatchPhase, BatchPlan
+from resin import BatchPhase, BatchPlan, SamplingParams
+from resin.backend.cuda import completion as completion_runtime
 from resin.backend.cuda.sampling import FusedSampler
 from resin.backend.speculative import SpeculativeStats
 from resin_models_cuda.deepseek_v41.cuda import DeepSeekV41CudaRunner
@@ -47,19 +48,22 @@ class _BlockSampler:
         self.calls.append(tuple(logits.shape))
 
 
-def _fixture(runner_type):
+def _fixture(runner_type, *, scored=False):
     runner: Any = object.__new__(runner_type)
     runner.device = torch.device("cpu")
     runner.speculative_draft_tokens = 2
     runner.vocab_size = 10
     runner.config = SimpleNamespace(vocab_size=10, hidden_size=2, num_hidden_layers=1)
     runner._speculation = SpeculativeStats(2)
+    runner._graph_logits = {}
+    runner._graph_acceptance = {}
     runner._eager_phase_timing = lambda *_args: None
     plan = BatchPlan(
         sequence_ids=[7, 8],
         context_lengths=[14, 25],
         token_ids=[2, 3],
         token_indptr=[0, 1, 2],
+        sampling_params=[SamplingParams(logprobs=scored)] * 2,
         phase=BatchPhase.DECODE,
     )
     logits = torch.arange(2 * 3 * 20, dtype=torch.float32).view(2, 3, 20)[..., ::2]
@@ -70,41 +74,154 @@ def _fixture(runner_type):
 
 
 @pytest.mark.parametrize("runner_type", [DeepSeekV41CudaRunner, InklingCudaRunner])
-def test_eager_verification_samples_entire_strided_block_once(monkeypatch, runner_type):
-    runner, plan, logits, drafts, _ = _fixture(runner_type)
+@pytest.mark.parametrize("fixed", [None, 0, 1, 2])
+@pytest.mark.parametrize("scored", [False, True])
+def test_eager_verification_preserves_state_and_unscored_cpu_harvest(
+    monkeypatch, runner_type, fixed, scored
+):
+    from resin.backend.speculative import _accept_speculative_tokens
+
+    runner, plan, logits, drafts, targets = _fixture(runner_type, scored=scored)
+    runner._speculation.benchmark_accepted_drafts = fixed
     positions = torch.tensor(plan.positions, dtype=torch.int64)
     anchors = torch.tensor(plan.token_ids, dtype=torch.int64)
-    broadcasts = []
+    expected = _accept_speculative_tokens(
+        drafts.tolist(), targets.tolist(), benchmark_accepted_drafts=fixed
+    )
+    state_counts, state_positions, broadcasts, commits = [], [], [], []
     if runner_type is DeepSeekV41CudaRunner:
+        from resin_models_cuda.deepseek_v41 import cuda as runtime
+
         runner._broadcast_tokens = lambda value: (
             broadcasts.append(tuple(value.shape)) or value
         )
         runner._model = SimpleNamespace(
             draft=lambda *_args, **_kwargs: drafts,
             forward_verify=lambda *_args, **_kwargs: (logits, object()),
-            commit_dspark_main_block=lambda *_args, **_kwargs: None,
-            clear_rejected_speculative_state=lambda *_args, **_kwargs: None,
+            commit_dspark_main_block=lambda *_args, **_kwargs: commits.append("main"),
+            clear_rejected_speculative_state=lambda _positions, counts, *_args, **_kwargs: (
+                state_counts.append(counts.clone())
+            ),
         )
-        output = runner._speculative_decode(plan, object(), anchors, positions)
-        assert broadcasts == [(2, 2), (2, 3)]
     else:
+        runtime = inkling_runtime
         runner._draft = SimpleNamespace(
             propose=lambda *_args: (drafts, None),
-            inject_target=lambda *_args: None,
+            inject_target=lambda *_args: commits.append("draft"),
         )
         runner._model = SimpleNamespace(
             target=lambda *_args, **_kwargs: (logits, object(), object(), None),
         )
         runner._initial_state = lambda *_args: object()
-        runner._store_state = lambda *_args: None
-        monkeypatch.setattr(
-            inkling_runtime, "select_convolution_state", lambda *_args, **_kwargs: None
+        runner._store_state = lambda _cache, positions, _state: state_positions.append(
+            positions.clone()
         )
+        monkeypatch.setattr(
+            runtime,
+            "select_convolution_state",
+            lambda _initial, _inputs, counts, **_kwargs: state_counts.append(
+                counts.clone()
+            ),
+        )
+
+    class Stager:
+        def __init__(self, device):
+            pass
+
+        def output(self, name, source):
+            return source.clone()
+
+    class Event:
+        def record(self, stream):
+            pass
+
+        def synchronize(self):
+            pass
+
+    decisions = []
+
+    def score(raw, decision, native):
+        assert scored
+        assert raw is logits and native is plan
+        decisions.append(decision)
+        return completion_runtime.DeviceScores(
+            torch.zeros_like(decision.tokens, dtype=torch.float32),
+            torch.empty((*decision.tokens.shape, 0), dtype=torch.int64),
+            torch.empty((*decision.tokens.shape, 0), dtype=torch.float32),
+            logits.shape[-1],
+        )
+
+    def forbid_list(_tensor):
+        raise AssertionError("verification must not round-trip device tokens")
+
+    monkeypatch.setattr(completion_runtime, "TensorStager", Stager)
+    monkeypatch.setattr(completion_runtime.torch.cuda, "Event", Event)
+    monkeypatch.setattr(
+        completion_runtime.torch.cuda, "current_stream", lambda device: None
+    )
+    monkeypatch.setattr(runtime, "score_completion", score)
+    with monkeypatch.context() as patch:
+        if scored:
+            patch.setattr(torch.Tensor, "tolist", forbid_list)
+        else:
+            forbidden = SimpleNamespace(
+                from_samples=forbid_list, from_acceptance=forbid_list
+            )
+            patch.setattr(runtime, "DeviceAcceptance", forbidden)
+            patch.setattr(runtime, "DeviceCompletion", forbidden)
         output = runner._speculative_decode(plan, object(), anchors, positions)
+    assert len(decisions) == int(scored)
+    assert broadcasts == (
+        [(2, 2), (2, 3)] if runner_type is DeepSeekV41CudaRunner else []
+    )
+    assert commits == (["main"] if runner_type is DeepSeekV41CudaRunner else ["draft"])
     assert runner._sampler.calls == [(2, 3, 10)]
-    assert output.token_ids.tolist() == [2, 4, 3, 4, 5]
-    assert output.token_indptr.tolist() == [0, 2, 5]
-    assert runner._speculation.accepted == 3
+    assert (output.logprobs is not None) == scored
+    assert state_counts[0].tolist() == expected.processed_counts
+    if state_positions:
+        assert (
+            state_positions[0].tolist()
+            == (positions + torch.tensor(expected.processed_counts) - 1).tolist()
+        )
+    assert output.token_ids.tolist() == sum(expected.token_rows, [])
+    assert runner._speculation.blocks == 2
+    assert runner._speculation.accepted == sum(expected.accepted_counts)
+    assert runner._speculation.emitted == sum(expected.processed_counts)
+
+
+@pytest.mark.parametrize("fixed", [None, 1])
+def test_deepseek_unscored_graph_harvests_directly_and_rolls_back(monkeypatch, fixed):
+    from resin.backend.speculative import _accept_speculative_tokens
+    from resin_models_cuda.deepseek_v41 import cuda as runtime
+
+    runner, plan, _logits, drafts, targets = _fixture(DeepSeekV41CudaRunner)
+    runner._speculation.benchmark_accepted_drafts = fixed
+    runner.parallel_groups = None
+    runner._graph_device_caches = {(2, 128): object()}
+    runner._dspark_phase_events = {}
+    runner._cache = SimpleNamespace(graph_plan_inputs=lambda *_args: {})
+    runner._run_cuda_graph = lambda *_args: torch.cat((drafts, targets), dim=1)
+    processed = []
+    runner._model = SimpleNamespace(
+        clear_rejected_speculative_state=lambda _positions, counts, *_args, **_kwargs: (
+            processed.append(counts.tolist())
+        )
+    )
+
+    def forbid_completion(*_args):
+        raise AssertionError("unscored synchronous graph must harvest directly")
+
+    runner._enqueue_graph_output = forbid_completion
+    monkeypatch.setattr(runtime, "pad_sampling_inputs", lambda *_args: {})
+    result = runner._graph_forward(plan, object(), shape=(2, 128))
+    expected = _accept_speculative_tokens(
+        drafts.tolist(), targets.tolist(), benchmark_accepted_drafts=fixed
+    )
+    assert result is not None
+    assert result.token_ids.tolist() == sum(expected.token_rows, [])
+    assert processed == [expected.processed_counts]
+    assert runner._speculation.blocks == 2
+    assert runner._speculation.accepted == sum(expected.accepted_counts)
 
 
 def test_deepseek_graph_verification_samples_and_broadcasts_one_block():
@@ -113,7 +230,6 @@ def test_deepseek_graph_verification_samples_and_broadcasts_one_block():
     runner.profile_graph_phases = False
     runner._graph_device_caches = {}
     runner._graph_inputs = {}
-    runner._graph_logits = {}
     runner._cache = SimpleNamespace(
         graph_cache=lambda *_args: object(),
         graph_device_inputs=lambda _cache: {},
@@ -139,4 +255,55 @@ def test_deepseek_graph_verification_samples_and_broadcasts_one_block():
     step.launch()
     assert runner._sampler.calls == [(2, 3, 10)]
     assert broadcasts == [(2, 2), (2, 3)]
+    torch.testing.assert_close(step.output, torch.cat((drafts, targets), dim=1))
+    assert runner._graph_logits[(2, 128)] is logits
+
+
+@pytest.mark.parametrize("fixed", [-1, 0, 2])
+def test_inkling_graph_keeps_target_logits_and_one_device_acceptance(
+    monkeypatch, fixed
+):
+    runner, plan, logits, drafts, targets = _fixture(InklingCudaRunner)
+    runner._graph_device_caches = {}
+    runner._cache = SimpleNamespace(
+        graph_cache=lambda *_args: object(),
+        graph_device_inputs=lambda _cache: {},
+        reset_null=lambda: None,
+    )
+    runner._new_phase_timing = lambda *_args: None
+    runner._graph_state_inputs = torch.empty(2)
+    runner._draft = SimpleNamespace(
+        propose=lambda *_args: (drafts, None),
+        inject_target=lambda *_args: None,
+    )
+    runner._model = SimpleNamespace(
+        target=lambda *_args, **_kwargs: (logits, object(), object(), None)
+    )
+    runner._initial_state = lambda *_args: object()
+    state_positions = []
+    runner._store_state = lambda _cache, positions, _state: state_positions.append(
+        positions.clone()
+    )
+    state_counts = []
+    monkeypatch.setattr(
+        inkling_runtime,
+        "select_convolution_state",
+        lambda _initial, _inputs, counts, **_kwargs: state_counts.append(
+            counts.clone()
+        ),
+    )
+    step = runner._new_decode_graph_step((2, 128))
+    step.inputs["token_ids"].copy_(torch.tensor(plan.token_ids, dtype=torch.int64))
+    positions = torch.tensor(plan.positions, dtype=torch.int64)
+    step.inputs["positions"].copy_(positions)
+    step.inputs["fixed_acceptance"].fill_(fixed)
+    step.launch()
+
+    acceptance = runner._graph_acceptance[(2, 128)]
+    expected = [2, 3] if fixed < 0 else [fixed + 1] * 2
+    assert acceptance.counts.tolist() == expected
+    assert state_counts[0].tolist() == expected
+    torch.testing.assert_close(state_positions[0], positions + acceptance.counts - 1)
+    assert runner._graph_logits[(2, 128)] is logits
+    assert runner._sampler.calls == [(2, 3, 10)]
     torch.testing.assert_close(step.output, torch.cat((drafts, targets), dim=1))

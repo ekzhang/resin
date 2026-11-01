@@ -141,6 +141,7 @@ impl NativeHttpServer {
                 "enable_demo=True requires enable_openai=True",
             ));
         }
+        let max_top_logprobs = Python::attach(|py| engine.bind(py).borrow().max_top_logprobs());
         Ok(Self {
             engine,
             distributed,
@@ -159,6 +160,7 @@ impl NativeHttpServer {
                 enable_demo,
                 enable_priority_scheduling,
                 routed_dp_size,
+                max_top_logprobs,
             },
             running: AtomicBool::new(false),
             shutdown: Mutex::new(None),

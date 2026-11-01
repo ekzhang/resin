@@ -12,6 +12,7 @@ import torch
 
 from resin import BatchPhase, RunnerConfig
 from resin.backend.capacity import plan_cache_capacity
+from resin.backend.cuda.completion import DeviceAcceptance, DeviceCompletion
 from resin.backend.cuda.graphs import (
     CudaGraphMode,
     CudaGraphStep,
@@ -33,8 +34,6 @@ from resin.backend.plans import PagedCachePlan
 from resin.backend.sampling import (
     SAMPLING_OFFSET_STRIDE,
     PromptScores,
-    format_output,
-    prompt_scores,
     token_output,
 )
 from resin.backend.speculative import SpeculativeStats
@@ -60,6 +59,7 @@ from resin_models_cuda.inkling.model import (
     select_convolution_state,
 )
 from resin_models_cuda.inkling.weights import load_draft_weights, load_target_weights
+from resin_models_cuda.scoring import format_output, prompt_scores, score_completion
 
 if TYPE_CHECKING:
     from resin import BatchPlan, ForwardOutput
@@ -131,6 +131,8 @@ class InklingCudaRunner(CudaRunner):
         self.eos_token_id = self.config.eos_token_id
         self._speculation = SpeculativeStats(self.speculative_draft_tokens)
         self._graph_device_caches: dict[GraphShape, DeviceCache] = {}
+        self._graph_logits: dict[GraphShape, torch.Tensor] = {}
+        self._graph_acceptance: dict[GraphShape, DeviceAcceptance] = {}
         self._media_features: dict[int, tuple[InklingMedia, torch.Tensor]] = {}
         self._vision_feature_cache = VisionFeatureCache()
 
@@ -237,6 +239,7 @@ class InklingCudaRunner(CudaRunner):
         return {
             "token_ids": (0,) * batch_size,
             "positions": (1,) * batch_size,
+            "fixed_acceptance": -1,
             **capture_sampling_inputs(batch_size, vocab_size, unique_seeds=True),
         }
 
@@ -256,6 +259,7 @@ class InklingCudaRunner(CudaRunner):
         token_ids = torch.empty(batch_size, dtype=torch.long, device=self.device)
         positions = torch.empty(batch_size, dtype=torch.long, device=self.device)
         sampling = self._sampler.empty(batch_size, self.device)
+        fixed_acceptance = torch.tensor(-1, dtype=torch.long, device=self.device)
         output_width = 2 * self.speculative_draft_tokens + 1
         output_ids = torch.empty(
             (batch_size, output_width), dtype=torch.long, device=self.device
@@ -297,10 +301,16 @@ class InklingCudaRunner(CudaRunner):
                 )
                 if phase_timing is not None:
                     phase_timing.mark(2)
+                self._graph_logits[shape] = logits
                 targets = self._sampler.sample_block(logits, sampling)
-                matches = drafts == targets[:, : self.speculative_draft_tokens]
-                accepted = torch.cumprod(matches.to(torch.int32), dim=1).sum(1)
-                processed = accepted.to(torch.long) + 1
+                acceptance = DeviceAcceptance.from_samples(
+                    drafts,
+                    targets,
+                    positions,
+                    fixed_acceptance=fixed_acceptance,
+                )
+                self._graph_acceptance[shape] = acceptance
+                processed = acceptance.counts.long()
                 select_convolution_state(
                     initial_state,
                     state_inputs,
@@ -315,7 +325,11 @@ class InklingCudaRunner(CudaRunner):
                 if phase_timing is not None:
                     phase_timing.mark(3)
 
-        inputs = {"token_ids": token_ids, "positions": positions}
+        inputs = {
+            "token_ids": token_ids,
+            "positions": positions,
+            "fixed_acceptance": fixed_acceptance,
+        }
         inputs.update(self._cache.graph_device_inputs(cache))
         inputs.update(self._sampler.graph_inputs(sampling))
         return CudaGraphStep(
@@ -327,9 +341,6 @@ class InklingCudaRunner(CudaRunner):
         )
 
     def _graph_forward(self, plan: BatchPlan, cache_plan: Any):
-        if plan.needs_logprobs:
-            self._cuda_graph_fallback("decode", "logprobs")
-            return None
         batch_size = plan.num_sequences
         required_length = (
             int(np.max(plan.positions)) + self.speculative_draft_tokens + 1
@@ -346,6 +357,9 @@ class InklingCudaRunner(CudaRunner):
         inputs: dict[str, object] = {
             "token_ids": np.pad(plan.token_ids, (0, padding)),
             "positions": np.pad(plan.positions, (0, padding), constant_values=1),
+            "fixed_acceptance": -1
+            if self._speculation.validated_benchmark_accepted_drafts is None
+            else self._speculation.validated_benchmark_accepted_drafts,
         }
         inputs.update(
             self._cache.graph_plan_inputs(self._graph_device_caches[shape], cache_plan)
@@ -353,15 +367,24 @@ class InklingCudaRunner(CudaRunner):
         inputs.update(
             pad_sampling_inputs(self._sampler, plan, self.vocab_size, padding)
         )
-        output = (
-            self._run_cuda_graph("decode", shape, inputs)[:batch_size].cpu().tolist()
-        )
-        width = self.speculative_draft_tokens
-        accepted = self._speculation.accept(
-            [row[:width] for row in output],
-            [row[width:] for row in output],
-        ).token_rows
-        return token_output(accepted)
+        output = self._run_cuda_graph("decode", shape, inputs)
+        if not plan.needs_logprobs:
+            output = output[:batch_size].cpu().tolist()
+            width = self.speculative_draft_tokens
+            accepted = self._speculation.accept(
+                [row[:width] for row in output],
+                [row[width:] for row in output],
+            )
+            return token_output(accepted.token_rows)
+        acceptance = self._graph_acceptance[shape]
+        return DeviceCompletion.from_acceptance(
+            acceptance,
+            rows=batch_size,
+            device=self.device,
+            stats=self._speculation,
+            plan=plan,
+            scores=score_completion(self._graph_logits[shape], acceptance, plan),
+        ).result()
 
     def _validate_plan(self, plan: BatchPlan) -> tuple[tuple[int, int], ...]:
         return validate_hybrid_plan(
@@ -374,7 +397,7 @@ class InklingCudaRunner(CudaRunner):
 
     def _sample(self, logits: torch.Tensor, plan: BatchPlan, step: int = 0):
         return self._sampler(
-            logits.float(),
+            logits,
             plan,
             offset_delta=step * SAMPLING_OFFSET_STRIDE,
         )
@@ -443,7 +466,13 @@ class InklingCudaRunner(CudaRunner):
                     ]
 
                 prompt_rows.append(
-                    prompt_scores(plan, row_logits[0], project, token_start=start)
+                    prompt_scores(
+                        plan,
+                        row_logits[0],
+                        project,
+                        token_start=start,
+                        cache_owner=self,
+                    )
                 )
                 row_logits = project(row_logits[:, -1:])
             logits.append(row_logits[:, -1])
@@ -558,12 +587,21 @@ class InklingCudaRunner(CudaRunner):
         if phase_timing is not None:
             phase_timing.mark(2)
         targets = self._sampler(logits, plan)
-        acceptance = self._speculation.accept(drafts.tolist(), targets.tolist())
-        processed = torch.tensor(
-            [count + 1 for count in acceptance.accepted_counts],
-            dtype=torch.long,
-            device=self.device,
-        )
+        decision, token_rows = None, None
+        if plan.needs_logprobs:
+            decision = DeviceAcceptance.from_samples(
+                drafts,
+                targets,
+                positions,
+                fixed_acceptance=self._speculation.validated_benchmark_accepted_drafts,
+            )
+            processed = decision.counts.long()
+        else:
+            acceptance = self._speculation.accept(drafts.tolist(), targets.tolist())
+            token_rows = acceptance.token_rows
+            processed = torch.tensor(
+                acceptance.processed_counts, dtype=torch.long, device=self.device
+            )
         select_convolution_state(
             initial_state,
             state_inputs,
@@ -574,7 +612,17 @@ class InklingCudaRunner(CudaRunner):
         self._draft.inject_target(taps, verify_positions, cache)
         if phase_timing is not None:
             phase_timing.mark(3)
-        return format_output(logits, acceptance.token_rows, plan)
+        if decision is None:
+            assert token_rows is not None
+            return token_output(token_rows)
+        return DeviceCompletion.from_acceptance(
+            decision,
+            rows=plan.num_sequences,
+            stats=self._speculation,
+            device=self.device,
+            plan=plan,
+            scores=score_completion(logits, decision, plan),
+        ).result()
 
     @observe_execution
     @execute_state

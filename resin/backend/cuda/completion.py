@@ -134,6 +134,16 @@ class DeviceAcceptance:
 
 
 @dataclass(frozen=True, slots=True)
+class DeviceScores:
+    """Small graph-owned raw scores, ready for an owned completion snapshot."""
+
+    logprobs: torch.Tensor
+    top_ids: torch.Tensor
+    top_logprobs: torch.Tensor
+    vocab_size: int
+
+
+@dataclass(frozen=True, slots=True)
 class ContinuationState:
     """An admission generation owning one row order, graph bucket and lease view."""
 
@@ -226,10 +236,12 @@ class DeviceCompletion:
         stats: SpeculativeStats | None = None,
         device: str | torch.device | None = None,
         plan: BatchPlan | None = None,
-        logits: torch.Tensor | None = None,
+        scores: DeviceScores | None = None,
         accepted_end_positions: torch.Tensor | None = None,
         state_checkpoints=None,
     ) -> None:
+        if plan is not None and plan.needs_logprobs and scores is None:
+            raise ValueError("requested logprobs require prepared scores")
         self.accepted_end_positions = (
             feedback.positions
             if accepted_end_positions is None
@@ -244,7 +256,8 @@ class DeviceCompletion:
         self._logprobs = None
         self._top_ids = self._top_logprobs = None
         if plan is not None and plan.needs_logprobs:
-            self._stage_scores(tokens, plan, logits)
+            assert scores is not None
+            self._stage_precomputed_scores(tokens, plan, scores)
         self._device = tokens.device
         self._event = None
         self._result = None
@@ -276,16 +289,21 @@ class DeviceCompletion:
         self._record_event()
         return self
 
-    def _stage_scores(
-        self, tokens: torch.Tensor, plan: BatchPlan, logits: torch.Tensor | None
+    def _stage_precomputed_scores(
+        self, tokens: torch.Tensor, plan: BatchPlan, scores: DeviceScores
     ) -> None:
-        if logits is None:
-            raise ValueError("requested logprobs require target logits")
-        if logits.ndim == 2:
-            logits = logits[:, None, :]
-        width = tokens.shape[1]
-        if logits.ndim != 3 or logits.shape[0] < self._rows or logits.shape[1] < width:
-            raise ValueError("target logits must cover the accepted token grid")
+        shape = (self._rows, tokens.shape[1])
+        if scores.logprobs.ndim != 2 or any(
+            actual < expected
+            for actual, expected in zip(scores.logprobs.shape, shape, strict=True)
+        ):
+            raise ValueError("prepared scores must cover the accepted token grid")
+        if (
+            scores.top_ids.ndim != 3
+            or scores.top_ids.shape != scores.top_logprobs.shape
+            or scores.top_ids.shape[:2] != scores.logprobs.shape
+        ):
+            raise ValueError("prepared top scores must align with selected scores")
         policies = plan.sampling_params
         self._requested = np.fromiter(
             (
@@ -299,28 +317,21 @@ class DeviceCompletion:
         self._score_rows = np.flatnonzero(self._requested)
         self._top_counts = np.fromiter(
             (
-                min(policies[row].top_logprobs, logits.shape[-1])
+                min(policies[row].top_logprobs, scores.vocab_size)
                 for row in self._score_rows
             ),
             dtype=np.uint32,
         )
-        # Keep a fixed grid until harvest: accepted counts live on the device,
-        # and CUDA boolean compaction would synchronize before the next launch.
-        values, selected_tokens = logits[: self._rows, :width], tokens[: self._rows]
-        if len(self._score_rows) != self._rows:
-            row_indices = self._staging.device(
-                "score_rows", self._score_rows, torch.long
+        if int(max(self._top_counts, default=0)) > scores.top_ids.shape[-1]:
+            raise ValueError("prepared top scores do not cover requested alternatives")
+        self._logprobs = self._staging.output("logprobs", scores.logprobs[: self._rows])
+        if np.any(self._top_counts):
+            self._top_ids = self._staging.output(
+                "top_ids", scores.top_ids[: self._rows]
             )
-            values = values.index_select(0, row_indices)
-            selected_tokens = selected_tokens.index_select(0, row_indices)
-        values = values.float().log_softmax(dim=-1)
-        selected = values.gather(-1, selected_tokens.long()[..., None]).squeeze(-1)
-        self._logprobs = self._staging.output("logprobs", selected)
-        top_k = int(max(self._top_counts, default=0))
-        if top_k:
-            top_values, top_ids = values.topk(top_k, dim=-1)
-            self._top_ids = self._staging.output("top_ids", top_ids)
-            self._top_logprobs = self._staging.output("top_logprobs", top_values)
+            self._top_logprobs = self._staging.output(
+                "top_logprobs", scores.top_logprobs[: self._rows]
+            )
 
     def _scored_output(
         self, output: ForwardOutput, counts: npt.NDArray[np.integer]
@@ -333,6 +344,7 @@ class DeviceCompletion:
         kept_counts = counts[self._score_rows].astype(np.uint32)
         keep = np.arange(width)[None, :] < kept_counts[:, None]
         columns: dict[str, Any] = {}
+        score_values = self._logprobs.numpy()[self._score_rows]
         if self._top_ids is not None:
             assert self._top_logprobs is not None
             top_counts = np.repeat(self._top_counts, kept_counts)
@@ -340,17 +352,19 @@ class DeviceCompletion:
                 np.arange(self._top_ids.shape[-1])[None, None, :]
                 < self._top_counts[:, None, None]
             )
+            top_ids = self._top_ids.numpy()[self._score_rows]
+            top_values = self._top_logprobs.numpy()[self._score_rows]
             columns = {
                 "top_indptr": np.concatenate(
                     (np.zeros(1, np.uint32), top_counts.cumsum(dtype=np.uint32))
                 ),
-                "top_token_ids": self._top_ids.numpy()[top_keep].astype(np.uint32),
-                "top_logprobs": self._top_logprobs.numpy()[top_keep],
+                "top_token_ids": top_ids[top_keep].astype(np.uint32),
+                "top_logprobs": top_values[top_keep],
             }
         return ForwardOutput(
             token_ids=output.token_ids,
             token_indptr=output.token_indptr,
-            logprobs=self._logprobs.numpy()[keep],
+            logprobs=score_values[keep],
             logprob_indptr=np.concatenate(
                 (np.zeros(1, np.uint32), scored_counts.cumsum(dtype=np.uint32))
             ),
