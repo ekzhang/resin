@@ -21,6 +21,10 @@ from resin.backend.sampling import PromptScores, _ScoreColumns
 if TYPE_CHECKING:
     from resin import BatchPlan, ForwardOutput
 
+# How many tokens to score for prompt_logprobs per loop iteration. We chunk it
+# to avoid having large logit tensors in memory.
+_PROMPT_SCORE_CHUNK_SIZE = 256
+
 
 def _owner(value: torch.Tensor) -> torch.Tensor:
     while value._base is not None:
@@ -263,8 +267,8 @@ def prompt_scores(
         cache = OrderedDict()
         setattr(owner, "_resin_prompt_score_graphs", cache)
     parts = []
-    for start in range(0, len(selected_rows), 128):
-        stop = min(start + 128, len(selected_rows))
+    for start in range(0, len(selected_rows), _PROMPT_SCORE_CHUNK_SIZE):
+        stop = min(start + _PROMPT_SCORE_CHUNK_SIZE, len(selected_rows))
         counts = target_counts[start:stop]
         ids = np.concatenate(
             [

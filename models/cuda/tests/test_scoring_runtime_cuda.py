@@ -8,7 +8,11 @@ import torch
 
 from resin import BatchPlan, SamplingParams
 from resin.backend.cuda.completion import DeviceAcceptance, DeviceCompletion
-from resin_models_cuda.scoring import prompt_scores, score_completion
+from resin_models_cuda.scoring import (
+    _PROMPT_SCORE_CHUNK_SIZE,
+    prompt_scores,
+    score_completion,
+)
 
 pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available(), reason="requires a CUDA GPU"
@@ -136,10 +140,10 @@ def test_captured_mixed_scores_survive_replay_and_forced_acceptance(monkeypatch)
 
 @torch.inference_mode()
 def test_prompt_projection_scores_and_duplicate_targets_use_cuda(monkeypatch):
-    count, hidden_size, vocab = 257, 32, 2051
+    count, hidden_size, vocab = 2 * _PROMPT_SCORE_CHUNK_SIZE + 1, 32, 2051
     hidden = torch.randn((count, hidden_size), device="cuda", dtype=torch.float32)
     head = torch.nn.Linear(hidden_size, vocab, bias=False, device="cuda")
-    tops = np.asarray([0, 1, 5] * (count // 3) + [0, 1], np.uint32)
+    tops = np.asarray([0, 1, 5], np.uint32)[np.arange(count) % 3]
     target_counts = np.asarray(
         [2 if row % 7 == 0 else 0 for row in range(count)], np.uint32
     )
@@ -161,7 +165,9 @@ def test_prompt_projection_scores_and_duplicate_targets_use_cuda(monkeypatch):
         prompt_target_indptr=target_indptr,
         prompt_target_token_ids=target_ids,
     )
-    values = torch.cat([head(part).double() for part in hidden.split(128)])
+    values = torch.cat(
+        [head(part).double() for part in hidden.split(_PROMPT_SCORE_CHUNK_SIZE)]
+    )
     reference = values.log_softmax(-1).cpu()
     expected = reference[
         torch.arange(count), torch.from_numpy(selected.astype(np.int64))
@@ -174,7 +180,8 @@ def test_prompt_projection_scores_and_duplicate_targets_use_cuda(monkeypatch):
 
     first = prompt_scores(plan, hidden, project)
     assert first is not None
-    assert max(projected) == 128 and set(projected) == {1, 128}
+    assert max(projected) == _PROMPT_SCORE_CHUNK_SIZE
+    assert set(projected) == {1, _PROMPT_SCORE_CHUNK_SIZE}
     projected.clear()
 
     def forbid_normalize(*args, **kwargs):

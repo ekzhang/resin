@@ -71,7 +71,7 @@ Counts through 32 use fused CuTe reduction and selection. Counts from 33 through
 2,048 use FlashInfer radix selection with sparse CuTe normalization; larger
 counts use repeated CuTe selection passes. Larger requests cost more work and
 output storage. Prompt scoring captures bounded output-head projections and the
-same scorer, retaining at most 128 projected predecessor rows per graph.
+same scorer, retaining at most 256 projected predecessor rows per graph.
 
 Compiled kernels specialize for vocabulary geometry, dtype, layout, and scoring
 features. After a path's first warmup, changing batch size or requested top count
