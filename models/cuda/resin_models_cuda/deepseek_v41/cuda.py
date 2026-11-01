@@ -1257,7 +1257,6 @@ class DeepSeekV41CudaRunner(CudaRunner):
                         row_logits[0],
                         project,
                         token_start=start,
-                        cache_owner=self,
                     )
                 )
                 row_logits = self._model.head(row_logits[:, -1:])

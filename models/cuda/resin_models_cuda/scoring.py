@@ -1,8 +1,7 @@
-"""Captured sparse CUDA scores and bounded prompt output-head projections."""
+"""Captured decode scores and eager bounded prompt output-head projections."""
 
 from __future__ import annotations
 
-from collections import OrderedDict
 from collections.abc import Callable
 from typing import TYPE_CHECKING
 
@@ -15,7 +14,7 @@ from resin.backend.cuda.completion import (
     DeviceFeedback,
     DeviceScores,
 )
-from resin.backend.cuda.staging import TensorStagerPool
+from resin.backend.cuda.staging import TensorStager, TensorStagerPool
 from resin.backend.sampling import PromptScores, _ScoreColumns
 
 if TYPE_CHECKING:
@@ -139,96 +138,6 @@ def score_completion(
     return entry.run(acceptance, requested, top_counts)
 
 
-class _PromptScores:
-    def __init__(self, hidden, project, count: int, capacity: int, targets: int):
-        from resin_models_cuda._scoring_cutedsl import score_logits
-
-        self.output: tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]
-        self.hidden = torch.zeros(
-            (count, hidden.shape[-1]), dtype=hidden.dtype, device=hidden.device
-        )
-        values = self.hidden if project is None else project(self.hidden)
-        self.vocab_size = values.shape[-1]
-        self.capacity = min(capacity, self.vocab_size)
-        self.indices = torch.zeros(count, dtype=torch.int64, device=hidden.device)
-        self.selected = torch.zeros(count, dtype=torch.int64, device=hidden.device)
-        self.top_counts = torch.zeros(count, dtype=torch.int32, device=hidden.device)
-        self.top_indices = torch.zeros(
-            count * self.capacity, dtype=torch.int64, device=hidden.device
-        )
-        self.target_rows = torch.zeros(targets, dtype=torch.int64, device=hidden.device)
-        self.target_ids = torch.zeros(targets, dtype=torch.int64, device=hidden.device)
-        self.staging = TensorStagerPool(hidden.device)
-
-        def launch():
-            values = self.hidden if project is None else project(self.hidden)
-            selected, top_ids, top_scores, target_scores = score_logits(
-                values,
-                self.selected,
-                top_counts=self.top_counts,
-                max_top_k=self.capacity,
-                target_rows=self.target_rows,
-                target_ids=self.target_ids,
-            )
-            if self.capacity:
-                top_ids = top_ids.reshape(-1).index_select(0, self.top_indices)
-                top_scores = top_scores.reshape(-1).index_select(0, self.top_indices)
-            self.output = selected, top_ids, top_scores, target_scores
-
-        self.graph = _capture(hidden.device, launch)
-
-    def run(
-        self, hidden, selected_rows, selected_ids, top_counts, target_rows, target_ids
-    ):
-        if np.any(target_ids >= self.vocab_size) or np.any(
-            selected_ids >= self.vocab_size
-        ):
-            raise ValueError(
-                f"prompt target token IDs must be less than vocabulary size {self.vocab_size}"
-            )
-        clipped = np.minimum(top_counts, self.vocab_size).astype(np.uint32)
-        offsets = np.concatenate(
-            (np.zeros(1, np.uint32), clipped.cumsum(dtype=np.uint32))
-        )
-        positions = np.arange(int(offsets[-1])) - np.repeat(offsets[:-1], clipped)
-        packed = np.repeat(np.arange(len(clipped)), clipped) * self.capacity + positions
-        top_indices = np.zeros(self.top_indices.numel(), dtype=np.int64)
-        top_indices[: len(packed)] = packed
-        self.staging.copy_into(
-            {
-                "indices": self.indices,
-                "selected": self.selected,
-                "top_counts": self.top_counts,
-                "top_indices": self.top_indices,
-                "target_rows": self.target_rows,
-                "target_ids": self.target_ids,
-            },
-            {
-                "indices": selected_rows,
-                "selected": selected_ids,
-                "top_counts": clipped.astype(np.int32),
-                "top_indices": top_indices,
-                "target_rows": np.pad(
-                    target_rows, (0, self.target_rows.numel() - len(target_rows))
-                ),
-                "target_ids": np.pad(
-                    target_ids, (0, self.target_ids.numel() - len(target_ids))
-                ),
-            },
-        )
-        torch.index_select(hidden, 0, self.indices, out=self.hidden)
-        self.graph.replay()
-        # A later chunk can replay this graph before PromptScores is consumed.
-        chosen, top_ids, top_scores, targets = self.output
-        return (
-            chosen.clone(),
-            top_ids.reshape(-1)[: len(packed)].clone(),
-            top_scores.reshape(-1)[: len(packed)].clone(),
-            targets[: len(target_ids)].clone(),
-            self.target_ids[: len(target_ids)].clone(),
-        )
-
-
 @torch.inference_mode()
 def prompt_scores(
     plan: BatchPlan,
@@ -236,15 +145,16 @@ def prompt_scores(
     project: Callable[[torch.Tensor], torch.Tensor] | None = None,
     *,
     token_start: int = 0,
-    cache_owner: object | None = None,
 ) -> PromptScores | None:
-    """Project requested predecessors and score them with captured CUDA kernels."""
+    """Eagerly project and score requested predecessors in bounded CUDA chunks."""
     if not plan.needs_prompt_logprobs:
         return None
     if not hidden.is_cuda:
         from resin.backend.sampling import prompt_scores as reference
 
         return reference(plan, hidden, project, token_start=token_start)
+    from resin_models_cuda._scoring_cutedsl import score_logits
+
     indices = plan.prompt_score_indices
     keep = (indices >= token_start) & (indices < token_start + hidden.shape[0])
     selected_rows = indices[keep].astype(np.int64) - token_start
@@ -253,68 +163,62 @@ def prompt_scores(
     target_indptr = plan.prompt_target_indptr
     target_counts = np.diff(target_indptr)[keep]
     source_rows = np.flatnonzero(keep)
-    owner = (
-        cache_owner
-        if cache_owner is not None
-        else (
-            getattr(project, "__self__", project)
-            if project is not None
-            else _owner(hidden)
-        )
-    )
-    cache = getattr(owner, "_resin_prompt_score_graphs", None)
-    if cache is None:
-        cache = OrderedDict()
-        setattr(owner, "_resin_prompt_score_graphs", cache)
     parts = []
     for start in range(0, len(selected_rows), _PROMPT_SCORE_CHUNK_SIZE):
         stop = min(start + _PROMPT_SCORE_CHUNK_SIZE, len(selected_rows))
+        staging = TensorStager(hidden.device)
+        indices = staging.device("indices", selected_rows[start:stop], torch.int64)
+        values = hidden.index_select(0, indices)
+        if project is not None:
+            values = project(values)
+        vocab = values.shape[-1]
         counts = target_counts[start:stop]
-        ids = np.concatenate(
-            [
-                plan.prompt_target_token_ids[
-                    target_indptr[row] : target_indptr[row + 1]
+        ids = (
+            np.concatenate(
+                [
+                    plan.prompt_target_token_ids[
+                        target_indptr[row] : target_indptr[row + 1]
+                    ]
+                    for row in source_rows[start:stop]
                 ]
-                for row in source_rows[start:stop]
-            ]
-        ).astype(np.int64)
-        rows = np.repeat(np.arange(stop - start, dtype=np.int64), counts)
-        maximum = int(np.max(top_counts[start:stop], initial=0))
-        capacity = 0 if maximum == 0 else max(32, 1 << (maximum - 1).bit_length())
-        target_capacity = 0 if len(ids) == 0 else 1 << (len(ids) - 1).bit_length()
-        key = (
-            hidden.device,
-            hidden.dtype,
-            hidden.shape[-1],
-            stop - start,
-            capacity,
-            target_capacity,
+            ).astype(np.int64)
+            if np.any(counts)
+            else np.empty(0, np.int64)
         )
-        entry = cache.pop(key, None)
-        if entry is None:
-            entry = _PromptScores(
-                hidden, project, stop - start, capacity, target_capacity
+        if np.any(ids >= vocab) or np.any(selected_ids[start:stop] >= vocab):
+            raise ValueError(
+                f"prompt target token IDs must be less than vocabulary size {vocab}"
             )
-        cache[key] = entry
-        # Every entry owns a captured output-head projection. Retaining every
-        # remainder length or arbitrary target count can otherwise grow without
-        # bound across requests. Output clones below own each caller's results.
-        while len(cache) > 4:
-            cache.popitem(last=False)
-        chosen, top_ids, top_values, targets, owned_target_ids = entry.run(
-            hidden,
-            selected_rows[start:stop],
-            selected_ids[start:stop],
-            top_counts[start:stop],
-            rows,
-            ids,
+        clipped = np.minimum(top_counts[start:stop], vocab).astype(np.uint32)
+        maximum = int(np.max(clipped, initial=0))
+        target_ids = target_rows = None
+        if len(ids):
+            target_ids = staging.device("target_ids", ids, torch.int64)
+            rows = np.repeat(np.arange(stop - start, dtype=np.int64), counts)
+            target_rows = staging.device("target_rows", rows, torch.int64)
+        chosen, top_ids, top_values, targets = score_logits(
+            values,
+            staging.device("selected", selected_ids[start:stop], torch.int64),
+            top_counts=staging.device(
+                "top_counts", clipped.astype(np.int32), torch.int32
+            ),
+            max_top_k=maximum,
+            target_rows=target_rows,
+            target_ids=target_ids,
         )
-        clipped = np.minimum(top_counts[start:stop], entry.vocab_size).astype(np.uint32)
         top = None
         if maximum:
+            offsets = np.concatenate(
+                (np.zeros(1, np.int64), clipped.cumsum(dtype=np.int64))
+            )
+            positions = np.arange(offsets[-1]) - np.repeat(offsets[:-1], clipped)
+            packed = np.repeat(np.arange(stop - start), clipped) * maximum + positions
+            top_indices = staging.device("top_indices", packed, torch.int64)
+            top_ids = top_ids.reshape(-1).index_select(0, top_indices)
+            top_values = top_values.reshape(-1).index_select(0, top_indices)
             top = _ScoreColumns(clipped, top_ids, top_values)
         target_columns = (
-            None if not len(ids) else _ScoreColumns(counts, owned_target_ids, targets)
+            None if target_ids is None else _ScoreColumns(counts, target_ids, targets)
         )
         parts.append(PromptScores(chosen, top, target_columns))
     return (

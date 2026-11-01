@@ -70,15 +70,15 @@ verification positions.
 Counts through 32 use fused CuTe reduction and selection. Counts from 33 through
 2,048 use FlashInfer radix selection with sparse CuTe normalization; larger
 counts use repeated CuTe selection passes. Larger requests cost more work and
-output storage. Prompt scoring captures bounded output-head projections and the
-same scorer, retaining at most 256 projected predecessor rows per graph.
+output storage. Prompt scoring eagerly projects and scores at most 256 requested
+predecessor rows at a time, with no prompt graph cache or padded target capacity.
 
 Compiled kernels specialize for vocabulary geometry, dtype, layout, and scoring
 features. After a path's first warmup, changing batch size or requested top count
-does not compile new kernels. Score graphs bind fixed buffers, so a new storage
-shape or capacity can require graph capture. Persistent artifacts use the
-[kernel cache](kernel-cache.md); reuse does not eliminate graph capture or model
-warmup.
+does not compile new kernels. Generated-token score graphs bind fixed buffers,
+so a new storage shape or capacity can require graph capture. Persistent artifacts
+use the [kernel cache](kernel-cache.md); reuse does not eliminate graph capture
+or model warmup.
 
 `deploy/modal_bench_scoring.py` runs checkpoint-free correctness, replay, compilation,
 allocation, and timing checks on A100, H200, and B200. Reports go under the ignored

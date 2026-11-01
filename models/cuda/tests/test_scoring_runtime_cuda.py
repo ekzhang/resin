@@ -140,6 +140,8 @@ def test_captured_mixed_scores_survive_replay_and_forced_acceptance(monkeypatch)
 
 @torch.inference_mode()
 def test_prompt_projection_scores_and_duplicate_targets_use_cuda(monkeypatch):
+    from resin_models_cuda import scoring
+
     count, hidden_size, vocab = 2 * _PROMPT_SCORE_CHUNK_SIZE + 1, 32, 2051
     hidden = torch.randn((count, hidden_size), device="cuda", dtype=torch.float32)
     head = torch.nn.Linear(hidden_size, vocab, bias=False, device="cuda")
@@ -178,10 +180,13 @@ def test_prompt_projection_scores_and_duplicate_targets_use_cuda(monkeypatch):
         projected.append(len(rows))
         return head(rows)
 
+    def forbid_capture(*args, **kwargs):
+        raise AssertionError("prompt scoring must not capture CUDA graphs")
+
+    monkeypatch.setattr(scoring, "_capture", forbid_capture)
     first = prompt_scores(plan, hidden, project)
     assert first is not None
-    assert max(projected) == _PROMPT_SCORE_CHUNK_SIZE
-    assert set(projected) == {1, _PROMPT_SCORE_CHUNK_SIZE}
+    assert projected == [_PROMPT_SCORE_CHUNK_SIZE, _PROMPT_SCORE_CHUNK_SIZE, 1]
     projected.clear()
 
     def forbid_normalize(*args, **kwargs):
@@ -194,7 +199,8 @@ def test_prompt_projection_scores_and_duplicate_targets_use_cuda(monkeypatch):
         result = prompt_scores(plan, hidden, project)
     finally:
         torch.cuda.set_sync_debug_mode(previous)
-    assert result is not None and projected == []
+    assert result is not None
+    assert projected == [_PROMPT_SCORE_CHUNK_SIZE, _PROMPT_SCORE_CHUNK_SIZE, 1]
     output = result.output(plan)
     np.testing.assert_allclose(
         output["prompt_logprobs"], expected.numpy(), atol=3e-6, rtol=0
@@ -243,8 +249,9 @@ def test_ordinary_inference_scores_reuse_the_original_logits_owner(monkeypatch):
 
 
 @torch.inference_mode()
-def test_prompt_graph_cache_buckets_targets_and_bounds_owned_projections():
+def test_prompt_scores_own_results_across_shapes_and_target_counts():
     logits = torch.randn((6, 65), device="cuda")
+    reference = logits.double().log_softmax(-1).cpu()
 
     def plan(rows, targets):
         return BatchPlan(
@@ -262,21 +269,15 @@ def test_prompt_graph_cache_buckets_targets_and_bounds_owned_projections():
         )
 
     first_plan = plan(4, 3)
-    first = prompt_scores(first_plan, logits[:4], cache_owner=logits)
+    first = prompt_scores(first_plan, logits[:4])
     assert first is not None
-    cache = getattr(logits, "_resin_prompt_score_graphs")
-    first_graph = next(iter(cache.values())).graph
     second_plan = plan(4, 4)
-    second = prompt_scores(second_plan, logits[:4], cache_owner=logits)
+    second = prompt_scores(second_plan, logits[:4])
     assert second is not None
-    assert len(cache) == 1 and next(iter(cache.values())).graph is first_graph
 
-    # Each different projection shape owns a graph pool, but only four stay hot.
-    # Earlier results must survive their source entry being evicted.
     for rows in range(1, 7):
-        prompt_scores(plan(rows, 0), logits[:rows], cache_owner=logits)
-        assert len(cache) <= 4
-    reference = logits.double().log_softmax(-1).cpu()
+        prompt_scores(plan(rows, 0), logits[:rows])
+    logits.zero_()
     first_output = first.output(first_plan)
     second_output = second.output(second_plan)
     np.testing.assert_allclose(
@@ -290,3 +291,25 @@ def test_prompt_graph_cache_buckets_targets_and_bounds_owned_projections():
             atol=3e-6,
             rtol=0,
         )
+
+
+@pytest.mark.parametrize("selected,target", [(65, 1), (1, 65)])
+@torch.inference_mode()
+def test_prompt_token_ids_are_validated_before_cuda_scoring(selected, target):
+    plan = BatchPlan(
+        sequence_ids=[1],
+        context_lengths=[0],
+        token_ids=[1],
+        token_indptr=[0, 1],
+        sampling_params=[SamplingParams(prompt_logprobs=True)],
+        prompt_score_indices=[0],
+        prompt_score_token_ids=[selected],
+        prompt_score_indptr=[0, 1],
+        prompt_score_top_counts=[0],
+        prompt_target_indptr=[0, 1],
+        prompt_target_token_ids=[target],
+    )
+    logits = torch.randn((1, 65), device="cuda")
+    with pytest.raises(ValueError, match="vocabulary size 65"):
+        prompt_scores(plan, logits)
+    torch.cuda.synchronize()

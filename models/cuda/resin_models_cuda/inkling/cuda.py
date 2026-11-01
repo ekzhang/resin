@@ -471,7 +471,6 @@ class InklingCudaRunner(CudaRunner):
                         row_logits[0],
                         project,
                         token_start=start,
-                        cache_owner=self,
                     )
                 )
                 row_logits = project(row_logits[:, -1:])
