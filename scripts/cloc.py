@@ -31,7 +31,7 @@ def source_files(path: Path, pattern: str, *, recursive: bool = True) -> list[Pa
 def python_package(path: Path) -> SourceTree:
     groups: SourceTree = {"_self": source_files(path, "*.py", recursive=False)}
     for directory in sorted(path.iterdir()):
-        if directory.is_dir() and not directory.name.startswith("__"):
+        if directory.is_dir() and not directory.name.startswith("_"):
             files = source_files(directory, "*.py")
             if files:
                 groups[directory.name.replace("_", "-")] = files
@@ -180,6 +180,7 @@ def report() -> dict[str, Counts]:
             "resin-models-torch": python_package(
                 ROOT / "models/torch/resin_models_torch"
             ),
+            "resin-models-mlx": python_package(ROOT / "models/mlx/resin_models_mlx"),
         },
     }
     return {
