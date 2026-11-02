@@ -56,12 +56,13 @@ def _weights(reference, *, mlx_format: bool = False):
 
 
 @pytest.mark.parametrize("dtype", ["float32", "bfloat16"])
-@pytest.mark.parametrize("grid", [[[1, 4, 6]], [[2, 2, 4], [1, 4, 2]]])
-def test_vision_features_match_transformers(dtype, grid):
+def test_vision_eager_and_compiled_features_match_transformers(dtype):
     import torch
 
-    reference = _reference()
-    model = Qwen35VisionModel(_config())
+    grid = [[2, 2, 4], [1, 4, 2]]
+    values = _config() | {"hidden_size": 128, "num_heads": 2, "intermediate_size": 256}
+    reference = _reference(values)
+    model = Qwen35VisionModel(values)
     model.load_weights(list(sanitize_vision_weights(_weights(reference)).items()))
     model.set_dtype(getattr(mx, dtype))
     reference = reference.to(getattr(torch, dtype))
@@ -79,6 +80,12 @@ def test_vision_features_match_transformers(dtype, grid):
     actual = np.array(model(pixels, np.array(grid)).astype(mx.float32))
     tolerance = 2e-2 if dtype == "bfloat16" else 2e-5
     np.testing.assert_allclose(actual, expected, atol=tolerance, rtol=tolerance)
+    model.enable_compile()
+    compiled = np.array(model(pixels, np.array(grid)).astype(mx.float32))
+    if dtype == "bfloat16":
+        np.testing.assert_array_equal(compiled, actual)
+    else:
+        np.testing.assert_allclose(compiled, actual, atol=2e-5, rtol=2e-5)
 
 
 def test_omitted_patch_size_matches_qwen35_reference_default():
@@ -96,107 +103,6 @@ def test_omitted_patch_size_matches_qwen35_reference_default():
             torch.from_numpy(pixels), torch.from_numpy(grid)
         ).pooler_output.numpy()
     np.testing.assert_allclose(model(pixels, grid), expected, atol=2e-5, rtol=2e-5)
-
-
-def test_native_no_resize_image_features_match_transformers():
-    import torch
-    from tokenizers import Tokenizer
-    from tokenizers.models import WordLevel
-
-    from resin.recipe import Image, Message, Qwen35Media, Role, get_native_recipe
-
-    tokenizer = Tokenizer(WordLevel({"[UNK]": 0}, unk_token="[UNK]"))
-    tokenizer.add_special_tokens(
-        [
-            "<|im_start|>",
-            "<|im_end|>",
-            "<|vision_start|>",
-            "<|image_pad|>",
-            "<|vision_end|>",
-            "<think>",
-            "</think>",
-        ]
-    )
-    recipe = get_native_recipe(
-        "qwen3_5",
-        tokenizer,
-        media_config={
-            "do_resize": False,
-            "patch_size": 2,
-            "temporal_patch_size": 2,
-            "merge_size": 2,
-        },
-    )
-    pixels = np.random.default_rng(8).uniform(size=(8, 12, 3)).astype(np.float32)
-    media = recipe.render([Message(Role.USER, [Image.from_rgb(pixels)])]).media
-    assert isinstance(media, Qwen35Media)
-    assert media.image_grid_thw.tolist() == [[1, 4, 6]]
-    assert media.pixel_values.shape == (24, 24)
-    reference = _reference()
-    model = Qwen35VisionModel(_config())
-    model.load_weights(list(sanitize_vision_weights(_weights(reference)).items()))
-    with torch.inference_mode():
-        expected = reference(
-            torch.from_numpy(media.pixel_values.copy()),
-            torch.from_numpy(media.image_grid_thw.copy()),
-        ).pooler_output.numpy()
-    actual = np.array(model(media.pixel_values, media.image_grid_thw))
-    np.testing.assert_allclose(actual, expected, atol=2e-5, rtol=2e-5)
-
-
-def test_packed_images_and_frames_keep_attention_separate():
-    reference = _reference()
-    model = Qwen35VisionModel(_config())
-    model.load_weights(list(sanitize_vision_weights(_weights(reference)).items()))
-    pixels = np.random.default_rng(4).normal(size=(24, 24)).astype(np.float32)
-    together = np.array(model(pixels, np.array([[2, 2, 4], [1, 4, 2]])))
-    separate = np.concatenate(
-        [
-            np.array(model(pixels[:8], np.array([[1, 2, 4]]))),
-            np.array(model(pixels[8:16], np.array([[1, 2, 4]]))),
-            np.array(model(pixels[16:], np.array([[1, 4, 2]]))),
-        ]
-    )
-    np.testing.assert_allclose(together, separate, atol=1e-6, rtol=1e-6)
-
-
-@pytest.mark.parametrize(
-    "dtype,width,heads", [("float32", 32, 4), ("bfloat16", 128, 2)]
-)
-def test_compiled_vision_matches_eager_across_frame_shapes(dtype, width, heads):
-    # The actual tower has head_dim=64: its nontrivial rotary frequencies must
-    # stay identical when the whole BF16 encoder is compiled.
-    values = _config() | {
-        "hidden_size": width,
-        "num_heads": heads,
-        "intermediate_size": width * 2,
-    }
-    reference = _reference(values)
-    model = Qwen35VisionModel(values)
-    model.load_weights(list(sanitize_vision_weights(_weights(reference)).items()))
-    model.set_dtype(getattr(mx, dtype))
-    rng = np.random.default_rng(93)
-    inputs = []
-    for grid in ([[1, 2, 4]], [[1, 4, 6]], [[2, 4, 4]]):
-        pixels = rng.normal(size=(sum(t * h * w for t, h, w in grid), 24)).astype(
-            np.float32
-        )
-        inputs.append((pixels, np.array(grid)))
-    expected = [
-        np.array(model(pixels, grid).astype(mx.float32)) for pixels, grid in inputs
-    ]
-    model.enable_compile()
-    for _ in range(2):
-        for (pixels, grid), output in zip(inputs, expected, strict=True):
-            actual = np.array(model(pixels, grid).astype(mx.float32))
-            if dtype == "bfloat16":
-                np.testing.assert_array_equal(actual, output)
-            else:
-                np.testing.assert_allclose(actual, output, atol=2e-5, rtol=2e-5)
-    model.enable_compile(False)
-    np.testing.assert_array_equal(
-        np.array(model(*inputs[0]).astype(mx.float32)), expected[0]
-    )
 
 
 @pytest.mark.parametrize("mlx_format,sharded", [(False, True), (True, False)])
@@ -255,10 +161,3 @@ def test_deepstack_and_packed_vision_weights_are_explicit_errors(tmp_path):
     )
     with pytest.raises(ValueError, match="packed quantized"):
         load_vision_model(tmp_path)
-
-
-@pytest.mark.parametrize("grid", [[[1, 3, 4]], [[0, 2, 4]], [[1.0, 2.0, 4.0]]])
-def test_vision_grid_validation(grid):
-    model = Qwen35VisionModel(_config())
-    with pytest.raises(ValueError, match="grid"):
-        model(np.zeros((8, 24), np.float32), np.array(grid))

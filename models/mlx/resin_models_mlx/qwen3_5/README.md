@@ -144,11 +144,9 @@ uv run scripts/bench.py --model qwen3.5-0.8b-mlx --backend local \
 
 ## Validation and limits
 
-The tests cover independent mlx-lm and Transformers forward references,
-checkpoint loading, raw-bit fusion contracts, eager/compiled vision, paged
-attention, cross-stream cache ordering and queued snapshots. Engine tests cover
-page/checkpoint boundaries, prefix reuse, cancellation, retraction, batch changes,
-logprobs, seeded sampling and synchronous/overlapped parity.
+The retained tests compare model/checkpoint and vision outputs with independent
+references, check essential fusion numerics and cache ordering, and exercise
+prefix reuse and overlapped decoding through the Engine.
 
 ```bash
 uv run pytest models/mlx/tests tests/test_deploy_models.py \
@@ -156,9 +154,8 @@ uv run pytest models/mlx/tests tests/test_deploy_models.py \
 uv build --package resin-models-mlx
 ```
 
-The final local run, including related CUDA configuration/model tests, passed
-449 tests; 13 CUDA-only tests were skipped on this Mac. Installed-wheel tests
-also exercise the native binding and vision adapter.
+Metal tests require Apple Silicon; CUDA-only checks run on CUDA hosts. The
+native binding and vision adapter have also been checked from installed wheels.
 
 Startup compilation stability remains unqualified: upstream MLX may create
 additional pipelines for first unseen inputs. Vision compilation is shape

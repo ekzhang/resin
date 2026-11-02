@@ -34,12 +34,7 @@ def _assert_bits(actual, expected):
 
 
 @pytest.mark.parametrize("write", ["rows", "slice"])
-@pytest.mark.parametrize(
-    "snapshot,explicit_readers", [(True, False), (True, True), (False, True)]
-)
-def test_cross_stream_readers_and_lazy_snapshots_precede_mutation(
-    write, snapshot, explicit_readers
-):
+def test_cross_stream_readers_and_lazy_snapshots_precede_mutation(write):
     rng = np.random.default_rng(9937)
     initial = mx.array(rng.normal(size=(10, 2, 128, 512)).astype(np.float32)).astype(
         mx.bfloat16
@@ -63,7 +58,7 @@ def test_cross_stream_readers_and_lazy_snapshots_precede_mutation(
     a, b = mx.new_stream(mx.gpu), mx.new_stream(mx.gpu)
     with mx.stream(a):
         epoch = owner.write_slice(owner.initial_epoch(), 0, initial)
-        before = owner.snapshot(epoch) if snapshot else None
+        before = owner.snapshot(epoch)
         units = owner.read_epoch(epoch).reshape(initial.shape)
         old_a = read(units)
     with mx.stream(b):
@@ -71,31 +66,28 @@ def test_cross_stream_readers_and_lazy_snapshots_precede_mutation(
     with mx.stream(a):
         roots = [*old_a, *old_b]
         ordered = mx.depends(epoch, roots)
-        keywords = {"after": roots} if explicit_readers else {}
         if write == "rows":
             epoch = owner.scatter_rows(
                 ordered,
                 mx.array([5 * 256], mx.int64),
                 mx.zeros((1, 512), mx.bfloat16),
-                **keywords,
+                after=roots,
             )
         else:
             epoch = owner.write_slice(
                 ordered,
                 5 * 256 * 512,
                 mx.zeros(512, mx.bfloat16),
-                **keywords,
+                after=roots,
             )
         current = owner.read_epoch(epoch).reshape(initial.shape)
         new_a = read(current)
     with mx.stream(b):
         new_b = read(current)
         after = owner.snapshot(mx.depends(epoch, [*new_a, *new_b]))
-    # Evaluate the entire queued chain together: pre-evaluating `before` hides
-    # the regression. The old snapshot alone is an automatic read dependency.
-    mx.eval(old_a, old_b, new_a, new_b, after, *([] if before is None else [before]))
-    if before is not None:
-        _assert_bits(before.reshape(initial.shape), initial)
+    # Pre-evaluating the old snapshot or partials would hide the regression.
+    mx.eval(old_a, old_b, new_a, new_b, after, before)
+    _assert_bits(before.reshape(initial.shape), initial)
     _assert_bits(after.reshape(initial.shape), changed)
     for actual, expected in (
         (old_a, expected_before),

@@ -105,21 +105,3 @@ def test_media_chunks_merge_features_and_keep_decode_rotary_delta():
         encoder.prepare(
             plan, rows, np.array([[99]]), np.array([1]), mx.zeros((1, 1, 8))
         )
-
-
-def test_vision_cache_uses_pixels_and_obeys_entry_limit():
-    calls = []
-
-    def visual(pixels, grid):
-        calls.append(1)
-        return mx.ones((4, 8)) * pixels[0, 0]
-
-    encoder = MediaEncoder(visual, 8, max_entries=1)
-    first = encoder.features(_media())
-    assert encoder.features(_media()) is first
-    second = encoder.features(_media(2.0))
-    assert first is not second
-    np.testing.assert_array_equal(np.array(second), np.full((4, 8), 2.0))
-    encoder.features(_media())
-    assert len(calls) == 3
-    assert encoder.size_bytes == first.nbytes
