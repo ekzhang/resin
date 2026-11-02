@@ -67,7 +67,7 @@ A native cache resource keeps one allocation across mutations. Dependency
 epochs and computed reader outputs order reads before later writes, and Metal
 completion handlers retain buffers until GPU work finishes. An explicit snapshot
 makes an independent copy; metadata queries do not copy the arena. See the
-[native cache contract](../native/README.md) for ordering and lifetime details.
+[native cache contract](../_native/README.md) for ordering and lifetime details.
 Streams are selected on the calling thread so startup and HTTP inference can
 run on different threads.
 

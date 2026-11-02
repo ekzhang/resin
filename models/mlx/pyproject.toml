@@ -35,11 +35,11 @@ namespaces = false
 [tool.setuptools.package-data]
 resin_models_mlx = [
   "*.pyi",
-  "native/*.cpp",
-  "native/*.metal",
-  "native/*.h",
-  "native/*.md",
-  "native/LICENSE*",
+  "_native/*.cpp",
+  "_native/*.metal",
+  "_native/*.h",
+  "_native/*.md",
+  "_native/LICENSE*",
   "qwen3_5/README.md",
   "qwen3_5/LICENSE",
 ]

@@ -33,10 +33,10 @@ if sys.platform == "darwin":
         extension.MetalExtension(
             "resin_models_mlx._native_cache",
             sources=[
-                "resin_models_mlx/native/cache.cpp",
-                "resin_models_mlx/native/cache.metal",
-                "resin_models_mlx/native/attention.cpp",
-                "resin_models_mlx/native/attention.metal",
+                "resin_models_mlx/_native/cache.cpp",
+                "resin_models_mlx/_native/cache.metal",
+                "resin_models_mlx/_native/attention.cpp",
+                "resin_models_mlx/_native/attention.metal",
             ],
             include_dirs=[str(distribution("mlx").locate_file("mlx/include"))],
         )

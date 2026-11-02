@@ -157,7 +157,7 @@ class CacheArena:
         self.slabs = layout.parent_capacity + 1
         # Import only when constructing an Apple GPU runner. The package can
         # still be imported on platforms which do not build the Metal extension.
-        from resin_models_mlx.native import CacheStorage
+        from resin_models_mlx._native import CacheStorage
 
         self._storage = CacheStorage(
             [self.slabs * geometry.slab_units, 2 * PAGE_TOKENS, geometry.kv_width],

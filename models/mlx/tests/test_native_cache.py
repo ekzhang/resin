@@ -10,7 +10,7 @@ import pytest
 mx = pytest.importorskip("mlx.core")
 pytestmark = pytest.mark.skipif(not mx.metal.is_available(), reason="Metal cache")
 
-from resin_models_mlx.native import CacheStorage  # noqa: E402
+from resin_models_mlx._native import CacheStorage  # noqa: E402
 
 
 def _bits(value):

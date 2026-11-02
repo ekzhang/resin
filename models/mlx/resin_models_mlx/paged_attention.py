@@ -35,7 +35,7 @@ _THREADGROUP_BYTES = 32 * 1024
 
 # The preprocessor selects declarations outside the generated entrypoint and
 # the same body inside it; the native metallib includes this header too.
-_HEADER = (Path(__file__).parent / "native/attention_kernel.h").read_text()
+_HEADER = (Path(__file__).parent / "_native/attention_kernel.h").read_text()
 _SOURCE = "#define RESIN_ATTENTION_BODY\n" + _HEADER + "\n#undef RESIN_ATTENTION_BODY\n"
 
 

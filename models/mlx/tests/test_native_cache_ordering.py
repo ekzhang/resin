@@ -7,7 +7,7 @@ import numpy as np
 import pytest
 
 from resin_models_mlx import paged_attention
-from resin_models_mlx.native import CacheStorage
+from resin_models_mlx._native import CacheStorage
 
 
 def _attention_partials(*args):
