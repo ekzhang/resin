@@ -40,7 +40,7 @@ def test_cache_writes_preserve_bits_lazy_snapshots_and_owner_lifetime(
     ]
     storage = CacheStorage((6, 512), dtype)
     epoch = storage.initial_epoch()
-    assert storage.buffer_identity == storage.allocation_count == 0
+    assert storage.buffer_identity != 0 and storage.allocation_count == 1
     epoch = storage.write_slice(epoch, 3, mx.array(raw).view(dtype))
     before = storage.snapshot(epoch)
     updates = np.stack([raw[0], raw[1], raw[0], raw[0]])
@@ -48,7 +48,7 @@ def test_cache_writes_preserve_bits_lazy_snapshots_and_owner_lifetime(
         epoch, mx.array([-1, 1, 6, 4], index_dtype), mx.array(updates).view(dtype)
     )
     after = storage.snapshot(epoch)
-    assert storage.buffer_identity == storage.allocation_count == 0
+    assert storage.buffer_identity != 0 and storage.allocation_count == 1
     # Both snapshots are still lazy; the write must preserve the earlier one.
     expected = np.zeros(6 * 512, unsigned)
     expected[3 : 3 + raw.size] = raw.reshape(-1)

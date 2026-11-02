@@ -8,12 +8,11 @@
 #include <mlx/backend/metal/device.h>
 #include <mlx/ops.h>
 #include <mlx/primitives.h>
+#include <mlx/transforms.h>
 #include <algorithm>
 #include <cstdint>
 #include <limits>
 #include <memory>
-#include <mutex>
-#include <optional>
 #include <stdexcept>
 
 namespace nb = nanobind;
@@ -26,47 +25,22 @@ using resin_models_mlx::native::library_directory;
 
 constexpr int kEpochElements = 8;
 
-enum class Kind { Initialize, Read, Snapshot, Rows, Slice };
+enum class Kind { Read, Rows, Slice };
 
-struct Storage {
-  mx::Shape shape;
-  mx::Dtype dtype;
-  size_t size;
-  std::optional<mx::array> arena;
-  std::mutex mutex;
-  size_t allocations = 0;
-
-  Storage(const std::vector<int>& dimensions, mx::Dtype type)
-      : shape(dimensions.begin(), dimensions.end()), dtype(type), size(1) {
-    if (shape.empty() || (dtype != mx::bfloat16 && dtype != mx::float32)) {
-      throw std::invalid_argument("CacheStorage requires nonempty shape and BF16/F32 dtype");
-    }
-    for (auto dimension : shape) {
-      if (dimension < 1 || size > std::numeric_limits<size_t>::max() / size_t(dimension)) {
-        throw std::invalid_argument("CacheStorage shape must be positive and fit size_t indexing");
-      }
-      size *= size_t(dimension);
-    }
-    if (size > std::numeric_limits<size_t>::max() / dtype.size()) {
-      throw std::invalid_argument("CacheStorage byte count overflows size_t");
-    }
+mx::array allocate_arena(const std::vector<int>& dimensions, mx::Dtype dtype) {
+  mx::Shape shape(dimensions.begin(), dimensions.end());
+  if (shape.empty() || (dtype != mx::bfloat16 && dtype != mx::float32)) {
+    throw std::invalid_argument("CacheStorage requires nonempty shape and BF16/F32 dtype");
   }
-
-  mx::array& allocation(bool create = false) {
-    std::lock_guard lock(mutex);
-    if (!arena) {
-      if (!create) {
-        throw std::runtime_error("CacheStorage initial_epoch must precede cache access");
-      }
-      mx::array allocated(shape, dtype, nullptr, std::vector<mx::array>{});
-      allocated.set_data(mx::allocator::malloc(size * dtype.size()));
-      allocated.set_status(mx::array::Status::available);
-      arena.emplace(std::move(allocated));
-      ++allocations;
+  size_t bytes = dtype.size();
+  for (auto dimension : shape) {
+    if (dimension < 1 || bytes > std::numeric_limits<size_t>::max() / size_t(dimension)) {
+      throw std::invalid_argument("CacheStorage shape must be positive and fit size_t indexing");
     }
-    return *arena;
+    bytes *= size_t(dimension);
   }
-};
+  return mx::zeros(shape, dtype, checked_stream());
+}
 
 void check_epoch(const mx::array& epoch) {
   if (epoch.dtype() != mx::uint32 || epoch.ndim() != 1 || epoch.size() != kEpochElements) {
@@ -76,7 +50,7 @@ void check_epoch(const mx::array& epoch) {
 
 class CacheOperation : public mx::Primitive {
  public:
-  CacheOperation(mx::Stream stream, std::shared_ptr<Storage> storage, Kind kind,
+  CacheOperation(mx::Stream stream, std::shared_ptr<mx::array> storage, Kind kind,
                  uint64_t start = 0)
       : Primitive(stream), storage_(std::move(storage)), kind_(kind), start_(start) {}
 
@@ -89,7 +63,7 @@ class CacheOperation : public mx::Primitive {
 
   void eval_gpu(const std::vector<mx::array>& inputs,
                 std::vector<mx::array>& outputs) override {
-    auto& arena = storage_->allocation(kind_ == Kind::Initialize);
+    auto& arena = *storage_;
     auto& output = outputs[0];
     if (kind_ == Kind::Read) {
       // Private read view only. The eventual attention/gather primitive binds
@@ -100,25 +74,8 @@ class CacheOperation : public mx::Primitive {
     output.set_data(mx::allocator::malloc(output.nbytes()));
     auto& device = mx::metal::device(stream().device);
     auto library = device.get_library(MLX_METAL_LIBRARY_NAME, library_directory());
-    auto suffix = storage_->dtype == mx::bfloat16 ? "_b2" : "_b4";
-    if (kind_ == Kind::Initialize) {
-      // Warm this owner's bounded byte-width catalog before serving. Neither
-      // request rows nor context lengths select another pipeline.
-      for (const std::string prefix : {"resin_cache_zero", "resin_cache_snapshot",
-                                        "resin_cache_slice"}) {
-        device.get_kernel(prefix + suffix, library);
-      }
-      device.get_kernel(std::string("resin_cache_rows") + suffix + "_i4", library);
-      device.get_kernel(std::string("resin_cache_rows") + suffix + "_i8", library);
-    }
-    std::string kernel_name;
-    switch (kind_) {
-      case Kind::Initialize: kernel_name = "resin_cache_zero"; break;
-      case Kind::Snapshot: kernel_name = "resin_cache_snapshot"; break;
-      case Kind::Rows: kernel_name = "resin_cache_rows"; break;
-      case Kind::Slice: kernel_name = "resin_cache_slice"; break;
-      default: throw std::runtime_error("Invalid cache operation");
-    }
+    auto suffix = storage_->dtype() == mx::bfloat16 ? "_b2" : "_b4";
+    std::string kernel_name = kind_ == Kind::Rows ? "resin_cache_rows" : "resin_cache_slice";
     kernel_name += suffix;
     if (kind_ == Kind::Rows) {
       kernel_name += inputs[1].dtype() == mx::int32 ? "_i4" : "_i8";
@@ -126,46 +83,32 @@ class CacheOperation : public mx::Primitive {
     auto kernel = device.get_kernel(kernel_name, library);
     auto& encoder = mx::metal::get_command_encoder(stream());
     encoder.set_compute_pipeline_state(kernel);
-    if (kind_ == Kind::Rows || kind_ == Kind::Slice) {
-      const size_t base_inputs = kind_ == Kind::Rows ? 3 : 2;
-      // Keep every completed reader in the writer's resource frontier. An
-      // alias-only Depends node can lose this edge across encoder boundaries.
-      // Slot 30 is outside the shaders' arguments; repeated binding records
-      // every real input buffer without copying any of its contents.
-      for (size_t i = base_inputs; i < inputs.size(); ++i) {
-        encoder.set_input_array(inputs[i], 30);
-      }
+    const size_t base_inputs = kind_ == Kind::Rows ? 3 : 2;
+    // Keep every completed reader in the writer's resource frontier. An
+    // alias-only Depends node can lose this edge across encoder boundaries.
+    // Slot 30 is outside the shaders' arguments; repeated binding records
+    // every real input buffer without copying any of its contents.
+    for (size_t i = base_inputs; i < inputs.size(); ++i) {
+      encoder.set_input_array(inputs[i], 30);
     }
-    uint64_t work = storage_->size;
-    if (kind_ == Kind::Initialize) {
-      encoder.set_output_array(arena, 0);
-      encoder.set_output_array(output, 1);
-      encoder.set_bytes(storage_->size, 2);
-    } else if (kind_ == Kind::Snapshot) {
-      encoder.set_input_array(arena, 0);
-      encoder.set_input_array(inputs[0], 1);
-      encoder.set_output_array(output, 2);
-      encoder.set_bytes(storage_->size, 3);
+    encoder.set_output_array(arena, 0);
+    encoder.set_input_array(inputs[0], 1);
+    encoder.set_output_array(output, 2);
+    uint64_t work = inputs[1].size();
+    if (kind_ == Kind::Rows) {
+      encoder.set_input_array(inputs[1], 3);
+      encoder.set_input_array(inputs[2], 4);
+      uint64_t width = storage_->shape(-1);
+      uint64_t count = inputs[1].size();
+      uint64_t total_rows = storage_->size() / width;
+      encoder.set_bytes(width, 5);
+      encoder.set_bytes(count, 6);
+      encoder.set_bytes(total_rows, 7);
     } else {
-      encoder.set_output_array(arena, 0);
-      encoder.set_input_array(inputs[0], 1);
-      encoder.set_output_array(output, 2);
-      if (kind_ == Kind::Rows) {
-        encoder.set_input_array(inputs[1], 3);
-        encoder.set_input_array(inputs[2], 4);
-        uint64_t width = storage_->shape.back();
-        uint64_t count = inputs[1].size();
-        uint64_t total_rows = storage_->size / width;
-        encoder.set_bytes(width, 5);
-        encoder.set_bytes(count, 6);
-        encoder.set_bytes(total_rows, 7);
-      } else {
-        encoder.set_input_array(inputs[1], 3);
-        uint64_t count = inputs[1].size();
-        encoder.set_bytes(start_, 4);
-        encoder.set_bytes(count, 5);
-        work = count;
-      }
+      encoder.set_input_array(inputs[1], 3);
+      uint64_t count = inputs[1].size();
+      encoder.set_bytes(start_, 4);
+      encoder.set_bytes(count, 5);
     }
     // arena is a resource captured by the primitive, not an ordinary input or
     // output array. Keep its Data alive explicitly until the GPU completes.
@@ -176,7 +119,7 @@ class CacheOperation : public mx::Primitive {
     // Width and rank-one index count are MLX int dimensions: both grid axes
     // fit uint32. Byte addresses remain 64-bit for large arenas.
     if (kind_ == Kind::Rows) {
-      const uint64_t width = storage_->shape.back();
+      const uint64_t width = storage_->shape(-1);
       const uint64_t count = inputs[1].size();
       const uint64_t columns = count ? std::max<uint64_t>(width, 8) : 8;
       encoder.dispatch_threads(MTL::Size(columns, std::max<uint64_t>(count, 1), 1),
@@ -197,7 +140,7 @@ class CacheOperation : public mx::Primitive {
   }
 
  private:
-  std::shared_ptr<Storage> storage_;
+  std::shared_ptr<mx::array> storage_;
   Kind kind_;
   uint64_t start_;
 };
@@ -205,21 +148,31 @@ class CacheOperation : public mx::Primitive {
 class CacheStorage {
  public:
   CacheStorage(const std::vector<int>& shape, mx::Dtype dtype)
-      : storage_(std::make_shared<Storage>(shape, dtype)) {}
-
-  mx::array initial_epoch() {
-    if (!initial_) {
-      initial_ = operation(Kind::Initialize, {});
-    }
-    return *initial_;
+      : storage_(std::make_shared<mx::array>(allocate_arena(shape, dtype))),
+        initial_(mx::zeros({kEpochElements}, mx::uint32, checked_stream())) {
+    // Materialize on the creating thread; serving may use another MLX stream.
+    mx::eval(*storage_, initial_);
+    auto& device = mx::metal::device(checked_stream().device);
+    auto library = device.get_library(MLX_METAL_LIBRARY_NAME, library_directory());
+    auto suffix = dtype == mx::bfloat16 ? "_b2" : "_b4";
+    // Request rows and context lengths never select another pipeline.
+    device.get_kernel(std::string("resin_cache_slice") + suffix, library);
+    device.get_kernel(std::string("resin_cache_rows") + suffix + "_i4", library);
+    device.get_kernel(std::string("resin_cache_rows") + suffix + "_i8", library);
   }
+
+  mx::array initial_epoch() { return initial_; }
   mx::array read_epoch(const mx::array& epoch) {
     check_epoch(epoch);
     return operation(Kind::Read, {epoch});
   }
   mx::array snapshot(const mx::array& epoch) {
     check_epoch(epoch);
-    auto result = operation(Kind::Snapshot, {epoch});
+    auto stream = checked_stream();
+    auto raw = mx::view(read_epoch(epoch), storage_->dtype() == mx::bfloat16 ? mx::uint16 : mx::uint32, stream);
+    // Copy integer words to preserve NaN payloads. The persistent owner retains
+    // the source Data, so Full cannot donate its buffer. mx::copy would alias.
+    auto result = mx::view(mx::full(raw.shape(), raw, raw.dtype(), stream), storage_->dtype(), stream);
     pending_snapshots_.push_back(result);
     return result;
   }
@@ -229,8 +182,8 @@ class CacheStorage {
     if (indices.ndim() != 1 || (indices.dtype() != mx::int32 && indices.dtype() != mx::int64)) {
       throw std::invalid_argument("CacheStorage row indices must be rank-one int32/int64");
     }
-    if (updates.dtype() != storage_->dtype || indices.size() > std::numeric_limits<size_t>::max() / size_t(storage_->shape.back())
-        || updates.size() != indices.size() * size_t(storage_->shape.back())) {
+    if (updates.dtype() != storage_->dtype() || indices.size() > std::numeric_limits<size_t>::max() / size_t(storage_->shape(-1))
+        || updates.size() != indices.size() * size_t(storage_->shape(-1))) {
       throw std::invalid_argument("CacheStorage row updates must match dtype and row payload size");
     }
     return operation(Kind::Rows, {epoch, mx::contiguous(indices), mx::contiguous(mx::reshape(updates, {-1}))}, 0, after);
@@ -238,25 +191,19 @@ class CacheStorage {
   mx::array write_slice(const mx::array& epoch, int64_t start,
                         const mx::array& updates, const std::vector<mx::array>& after) {
     check_epoch(epoch);
-    if (start < 0 || uint64_t(start) > storage_->size || updates.size() > storage_->size - uint64_t(start)) {
+    if (start < 0 || uint64_t(start) > storage_->size() || updates.size() > storage_->size() - uint64_t(start)) {
       throw std::invalid_argument("CacheStorage slice is outside the allocation");
     }
-    if (updates.dtype() != storage_->dtype) {
+    if (updates.dtype() != storage_->dtype()) {
       throw std::invalid_argument("CacheStorage slice updates must match storage dtype");
     }
     return operation(Kind::Slice, {epoch, mx::contiguous(mx::reshape(updates, {-1}))}, start, after);
   }
-  size_t nbytes() const { return storage_->size * storage_->dtype.size(); }
+  size_t nbytes() const { return storage_->nbytes(); }
   uintptr_t identity() const { return reinterpret_cast<uintptr_t>(storage_.get()); }
-  uintptr_t buffer_identity() const {
-    std::lock_guard lock(storage_->mutex);
-    return storage_->arena ? reinterpret_cast<uintptr_t>(storage_->arena->buffer().ptr()) : 0;
-  }
-  size_t allocation_count() const {
-    std::lock_guard lock(storage_->mutex);
-    return storage_->allocations;
-  }
-  std::vector<int> shape() const { return {storage_->shape.begin(), storage_->shape.end()}; }
+  uintptr_t buffer_identity() const { return reinterpret_cast<uintptr_t>(storage_->buffer().ptr()); }
+  size_t allocation_count() const { return 1; }
+  std::vector<int> shape() const { return {storage_->shape().begin(), storage_->shape().end()}; }
 
  private:
   mx::array after_snapshots(const mx::array& epoch, std::vector<mx::array>& dependencies) {
@@ -274,16 +221,16 @@ class CacheStorage {
       ordered_inputs[0] = after_snapshots(inputs[0], dependencies);
       ordered_inputs.insert(ordered_inputs.end(), dependencies.begin(), dependencies.end());
     }
-    bool is_read = kind == Kind::Read || kind == Kind::Snapshot;
-    auto result = mx::array(is_read ? storage_->shape : mx::Shape{kEpochElements},
-                     is_read ? storage_->dtype : mx::uint32,
+    bool is_read = kind == Kind::Read;
+    auto result = mx::array(is_read ? storage_->shape() : mx::Shape{kEpochElements},
+                     is_read ? storage_->dtype() : mx::uint32,
                      std::make_shared<CacheOperation>(stream, storage_, kind, start), ordered_inputs);
     if (kind == Kind::Rows || kind == Kind::Slice) pending_snapshots_.clear();
     return result;
   }
-  std::shared_ptr<Storage> storage_;
-  std::optional<mx::array> initial_;
-  // Keep reader roots on the wrapper, avoiding a Storage→primitive→Storage cycle.
+  std::shared_ptr<mx::array> storage_;
+  mx::array initial_;
+  // Keep reader roots on the wrapper, avoiding an owner→primitive→owner cycle.
   std::vector<mx::array> pending_snapshots_;
 };
 }  // namespace

@@ -94,7 +94,7 @@ The compact runtime retains the useful fusions:
   compiled MLX fallback. K/V packing preserves raw bits for strided layer rows.
 
 Model constructors, activations and recurrent kernels reuse MLX LM. Runtime
-source totals 3,785 lines of Python, type stubs, C++ and Metal, versus 4,817 in
+source totals 3,712 lines of Python, type stubs, C++ and Metal, versus 4,817 in
 the larger implementation and 1,906 before these additions. Tests, docs and
 packaging are excluded.
 
