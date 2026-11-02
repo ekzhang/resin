@@ -10,6 +10,8 @@ deploy/modal_serve.py.
 from __future__ import annotations
 
 import argparse
+import math
+import os
 import time
 from pathlib import Path
 
@@ -25,7 +27,19 @@ def main(argv=None) -> None:
     parser.add_argument("--port", type=int, default=8000)
     parser.add_argument("--context-length", type=int)
     parser.add_argument("--max-batch-size", type=int)
+    parser.add_argument(
+        "--wired-limit-gib",
+        type=float,
+        help="MLX wired budget in GiB (default: live memory + 1 GiB, capped at Metal's recommended limit; 0 disables)",
+    )
     args = parser.parse_args(argv)
+    if args.wired_limit_gib is not None and (
+        not math.isfinite(args.wired_limit_gib) or args.wired_limit_gib < 0
+    ):
+        parser.error("--wired-limit-gib must be finite and nonnegative")
+
+    os.environ.setdefault("MLX_METAL_RESIDENCY_REFRESH_INTERVAL_MS", "500")
+    import mlx.core as mx
 
     from resin import Engine, SchedulerConfig
     from resin.server import HttpServer
@@ -56,12 +70,30 @@ def main(argv=None) -> None:
             max_batch_tokens=batch_tokens, prefill_chunk_size=spec.prefill_chunk_size
         ),
     )
-    print(
-        f"[serve] {spec.name} ready in {time.perf_counter() - started:.1f}s "
-        f"at http://{args.host}:{args.port}",
-        flush=True,
-    )
+    previous_wired_limit = None
     try:
+        mx.synchronize()
+        mx.clear_cache()
+        active = mx.get_active_memory()
+        if args.wired_limit_gib is not None:
+            wired_limit = int(args.wired_limit_gib * (1 << 30))
+        else:
+            wired_limit = min(
+                active + (1 << 30),
+                int(mx.device_info()["max_recommended_working_set_size"]),
+            )
+        previous_wired_limit = mx.set_wired_limit(wired_limit)
+        print(
+            f"[serve] wired budget {wired_limit / (1 << 30):.2f} GiB; "
+            f"MLX active {active / (1 << 30):.2f} GiB; "
+            f"residency refresh {os.environ['MLX_METAL_RESIDENCY_REFRESH_INTERVAL_MS']} ms",
+            flush=True,
+        )
+        print(
+            f"[serve] {spec.name} ready in {time.perf_counter() - started:.1f}s "
+            f"at http://{args.host}:{args.port}",
+            flush=True,
+        )
         HttpServer(
             engine,
             recipe=recipe,
@@ -69,8 +101,12 @@ def main(argv=None) -> None:
             enable_anthropic=spec.enable_anthropic,
         ).serve(host=args.host, port=args.port)
     finally:
-        if not engine.closed:
-            engine.close()
+        try:
+            if not engine.closed:
+                engine.close()
+        finally:
+            if previous_wired_limit is not None:
+                mx.set_wired_limit(previous_wired_limit)
 
 
 if __name__ == "__main__":
