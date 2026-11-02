@@ -106,18 +106,18 @@ AB/BA windows per backend, with greedy sampling and 320 completions after five
 warmup steps. Decode starts from an 8K prompt:
 
 | Aggregate output tokens/s | Batch 1 | Batch 2 | Batch 4 |
-| --- | ---: | ---: | ---: |
-| Resin Engine | 135.2 | 212.7 | 259.3 |
-| Native mlx-lm decoder | 123.5 | 213.0 | 249.7 |
+| ------------------------- | ------: | ------: | ------: |
+| Resin Engine              |   135.2 |   212.7 |   259.3 |
+| Native mlx-lm decoder     |   123.5 |   213.0 |   249.7 |
 
 Batches 1 and 4 are faster in all four pairs. Batch 2 is effectively tied, with
 two wins and two losses. The ratio of medians is +9.5%, −0.1% and +3.8%; these
 four windows do not establish confidence intervals or performance elsewhere.
 
 | Complete prefill latency, seconds | 4K prompt | 8K prompt |
-| --- | ---: | ---: |
-| Resin Engine | 2.047 | 4.417 |
-| Native mlx-lm decoder | 2.036 | 4.464 |
+| --------------------------------- | --------: | --------: |
+| Resin Engine                      |     2.047 |     4.417 |
+| Native mlx-lm decoder             |     2.036 |     4.464 |
 
 Both paths retain the same 694 parameter arrays, vision tower, 512 MiB
 allocator-cache limit, recommended wired-memory limit and 674,758,656-byte arena.
