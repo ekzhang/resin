@@ -1,4 +1,4 @@
-"""Qwen3.5-MoE runner on Apple Silicon over Engine-owned MLX slabs."""
+"""Qwen3.5 runner on Apple Silicon over Engine-owned MLX slabs."""
 
 from __future__ import annotations
 
@@ -17,14 +17,14 @@ from resin.backend.plans import PagedCachePlan
 from resin.backend.sampling import PromptScores, format_output, prompt_scores
 from resin.backend.topology import ParallelismCapabilities
 from resin.models.qwen3_5.config import Qwen35Config
-from resin_models_mlx.qwen3_5_moe.cache import (
+from resin_models_mlx.qwen3_5.cache import (
     PREFILL_CHUNK_SIZE,
     CacheArena,
     CacheGeometry,
 )
-from resin_models_mlx.qwen3_5_moe.checkpoint import load_model
-from resin_models_mlx.qwen3_5_moe.model import Qwen35MoeModel, StepOutput
-from resin_models_mlx.qwen3_5_moe.state import LiveStates
+from resin_models_mlx.qwen3_5.checkpoint import checkpoint_quantization, load_model
+from resin_models_mlx.qwen3_5.model import Qwen35Model, StepOutput
+from resin_models_mlx.qwen3_5.state import LiveStates
 from resin_models_mlx.sampling import MlxSampler
 
 if TYPE_CHECKING:
@@ -39,7 +39,7 @@ def _to_torch(array: mx.array) -> torch.Tensor:
 
 @dataclass(slots=True)
 class _Launch:
-    """A step's unevaluated outputs; its arena writes wait until its reads finish."""
+    """A step's outputs, retained through its GPU-ordered cache writes."""
 
     plan: PagedCachePlan
     rows: np.ndarray
@@ -64,23 +64,16 @@ class _Launch:
         )
 
 
+@dataclass(slots=True)
 class _Completion:
     """One overlapped decode step, collected after the next one is launched."""
 
-    def __init__(
-        self,
-        runner: Qwen3_5MoeMlxRunner,
-        plan: BatchPlan,
-        launch: _Launch,
-        tokens: mx.array,
-        continues: bool,
-    ) -> None:
-        self._runner = runner
-        self._plan = plan
-        self._launch = launch
-        self._tokens = tokens
-        self._continues = continues
-        self._result: ForwardOutput | None = None
+    _runner: Qwen35MlxRunner
+    _plan: BatchPlan
+    _launch: _Launch
+    _tokens: mx.array
+    _continues: bool
+    _result: ForwardOutput | None = field(default=None, init=False)
 
     @property
     def feedback(self) -> mx.array | None:
@@ -104,8 +97,8 @@ class _Completion:
         return self._result
 
 
-class Qwen3_5MoeMlxRunner:
-    """Text-only Qwen3.5-MoE runner with paged attention and DeltaNet state."""
+class Qwen35MlxRunner:
+    """Qwen3.5 runner with paged attention, DeltaNet state and optional vision."""
 
     page_size = 128
     prefill_chunk_size = PREFILL_CHUNK_SIZE
@@ -113,7 +106,7 @@ class Qwen3_5MoeMlxRunner:
 
     def __init__(
         self,
-        model: str | Path | Qwen35MoeModel,
+        model: str | Path | Qwen35Model,
         *,
         weight_bits: int | None = 8,
         group_size: int = 64,
@@ -121,22 +114,55 @@ class Qwen3_5MoeMlxRunner:
         cache_slab_capacity: int | None = None,
         max_seq_len: int | None = None,
         max_batch_size: int = 16,
+        workspace_bytes: int = _WORKSPACE_BYTES,
+        include_vision: bool = True,
+        compile_vision: bool = True,
     ) -> None:
-        if isinstance(model, Qwen35MoeModel):
+        self._media = None
+        if workspace_bytes < 0:
+            raise ValueError("workspace_bytes must be non-negative")
+        if isinstance(model, Qwen35Model):
             self._model = model
             self.config: Qwen35Config = model.config
             self.model_path = None
             quantization = "preloaded"
+            weight_source = "preloaded"
         else:
             self.model_path = Path(model)
-            self._model, self.config, _ = load_model(
-                self.model_path, bits=weight_bits, group_size=group_size
+            self._model, self.config, raw_config = load_model(
+                self.model_path,
+                bits=weight_bits,
+                group_size=group_size,
             )
-            quantization = (
-                "bfloat16"
-                if weight_bits is None
-                else f"mlx-int{weight_bits}-g{group_size}"
+            packed = checkpoint_quantization(raw_config)
+            bits, group = (
+                (packed["bits"], packed["group_size"])
+                if packed is not None
+                else (weight_bits, group_size)
             )
+            quantization = "bfloat16" if bits is None else f"mlx-int{bits}-g{group}"
+            weight_source = (
+                "bf16_checkpoint" if packed is None else "prequantized_checkpoint"
+            )
+            if include_vision and raw_config.get("vision_config"):
+                from resin_models_mlx.qwen3_5.media import MediaEncoder
+                from resin_models_mlx.qwen3_5.vision import load_vision_model
+
+                visual = load_vision_model(
+                    self.model_path, raw_config, compiled=compile_vision
+                )
+                self._media = MediaEncoder(visual, self.config.hidden_size)
+                if compile_vision:
+                    side = visual.config.spatial_merge_size * 8
+                    mx.eval(
+                        visual(
+                            mx.zeros(
+                                (side * side, visual.config.patch_width),
+                                dtype=mx.bfloat16,
+                            ),
+                            np.array([[1, side, side]], dtype=np.int64),
+                        )
+                    )
         limit_positions = self.config.max_position_embeddings
         self.max_seq_len = limit_positions if max_seq_len is None else max_seq_len
         if not 0 < self.max_seq_len <= limit_positions:
@@ -147,7 +173,8 @@ class Qwen3_5MoeMlxRunner:
         # Describes how this runner executes for benchmark records.
         self.benchmark_metadata = {
             "quant": quantization,
-            "expert_backend": "mlx-gather-qmm",
+            "weight_source": weight_source,
+            "expert_backend": "mlx-gather-qmm" if self.config.is_moe else "none",
             "graphs": {"prefill": "disabled", "decode": "disabled"},
         }
         self.vocab_size = self.config.vocab_size
@@ -162,7 +189,7 @@ class Qwen3_5MoeMlxRunner:
             self.cache_geometry.slab_bytes,
             # Live DeltaNet state is held for every running request, and a
             # step's output exists beside its input.
-            overhead_bytes=_WORKSPACE_BYTES
+            overhead_bytes=workspace_bytes
             + 2 * max_batch_size * self.cache_geometry.state_bytes,
         )
         # The arena is one Metal buffer, including the reserved null slab.
@@ -174,6 +201,18 @@ class Qwen3_5MoeMlxRunner:
             slab_capacity = min(slab_capacity, cache_slab_capacity)
         self.cache_layout = self.cache_geometry.layout(slab_capacity)
         self._cache = CacheArena(self.cache_layout, self.cache_geometry)
+        if self.config.head_dim == 256:
+            from resin_models_mlx.paged_attention import _warm_fused_merge
+
+            _warm_fused_merge()
+        if (
+            self.config.num_attention_heads,
+            self.config.num_key_value_heads,
+            self.config.head_dim,
+        ) == (8, 2, 256):
+            from resin_models_mlx._native_cache import _warm_paged_attention
+
+            _warm_paged_attention()
         self.runner_config = RunnerConfig(
             max_batch_tokens=PREFILL_CHUNK_SIZE,
             prefill_chunk_size=PREFILL_CHUNK_SIZE,
@@ -222,19 +261,34 @@ class Qwen3_5MoeMlxRunner:
             if tokens.shape[1] == 1
             else self._cache.history(plan, int(rows[0]), int(contexts[0]))
         )
+        embeddings = None
+        rotary_positions = None
+        if any(batch._plan.media[int(row)] is not None for row in rows):
+            if self._media is None:
+                raise ValueError("this Qwen3.5 runner did not load a vision tower")
+            embeddings, rotary_positions = self._media.prepare(
+                batch._plan,
+                rows,
+                batch.token_ids[tokens],
+                contexts,
+                self._model.embed_tokens(token_ids.reshape(tokens.shape)),
+            )
         output = self._model(
             token_ids.reshape(tokens.shape),
             mx.array(contexts.astype(np.int32)),
             self._states.gather(plan, rows),
             history,
+            input_embeddings=embeddings,
+            rotary_positions=rotary_positions,
         )
         last = self._model.logits(output.hidden[:, -1])
         return _Launch(plan, rows, tokens, contexts, output, last)
 
     def _write(self, launch: _Launch) -> None:
-        """Queue ``launch``'s arena writes and hold its state; reads must be done."""
+        """Order writes after this graph's readers and hold its live state."""
 
         output = launch.output
+        self._cache.order_after(launch.reads)
         self._cache.write_tokens(
             launch.plan,
             tuple(key.reshape(-1, *key.shape[2:]) for key in output.keys),
@@ -249,104 +303,71 @@ class Qwen3_5MoeMlxRunner:
         )
 
     def _write_pending(self) -> None:
-        """Finish an overlapped step's reads, then update the arena in place."""
+        """Drain pending cache work before a terminal/ownership transition."""
 
         launch, self._pending = self._pending, None
         if launch is None:
             return
-        mx.eval(*launch.reads)
         self._write(launch)
-        mx.async_eval(self._cache.storage)
+        # This path is used when there is no continuation to retain the lease.
+        # Include snapshots and KV writes, not only the sampled-token event.
+        mx.eval(self._cache.epoch)
 
-    def _step(
-        self,
-        plan: PagedCachePlan,
-        rows: np.ndarray,
-        tokens: np.ndarray,
-    ) -> tuple[StepOutput, mx.array, tuple[int, ...]]:
-        """Run one step synchronously.
-
-        Returns the output, last-token logits and written snapshot receipts.
-        """
-
-        with record_function("resin.mlx.forward"):
-            launch = self._launch(plan, rows, tokens)
-            # Finish every arena read before scattering, so MLX can donate the
-            # arena buffer to the writes instead of copying it.
-            mx.eval(*launch.reads)
-        with record_function("resin.mlx.cache_write"):
-            self._write(launch)
-            # Reads of this step are complete, so the writes can update the arena
-            # in place while the host samples and commits. The next step's reads
-            # depend on the written arena and therefore run after them.
-            mx.async_eval(self._cache.storage)
-        assert launch.receipts is not None
-        return launch.output, launch.last, launch.receipts
-
-    def _output(
-        self, plan: BatchPlan, logits: mx.array, prompt_logprobs=None
-    ) -> ForwardOutput:
-        with record_function("resin.mlx.sample"):
-            tokens = self._sampler(logits, plan)
-        # Logits leave the GPU only when the plan asks for scores.
-        host_logits = _to_torch(logits) if plan.needs_logprobs else None
-        return format_output(host_logits, tokens, plan, prompt_logprobs=prompt_logprobs)
-
-    def _prefill(self, plan: BatchPlan, cache_plan: PagedCachePlan) -> ForwardOutput:
+    def forward(self, plan: BatchPlan) -> ForwardOutput:
+        self._write_pending()
+        cache_plan = self._cache_plan(plan)
         batch = cache_plan.batch
+        prefill = plan.phase == BatchPhase.PREFILL
+        rows = np.arange(batch.num_sequences)
+        groups = rows[:, None] if prefill else (rows,)
         logits = []
         prompt_rows = []
         receipts: list[int] = []
-        for row in range(batch.num_sequences):
-            selected = batch.token_slice(row)
-            output, last, written = self._step(
-                cache_plan,
-                np.array([row]),
-                np.arange(selected.start, selected.stop)[None],
-            )
-            logits.append(last)
-            receipts += written
-            if (
-                plan.needs_prompt_logprobs
-                and (
-                    scores := prompt_scores(
-                        plan,
-                        _to_torch(output.hidden[0]),
-                        self._project,
-                        token_start=selected.start,
-                    )
+        for rows in groups:
+            if prefill:
+                selected = batch.token_slice(int(rows[0]))
+                tokens = np.arange(selected.start, selected.stop)[None]
+            else:
+                tokens = rows[:, None]
+            with record_function("resin.mlx.forward"):
+                launch = self._launch(cache_plan, rows, tokens)
+            with record_function("resin.mlx.cache_write"):
+                self._write(launch)
+                mx.async_eval(self._cache.epoch, *launch.reads)
+            logits.append(launch.last)
+            assert launch.receipts is not None
+            receipts += launch.receipts
+            if prefill and plan.needs_prompt_logprobs:
+                scores = prompt_scores(
+                    plan,
+                    _to_torch(launch.output.hidden[0]),
+                    self._project,
+                    token_start=int(tokens[0, 0]),
                 )
-                is not None
-            ):
-                prompt_rows.append(scores)
-        return self._output(
+                if scores is not None:
+                    prompt_rows.append(scores)
+        # A synchronous result can release the lease immediately: wait for
+        # every issued cache write, not just the sampled-token event.
+        combined = logits[0] if len(logits) == 1 else mx.concatenate(logits)
+        combined = mx.depends(combined, self._cache.epoch)
+        with record_function("resin.mlx.sample"):
+            tokens = self._sampler(combined, plan)
+        return format_output(
+            _to_torch(combined) if plan.needs_logprobs else None,
+            tokens,
             plan,
-            mx.concatenate(logits),
             prompt_logprobs=PromptScores.concat(prompt_rows),
         ).with_state_checkpoints(receipts)
-
-    def _decode(self, plan: BatchPlan, cache_plan: PagedCachePlan) -> ForwardOutput:
-        batch = cache_plan.batch
-        rows = np.arange(batch.num_sequences)
-        _, last, receipts = self._step(cache_plan, rows, rows[:, None])
-        return self._output(plan, last).with_state_checkpoints(receipts)
 
     def _cache_plan(self, plan: BatchPlan) -> PagedCachePlan:
         cache_plan = PagedCachePlan.from_plan(plan, self.cache_layout)
         if np.any(cache_plan.token_ids >= self.vocab_size):
-            raise ValueError("token id is out of range for Qwen3.5-MoE")
+            raise ValueError("token id is out of range for Qwen3.5")
         if int(np.max(cache_plan.batch.post_lengths)) > self.max_seq_len:
             raise ValueError(
                 f"sequence exceeds this runner's {self.max_seq_len}-token context"
             )
         return cache_plan
-
-    def forward(self, plan: BatchPlan) -> ForwardOutput:
-        self._write_pending()
-        cache_plan = self._cache_plan(plan)
-        if plan.phase == BatchPhase.PREFILL:
-            return self._prefill(plan, cache_plan)
-        return self._decode(plan, cache_plan)
 
     def enqueue(
         self, plan: BatchPlan, *, feedback: mx.array | None = None
@@ -355,7 +376,7 @@ class Qwen3_5MoeMlxRunner:
 
         ``feedback`` holds the previous step's sampled tokens, which replace
         the continuation plan's token IDs. The previous step's arena writes are
-        queued once its reads finish, ahead of this step's reads.
+        ordered after its reads and before this step's reads on the GPU.
         """
 
         if plan.phase != BatchPhase.DECODE or plan.needs_logprobs:
@@ -367,17 +388,15 @@ class Qwen3_5MoeMlxRunner:
         rows = np.arange(cache_plan.batch.num_sequences)
         with record_function("resin.mlx.enqueue"):
             if previous is not None:
-                # The writes stay unevaluated until the previous reads finish,
-                # but this step's history and state must already include them.
+                # Epoch dependencies order previous reads -> writes -> new
+                # reads without waiting for the GPU on the calling thread.
                 self._write(previous)
             launch = self._launch(cache_plan, rows, rows[:, None], feedback)
             tokens = self._sampler.tokens(launch.last, plan)
-            if previous is not None:
-                mx.eval(*previous.reads)
-            mx.async_eval(self._cache.storage, tokens, *launch.reads)
+            mx.async_eval(self._cache.epoch, tokens, *launch.reads)
         self._pending = launch
         continues = int(np.max(cache_plan.batch.post_lengths)) < self.max_seq_len
         return _Completion(self, plan, launch, tokens, continues)
 
 
-__all__ = ["Qwen3_5MoeMlxRunner"]
+__all__ = ["Qwen35MlxRunner"]

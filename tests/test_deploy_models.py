@@ -10,6 +10,7 @@ import pytest
 
 from deploy.models import (
     MODEL_SPECS,
+    create_recipe,
     create_runner,
     download_checkpoint,
     get_model,
@@ -41,14 +42,15 @@ def test_runtime_prepares_persistent_cute_cache(tmp_path, name):
     assert Path(env["CUTE_DSL_CACHE_DIR"]).is_dir()
 
 
-def test_mlx_factory_constructs_single_device_runner(monkeypatch, tmp_path):
+@pytest.mark.parametrize("name", ["ornith-1.0-35b", "qwen3.5-0.8b-mlx"])
+def test_mlx_factory_constructs_single_device_runner(monkeypatch, tmp_path, name):
     pytest.importorskip("mlx.core")
-    spec = get_model("ornith-1.0-35b")
-    module = importlib.import_module("resin_models_mlx.qwen3_5_moe")
+    spec = get_model(name)
+    module = importlib.import_module("resin_models_mlx.qwen3_5")
     calls = []
     monkeypatch.setattr(
         module,
-        "Qwen3_5MoeMlxRunner",
+        "Qwen35MlxRunner",
         lambda *args, **kwargs: calls.append((args, kwargs)),
     )
 
@@ -62,21 +64,28 @@ def test_mlx_factory_constructs_single_device_runner(monkeypatch, tmp_path):
         )
         return create_runner(spec, checkpoint, **(options | overrides))
 
-    checkpoint = tmp_path / "ornith"
+    checkpoint = tmp_path / spec.name
     create()
     assert calls == [
         (
             (checkpoint,),
-            {"memory_utilization": 0.7, "max_seq_len": 8192, "max_batch_size": 8},
+            {
+                "memory_utilization": spec.gpu_memory_utilization,
+                "max_seq_len": 8192,
+                "max_batch_size": 8,
+                "include_vision": not spec.text_only,
+            },
         )
     ]
-    with pytest.raises(ValueError, match="no MTP"):
-        create(draft_tokens=2)
+    with pytest.raises(ValueError, match="use draft_tokens=0"):
+        create(draft_tokens=4)
+    with pytest.raises(ValueError, match="use draft_tokens=0"):
+        create(draft_tokens=1, assistant_checkpoint=tmp_path / "mtp")
     with pytest.raises(ValueError, match="one Apple Silicon device"):
         create(groups=object())
     with pytest.raises(ValueError, match="4096-token chunks"):
         create(prefill_chunk_size=8192)
-    with pytest.raises(ValueError, match="mlx-gather-qmm experts"):
+    with pytest.raises(ValueError, match="expert_backend"):
         create(expert_backend="flashinfer")
     # MLX presets have no managed volume; their checkpoint is always explicit.
     with pytest.raises(ValueError, match="no managed checkpoint volume"):
@@ -87,6 +96,59 @@ def test_mlx_factory_constructs_single_device_runner(monkeypatch, tmp_path):
             max_batch_size=8,
             prefill_chunk_size=4096,
             draft_tokens=0,
+        )
+
+
+@pytest.mark.parametrize(
+    "name,expected_recipe",
+    [("ornith-1.0-35b", "ornith"), ("qwen3.5-0.8b-mlx", "qwen3_5")],
+)
+def test_mlx_presets_use_matching_media_capabilities(
+    monkeypatch, tmp_path, name, expected_recipe
+):
+    import numpy as np
+    from tokenizers import Tokenizer
+    from tokenizers.models import WordLevel
+
+    import resin.recipe
+    from resin.recipe import Image, Message, Qwen35Media, Role, Text
+
+    tokenizer = Tokenizer(WordLevel({"[UNK]": 0}, unk_token="[UNK]"))
+    tokenizer.add_special_tokens(
+        [
+            "<|im_start|>",
+            "<|im_end|>",
+            "<|endoftext|>",
+            "<think>",
+            "</think>",
+            "<|vision_start|>",
+            "<|image_pad|>",
+            "<|vision_end|>",
+        ]
+    )
+    processor = SimpleNamespace(tokenizer=tokenizer)
+    monkeypatch.setattr(
+        "transformers.AutoProcessor.from_pretrained", lambda *args, **kwargs: processor
+    )
+    native_recipe = resin.recipe.get_native_recipe
+    calls = []
+
+    def create(recipe_name, owner, **kwargs):
+        calls.append((recipe_name, owner, kwargs))
+        return native_recipe(recipe_name, owner, **kwargs)
+
+    monkeypatch.setattr(resin.recipe, "get_native_recipe", create)
+    recipe = create_recipe(name, tmp_path)
+    text_only = get_model(name).text_only
+    assert calls == [(expected_recipe, processor, {"text_only": text_only})]
+    recipe.render([Message(Role.USER, [Text("hello")])])
+    image = Image.from_rgb(np.zeros((2, 2, 3), dtype=np.float32))
+    if text_only:
+        with pytest.raises(ValueError, match="does not support media"):
+            recipe.render([Message(Role.USER, [image])])
+    else:
+        assert isinstance(
+            recipe.render([Message(Role.USER, [image])]).media, Qwen35Media
         )
 
 
@@ -322,13 +384,13 @@ def test_glm_serving_checkpoints_allow_real_engine_prefix_reuse(
         assert second.take_result() == [len(prompt)]
 
 
-def test_local_presets_require_an_explicit_checkpoint(tmp_path):
-    spec = get_model("ornith-1.0-35b")
+@pytest.mark.parametrize("name", ["ornith-1.0-35b", "qwen3.5-0.8b-mlx"])
+def test_local_presets_require_an_explicit_checkpoint(tmp_path, name):
+    spec = get_model(name)
     with pytest.raises(ValueError, match="runs locally"):
         require_checkpoint(spec)
     with pytest.raises(ValueError, match="no managed volume"):
         download_checkpoint(spec, metadata_only=True)
-    make_checkpoint(tmp_path / "ornith", spec.checkpoint.required_files)
-    assert (
-        require_checkpoint(spec, checkpoint=tmp_path / "ornith") == tmp_path / "ornith"
-    )
+    checkpoint = tmp_path / name
+    make_checkpoint(checkpoint, spec.checkpoint.required_files)
+    assert require_checkpoint(spec, checkpoint=checkpoint) == checkpoint

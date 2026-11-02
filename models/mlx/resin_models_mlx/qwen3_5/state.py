@@ -14,44 +14,30 @@ from collections.abc import Iterable
 
 import mlx.core as mx
 import numpy as np
+from mlx.utils import tree_map
 
 from resin.backend.plans import PagedCachePlan
-from resin_models_mlx.qwen3_5_moe.cache import STATE_GROUP, CacheArena
-from resin_models_mlx.qwen3_5_moe.model import LinearState, Qwen35MoeModel
-
-
-def _rows(state: LinearState) -> int:
-    return state.recurrent[0].shape[0]
+from resin_models_mlx.qwen3_5.cache import STATE_GROUP, CacheArena
+from resin_models_mlx.qwen3_5.model import LinearState, Qwen35Model
 
 
 def _take(state: LinearState, indices: list[int]) -> LinearState:
-    if indices == list(range(_rows(state))):
+    if indices == list(range(state.recurrent[0].shape[0])):
         return state
     selected = mx.array(indices)
-    return LinearState(
-        tuple(mx.take(value, selected, axis=0) for value in state.recurrent),
-        tuple(mx.take(value, selected, axis=0) for value in state.convolution),
-    )
+    return tree_map(lambda value: mx.take(value, selected, axis=0), state)
 
 
 def _concatenate(parts: list[LinearState]) -> LinearState:
     if len(parts) == 1:
         return parts[0]
-    return LinearState(
-        tuple(
-            mx.concatenate(list(layer)) for layer in zip(*(p.recurrent for p in parts))
-        ),
-        tuple(
-            mx.concatenate(list(layer))
-            for layer in zip(*(p.convolution for p in parts))
-        ),
-    )
+    return tree_map(lambda *values: mx.concatenate(list(values)), *parts)
 
 
 class LiveStates:
     """Per-request DeltaNet state, indexed into the batch arrays that hold it."""
 
-    def __init__(self, arena: CacheArena, model: Qwen35MoeModel) -> None:
+    def __init__(self, arena: CacheArena, model: Qwen35Model) -> None:
         self._arena = arena
         self._model = model
         # sequence ID -> (tokens processed, batch state, row in that batch)
@@ -69,6 +55,13 @@ class LiveStates:
             int(row): (int(slab), int(slot))
             for row, slab, slot in (restore.restore_copies if restore else ())
         }
+        # Source slab zero is the Engine's explicit immutable zero state.
+        # Preserve every real restore and mixed/held path below.
+        if len(rows) and all(
+            int(batch.context_lengths[row]) == 0 and sources.get(int(row)) == (0, 0)
+            for row in rows
+        ):
+            return self._model.initial_state(len(rows))
         snapshots, fresh = [], []
         held: dict[int, tuple[LinearState, list[int], list[int]]] = {}
         for position, row in enumerate(rows.tolist()):

@@ -67,6 +67,7 @@ class ModelSpec:
     memory: int = 256 * 1024
     enable_anthropic: bool = True
     image_warmup: bool = False
+    text_only: bool = False
     recipe: str | None = None
 
     @property
@@ -288,6 +289,32 @@ MODEL_SPECS.update(
             memory=128 * 1024,
             image_warmup=True,
         ),
+        "qwen3.5-0.8b-mlx": ModelSpec(
+            name="qwen3.5-0.8b-mlx",
+            family="qwen3_5",
+            checkpoint=Checkpoint(
+                repo_id="mlx-community/Qwen3.5-0.8B-8bit",
+                revision="87e768fbfa03994095f3d14527c80c5ae70c5758",
+                directory="",
+                required_files=(
+                    "config.json",
+                    "chat_template.jinja",
+                    "tokenizer.json",
+                    "tokenizer_config.json",
+                    "processor_config.json",
+                    "preprocessor_config.json",
+                    "video_preprocessor_config.json",
+                ),
+            ),
+            backend="mlx",
+            gpu="Apple-Silicon",
+            label="qwen3.5-0.8b-mlx",
+            expert_backend="none",
+            context_length=8192,
+            max_batch_size=4,
+            gpu_memory_utilization=0.60,
+            recipe="qwen3_5",
+        ),
         "ornith-1.0-35b": ModelSpec(
             name="ornith-1.0-35b",
             family="qwen3_5_moe",
@@ -313,6 +340,7 @@ MODEL_SPECS.update(
             # Unified memory is shared with the OS and other applications.
             gpu_memory_utilization=0.70,
             recipe="ornith",
+            text_only=True,
         ),
         "inkling": ModelSpec(
             name="inkling",
@@ -577,28 +605,30 @@ def create_runner(
         else gpu_memory_utilization
     )
     if spec.backend == "mlx":
-        from resin_models_mlx.qwen3_5_moe import Qwen3_5MoeMlxRunner
-        from resin_models_mlx.qwen3_5_moe.cache import PREFILL_CHUNK_SIZE
-
         if draft_tokens:
             raise ValueError(
-                "Ornith checkpoints ship no MTP weights; use draft_tokens=0"
+                "this MLX Qwen3.5 runner does not support draft decoding; "
+                "use draft_tokens=0"
             )
+        from resin_models_mlx.qwen3_5 import Qwen35MlxRunner
+        from resin_models_mlx.qwen3_5.cache import PREFILL_CHUNK_SIZE
+
         if groups is not None:
             raise ValueError("the MLX runner executes on one Apple Silicon device")
         if prefill_chunk_size != PREFILL_CHUNK_SIZE:
             raise ValueError(
-                f"the MLX Qwen3.5-MoE runner uses {PREFILL_CHUNK_SIZE}-token chunks"
+                f"the MLX Qwen3.5 runner uses {PREFILL_CHUNK_SIZE}-token chunks"
             )
         if expert_backend not in (None, spec.expert_backend):
-            raise ValueError(f"{spec.name} uses {spec.expert_backend} experts")
+            raise ValueError(f"{spec.name} uses expert_backend={spec.expert_backend!r}")
         # MLX has no CUDA graphs or graph batch catalog; graph options and
         # decode_batch_sizes do not apply. The batch limit sizes live state.
-        return Qwen3_5MoeMlxRunner(
+        return Qwen35MlxRunner(
             checkpoint,
             memory_utilization=memory,
             max_seq_len=context_length,
             max_batch_size=max_batch_size,
+            include_vision=not spec.text_only,
         )
     common: dict[str, Any] = dict(
         device=device, cuda_graph_prefill=prefill_graph, cuda_graph_decode=decode_graph
@@ -770,7 +800,6 @@ def create_recipe(
         else {}
     )
     if spec.backend == "mlx":
-        # MLX runners serve the language model only.
-        options["text_only"] = True
+        options["text_only"] = spec.text_only
     name = spec.recipe or ("qwen3_8" if spec.family == "qwen3_5" else spec.family)
     return get_native_recipe(name, processor, **options)

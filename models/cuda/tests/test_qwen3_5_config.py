@@ -1,12 +1,18 @@
 from __future__ import annotations
 
 import copy
+import json
 from typing import Any
 
 import pytest
 
 from resin.models.qwen3_5.config import Qwen35Config
-from resin_models_cuda.qwen3_5.checkpoint import DEFAULT_MODEL, DEFAULT_REVISION
+from resin_models_cuda.qwen3_5.checkpoint import (
+    DEFAULT_MODEL,
+    DEFAULT_REVISION,
+    build_meta_model,
+    load_config,
+)
 
 
 def _qwen38() -> dict[str, Any]:
@@ -91,3 +97,14 @@ def test_qwen35_rejects_incompatible_gate_semantics() -> None:
     values["text_config"]["attn_output_gate"] = False  # type: ignore[index]
     with pytest.raises(ValueError, match="unsupported Qwen3.5 options"):
         Qwen35Config.from_hugging_face(values)
+
+
+def test_cuda_loader_rejects_tied_embeddings(tmp_path) -> None:
+    values = _qwen38()
+    values["text_config"]["tie_word_embeddings"] = True
+    (tmp_path / "config.json").write_text(json.dumps(values))
+
+    with pytest.raises(ValueError, match="tied embeddings"):
+        load_config(tmp_path)
+    with pytest.raises(ValueError, match="tied embeddings"):
+        build_meta_model(values, include_mtp=False)

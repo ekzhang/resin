@@ -15,8 +15,8 @@ from resin.backend.cuda.parallel import (
 from resin.models.qwen3_5.config import Qwen35Config
 from resin_models_cuda.dense_parallel import TensorParallelSum, shard_linear
 from resin_models_cuda.qwen3_5.model import (
-    Qwen3_5ForConditionalGeneration,
     Qwen35Attention,
+    Qwen35ForConditionalGeneration,
     Qwen35GatedDeltaNet,
 )
 from resin_models_cuda.qwen3_5.quantization import ModelOptFp8Linear
@@ -184,7 +184,7 @@ def _delta_net(module: Qwen35GatedDeltaNet, parallel: TensorParallelContext) -> 
 
 
 def prepare_attention_parallel(
-    model: Qwen3_5ForConditionalGeneration, parallel: TensorParallelContext
+    model: Qwen35ForConditionalGeneration, parallel: TensorParallelContext
 ) -> None:
     """Shard loaded target and MTP projections before any graph or KV allocation.
 

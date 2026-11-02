@@ -150,13 +150,59 @@ models/cuda/resin_models_cuda/glm5_3_flash/LICENSE.fla. The adaptation computes
 only accepted recurrent state, with Resin's FP32 beta sigmoid and explicit
 preservation of empty rows; it does not produce attention outputs.
 
-The Qwen3.5-MoE MLX model implementation in
-models/mlx/resin_models_mlx/qwen3_5_moe/model.py contains portions adapted from
+The Qwen3.5 MLX model implementation in
+models/mlx/resin_models_mlx/qwen3_5/model.py contains portions adapted from
 Apple MLX LM (mlx_lm/models/qwen3_5.py and qwen3_next.py), which it also imports
-for its gated delta-rule and switched-expert kernels:
+for model constructors, activations, gated delta-rule and switched-expert kernels:
 
   Copyright © 2023 Apple Inc.
+  Copyright © 2025 Apple Inc.
+  Copyright © 2026 Apple Inc.
   https://github.com/ml-explore/mlx-lm
 
 MLX LM is licensed under the MIT License. The MIT notice is retained in that
 model directory's LICENSE.
+
+The fused decode convolution in
+models/mlx/resin_models_mlx/qwen3_5/fused_conv.py adapts MLX v0.32.4's sigmoid
+formula from mlx/backend/metal/kernels/unary_ops.h:
+
+  Copyright 2024 Apple Inc.
+  https://github.com/ml-explore/mlx/tree/v0.32.4/mlx/backend/metal/kernels
+
+MLX is licensed under the MIT License. The notice is retained in the model
+directory's LICENSE. The adaptation preserves BF16 convolution and sigmoid
+rounding while returning Q/K/V and the next carry in the same dispatch.
+
+The mixed-precision RMS and rounded residual-RMS kernels in
+models/mlx/resin_models_mlx/qwen3_5/fused_norm.py adapt the four-values-per-thread
+reduction from MLX v0.32.4's mlx/backend/metal/kernels/rms_norm.metal:
+
+  Copyright 2024 Apple Inc.
+  https://github.com/ml-explore/mlx/tree/v0.32.4/mlx/backend/metal/kernels
+
+MLX is licensed under the MIT License. The notice is retained in the model
+directory's LICENSE. These kernels preserve FP32 effective scales and explicit
+BF16 residual and output rounding.
+
+The small-partition attention merge in
+models/mlx/resin_models_mlx/paged_attention.py adapts MLX v0.32.4's FP32
+column/row reduction order and exponential implementation from
+mlx/backend/metal/kernels/reduction/{reduce_col,reduce_row,ops}.h and unary_ops.h:
+
+  Copyright 2023-2024 Apple Inc.
+  https://github.com/ml-explore/mlx/tree/v0.32.4/mlx/backend/metal/kernels
+
+MLX is licensed under the MIT License. The notice is retained in the model
+directory's LICENSE. The adaptation preserves FP32 product/reduction boundaries
+and BF16 output rounding.
+
+The Qwen3.5 MLX vision adapter in
+models/mlx/resin_models_mlx/qwen3_5/vision.py reuses MLX-VLM 0.7.11's Qwen3.5
+and Qwen3-VL vision modules, including their geometry and encoder blocks:
+
+  Copyright © 2025 Prince Canuma
+  https://github.com/Blaizzy/mlx-vlm
+
+MLX-VLM is licensed under the MIT License. Its notice is retained in the model
+directory's LICENSE and in the dependency distribution.

@@ -16,6 +16,7 @@ size are runtime data; only the model geometry selects a compiled kernel.
 from __future__ import annotations
 
 from functools import cache, partial
+from pathlib import Path
 
 import mlx.core as mx
 
@@ -25,159 +26,17 @@ SMALL_BATCH_ROWS = 4
 SIMDGROUPS = 4
 PREFETCH = 4
 _HEADS_PER_THREADGROUP = 4
+# Bound the query and output registers held by each lane. Four 256-wide
+# heads plus prefetched K/V spill on M1 Pro; two heads with one K/V pair
+# also expose more independent threadgroups without duplicating the cache.
+_HEAD_DIMENSIONS_PER_THREADGROUP = 512
 # Metal guarantees 32 KiB of threadgroup memory.
 _THREADGROUP_BYTES = 32 * 1024
 
-_HEADER = """
-template <int GROUP, int LANE_DIMS>
-inline void attend(
-    thread const float (&q)[GROUP][LANE_DIMS],
-    thread const float (&k)[LANE_DIMS],
-    thread const float (&v)[LANE_DIMS],
-    thread float (&m)[GROUP],
-    thread float (&l)[GROUP],
-    thread float (&acc)[GROUP][LANE_DIMS]) {
-    for (int h = 0; h < GROUP; ++h) {
-        float dot = 0.0f;
-        for (int i = 0; i < LANE_DIMS; ++i) dot += q[h][i] * k[i];
-        const float score = simd_sum(dot);
-        const float peak = max(m[h], score);
-        const float correction = fast::exp(m[h] - peak);
-        const float weight = fast::exp(score - peak);
-        l[h] = l[h] * correction + weight;
-        for (int i = 0; i < LANE_DIMS; ++i) {
-            acc[h][i] = acc[h][i] * correction + weight * v[i];
-        }
-        m[h] = peak;
-    }
-}
-"""
-
-_SOURCE = """
-    constexpr int LANE_DIMS = D / 32;
-    const uint lane = thread_index_in_simdgroup;
-    const uint group = simdgroup_index_in_threadgroup;
-    const uint tid = thread_position_in_threadgroup.x;
-    // Runtime geometry: page-table width, partition count and layer offset.
-    const int PAGES = geometry[0];
-    const int PARTITIONS = geometry[1];
-    const int layer = geometry[2];
-
-    const int work = threadgroup_position_in_grid.z;
-    const int partition = work % PARTITIONS;
-    const int head_group = (work / PARTITIONS) % HEAD_GROUPS;
-    const int kv_head = (work / (PARTITIONS * HEAD_GROUPS)) % KV_HEADS;
-    const int row = work / (PARTITIONS * HEAD_GROUPS * KV_HEADS);
-    const int first_head = kv_head * (HEADS / KV_HEADS) + head_group * GROUP;
-
-    const int history = lengths[row];
-    const int total = history + 1;
-    const int start = partition * PART;
-    const int stop = min(start + PART, total);
-
-    float q[GROUP][LANE_DIMS];
-    for (int h = 0; h < GROUP; ++h) {
-        for (int i = 0; i < LANE_DIMS; ++i) {
-            q[h][i] = float(queries[((row * HEADS) + first_head + h) * D
-                                    + lane * LANE_DIMS + i]) * scale[0];
-        }
-    }
-    float m[GROUP];
-    float l[GROUP];
-    float acc[GROUP][LANE_DIMS];
-    for (int h = 0; h < GROUP; ++h) {
-        m[h] = -INFINITY;
-        l[h] = 0.0f;
-        for (int i = 0; i < LANE_DIMS; ++i) acc[h][i] = 0.0f;
-    }
-
-    // Each simdgroup walks its own contiguous run of positions, page by page,
-    // loading PREFETCH positions ahead so their memory latency overlaps.
-    const int width = KV_HEADS * D;
-    const int run = PART / SIMDGROUPS;
-    const int first = start + int(group) * run;
-    const int last = min(first + run, stop);
-    const int cached = min(last, history);
-    int p = first;
-    while (p < cached) {
-        const int page_end = min(cached, (p / PAGE + 1) * PAGE);
-        const long unit = long(pages[row * PAGES + p / PAGE]) + layer;
-        const device T* key = units + (unit * 2 * PAGE + p % PAGE) * width
-                              + kv_head * D + lane * LANE_DIMS;
-        const device T* value = key + long(PAGE) * width;
-        for (; p + PREFETCH <= page_end; p += PREFETCH) {
-            float k[PREFETCH][LANE_DIMS];
-            float v[PREFETCH][LANE_DIMS];
-            for (int t = 0; t < PREFETCH; ++t) {
-                for (int i = 0; i < LANE_DIMS; ++i) k[t][i] = float(key[t * width + i]);
-            }
-            for (int t = 0; t < PREFETCH; ++t) {
-                for (int i = 0; i < LANE_DIMS; ++i) v[t][i] = float(value[t * width + i]);
-            }
-            for (int t = 0; t < PREFETCH; ++t) attend(q, k[t], v[t], m, l, acc);
-            key += PREFETCH * width;
-            value += PREFETCH * width;
-        }
-        for (; p < page_end; ++p) {
-            float k[LANE_DIMS];
-            float v[LANE_DIMS];
-            for (int i = 0; i < LANE_DIMS; ++i) {
-                k[i] = float(key[i]);
-                v[i] = float(value[i]);
-            }
-            attend(q, k, v, m, l, acc);
-            key += width;
-            value += width;
-        }
-    }
-    // The step's own key and value follow the history.
-    if (first <= history && history < last) {
-        const int base = (row * KV_HEADS + kv_head) * D + lane * LANE_DIMS;
-        float k[LANE_DIMS];
-        float v[LANE_DIMS];
-        for (int i = 0; i < LANE_DIMS; ++i) {
-            k[i] = float(current_keys[base + i]);
-            v[i] = float(current_values[base + i]);
-        }
-        attend(q, k, v, m, l, acc);
-    }
-
-    threadgroup float shared_m[SIMDGROUPS][GROUP];
-    threadgroup float shared_l[SIMDGROUPS][GROUP];
-    threadgroup float shared_acc[SIMDGROUPS][GROUP][D];
-    for (int h = 0; h < GROUP; ++h) {
-        if (lane == 0) {
-            shared_m[group][h] = m[h];
-            shared_l[group][h] = l[h];
-        }
-        for (int i = 0; i < LANE_DIMS; ++i) {
-            shared_acc[group][h][lane * LANE_DIMS + i] = acc[h][i];
-        }
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-
-    for (int index = tid; index < GROUP * D; index += SIMDGROUPS * 32) {
-        const int h = index / D;
-        const int d = index % D;
-        float peak = -INFINITY;
-        for (int s = 0; s < SIMDGROUPS; ++s) peak = max(peak, shared_m[s][h]);
-        float sum = 0.0f;
-        float value = 0.0f;
-        if (peak != -INFINITY) {
-            for (int s = 0; s < SIMDGROUPS; ++s) {
-                const float scaled = fast::exp(shared_m[s][h] - peak);
-                sum += shared_l[s][h] * scaled;
-                value += shared_acc[s][h][d] * scaled;
-            }
-        }
-        const int out = ((row * HEADS) + first_head + h) * PARTITIONS + partition;
-        partial[out * D + d] = value;
-        if (d == 0) {
-            maxima[out] = peak;
-            sums[out] = sum;
-        }
-    }
-"""
+# The preprocessor selects declarations outside the generated entrypoint and
+# the same body inside it; the native metallib includes this header too.
+_HEADER = (Path(__file__).parent / "_native/attention_kernel.h").read_text()
+_SOURCE = "#define RESIN_ATTENTION_BODY\n" + _HEADER + "\n#undef RESIN_ATTENTION_BODY\n"
 
 
 @cache
@@ -226,20 +85,56 @@ def paged_decode_attention(
         raise ValueError("query heads must be a multiple of KV heads")
     if head_dim % 32:
         raise ValueError("paged decode attention needs head_dim divisible by 32")
+    # Bind sparse cache reads without charging the entire arena to MLX's
+    # command-buffer packing heuristic. Other geometries retain the same body.
+    if (
+        rows > 0
+        and (heads, kv_heads, head_dim, page) == (8, 2, 256, 128)
+        and units.ndim == 4
+        and units.shape[0] > 0
+        and units.shape[1:] == (2, 128, 512)
+        and queries.dtype
+        == current_keys.dtype
+        == current_values.dtype
+        == units.dtype
+        == mx.bfloat16
+        and pages.dtype == lengths.dtype == mx.int32
+        and mx.default_device() == mx.gpu
+        and mx.metal.is_available()
+    ):
+        from resin_models_mlx._native_cache import _paged_attention_partials
+
+        return _merge_output(
+            *_paged_attention_partials(
+                queries,
+                current_keys,
+                current_values,
+                units,
+                pages,
+                lengths,
+                layer,
+                scale,
+            ),
+            dtype=queries.dtype,
+        )
     # Each threadgroup serves an equal share of the query heads of a KV head.
     shared = heads // kv_heads
     # The cross-simdgroup reduction stores float maxima, sums and outputs.
     fits = [
         g
         for g in range(1, _HEADS_PER_THREADGROUP + 1)
-        if shared % g == 0 and SIMDGROUPS * g * (head_dim + 2) * 4 <= _THREADGROUP_BYTES
+        if shared % g == 0
+        and (g == 1 or g * head_dim <= _HEAD_DIMENSIONS_PER_THREADGROUP)
+        and SIMDGROUPS * g * (head_dim + 2) * 4 <= _THREADGROUP_BYTES
     ]
     if not fits:
         raise ValueError(f"head_dim {head_dim} exceeds paged decode threadgroup memory")
     group = max(fits)
     head_groups = shared // group
     longest = pages.shape[1] * page + 1
-    part = PARTITION_TOKENS // (2 if rows < SMALL_BATCH_ROWS else 1)
+    wide_head = head_dim >= 256
+    part = PARTITION_TOKENS // (2 if rows < SMALL_BATCH_ROWS and not wide_head else 1)
+    prefetch = 1 if wide_head else PREFETCH
     partitions = -(-longest // part)
     outputs, maxima, sums = _kernel()(
         inputs=[
@@ -261,7 +156,7 @@ def paged_decode_attention(
             ("PAGE", page),
             ("PART", part),
             ("SIMDGROUPS", SIMDGROUPS),
-            ("PREFETCH", PREFETCH),
+            ("PREFETCH", prefetch),
             ("T", units.dtype),
         ],
         grid=(32 * SIMDGROUPS, 1, rows * kv_heads * head_groups * partitions),
@@ -273,7 +168,7 @@ def paged_decode_attention(
         ],
         output_dtypes=[mx.float32, mx.float32, mx.float32],
     )
-    return _merge(outputs, maxima, sums).astype(queries.dtype)
+    return _merge_output(outputs, maxima, sums, dtype=queries.dtype)
 
 
 @partial(mx.compile, shapeless=True)
@@ -288,3 +183,132 @@ def _merge(outputs: mx.array, maxima: mx.array, sums: mx.array) -> mx.array:
 
 
 __all__ = ["PARTITION_TOKENS", "paged_decode_attention"]
+
+
+# MLX v0.32.4's small-column reduction order, Apple Inc., MIT (see NOTICE).
+_MERGE_HEADER = r"""
+#pragma clang fp contract(off)
+inline float resin_max(float a, float b) {
+    return (metal::isnan(a) || metal::isnan(b)) ? float(NAN) : (a > b ? a : b);
+}
+"""
+_MERGE_SMALL_SOURCE = r"""
+    const uint x = thread_position_in_threadgroup.x;
+    const uint y = thread_position_in_threadgroup.y;
+    const uint tile = threadgroup_position_in_grid.x;
+    const uint head = threadgroup_position_in_grid.z;
+    const uint P = uint(geometry[0]);
+    const uint Y = min(P, 8u);
+    const uint d = tile * 128 + x * 4;
+    const ulong base = ulong(head) * P;
+    threadgroup float peak;
+    threadgroup float weights[32];
+    threadgroup float denominator;
+    threadgroup float intermediate[8 * 128];
+    if (x == 0 && y == 0) {
+        float value = -INFINITY;
+        for (uint p = 0; p < P; ++p)
+            value = resin_max(maxima[base + p], value);
+        peak = value;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    const uint index = y * 32 + x;
+    if (index < P) {
+        const float maximum = maxima[base + index];
+        const float shifted = maximum - peak;
+        weights[index] = maximum == -INFINITY ? 0.0f : metal::precise::exp(shifted);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (x == 0 && y == 0) {
+        float value = 0.0f;
+        for (uint p = 0; p < P; ++p) {
+            // The original multiply materializes F32 before row_reduce_small.
+            const float product = sums[base + p] * weights[p];
+            value = product + value;
+        }
+        denominator = value;
+    }
+    float value[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    // col_reduce_small: y,y+Y,..., then serial y0,y1,...,y(Y-1).
+    for (uint p = y; p < P; p += Y) {
+        const ulong input = (base + p) * D + d;
+        for (uint i = 0; i < 4; ++i) {
+            const float product = float(partials[input + i]) * weights[p];
+            value[i] = product + value[i];
+        }
+    }
+    for (uint i = 0; i < 4; ++i)
+        intermediate[y * 128 + x * 4 + i] = value[i];
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (y == 0) {
+        for (uint i = 0; i < 4; ++i) {
+            float total = intermediate[x * 4 + i];
+            for (uint row = 1; row < Y; ++row)
+                total = intermediate[row * 128 + x * 4 + i] + total;
+            const float result = total / denominator;
+            output[ulong(head) * D + d + i] = T(result);
+        }
+    }
+"""
+
+
+@cache
+def _merge_kernel():
+    return mx.fast.metal_kernel(
+        name="resin_partition_merge_small",
+        input_names=["partials", "maxima", "sums", "geometry"],
+        output_names=["output"],
+        source=_MERGE_SMALL_SOURCE,
+        header=_MERGE_HEADER,
+        compile_options={"math_mode": "safe"},
+    )
+
+
+def _fused_merge(outputs, maxima, sums, *, dtype):
+    """Fuse D256/F32 partitions 2..31; other regimes keep native MLX."""
+    if outputs.ndim != 4:
+        return None
+    rows, heads, partitions, dim = outputs.shape
+    if not (
+        dim == 256
+        and 2 <= partitions < 32
+        and rows * heads * partitions >= 8
+        and maxima.shape == sums.shape == (rows, heads, partitions)
+        and outputs.dtype == maxima.dtype == sums.dtype == mx.float32
+        and dtype in (mx.float32, mx.bfloat16)
+        and mx.default_device() == mx.gpu
+        and mx.metal.is_available()
+    ):
+        return None
+    return _merge_kernel()(
+        inputs=[outputs, maxima, sums, mx.array([partitions], mx.int32)],
+        template=[("D", 256), ("T", dtype)],
+        grid=(64, min(partitions, 8), rows * heads),
+        threadgroup=(32, min(partitions, 8), 1),
+        output_shapes=[(rows, heads, dim)],
+        output_dtypes=[dtype],
+    )[0]
+
+
+def _merge_output(outputs, maxima, sums, *, dtype):
+    fused = _fused_merge(outputs, maxima, sums, dtype=dtype)
+    return _merge(outputs, maxima, sums).astype(dtype) if fused is None else fused
+
+
+@cache
+def _warm_small_merge():
+    # Cache only completion, never arrays or streams created on this thread.
+    partials = mx.zeros((1, 8, 2, 256), mx.float32)
+    maxima = mx.zeros((1, 8, 2), mx.float32)
+    sums = mx.ones((1, 8, 2), mx.float32)
+    mx.eval(
+        [
+            _fused_merge(partials, maxima, sums, dtype=dtype)
+            for dtype in (mx.bfloat16, mx.float32)
+        ]
+    )
+
+
+def _warm_fused_merge():
+    if mx.default_device() == mx.gpu and mx.metal.is_available():
+        _warm_small_merge()

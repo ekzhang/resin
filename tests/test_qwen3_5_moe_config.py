@@ -79,6 +79,30 @@ def test_moe_text_config_parses_without_root() -> None:
     assert config.is_moe
 
 
+@pytest.mark.parametrize("bos", [None, 248044])
+def test_dense_tied_config_accepts_optional_bos(bos: int | None) -> None:
+    # The small dense checkpoints tie their output projection to the input
+    # embeddings and do not define a BOS token in their text configuration.
+    raw = _ornith_35b()
+    raw["model_type"] = "qwen3_5"
+    text = raw["text_config"]
+    text.update(
+        model_type="qwen3_5_text", intermediate_size=4096, tie_word_embeddings=True
+    )
+    if bos is None:
+        text.pop("bos_token_id")
+    else:
+        text["bos_token_id"] = bos
+    config = Qwen35Config.from_hugging_face(raw)
+
+    assert not config.is_moe
+    assert config.tie_word_embeddings
+    assert config.bos_token_id == bos
+    config.require_dense()
+    with pytest.raises(ValueError, match="tied embeddings"):
+        config.require_untied_embeddings()
+
+
 def test_moe_root_requires_matching_text_type() -> None:
     raw = _ornith_35b()
     raw["text_config"]["model_type"] = "qwen3_5_text"
