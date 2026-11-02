@@ -15,7 +15,7 @@ from resin.backend.loading import prepare_model
 from resin_models_cuda.dense_parallel import TensorParallelSum, shard_dense_mlp
 from resin_models_cuda.nvfp4 import Nvfp4LinearWeights
 from resin_models_cuda.qwen3_5.model import (
-    Qwen3_5ForConditionalGeneration,
+    Qwen35ForConditionalGeneration,
     Qwen35GatedDeltaNet,
     Qwen35MLP,
 )
@@ -31,7 +31,7 @@ def test_checkpoint_shards_on_cpu_before_allocating_gpu(tmp_path, monkeypatch):
     raw = _qwen38()
     raw["text_config"].update(asdict(config))
     (tmp_path / "config.json").write_text(json.dumps(raw))
-    original = Qwen3_5ForConditionalGeneration(config, include_mtp=True).bfloat16()
+    original = Qwen35ForConditionalGeneration(config, include_mtp=True).bfloat16()
     state = original.state_dict()
     save_file(state, str(tmp_path / "model.safetensors"))
     (tmp_path / "model.safetensors.index.json").write_text(
@@ -51,7 +51,7 @@ def test_checkpoint_shards_on_cpu_before_allocating_gpu(tmp_path, monkeypatch):
         transferred.append(model)
         return model
 
-    monkeypatch.setattr(Qwen3_5ForConditionalGeneration, "to", transfer_local_model)
+    monkeypatch.setattr(Qwen35ForConditionalGeneration, "to", transfer_local_model)
     parallel = TensorParallelContext(
         TensorParallelLayout(rank=1, size=2), cast(ProcessGroup, object())
     )
@@ -72,7 +72,7 @@ def test_checkpoint_shards_on_cpu_before_allocating_gpu(tmp_path, monkeypatch):
 def test_dense_tp_prepares_target_and_mtp_without_sharding_attention(quantized):
     torch.manual_seed(57)
     config = replace(_tiny_config(), intermediate_size=256)
-    model = Qwen3_5ForConditionalGeneration(
+    model = Qwen35ForConditionalGeneration(
         config, include_mtp=True, quantized=quantized
     )
     if not quantized:
@@ -170,7 +170,7 @@ def test_attention_tp_rejects_partial_kv_or_recurrent_heads():
 def test_target_and_mtp_attention_tp_preserves_head_gate_order(monkeypatch, tokens):
     monkeypatch.setattr(TensorParallelContext, "sum", lambda self, tensor: tensor)
     torch.manual_seed(83)
-    model = Qwen3_5ForConditionalGeneration(_tiny_config(), include_mtp=True)
+    model = Qwen35ForConditionalGeneration(_tiny_config(), include_mtp=True)
     ranks = _attention_ranks(model)
     hidden = torch.randn(2, tokens, model.config.hidden_size)
     positions = torch.arange(tokens)[None].expand(2, -1)
@@ -200,7 +200,7 @@ def test_delta_tp_preserves_packed_heads_and_continued_states(monkeypatch, value
     monkeypatch.setattr(TensorParallelContext, "sum", lambda self, tensor: tensor)
     torch.manual_seed(84)
     config = replace(_tiny_config(), linear_num_value_heads=value_heads)
-    model = Qwen3_5ForConditionalGeneration(config, include_mtp=False)
+    model = Qwen35ForConditionalGeneration(config, include_mtp=False)
     ranks = _attention_ranks(model)
     reference = cast(Qwen35GatedDeltaNet, model.language_model.layers[0].linear_attn)
     local_modules = [local.language_model.layers[0].linear_attn for local in ranks]
@@ -254,7 +254,7 @@ def test_fp8_projection_shards_keep_scales_and_packed_qkv_rows():
     from resin_models_cuda.qwen3_5.quantization import ModelOptFp8Linear
 
     torch.manual_seed(85)
-    model = Qwen3_5ForConditionalGeneration(
+    model = Qwen35ForConditionalGeneration(
         _tiny_config(), include_mtp=True, quantized=True
     )
     for module in model.modules():

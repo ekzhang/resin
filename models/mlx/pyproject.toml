@@ -1,22 +1,45 @@
 [build-system]
-requires = ["uv_build>=0.9.2,<0.10"]
-build-backend = "uv_build"
+requires = [
+  "setuptools>=80",
+  "cmake>=3.25; sys_platform == 'darwin'",
+  "mlx==0.32.4; sys_platform == 'darwin'",
+  "nanobind==3.1.0; sys_platform == 'darwin'",
+]
+build-backend = "setuptools.build_meta"
 
 [project]
 name = "resin-models-mlx"
 version = "0.1.0"
 description = "Apple Silicon (MLX) model runners for Resin"
+readme = "resin_models_mlx/qwen3_5/README.md"
 requires-python = ">=3.11"
 license = "Apache-2.0"
+license-files = ["LICENSE", "resin_models_mlx/**/LICENSE"]
 dependencies = [
   "resin==0.1.0",
-  "mlx>=0.32.4; sys_platform == 'darwin'",
+  # Native primitives use the MLX C++ ABI, so build and runtime must match.
+  "mlx==0.32.4; sys_platform == 'darwin'",
   "mlx-lm>=0.32.2; sys_platform == 'darwin'",
+  "mlx-vlm==0.7.11; sys_platform == 'darwin'",
   "huggingface-hub>=0.35",
 ]
 
 [tool.uv.sources]
 resin = { workspace = true }
 
-[tool.uv.build-backend]
-module-root = ""
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["resin_models_mlx*"]
+namespaces = false
+
+[tool.setuptools.package-data]
+resin_models_mlx = [
+  "*.pyi",
+  "native/*.cpp",
+  "native/*.metal",
+  "native/*.h",
+  "native/*.md",
+  "native/LICENSE*",
+  "qwen3_5/README.md",
+  "qwen3_5/LICENSE",
+]

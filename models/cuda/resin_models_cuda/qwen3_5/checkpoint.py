@@ -21,7 +21,7 @@ from resin.models.qwen3_5.config import Qwen35Config
 from resin_models_cuda.dense_parallel import shard_dense_mlp
 from resin_models_cuda.nvfp4 import prepare_nvfp4_modules, select_nvfp4_backend
 from resin_models_cuda.qwen3_5.model import (
-    Qwen3_5ForConditionalGeneration,
+    Qwen35ForConditionalGeneration,
     Qwen35MLP,
 )
 from resin_models_cuda.qwen3_5.parallel import (
@@ -72,6 +72,7 @@ def load_config(model_path: str | Path) -> tuple[Qwen35Config, dict]:
     raw_config = read_config(Path(model_path))
     config = Qwen35Config.from_hugging_face(raw_config)
     config.require_dense()
+    config.require_untied_embeddings()
     return config, raw_config
 
 
@@ -97,7 +98,7 @@ def is_modelopt_nvfp4(raw_config: dict[str, Any]) -> bool:
 
 def build_meta_model(
     raw_config: dict[str, Any], *, include_mtp: bool, include_vision: bool = False
-) -> tuple[Qwen3_5ForConditionalGeneration, Qwen35Config]:
+) -> tuple[Qwen35ForConditionalGeneration, Qwen35Config]:
     config = Qwen35Config.from_hugging_face(raw_config)
     config.require_dense()
     if include_mtp:
@@ -106,7 +107,7 @@ def build_meta_model(
     if raw_config.get("quantization_config") and not quantized:
         raise ValueError("unsupported Qwen3.5 checkpoint quantization contract")
     with use_default_dtype(torch.bfloat16), torch.device("meta"):
-        model = Qwen3_5ForConditionalGeneration(
+        model = Qwen35ForConditionalGeneration(
             config,
             include_mtp=include_mtp,
             vision_config=raw_config.get("vision_config") if include_vision else None,
@@ -146,7 +147,7 @@ def load_model(
     nvfp4_backend: str = "auto",
     tensor_parallel: TensorParallelContext | None = None,
     attention_parallel: TensorParallelContext | None = None,
-) -> tuple[Qwen3_5ForConditionalGeneration, Qwen35Config, dict[str, Any]]:
+) -> tuple[Qwen35ForConditionalGeneration, Qwen35Config, dict[str, Any]]:
     """Stream the target, visual tower, and optional bundled MTP weights."""
 
     root = Path(model_path).expanduser().resolve()
@@ -201,7 +202,7 @@ def load_model(
     )
     prepared.to(target)
     model = cast(
-        Qwen3_5ForConditionalGeneration,
+        Qwen35ForConditionalGeneration,
         prepare_nvfp4_modules(
             prepared,
             select_nvfp4_backend(nvfp4_backend, torch.backends.cudnn.version()),

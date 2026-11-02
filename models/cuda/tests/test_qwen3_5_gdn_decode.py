@@ -275,7 +275,7 @@ def test_tiny_runner_overlap_matches_sync(
 
     from resin import Engine, SamplingParams, SchedulerConfig
     from resin_models_cuda.qwen3_5 import cuda as runtime
-    from resin_models_cuda.qwen3_5.model import Qwen3_5ForConditionalGeneration
+    from resin_models_cuda.qwen3_5.model import Qwen35ForConditionalGeneration
 
     config = _tiny_runner_config()
 
@@ -283,7 +283,7 @@ def test_tiny_runner_overlap_matches_sync(
         # Fresh, identical CPU initialization for every independently bound runner.
         with torch.random.fork_rng(devices=[torch.cuda.current_device()]):
             torch.manual_seed(41)
-            model = Qwen3_5ForConditionalGeneration(config, include_mtp=include_mtp)
+            model = Qwen35ForConditionalGeneration(config, include_mtp=include_mtp)
         model = (
             model.to(device=device, dtype=torch.bfloat16).eval().requires_grad_(False)
         )

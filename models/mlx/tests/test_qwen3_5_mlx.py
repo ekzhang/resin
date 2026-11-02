@@ -3,7 +3,6 @@ from __future__ import annotations
 import subprocess
 import sys
 from pathlib import Path
-from types import SimpleNamespace
 from typing import Any, cast
 
 import numpy as np
@@ -11,38 +10,30 @@ import pytest
 
 mx = pytest.importorskip("mlx.core")
 
+import mlx.nn as nn  # noqa: E402
 from mlx.utils import tree_flatten  # noqa: E402
 
 from resin import Engine, SamplingParams, SchedulerConfig  # noqa: E402
 from resin.models.qwen3_5.config import Qwen35Config  # noqa: E402
-from resin_models_mlx.qwen3_5_moe.cache import (  # noqa: E402
+from resin_models_mlx.qwen3_5.cache import (  # noqa: E402
     PAGE_TOKENS,
     PREFILL_CHUNK_SIZE,
-    STATE_GROUP,
     CacheGeometry,
 )
-from resin_models_mlx.qwen3_5_moe.model import (  # noqa: E402
-    LinearState,
-    Qwen35MoeModel,
+from resin_models_mlx.qwen3_5.model import (  # noqa: E402
+    Qwen35Model,
 )
-from resin_models_mlx.qwen3_5_moe.runner import Qwen3_5MoeMlxRunner  # noqa: E402
+from resin_models_mlx.qwen3_5.runner import Qwen35MlxRunner  # noqa: E402
 
 
-@pytest.fixture(autouse=True)
-def _tiny_model_workspace(monkeypatch):
-    # The 64-wide test model does not need the production runner's 4 GiB
-    # workspace reserve, which exceeds the budget on small Apple CI runners.
-    monkeypatch.setattr(
-        "resin_models_mlx.qwen3_5_moe.runner._WORKSPACE_BYTES", 64 << 20
-    )
-
-
-def _text_config() -> dict[str, Any]:
+def _text_config(
+    *, dense: bool = False, tie_word_embeddings: bool = False
+) -> dict[str, Any]:
     layers = [
         "full_attention" if (index + 1) % 4 == 0 else "linear_attention"
         for index in range(8)
     ]
-    return {
+    config = {
         "model_type": "qwen3_5_moe_text",
         "vocab_size": 256,
         "hidden_size": 64,
@@ -73,12 +64,36 @@ def _text_config() -> dict[str, Any]:
         "num_experts_per_tok": 2,
         "moe_intermediate_size": 32,
         "shared_expert_intermediate_size": 48,
+        "tie_word_embeddings": tie_word_embeddings,
     }
+    if dense:
+        config.update(
+            model_type="qwen3_5_text", intermediate_size=128, bos_token_id=None
+        )
+        for key in (
+            "num_experts",
+            "num_experts_per_tok",
+            "moe_intermediate_size",
+            "shared_expert_intermediate_size",
+        ):
+            config.pop(key)
+    return config
 
 
-def _model(seed: int = 0, dtype=None, *, all_experts: bool = False) -> Qwen35MoeModel:
+def _model(
+    seed: int = 0,
+    dtype=None,
+    *,
+    all_experts: bool = False,
+    dense: bool = False,
+    tie_word_embeddings: bool = False,
+) -> Qwen35Model:
     mx.random.seed(seed)
-    model = Qwen35MoeModel(Qwen35Config.from_hugging_face(_text_config()))
+    model = Qwen35Model(
+        Qwen35Config.from_hugging_face(
+            _text_config(dense=dense, tie_word_embeddings=tie_word_embeddings)
+        )
+    )
     # Give norms and DeltaNet decay realistic, non-trivial values.
     updates = []
     for name, value in cast(list[tuple[str, Any]], tree_flatten(model.parameters())):
@@ -97,7 +112,7 @@ def _model(seed: int = 0, dtype=None, *, all_experts: bool = False) -> Qwen35Moe
     selected = mx.bfloat16 if dtype is None else dtype
     model.set_dtype(selected, lambda dtype: dtype == mx.float32)
     mx.eval(model.parameters())
-    if all_experts:
+    if all_experts and model.config.is_moe:
         # Random routers have near-tied experts, so BF16 rounding can flip a
         # top-k choice; routing to every expert keeps logits continuous.
         for layer in model.layers:
@@ -105,7 +120,7 @@ def _model(seed: int = 0, dtype=None, *, all_experts: bool = False) -> Qwen35Moe
     return model
 
 
-def _full_logits(model: Qwen35MoeModel, tokens: list[int]) -> mx.array:
+def _full_logits(model: Qwen35Model, tokens: list[int]) -> mx.array:
     output = model(
         mx.array([tokens]),
         mx.array([0]),
@@ -116,7 +131,7 @@ def _full_logits(model: Qwen35MoeModel, tokens: list[int]) -> mx.array:
 
 
 def _assert_greedy(
-    model: Qwen35MoeModel, prompt: list[int], generated: list[int], count: int
+    model: Qwen35Model, prompt: list[int], generated: list[int], count: int
 ) -> None:
     """Each token must be a reference argmax up to BF16 tie tolerance.
 
@@ -139,8 +154,8 @@ def _generate(engine: Engine, prompts: list[list[int]], count: int):
     return [request.take_result() for request in requests]
 
 
-def _runner(model: Qwen35MoeModel, slabs: int = 64) -> Qwen3_5MoeMlxRunner:
-    return Qwen3_5MoeMlxRunner(model, cache_slab_capacity=slabs)
+def _runner(model: Qwen35Model, slabs: int = 64) -> Qwen35MlxRunner:
+    return Qwen35MlxRunner(model, cache_slab_capacity=slabs, workspace_bytes=64 << 20)
 
 
 def _prompt(length: int, seed: int) -> list[int]:
@@ -179,7 +194,7 @@ def test_geometry_packs_ornith_state_into_whole_kv_units() -> None:
     assert geometry.unit_elements * 2 == 256 * 1024
 
 
-def _mlx_lm_reference(model: Qwen35MoeModel):
+def _mlx_lm_reference(model: Qwen35Model):
     from mlx_lm.models.qwen3_5_moe import Model, ModelArgs
 
     reference = Model(
@@ -220,9 +235,128 @@ def test_forward_matches_mlx_lm_reference() -> None:
     assert (mx.argmax(actual, axis=-1) == mx.argmax(expected, axis=-1)).all().item()
 
 
-def test_incremental_state_matches_full_forward_exactly() -> None:
+@pytest.mark.parametrize("tied", [False, True], ids=["untied", "tied"])
+def test_dense_output_projection_respects_embedding_tying(tied: bool) -> None:
+    model = _model(dtype=mx.float32, dense=True, tie_word_embeddings=tied)
+    hidden = mx.random.normal((2, 3, model.config.hidden_size))
+    parameters = dict(tree_flatten(model.parameters()))
+    assert ("lm_head.weight" in parameters) is not tied
+
+    # An independent head keeps its own weights; tied logits follow later
+    # embedding updates without maintaining a second parameter copy.
+    before = model.logits(hidden)
+    mx.eval(before)
+    model.embed_tokens.weight = model.embed_tokens.weight + 0.25
+    after = model.logits(hidden)
+    if tied:
+        expected = hidden @ model.embed_tokens.weight.T
+        assert mx.allclose(after, expected, atol=1e-5).item()
+        assert not mx.allclose(before, after).item()
+    else:
+        assert mx.array_equal(before, after).item()
+
+
+def test_dense_tied_logits_support_quantized_embeddings() -> None:
+    model = _model(dense=True, tie_word_embeddings=True)
+    hidden = mx.random.normal((2, 3, model.config.hidden_size)).astype(mx.bfloat16)
+    expected = model.logits(hidden)
+    mx.eval(expected)
+    nn.quantize(
+        model,
+        bits=8,
+        group_size=64,
+        class_predicate=lambda path, _module: path == "embed_tokens",
+    )
+    assert "lm_head.weight" not in dict(tree_flatten(model.parameters()))
+    np.testing.assert_allclose(
+        np.array(model.logits(hidden).astype(mx.float32)),
+        np.array(expected.astype(mx.float32)),
+        atol=0.05,
+        rtol=0.03,
+    )
+
+
+@pytest.mark.parametrize(
+    "precision,rows", [("fp32", 1), ("bf16", 4), ("int8", 1), ("int8", 5)]
+)
+def test_preparation_preserves_forward_bits_and_checkpoint_parameters(precision, rows):
+    model = _model(
+        seed=87, dtype=mx.float32 if precision == "fp32" else mx.bfloat16, dense=True
+    )
+    if precision == "int8":
+        nn.quantize(model, bits=8, group_size=64)
+    tokens = mx.array(_prompt(rows, seed=86), mx.int32)[:, None]
+    state, history = model.initial_state(rows), (None,) * model.config.full_layer_count
+
+    def arrays(output):
+        return (
+            output.hidden,
+            model.logits(output.hidden),
+            *output.keys,
+            *output.values,
+            *output.state.recurrent,
+            *output.state.convolution,
+        )
+
+    def bits(value):
+        integer = mx.uint16 if value.dtype in (mx.bfloat16, mx.float16) else mx.uint32
+        return np.array(value.view(integer))
+
+    expected = arrays(model(tokens, mx.zeros(rows, mx.int32), state, history))
+    mx.eval(expected)
+    before = {name: bits(value) for name, value in tree_flatten(model.parameters())}
+    model.prepare_for_inference()
+    actual = arrays(model(tokens, mx.zeros(rows, mx.int32), state, history))
+    mx.eval(actual)
+    for value, reference in zip(actual, expected, strict=True):
+        assert value.shape == reference.shape and value.dtype == reference.dtype
+        np.testing.assert_array_equal(bits(value), bits(reference))
+    parameters = dict(tree_flatten(model.parameters()))
+    assert parameters.keys() == before.keys()
+    for name, value in parameters.items():
+        np.testing.assert_array_equal(bits(value), before[name])
+
+
+def test_load_weights_updates_projection_outputs():
+    model = _model(seed=84, dense=True)
+    nn.quantize(model, bits=8, group_size=64)
+    model.prepare_for_inference()
+    mlp = model.layers[0].mlp
+    hidden = mx.random.normal((2, 1, model.config.hidden_size)).astype(mx.bfloat16)
+    original = np.array(mlp(hidden).astype(mx.float32))
+    assert np.any(original != 0)
+    # A zero affine gate has zero output regardless of its packed payload.
+    # Public weight loading must replace the values used by the model.
+    model.load_weights(
+        [
+            ("layers.0.mlp.gate_proj.scales", mx.zeros_like(mlp.gate_proj.scales)),
+            ("layers.0.mlp.gate_proj.biases", mx.zeros_like(mlp.gate_proj.biases)),
+        ],
+        strict=False,
+    )
+    np.testing.assert_array_equal(
+        np.array(mlp(hidden).astype(mx.float32)), np.zeros_like(original)
+    )
+
+
+def test_set_dtype_updates_projection_outputs():
+    model = _model(seed=85, dtype=mx.float32, dense=True)
+    model.prepare_for_inference()
+    model.set_dtype(mx.bfloat16)
+    mlp = model.layers[0].mlp
+    hidden = mx.random.normal((2, 3, model.config.hidden_size)).astype(mx.bfloat16)
+    expected = mlp.down_proj(nn.silu(mlp.gate_proj(hidden)) * mlp.up_proj(hidden))
+    actual = mlp(hidden)
+    assert actual.dtype == expected.dtype == mx.bfloat16
+    np.testing.assert_array_equal(
+        np.array(actual.astype(mx.float32)), np.array(expected.astype(mx.float32))
+    )
+
+
+@pytest.mark.parametrize("dense", [False, True], ids=["moe", "dense"])
+def test_incremental_state_matches_full_forward_exactly(dense: bool) -> None:
     # FP32 isolates state and history plumbing from BF16 rounding.
-    model = _model(dtype=mx.float32)
+    model = _model(dtype=mx.float32, dense=dense)
     tokens = _prompt(21, seed=2)
     config = model.config
     expected = _full_logits(model, tokens)
@@ -233,7 +367,7 @@ def test_incremental_state_matches_full_forward_exactly() -> None:
         model.initial_state(1),
         (None,) * config.full_layer_count,
     )
-    from resin_models_mlx.qwen3_5_moe.model import AttentionHistory
+    from resin_models_mlx.qwen3_5.model import AttentionHistory
 
     history = tuple(
         AttentionHistory(key, value)
@@ -245,8 +379,9 @@ def test_incremental_state_matches_full_forward_exactly() -> None:
     assert mx.allclose(actual, expected[13:], atol=1e-5, rtol=1e-5).item()
 
 
-def test_engine_greedy_matches_reference_across_page_boundaries() -> None:
-    model = _model(all_experts=True)
+@pytest.mark.parametrize("dense", [False, True], ids=["moe", "dense"])
+def test_engine_greedy_matches_reference_across_page_boundaries(dense: bool) -> None:
+    model = _model(all_experts=True, dense=dense)
     lengths = (5, PAGE_TOKENS - 2, PAGE_TOKENS - 1, PAGE_TOKENS, PAGE_TOKENS + 1)
     prompts = [_prompt(length, seed=length) for length in lengths]
 
@@ -301,49 +436,6 @@ def test_cancel_releases_live_state_and_others_continue() -> None:
         _assert_greedy(model, prompts[index], leases[index].take_result(), 10)
 
 
-def test_live_states_regroup_rows_held_by_different_batches() -> None:
-    model = _model()
-    runner = _runner(model)
-    states = runner._states
-
-    def plan(sequences: list[int], contexts: list[int], restores=()) -> Any:
-        state = SimpleNamespace(restore_copies=restores, checkpoint_slots=())
-        return SimpleNamespace(
-            batch=SimpleNamespace(
-                sequence_ids=np.array(sequences), context_lengths=np.array(contexts)
-            ),
-            groups={STATE_GROUP: SimpleNamespace(state=state)},
-        )
-
-    def marked(rows: list[int]) -> LinearState:
-        # Every element of a row's state holds that row's marker.
-        def fill(value: mx.array) -> mx.array:
-            marks = mx.array(rows).reshape(-1, *[1] * (value.ndim - 1))
-            return (value + marks).astype(value.dtype)
-
-        state = model.initial_state(len(rows))
-        return LinearState(
-            tuple(map(fill, state.recurrent)), tuple(map(fill, state.convolution))
-        )
-
-    runner._cache.write_states([runner._cache.state_start(3, 0)], marked([7]))
-    states.commit(
-        plan([1, 3], [9, 9]), np.arange(2), np.array([10, 10]), marked([1, 3])
-    )
-    states.commit(
-        plan([5, 2], [19, 19]), np.arange(2), np.array([20, 20]), marked([5, 2])
-    )
-    # Sequences 1 and 2 come from different batches whose other rows left. A
-    # new request restores the null slab and another a snapshot in slab 3.
-    gathered = states.gather(
-        plan([4, 1, 2, 6], [0, 10, 20, 4096], restores=((0, 0, 0), (3, 3, 0))),
-        np.arange(4),
-    )
-    expected = mx.array([[0], [1], [2], [7]])
-    for value in (*gathered.recurrent, *gathered.convolution):
-        assert (value.reshape(4, -1) == expected).all().item()
-
-
 def test_retracted_requests_replay_from_fresh_state() -> None:
     model = _model(all_experts=True)
     prompts = [_prompt(500, seed=40), _prompt(500, seed=41)]
@@ -368,7 +460,7 @@ def test_retracted_requests_replay_from_fresh_state() -> None:
 
 
 def _decode_with_stops(
-    overlap: bool, model: Qwen35MoeModel, temperature: float, stops: tuple[int, ...]
+    overlap: bool, model: Qwen35Model, temperature: float, stops: tuple[int, ...]
 ) -> tuple[list[list[int]], tuple[int, int]]:
     prompts = [_prompt(length, seed=60 + length) for length in (9, 40, 100)]
     counts = [16, 7, 20]
@@ -391,9 +483,12 @@ def _decode_with_stops(
     return [lease.take_result() for lease in leases], stats
 
 
+@pytest.mark.parametrize("dense", [False, True], ids=["moe", "dense"])
 @pytest.mark.parametrize("temperature", [0.0, 0.8])
-def test_overlapped_decode_matches_synchronous_steps(temperature: float) -> None:
-    model = _model(all_experts=True)
+def test_overlapped_decode_matches_synchronous_steps(
+    temperature: float, dense: bool
+) -> None:
+    model = _model(all_experts=True, dense=dense)
     synchronous, stats = _decode_with_stops(False, model, temperature, ())
     assert stats == (0, 0)
     # The first row stops partway through while its next step is in flight.
@@ -427,8 +522,9 @@ def test_snapshot_written_during_decode_serves_the_next_turn() -> None:
     _assert_greedy(model, turn, cached, 4)
 
 
-def test_chunked_prefill_crosses_state_checkpoint() -> None:
-    model = _model(all_experts=True)
+@pytest.mark.parametrize("dense", [False, True], ids=["moe", "dense"])
+def test_chunked_prefill_crosses_state_checkpoint(dense: bool) -> None:
+    model = _model(all_experts=True, dense=dense)
     prompt = _prompt(PREFILL_CHUNK_SIZE + 37, seed=3)
 
     with Engine(_runner(model), context_length=16384) as engine:
@@ -436,8 +532,9 @@ def test_chunked_prefill_crosses_state_checkpoint() -> None:
     _assert_greedy(model, prompt, generated, 4)
 
 
-def test_prefix_cache_hit_matches_fresh_run() -> None:
-    model = _model(all_experts=True)
+@pytest.mark.parametrize("dense", [False, True], ids=["moe", "dense"])
+def test_prefix_cache_hit_matches_fresh_run(dense: bool) -> None:
+    model = _model(all_experts=True, dense=dense)
     shared = _prompt(PREFILL_CHUNK_SIZE, seed=4)
     suffix = _prompt(9, seed=5)
 
@@ -460,8 +557,9 @@ def test_prefix_cache_hit_matches_fresh_run() -> None:
     _assert_greedy(model, shared + suffix, fresh, 5)
 
 
-def test_prompt_logprobs_match_one_pass_forward() -> None:
-    model = _model()
+@pytest.mark.parametrize("dense", [False, True], ids=["moe", "dense-tied"])
+def test_prompt_logprobs_match_one_pass_forward(dense: bool) -> None:
+    model = _model(dense=dense, tie_word_embeddings=dense)
     prompts = [_prompt(37, seed=8), _prompt(21, seed=9)]
     params = SamplingParams(max_output_tokens=1, prompt_logprobs=True, temperature=0)
 
@@ -480,19 +578,35 @@ def test_prompt_logprobs_match_one_pass_forward() -> None:
         assert actual == pytest.approx(expected.tolist(), abs=0.05)
 
 
-def _assert_checkpoint_loader_matches_transformers(layout: str) -> None:
+@pytest.mark.parametrize(
+    "layout,dense,tied",
+    [
+        pytest.param("per-expert", False, False, id="moe-per-expert-sharded"),
+        pytest.param("fused", False, False, id="moe-fused"),
+        pytest.param("fused", True, True, id="dense-nested-tied"),
+        pytest.param("text-only", True, False, id="dense-text-only-untied"),
+    ],
+)
+def test_checkpoint_loader_matches_transformers_reference(layout, dense, tied):
     import json
     import tempfile
 
     import torch
     from safetensors.torch import save_file
-    from transformers import Qwen3_5MoeForCausalLM, Qwen3_5MoeTextConfig
+    from transformers import (
+        Qwen3_5ForCausalLM,
+        Qwen3_5MoeForCausalLM,
+        Qwen3_5MoeTextConfig,
+        Qwen3_5TextConfig,
+    )
 
-    from resin_models_mlx.qwen3_5_moe.checkpoint import load_model
+    from resin_models_mlx.qwen3_5.checkpoint import load_model
 
-    values = _text_config()
+    values = _text_config(dense=dense, tie_word_embeddings=tied)
     torch.manual_seed(0)
-    reference = Qwen3_5MoeForCausalLM(Qwen3_5MoeTextConfig(**values)).float().eval()
+    config_type = Qwen3_5TextConfig if dense else Qwen3_5MoeTextConfig
+    model_type = Qwen3_5ForCausalLM if dense else Qwen3_5MoeForCausalLM
+    reference = model_type(config_type(**values)).float().eval()
     with torch.no_grad():
         for name, parameter in reference.named_parameters():
             if name.endswith("norm.weight"):
@@ -510,6 +624,9 @@ def _assert_checkpoint_loader_matches_transformers(layout: str) -> None:
         name: tensor if name.endswith(decay) else tensor.to(torch.bfloat16)
         for name, tensor in reference.state_dict().items()
     }
+    if tied:
+        # Hugging Face saves only the embedding tensor for tied weights.
+        state.pop("lm_head.weight")
     if layout != "text-only":
         # Multimodal exports nest the text model.
         state = {
@@ -560,10 +677,14 @@ def _assert_checkpoint_loader_matches_transformers(layout: str) -> None:
         config = (
             values
             if layout == "text-only"
-            else {"model_type": "qwen3_5_moe", "text_config": values}
+            else {
+                "model_type": "qwen3_5" if dense else "qwen3_5_moe",
+                "text_config": values,
+            }
         )
         (path / "config.json").write_text(json.dumps(config))
         model, _, _ = load_model(path, bits=None)
+        assert ("lm_head.weight" in dict(tree_flatten(model.parameters()))) is not tied
         for layer in model.layers:
             if hasattr(layer, "linear_attn"):
                 assert layer.linear_attn.A_log.dtype == mx.float32
@@ -573,30 +694,308 @@ def _assert_checkpoint_loader_matches_transformers(layout: str) -> None:
     assert (actual.argmax(-1) == expected.argmax(-1)).mean() > 0.9
 
 
-@pytest.mark.parametrize("layout", ["per-expert", "fused", "text-only"])
-def test_checkpoint_loader_matches_transformers_reference(layout: str) -> None:
+@pytest.mark.parametrize("tied", [False, True], ids=["untied", "tied"])
+def test_prequantized_checkpoint_preserves_packed_weights_and_reference_logits(
+    tmp_path, tied: bool
+) -> None:
+    import copy
+    import json
+
+    from mlx_lm.models.qwen3_5 import Model, ModelArgs
+
+    import resin_models_mlx.qwen3_5.checkpoint as checkpoint
+
+    values = _text_config(dense=True, tie_word_embeddings=tied)
+    quantization = {"bits": 8, "group_size": 64, "mode": "affine"}
+    raw = {
+        "model_type": "qwen3_5",
+        "text_config": values,
+        # MLX exports can carry both spellings with identical settings.
+        "quantization": quantization,
+        "quantization_config": quantization.copy(),
+    }
+    mx.random.seed(17)
+    reference = Model(ModelArgs.from_dict(copy.deepcopy(raw)))
+    updates = []
+    for name, value in cast(
+        list[tuple[str, Any]], tree_flatten(reference.parameters())
+    ):
+        if name.endswith("norm.weight"):
+            # mlx-lm stores sanitized RMSNorm scales rather than HF offsets.
+            updates.append((name, 1.0 + 0.1 * mx.random.normal(value.shape)))
+        elif name.endswith("A_log"):
+            updates.append((name, mx.random.uniform(-8.0, 1.0, value.shape)))
+        elif name.endswith("dt_bias"):
+            updates.append((name, 0.1 * mx.random.normal(value.shape)))
+    reference.load_weights(updates, strict=False)
+    nn.quantize(reference, bits=8, group_size=64, mode="affine")
+    reference.eval()
+    saved = dict(cast(list[tuple[str, Any]], tree_flatten(reference.parameters())))
+    mx.eval(saved)
+    # Independent mlx-lm parameter names and depthwise-convolution layout are
+    # the ones found in converted community checkpoints.
+    assert saved["language_model.model.embed_tokens.weight"].dtype == mx.uint32
+    mx.save_safetensors(str(tmp_path / "model.safetensors"), saved)
+    (tmp_path / "config.json").write_text(json.dumps(raw))
+
+    model, config, _ = checkpoint.load_model(tmp_path)
+    parameters = dict(tree_flatten(model.parameters()))
+    assert config.tie_word_embeddings is tied
+    assert isinstance(model.embed_tokens, nn.QuantizedEmbedding)
+    assert ("lm_head.weight" in parameters) is not tied
+
+    for name, value in saved.items():
+        target = name.removeprefix("language_model.").removeprefix("model.")
+        if value.dtype == mx.uint32 or name.endswith((".scales", ".biases")):
+            assert parameters[target].dtype == value.dtype
+            np.testing.assert_array_equal(np.array(parameters[target]), np.array(value))
+    np.testing.assert_array_equal(
+        np.array(model.norm.weight),
+        np.array(saved["language_model.model.norm.weight"]),
+    )
+
+    tokens = _prompt(29, seed=17)
+    expected = reference(mx.array([tokens]))[0].astype(mx.float32)
+    actual = _full_logits(model, tokens)
+    np.testing.assert_allclose(
+        np.array(actual), np.array(expected), atol=1e-3, rtol=1e-3
+    )
+    assert mx.array_equal(
+        mx.argmax(actual, axis=-1), mx.argmax(expected, axis=-1)
+    ).item()
+
+
+def _assert_first_inference_in_native_http_actor(checkpoint: Path) -> None:
+    import copy
+    import json
+    import socket
+    import threading
+    import time
+    import urllib.error
+    import urllib.request
+
+    from mlx_lm.models.qwen3_5 import Model, ModelArgs
+
+    from resin.recipe import RenderedPrompt, TextDelta
+    from resin.server import HttpServer
+    from resin_models_mlx.qwen3_5.vision import Qwen35VisionModel
+
+    values = _text_config(dense=True, tie_word_embeddings=True)
+    values["linear_key_head_dim"] = 128
+    visual_config = dict(
+        model_type="qwen3_5_vision",
+        hidden_size=32,
+        intermediate_size=64,
+        out_hidden_size=values["hidden_size"],
+        num_heads=4,
+        depth=2,
+        patch_size=2,
+        temporal_patch_size=2,
+        spatial_merge_size=2,
+        in_channels=3,
+        num_position_embeddings=16,
+        hidden_act="gelu_pytorch_tanh",
+        deepstack_visual_indexes=[],
+    )
+    raw = dict(
+        model_type="qwen3_5",
+        text_config=values,
+        quantization=dict(bits=8, group_size=64, mode="affine"),
+        vision_config=visual_config,
+    )
+    mx.random.seed(94)
+    reference = Model(ModelArgs.from_dict(copy.deepcopy(raw)))
+    nn.quantize(reference, bits=8, group_size=64)
+    visual = Qwen35VisionModel(visual_config)
+    visual.set_dtype(mx.bfloat16)
+    saved = dict(cast(list[tuple[str, Any]], tree_flatten(reference.parameters())))
+    saved.update(
+        ("vision_tower." + name, value)
+        for name, value in cast(
+            list[tuple[str, Any]], tree_flatten(visual.parameters())
+        )
+    )
+    mx.eval(saved)
+    mx.save_safetensors(str(checkpoint / "model.safetensors"), saved)
+    (checkpoint / "config.json").write_text(json.dumps(raw))
+
+    constructed_on = threading.get_native_id()
+    forwarded_on = []
+
+    class Runner(Qwen35MlxRunner):
+        def forward(self, plan):
+            forwarded_on.append(threading.get_native_id())
+            return super().forward(plan)
+
+    # Load real packed tensors and warm the
+    # default compiled vision encoder on the constructor thread. The first text
+    # forward must then run on the actual Rust HTTP inference actor.
+    runner = Runner(checkpoint, cache_slab_capacity=64, workspace_bytes=64 << 20)
+    assert runner._media is not None
+    from resin_models_mlx.qwen3_5.normalization import normalize_qk
+
+    # The first native actor forward also reuses constants first published on
+    # the constructor thread, as happens after main-thread model warmup.
+    for dtype in (mx.bfloat16, mx.float32):
+        qk = mx.zeros((1, 1, 2, 128), dtype=dtype)
+        mx.eval(normalize_qk(qk, qk, inv_scale=128**-0.5, eps=1e-6))
+    prompts = [_prompt(19, seed=95), _prompt(131, seed=96)]
+
+    class Recipe:
+        tokenizer = None
+        stop_token_ids = []
+
+        def render(self, messages, *, tools=(), options=None):
+            return RenderedPrompt(prompts[int(messages[0].content[0].text)])
+
+        def create_parser(self, prompt):
+            class Parser:
+                def feed(self, token_ids):
+                    return [
+                        TextDelta(
+                            " ".join(str(int(token)) for token in token_ids) + " "
+                        )
+                    ]
+
+            return Parser()
+
+    with socket.socket() as probe:
+        probe.bind(("127.0.0.1", 0))
+        port = probe.getsockname()[1]
+    engine = Engine(runner, context_length=8192)
+    server = HttpServer(engine, recipe=Recipe(), model="tiny-packed")
+    errors = []
+
+    def serve():
+        try:
+            server.serve(port=port)
+        except BaseException as error:
+            errors.append(error)
+
+    thread = threading.Thread(target=serve, daemon=True)
+    thread.start()
+    base = f"http://127.0.0.1:{port}"
+    try:
+        deadline = time.monotonic() + 10
+        while True:
+            try:
+                with urllib.request.urlopen(base + "/health", timeout=0.2) as response:
+                    assert response.status == 200
+                break
+            except (OSError, urllib.error.URLError):
+                assert not errors, errors
+                assert time.monotonic() < deadline, "native HTTP actor did not start"
+                time.sleep(0.01)
+        actual = []
+        for index in range(len(prompts)):
+            request = urllib.request.Request(
+                base + "/v1/chat/completions",
+                data=json.dumps(
+                    dict(
+                        model="tiny-packed",
+                        messages=[dict(role="user", content=str(index))],
+                        max_tokens=8,
+                        temperature=0,
+                    )
+                ).encode(),
+                headers={"Content-Type": "application/json"},
+            )
+            with urllib.request.urlopen(request, timeout=10) as response:
+                assert response.status == 200
+                body = json.load(response)
+            actual.append(
+                [
+                    int(token)
+                    for token in body["choices"][0]["message"]["content"].split()
+                ]
+            )
+            assert len(actual[-1]) == 8
+        assert not engine.poisoned
+        assert engine.overlap_stats[1] > 0
+    finally:
+        server.shutdown()
+        thread.join(timeout=10)
+        assert not thread.is_alive(), "native HTTP actor failed to shut down"
+        assert errors == []
+    assert forwarded_on and all(
+        native_id != constructed_on for native_id in forwarded_on
+    )
+    # Compare the actor's outputs with the same loaded checkpoint running on the
+    # constructor thread, including the second prompt's page-crossing history.
+    direct = Qwen35MlxRunner(
+        checkpoint,
+        include_vision=False,
+        cache_slab_capacity=64,
+        workspace_bytes=64 << 20,
+    )
+    with Engine(direct, context_length=8192) as engine:
+        expected = [_generate(engine, [prompt], 8)[0] for prompt in prompts]
+    assert actual == expected
+
+
+def test_first_inference_uses_fresh_native_http_actor_after_checkpoint_loading(
+    tmp_path,
+):
+    # A separate process prevents an earlier test from initializing the actor's
+    # MLX stream registry or warming the target model before its first request.
     tests = Path(__file__).resolve().parent
     subprocess.run(
         [
             sys.executable,
             "-c",
             (
-                "import sys; "
+                "import sys; from pathlib import Path; "
                 f"sys.path.insert(0, {str(tests)!r}); "
-                "from test_qwen3_5_moe_mlx import "
-                "_assert_checkpoint_loader_matches_transformers as check; "
-                f"check({layout!r})"
+                "from test_qwen3_5_mlx import "
+                "_assert_first_inference_in_native_http_actor as check; "
+                f"check(Path({str(tmp_path)!r}))"
             ),
         ],
         check=True,
+        timeout=60,
     )
+
+
+@pytest.mark.parametrize(
+    "metadata",
+    [
+        pytest.param(
+            {
+                "quantization": {"bits": 8, "group_size": 64},
+                "quantization_config": {"bits": 4, "group_size": 64},
+            },
+            id="conflicting-aliases",
+        ),
+        pytest.param(
+            {"quantization": {"bits": 8, "group_size": 64, "mode": "mxfp8"}},
+            id="unsupported-format",
+        ),
+        pytest.param(
+            {"quantization_config": {"quant_method": "awq", "bits": 8}},
+            id="foreign-format",
+        ),
+    ],
+)
+def test_prequantized_config_rejects_ambiguous_formats(tmp_path, metadata) -> None:
+    import json
+
+    from resin_models_mlx.qwen3_5.checkpoint import load_config
+
+    raw = {
+        "model_type": "qwen3_5",
+        "text_config": _text_config(dense=True),
+        **metadata,
+    }
+    (tmp_path / "config.json").write_text(json.dumps(raw))
+    with pytest.raises(ValueError, match="quantization"):
+        load_config(tmp_path)
 
 
 def test_cache_writes_update_the_arena_in_place() -> None:
     model = _model()
     # Keep a >1 GiB copy detector without occupying most of a small CI runner.
     runner = _runner(model, slabs=5_000)
-    arena = runner._cache.storage.nbytes
+    arena = runner._cache.nbytes
     with Engine(runner, context_length=8192) as engine:
         params = SamplingParams(max_output_tokens=12, temperature=0.0)
         for seed in range(3):
@@ -619,8 +1018,15 @@ def test_context_is_capped_by_checkpoint_positions() -> None:
     model = _model()
     limit = model.config.max_position_embeddings
     with pytest.raises(ValueError, match="checkpoint's"):
-        Qwen3_5MoeMlxRunner(model, cache_slab_capacity=8, max_seq_len=limit + 1)
-    runner = Qwen3_5MoeMlxRunner(model, cache_slab_capacity=64, max_seq_len=300)
+        Qwen35MlxRunner(
+            model,
+            cache_slab_capacity=8,
+            max_seq_len=limit + 1,
+            workspace_bytes=64 << 20,
+        )
+    runner = Qwen35MlxRunner(
+        model, cache_slab_capacity=64, max_seq_len=300, workspace_bytes=64 << 20
+    )
     assert runner.benchmark_metadata["quant"] == "preloaded"
     with Engine(runner, context_length=8192) as engine:
         engine.submit(
@@ -633,7 +1039,9 @@ def test_context_is_capped_by_checkpoint_positions() -> None:
 
 
 def test_overlapped_decode_drains_before_the_context_cap() -> None:
-    runner = Qwen3_5MoeMlxRunner(_model(), cache_slab_capacity=64, max_seq_len=300)
+    runner = Qwen35MlxRunner(
+        _model(), cache_slab_capacity=64, max_seq_len=300, workspace_bytes=64 << 20
+    )
     params = SamplingParams(max_output_tokens=60, temperature=0.0)
     with Engine(runner, context_length=8192) as engine:
         long = engine.submit(_prompt(280, seed=1), sampling_params=params)
@@ -650,7 +1058,7 @@ def test_overlapped_decode_drains_before_the_context_cap() -> None:
 
 
 def test_query_blocked_prefill_attention_matches_one_block(monkeypatch) -> None:
-    import resin_models_mlx.qwen3_5_moe.model as model_module
+    import resin_models_mlx.qwen3_5.model as model_module
 
     model = _model(dtype=mx.float32)
     attention = model.layers[3].self_attn

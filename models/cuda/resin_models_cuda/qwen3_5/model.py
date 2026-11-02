@@ -704,7 +704,7 @@ class Qwen35MTP(nn.Module):
         return self.norm(hidden)
 
 
-class Qwen3_5ForConditionalGeneration(nn.Module):
+class Qwen35ForConditionalGeneration(nn.Module):
     """Text-only target whose parameter names match the public checkpoint."""
 
     def __init__(
@@ -716,6 +716,7 @@ class Qwen3_5ForConditionalGeneration(nn.Module):
         quantized: bool = False,
     ) -> None:
         super().__init__()
+        config.require_untied_embeddings()
         self.config = config
         self.model = _Qwen35Backbone(
             config, vision_config=vision_config, quantized=quantized
@@ -739,7 +740,7 @@ class Qwen3_5ForConditionalGeneration(nn.Module):
 
 __all__ = [
     "Qwen35Attention",
-    "Qwen3_5ForConditionalGeneration",
+    "Qwen35ForConditionalGeneration",
     "Qwen35GatedDeltaNet",
     "Qwen35MTP",
     "Qwen35RMSNorm",

@@ -1,6 +1,7 @@
 """Serve a local Apple Silicon (MLX) registry preset through Resin's HTTP APIs.
 
-uv run scripts/mlx_serve.py --model ornith-1.0-35b --checkpoint ~/models/Ornith-1.0-35B
+Pass the snapshot path returned by ``hf download`` through ``--checkpoint``.
+The model README includes commands using Hugging Face's normal cache.
 
 CUDA presets need graph capture, warmup and runtime preparation; serve them with
 deploy/modal_serve.py.
@@ -40,7 +41,7 @@ def main(argv=None) -> None:
         context_length=context_length,
         max_batch_size=max_batch_size,
         prefill_chunk_size=spec.prefill_chunk_size,
-        draft_tokens=spec.draft_tokens,
+        draft_tokens=0,
     )
     recipe = create_recipe(spec, args.checkpoint.expanduser(), runner=runner)
     batch_tokens = getattr(

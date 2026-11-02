@@ -242,12 +242,16 @@ hardware, and serving limits.
 ## MLX runner (Apple Silicon)
 
 Model runners are not tied to CUDA. `resin_models_mlx` runs
-[Qwen3.5-MoE models such as Ornith](models/mlx/resin_models_mlx/qwen3_5_moe/README.md)
-on Apple Silicon with MLX, on the same core engine:
+[dense and MoE Qwen3.5 models](models/mlx/resin_models_mlx/qwen3_5/README.md)
+on Apple Silicon with MLX, on the same core engine. For a small local model:
 
 ```bash
-uv run scripts/mlx_serve.py --model ornith-1.0-35b --checkpoint ~/models/Ornith-1.0-35B
+QWEN_CHECKPOINT="$(uv run hf download mlx-community/Qwen3.5-0.8B-8bit \
+  --revision 87e768fbfa03994095f3d14527c80c5ae70c5758 --quiet)"
+uv run scripts/mlx_serve.py --model qwen3.5-0.8b-mlx --checkpoint "$QWEN_CHECKPOINT"
 ```
+
+The download uses Hugging Face's normal cache and returns its snapshot path.
 
 ## Checks
 

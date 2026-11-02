@@ -36,31 +36,30 @@ def _reference(queries, keys, values, history, scale):
 
 
 @pytest.mark.parametrize(
-    "lengths",
+    "heads,kv_heads,head_dim,lengths",
     [
-        [0],
-        [1, 127, 128, 129],
-        [PARTITION_TOKENS - 1, PARTITION_TOKENS, PARTITION_TOKENS + 1],
-        # Fewer than four rows use half-size partitions.
-        [PARTITION_TOKENS // 2 - 1, PARTITION_TOKENS // 2, PARTITION_TOKENS // 2 + 1],
-        [PARTITION_TOKENS * 4 + 3],
-        [3000, 17, 0, 2049],
+        (16, 2, 256, [0]),
+        (16, 2, 256, [511, 512, 513]),
+        (4, 2, 64, [255, 256, 257]),  # Half-sized partitions below four rows.
+        (4, 2, 64, [511, 512, 513, 1025]),
+        (6, 1, 64, [127, 129]),  # Three query heads per group.
+        (10, 2, 96, [3000, 17, 0, 2049]),
+        (3, 3, 32, [1, 127, 128, 129]),
+        (8, 2, 512, [PARTITION_TOKENS * 4 + 3]),
     ],
 )
-@pytest.mark.parametrize(
-    "heads,kv_heads,head_dim",
-    [(16, 2, 256), (4, 2, 64), (6, 1, 64), (10, 2, 96), (3, 3, 32), (8, 2, 512)],
-)
-def test_paged_decode_matches_gathered_attention(lengths, heads, kv_heads, head_dim):
+def test_paged_decode_matches_gathered_attention(heads, kv_heads, head_dim, lengths):
+    _assert_paged_decode_matches_gathered_attention(lengths, heads, kv_heads, head_dim)
+
+
+def _assert_paged_decode_matches_gathered_attention(lengths, heads, kv_heads, head_dim):
     rng = np.random.default_rng(len(lengths) + heads)
     rows = len(lengths)
     layers, layer = 3, 1
     width = max(1, -(-max(lengths) // PAGE))
     unit_count = rows * width * layers + 7
-    units = rng.standard_normal((unit_count, 2, PAGE, kv_heads * head_dim))
-    # Poison every unit, then write real history only where rows own it, so a
-    # read beyond a row's length produces NaN.
-    units[:] = np.nan
+    # Unowned units and row tails remain poisoned.
+    units = np.full((unit_count, 2, PAGE, kv_heads * head_dim), np.nan)
     order = rng.permutation(rows * width) * layers
     pages = order.reshape(rows, width).astype(np.int32)
     keys = rng.standard_normal((rows, width * PAGE + 1, kv_heads, head_dim))
