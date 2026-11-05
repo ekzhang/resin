@@ -25,6 +25,8 @@ PARTITION_TOKENS = 512
 SMALL_BATCH_ROWS = 4
 SIMDGROUPS = 4
 PREFETCH = 4
+# MLX 0.32.4 binds kernel arguments below eight elements as constants.
+_MIN_METADATA_ROWS = 8
 _HEADS_PER_THREADGROUP = 4
 # Bound the query and output registers held by each lane. Four 256-wide
 # heads plus prefetched K/V spill on M1 Pro; two heads with one K/V pair
@@ -68,6 +70,7 @@ def paged_decode_attention(
     lengths: mx.array,
     layer: int,
     scale: float,
+    skip: int = 0,
 ) -> mx.array:
     """Attend one new token per row over paged history plus itself.
 
@@ -75,8 +78,142 @@ def paged_decode_attention(
     ``current_values`` are ``[rows, kv_heads, head_dim]``; ``units`` is the
     arena viewed as ``[units, 2, page, kv_heads * head_dim]``; ``pages`` is
     ``[rows, blocks]`` int32 base units, offset by ``layer``; ``lengths`` is the
-    int32 history length of each row. Returns ``[rows, heads, head_dim]``.
+    int32 history length of each row. History positions before ``skip`` are
+    not read. Returns ``[rows, heads, head_dim]``.
     """
+
+    return _merge_output(
+        *_partials(
+            queries,
+            current_keys,
+            current_values,
+            units,
+            pages,
+            lengths,
+            layer,
+            scale,
+            skip,
+        ),
+        dtype=queries.dtype,
+    )
+
+
+def paged_block_attention(
+    queries: mx.array,
+    keys: mx.array,
+    values: mx.array,
+    units: mx.array,
+    pages: mx.array,
+    lengths: mx.array,
+    layer: int,
+    scale: float,
+    skip: int = 0,
+    prior: tuple[mx.array, mx.array] | None = None,
+) -> mx.array:
+    """Attend a causal block of new tokens per row over paged history.
+
+    ``queries`` is ``[rows, tokens, heads, head_dim]`` and ``keys``/``values``
+    are ``[rows, tokens, kv_heads, head_dim]``, none of them written to the
+    arena yet. Token ``j`` attends to the row's ``lengths`` history, then the
+    optional ``prior`` keys and values (``[rows, count, kv_heads, head_dim]``,
+    also unwritten), then block tokens ``0..j``. Each token is one row of the
+    decode kernel, with its own key as the current position; the earlier
+    unwritten keys form one more partition, merged by log-sum-exp. Returns
+    ``[rows, tokens, heads, head_dim]``.
+    """
+
+    rows, tokens, heads, head_dim = queries.shape
+    kv_heads = keys.shape[2]
+    flat = rows * tokens
+    flat_pages = mx.repeat(pages[:rows], tokens, axis=0)
+    flat_lengths = mx.repeat(lengths[:rows], tokens, axis=0)
+    if flat < _MIN_METADATA_ROWS:
+        # Unread padding rows keep metadata out of constant address space,
+        # whose different kernel ABI would compile another variant.
+        padding = _MIN_METADATA_ROWS - flat
+        flat_pages = mx.concatenate(
+            [flat_pages, mx.zeros((padding, pages.shape[1]), pages.dtype)]
+        )
+        flat_lengths = mx.concatenate(
+            [flat_lengths, mx.zeros((padding,), lengths.dtype)]
+        )
+    outputs, maxima, sums = _partials(
+        queries.reshape(flat, heads, head_dim),
+        keys.reshape(flat, kv_heads, head_dim),
+        values.reshape(flat, kv_heads, head_dim),
+        units,
+        flat_pages,
+        flat_lengths,
+        layer,
+        scale,
+        skip,
+    )
+    if prior is not None:
+        keys = mx.concatenate([prior[0], keys], axis=1)
+        values = mx.concatenate([prior[1], values], axis=1)
+    if keys.shape[1] > 1:
+        block = _earlier_partition(scale)(queries, keys, values)
+        outputs, maxima, sums = (
+            mx.concatenate([part, extra], axis=2)
+            for part, extra in zip((outputs, maxima, sums), block, strict=True)
+        )
+    output = _merge_output(outputs, maxima, sums, dtype=queries.dtype)
+    return output.reshape(rows, tokens, heads, head_dim)
+
+
+@cache
+def _earlier_partition(scale: float):
+    """One fused graph per softmax scale; shapes follow the block and batch."""
+
+    return mx.compile(partial(_earlier_block_partition, scale=scale))
+
+
+def _earlier_block_partition(queries, keys, values, *, scale):
+    """One partition per query over the unwritten keys strictly before it.
+
+    The last ``tokens`` keys belong to the queries, in order; any before them
+    precede every query. Returns ``[rows * tokens, heads, 1, head_dim]``
+    unnormalized outputs and ``[rows * tokens, heads, 1]`` maxima and sums in
+    the kernel's format; a query without earlier keys contributes an empty
+    partition.
+    """
+
+    rows, tokens, heads, head_dim = queries.shape
+    prior = keys.shape[1] - tokens
+    shared = heads // keys.shape[2]
+    query = queries.astype(mx.float32).transpose(0, 2, 1, 3) * scale
+    key = mx.repeat(keys.astype(mx.float32), shared, axis=2).transpose(0, 2, 3, 1)
+    value = mx.repeat(values.astype(mx.float32), shared, axis=2).transpose(0, 2, 1, 3)
+    scores = query @ key  # [rows, heads, tokens, tokens]
+    earlier = mx.arange(prior + tokens)[None, :] < (prior + mx.arange(tokens))[:, None]
+    scores = mx.where(earlier, scores, -mx.inf)
+    peak = scores.max(axis=-1, keepdims=True)
+    weights = mx.where(earlier, mx.exp(scores - mx.where(earlier, peak, 0.0)), 0.0)
+    output = weights @ value  # [rows, heads, tokens, head_dim]
+
+    def flatten(array):
+        return array.transpose(0, 2, 1, *range(3, array.ndim)).reshape(
+            rows * tokens, heads, 1, *array.shape[3:]
+        )
+
+    return (
+        flatten(output),
+        flatten(peak).squeeze(-1),
+        flatten(weights.sum(axis=-1, keepdims=True)).squeeze(-1),
+    )
+
+
+def _partials(
+    queries: mx.array,
+    current_keys: mx.array,
+    current_values: mx.array,
+    units: mx.array,
+    pages: mx.array,
+    lengths: mx.array,
+    layer: int,
+    scale: float,
+    skip: int,
+) -> tuple[mx.array, mx.array, mx.array]:
 
     rows, heads, head_dim = queries.shape
     kv_heads = current_keys.shape[1]
@@ -104,19 +241,18 @@ def paged_decode_attention(
     ):
         from resin_models_mlx._native_cache import _paged_attention_partials
 
-        return _merge_output(
-            *_paged_attention_partials(
-                queries,
-                current_keys,
-                current_values,
-                units,
-                pages,
-                lengths,
-                layer,
-                scale,
-            ),
-            dtype=queries.dtype,
+        outputs, maxima, sums = _paged_attention_partials(
+            queries,
+            current_keys,
+            current_values,
+            units,
+            pages,
+            lengths,
+            layer,
+            scale,
+            skip,
         )
+        return outputs, maxima, sums
     # Each threadgroup serves an equal share of the query heads of a KV head.
     shared = heads // kv_heads
     # The cross-simdgroup reduction stores float maxima, sums and outputs.
@@ -144,7 +280,7 @@ def paged_decode_attention(
             units,
             pages,
             lengths,
-            mx.array([pages.shape[1], partitions, layer], dtype=mx.int32),
+            mx.array([pages.shape[1], partitions, layer, skip], dtype=mx.int32),
             mx.array([scale], dtype=mx.float32),
         ],
         template=[
@@ -168,7 +304,7 @@ def paged_decode_attention(
         ],
         output_dtypes=[mx.float32, mx.float32, mx.float32],
     )
-    return _merge_output(outputs, maxima, sums, dtype=queries.dtype)
+    return outputs, maxima, sums
 
 
 @partial(mx.compile, shapeless=True)
@@ -182,7 +318,7 @@ def _merge(outputs: mx.array, maxima: mx.array, sums: mx.array) -> mx.array:
     return numerator / denominator
 
 
-__all__ = ["PARTITION_TOKENS", "paged_decode_attention"]
+__all__ = ["PARTITION_TOKENS", "paged_block_attention", "paged_decode_attention"]
 
 
 # MLX v0.32.4's small-column reduction order, Apple Inc., MIT (see NOTICE).

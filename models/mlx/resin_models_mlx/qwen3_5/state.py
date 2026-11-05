@@ -41,13 +41,20 @@ class LiveStates:
         self._arena = arena
         self._model = model
         # sequence ID -> (tokens processed, batch state, row in that batch)
-        self._rows: dict[int, tuple[int, LinearState, int]] = {}
+        self._rows: dict[int, tuple[int | mx.array, LinearState, int]] = {}
 
     def __len__(self) -> int:
         return len(self._rows)
 
-    def gather(self, plan: PagedCachePlan, rows: np.ndarray) -> LinearState:
-        """State before each of ``rows`` runs, in plan row order."""
+    def gather(
+        self, plan: PagedCachePlan, rows: np.ndarray, *, exact: bool = True
+    ) -> LinearState:
+        """State before each of ``rows`` runs, in plan row order.
+
+        A continuation plan's context lengths only bound the GPU positions
+        its feedback carries; ``exact=False`` then skips validating the held
+        state's position, which would wait for the previous step.
+        """
 
         batch = plan.batch
         restore = plan.groups[STATE_GROUP].state
@@ -73,7 +80,7 @@ class LiveStates:
             else:
                 sequence = int(batch.sequence_ids[row])
                 entry = self._rows.get(sequence)
-                if entry is None or entry[0] != context:
+                if entry is None or (exact and int(entry[0]) != context):
                     raise RuntimeError(
                         f"sequence {sequence} has no live recurrent state at "
                         f"position {context}"
@@ -106,18 +113,24 @@ class LiveStates:
         self,
         plan: PagedCachePlan,
         rows: np.ndarray,
-        ends: np.ndarray,
+        ends: np.ndarray | mx.array,
         state: LinearState,
     ) -> tuple[int, ...]:
         """Hold each row's state after ``ends`` tokens and publish due snapshots.
 
+        ``ends`` may be unevaluated; it is read on the host only when a
+        snapshot is due, or when the row's next step validates its state.
         Returns the reservation IDs of the snapshots written.
         """
 
         sequences = plan.batch.sequence_ids
+        lazy = isinstance(ends, mx.array)
         for index, row in enumerate(rows.tolist()):
-            self._rows[int(sequences[row])] = (int(ends[index]), state, index)
+            end = ends[index] if lazy else int(ends[index])
+            self._rows[int(sequences[row])] = (end, state, index)
         checkpoints = plan.groups[STATE_GROUP].state
+        if lazy and checkpoints and len(checkpoints.checkpoint_slots):
+            ends = np.array(ends)
         positions = {row: index for index, row in enumerate(rows.tolist())}
         written, starts, indices = [], [], []
         for reservation, row, prefix, slab, slot in (

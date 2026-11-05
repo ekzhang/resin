@@ -32,8 +32,10 @@ bool supported_units(const mx::array& units) {
 
 class AttentionPartitions : public mx::Primitive {
  public:
-  AttentionPartitions(mx::Stream stream, int partitions, int layer, float scale)
-      : Primitive(stream), partitions_(partitions), layer_(layer), scale_(scale) {}
+  AttentionPartitions(mx::Stream stream, int partitions, int layer, float scale,
+                      int skip)
+      : Primitive(stream), partitions_(partitions), layer_(layer), scale_(scale),
+        skip_(skip) {}
 
   const char* name() const override { return "ResinPagedAttentionPartitions"; }
   // Primitive defaults to is_equivalent=false. No transform is admitted by
@@ -68,9 +70,10 @@ class AttentionPartitions : public mx::Primitive {
     encoder.set_buffer(units_buffer, 3, units.offset());
     encoder.set_input_array(inputs[4], 4);
     encoder.set_input_array(inputs[5], 5);
-    const std::array<int32_t, 3> geometry = {
-        int32_t(inputs[4].shape(1)), int32_t(partitions_), int32_t(layer_)};
-    encoder.set_bytes(geometry.data(), 3, 6);
+    const std::array<int32_t, 4> geometry = {
+        int32_t(inputs[4].shape(1)), int32_t(partitions_), int32_t(layer_),
+        int32_t(skip_)};
+    encoder.set_bytes(geometry.data(), 4, 6);
     encoder.set_bytes(scale_, 7);
     encoder.set_output_array(outputs[0], 8);
     encoder.set_output_array(outputs[1], 9);
@@ -90,13 +93,14 @@ class AttentionPartitions : public mx::Primitive {
   int partitions_;
   int layer_;
   float scale_;
+  int skip_;
 };
 
 std::vector<mx::array> attention_partials(
     const mx::array& queries, const mx::array& current_keys,
     const mx::array& current_values, const mx::array& units,
     const mx::array& pages, const mx::array& lengths,
-    int layer, float scale) {
+    int layer, float scale, int skip) {
   auto stream = checked_stream();
   if (queries.ndim() != 3 || queries.shape(0) < 1 ||
       queries.shape(1) != kHeads || queries.shape(2) != kHeadDim ||
@@ -117,7 +121,8 @@ std::vector<mx::array> attention_partials(
   if (pages.ndim() != 2 || pages.shape(0) < rows || pages.shape(1) < 1 ||
       lengths.ndim() != 1 || lengths.size() < size_t(rows) ||
       pages.dtype() != mx::int32 || lengths.dtype() != mx::int32 ||
-      layer < 0 || layer >= units.shape(0) || !std::isfinite(scale)) {
+      layer < 0 || layer >= units.shape(0) || !std::isfinite(scale) ||
+      skip < 0) {
     throw std::invalid_argument("Native paged attention has invalid metadata geometry/dtype/layer/scale");
   }
   const uint64_t longest = uint64_t(pages.shape(1)) * kPage + 1;
@@ -141,7 +146,8 @@ std::vector<mx::array> attention_partials(
       {{rows, kHeads, count, kHeadDim}, {rows, kHeads, count},
        {rows, kHeads, count}},
       {mx::float32, mx::float32, mx::float32},
-      std::make_shared<AttentionPartitions>(stream, count, layer, scale), inputs);
+      std::make_shared<AttentionPartitions>(stream, count, layer, scale, skip),
+      inputs);
 }
 void warm_paged_attention() {
   // Warm a device-wide pipeline on the caller's current GPU stream. No
@@ -160,7 +166,8 @@ namespace resin_models_mlx::native {
 void bind_paged_attention(nb::module_& module) {
   module.def("_paged_attention_partials", &attention::attention_partials,
              "queries"_a, "current_keys"_a, "current_values"_a,
-             "units"_a, "pages"_a, "lengths"_a, "layer"_a, "scale"_a);
+             "units"_a, "pages"_a, "lengths"_a, "layer"_a, "scale"_a,
+             "skip"_a = 0);
   module.def("_warm_paged_attention", &attention::warm_paged_attention);
 }
 }  // namespace resin_models_mlx::native

@@ -15,15 +15,24 @@ from resin import BatchPhase, RunnerConfig
 from resin.backend.capacity import plan_cache_capacity
 from resin.backend.plans import PagedCachePlan
 from resin.backend.sampling import PromptScores, format_output, prompt_scores
+from resin.backend.speculative import SpeculativeStats
 from resin.backend.topology import ParallelismCapabilities
 from resin.models.qwen3_5.config import Qwen35Config
 from resin_models_mlx.qwen3_5.cache import (
+    KV_GROUP,
+    MTP_GROUP,
     PREFILL_CHUNK_SIZE,
+    STATE_GROUP,
     CacheArena,
     CacheGeometry,
 )
 from resin_models_mlx.qwen3_5.checkpoint import checkpoint_quantization, load_model
-from resin_models_mlx.qwen3_5.model import Qwen35Model, StepOutput
+from resin_models_mlx.qwen3_5.model import (
+    BlockInputs,
+    PagedHistory,
+    Qwen35Model,
+    StepOutput,
+)
 from resin_models_mlx.qwen3_5.state import LiveStates
 from resin_models_mlx.sampling import MlxSampler
 
@@ -97,6 +106,80 @@ class _Completion:
         return self._result
 
 
+@dataclass(frozen=True, slots=True)
+class _SpeculativeFeedback:
+    """Next anchors and their positions, still on the GPU."""
+
+    sequence_ids: tuple[int, ...]
+    anchors: mx.array
+    positions: mx.array
+
+
+@dataclass(slots=True)
+class _SpeculativeStep:
+    """One issued speculative step; ``output`` waits only for its own work."""
+
+    plan: BatchPlan
+    drafts: mx.array
+    targets: mx.array
+    accepted: mx.array
+    logits: mx.array
+    receipts: tuple[int, ...]
+    # Cache writes issued through this step, excluding any later step's.
+    epoch: mx.array
+    feedback: _SpeculativeFeedback
+    state: tuple[mx.array, ...]
+
+    @property
+    def arrays(self) -> tuple[mx.array, ...]:
+        feedback = self.feedback
+        return (
+            self.drafts,
+            self.targets,
+            self.accepted,
+            feedback.anchors,
+            feedback.positions,
+            *self.state,
+        )
+
+    def output(self, stats: SpeculativeStats) -> ForwardOutput:
+        # A result releases its lease: finish every cache write it issued.
+        mx.eval(self.epoch, *self.arrays)
+        acceptance = stats.accept(
+            np.array(self.drafts).tolist(), np.array(self.targets).tolist()
+        )
+        if acceptance.accepted_counts != np.array(self.accepted).tolist():
+            # Cache writes and live state already advanced: quarantine, never retry.
+            error = RuntimeError("MLX speculative acceptance diverged from the host")
+            error._resin_post_accept = True  # ty: ignore[unresolved-attribute]
+            raise error
+        return format_output(
+            _to_torch(self.logits) if self.plan.needs_logprobs else None,
+            acceptance.token_rows,
+            self.plan,
+        ).with_state_checkpoints(self.receipts)
+
+
+@dataclass(slots=True)
+class _SpeculativeCompletion:
+    """An overlapped speculative step, collected after the next is launched."""
+
+    _runner: Qwen35MlxRunner
+    _step: _SpeculativeStep
+    _continues: bool
+    _result: ForwardOutput | None = field(default=None, init=False)
+
+    @property
+    def feedback(self) -> _SpeculativeFeedback | None:
+        # None drains the Engine before a continuation could pass the context.
+        return self._step.feedback if self._continues else None
+
+    def result(self) -> ForwardOutput:
+        if self._result is None:
+            self._result = self._step.output(self._runner._speculation)
+        return self._result
+
+
 class Qwen35MlxRunner:
     """Qwen3.5 runner with paged attention, DeltaNet state and optional vision."""
 
@@ -117,11 +200,21 @@ class Qwen35MlxRunner:
         workspace_bytes: int = _WORKSPACE_BYTES,
         include_vision: bool = True,
         compile_vision: bool = True,
+        speculative_draft_tokens: int = 0,
     ) -> None:
         self._media = None
         if workspace_bytes < 0:
             raise ValueError("workspace_bytes must be non-negative")
+        if (
+            isinstance(speculative_draft_tokens, bool)
+            or not isinstance(speculative_draft_tokens, int)
+            or speculative_draft_tokens < 0
+        ):
+            raise ValueError("speculative_draft_tokens must be a non-negative integer")
+        self.speculative_draft_tokens = speculative_draft_tokens
         if isinstance(model, Qwen35Model):
+            if speculative_draft_tokens and not model.has_mtp:
+                raise ValueError("MTP decoding requires a model with its MTP head")
             self._model = model
             self.config: Qwen35Config = model.config
             self.model_path = None
@@ -133,6 +226,7 @@ class Qwen35MlxRunner:
                 self.model_path,
                 bits=weight_bits,
                 group_size=group_size,
+                include_mtp=speculative_draft_tokens > 0,
             )
             packed = checkpoint_quantization(raw_config)
             bits, group = (
@@ -176,10 +270,17 @@ class Qwen35MlxRunner:
             "weight_source": weight_source,
             "expert_backend": "mlx-gather-qmm" if self.config.is_moe else "none",
             "graphs": {"prefill": "disabled", "decode": "disabled"},
+            "speculative": (
+                {"method": "mtp", "draft_tokens": speculative_draft_tokens}
+                if speculative_draft_tokens
+                else None
+            ),
         }
         self.vocab_size = self.config.vocab_size
         self.eos_token_id = self.config.eos_token_id
-        self.cache_geometry = CacheGeometry.from_config(self.config)
+        self.cache_geometry = CacheGeometry.from_config(
+            self.config, include_mtp=speculative_draft_tokens > 0
+        )
         device = mx.device_info()
         limit = int(device["max_recommended_working_set_size"])
         self.cache_capacity_plan = plan_cache_capacity(
@@ -188,9 +289,12 @@ class Qwen35MlxRunner:
             memory_utilization,
             self.cache_geometry.slab_bytes,
             # Live DeltaNet state is held for every running request, and a
-            # step's output exists beside its input.
+            # step's output exists beside its input; a verified block also
+            # holds the replayed state of its accepted prefix.
             overhead_bytes=workspace_bytes
-            + 2 * max_batch_size * self.cache_geometry.state_bytes,
+            + (3 if speculative_draft_tokens else 2)
+            * max_batch_size
+            * self.cache_geometry.state_bytes,
         )
         # The arena is one Metal buffer, including the reserved null slab.
         buffer_slabs = (
@@ -217,12 +321,21 @@ class Qwen35MlxRunner:
             max_batch_tokens=PREFILL_CHUNK_SIZE,
             prefill_chunk_size=PREFILL_CHUNK_SIZE,
             continuation_prefill=True,
+            max_accepted_per_step=speculative_draft_tokens + 1,
             cache_layout=self.cache_layout,
         )
         self._sampler = MlxSampler()
         self._states = LiveStates(self._cache, self._model)
         # An enqueued decode step whose arena writes have not been issued.
         self._pending: _Launch | None = None
+        self._speculation = SpeculativeStats(speculative_draft_tokens)
+        # Per sequence: the target's last hidden state, and the next MTP
+        # proposal with the MTP hidden state that produced it.
+        self._last_hidden: dict[int, mx.array] = {}
+        self._drafts: dict[int, tuple[mx.array, mx.array]] = {}
+
+    def speculative_stats(self) -> dict[str, int | float]:
+        return self._speculation.snapshot(include_draft_tokens=True)
 
     def bind_resources(self, resources: ResourceBinding) -> None:
         self._cache.binding.bind_resources(resources)
@@ -231,6 +344,9 @@ class Qwen35MlxRunner:
         # A pending step would hold the released rows' state again.
         self._write_pending()
         self._states.release(sequence_ids)
+        for sequence in sequence_ids:
+            self._last_hidden.pop(int(sequence), None)
+            self._drafts.pop(int(sequence), None)
 
     def _project(self, hidden: torch.Tensor) -> torch.Tensor:
         logits = self._model.logits(mx.array(hidden.numpy()).astype(mx.bfloat16))
@@ -318,6 +434,8 @@ class Qwen35MlxRunner:
         cache_plan = self._cache_plan(plan)
         batch = cache_plan.batch
         prefill = plan.phase == BatchPhase.PREFILL
+        if self.speculative_draft_tokens and not prefill:
+            return self._speculative_forward(plan, cache_plan)
         rows = np.arange(batch.num_sequences)
         groups = rows[:, None] if prefill else (rows,)
         logits = []
@@ -333,6 +451,8 @@ class Qwen35MlxRunner:
                 launch = self._launch(cache_plan, rows, tokens)
             with record_function("resin.mlx.cache_write"):
                 self._write(launch)
+                if prefill and self.speculative_draft_tokens:
+                    self._prefill_mtp(cache_plan, int(rows[0]), tokens, launch)
                 mx.async_eval(self._cache.epoch, *launch.reads)
             logits.append(launch.last)
             assert launch.receipts is not None
@@ -359,8 +479,341 @@ class Qwen35MlxRunner:
             prompt_logprobs=PromptScores.concat(prompt_rows),
         ).with_state_checkpoints(receipts)
 
+    def _prefill_mtp(
+        self, plan: PagedCachePlan, row: int, tokens: np.ndarray, launch: _Launch
+    ) -> None:
+        """Write the MTP pairs whose tokens this prefill chunk schedules.
+
+        Slot ``p`` pairs the target hidden state at ``p - 1`` with token ``p``.
+        A chunk starting at ``s`` needs the hidden state at ``s - 1``: the
+        previous chunk's, or zeros after a prefix hit, which does not store
+        it. That pair stays in the cache and weakens later proposals, never
+        the output.
+        """
+
+        batch = plan.batch
+        sequence = int(batch.sequence_ids[row])
+        start, count = int(launch.contexts[0]), tokens.shape[1]
+        hidden = launch.output.hidden
+        token_ids = mx.array(batch.token_ids[tokens].astype(np.int32))
+        if start == 0:
+            # Slot 0 holds no pair.
+            pair_ids, previous, first = token_ids[:, 1:], hidden[:, :-1], 1
+        else:
+            last = self._last_hidden.get(sequence)
+            if last is None:
+                last = mx.zeros((hidden.shape[-1],), dtype=hidden.dtype)
+            pair_ids = token_ids
+            previous = mx.concatenate([last[None, None], hidden[:, :-1]], axis=1)
+            first = start
+        # A slice, or an unevaluated copy, would keep the whole chunk alive.
+        last = self._last_hidden[sequence] = mx.contiguous(hidden[0, -1])
+        mx.async_eval(last)
+        if pair_ids.shape[1] == 0:
+            return
+        key, value = self._model.mtp.keys_values(
+            self._model.embed_tokens(pair_ids),
+            previous,
+            mx.array([first - 1], dtype=mx.int32),
+        )
+        self._cache.write_positions(
+            plan,
+            np.array([row]),
+            np.arange(first, start + count)[None],
+            (key,),
+            (value,),
+            MTP_GROUP,
+        )
+
+    def _mtp_step(
+        self,
+        plan: PagedCachePlan,
+        rows: np.ndarray,
+        token_ids: mx.array,
+        previous: mx.array,
+        first: mx.array,
+        written: mx.array | None = None,
+        prior: tuple[mx.array, mx.array] | None = None,
+    ) -> tuple[mx.array, mx.array, mx.array]:
+        """Run MTP pairs ``[rows, tokens]`` at consecutive slots ``first + j``.
+
+        Each attends to the written pairs before slot ``written`` (default
+        ``first``), then ``prior`` unwritten ones, then the block's earlier
+        pairs. A pair at slot ``p`` has rotary position ``p - 1``. Slots are
+        int32 GPU arrays, so a continuation never waits for its feedback.
+        """
+
+        history = self._cache.leased_history(
+            plan, rows, first if written is None else written, MTP_GROUP, skip=1
+        )
+        if prior is not None:
+            history = PagedHistory(
+                history.units,
+                history.pages,
+                history.lengths,
+                history.layer_stride,
+                history.skip,
+                prior,
+            )
+        hidden, key, value = self._model.mtp(
+            self._model.embed_tokens(token_ids),
+            previous,
+            first - 1,
+            history,
+        )
+        # The hidden state is the only output computed from the arena view.
+        self._cache.order_after([hidden])
+        return hidden, key, value
+
+    def _speculative_launch(
+        self,
+        plan: BatchPlan,
+        cache_plan: PagedCachePlan,
+        feedback: _SpeculativeFeedback | None = None,
+    ) -> _SpeculativeStep:
+        """Draft with MTP, verify ``[anchor, drafts]`` once, commit the accepted.
+
+        The anchor at position ``P`` was sampled by the previous step, and its
+        first draft was proposed then. Verification writes K/V for all
+        ``K + 1`` leased positions; only the accepted prefix becomes readable,
+        through positions. DeltaNet state is recomputed for the accepted
+        prefix from the block's retained inputs. MTP then re-reads the
+        verified hidden states to write slots ``P + 1 ..= P + K + 1`` and
+        propose the next anchor's first draft.
+
+        Every position-dependent input derives from GPU positions: the plan's
+        exact context lengths, or a continuation's ``feedback``, whose plan
+        only bounds them. Nothing here waits for the GPU.
+        """
+
+        batch = cache_plan.batch
+        model = self._model
+        drafts_per_step = self.speculative_draft_tokens
+        count = batch.num_sequences
+        rows = np.arange(count)
+        sequences = tuple(int(sequence) for sequence in batch.sequence_ids)
+        # Exact, or a continuation's upper bound on each GPU position.
+        bounds = batch.context_lengths.astype(np.int64)
+        if feedback is None:
+            contexts = batch.context_lengths.astype(np.int64)
+            anchors = mx.array(batch.token_ids.astype(np.int32))
+            positions = mx.array(contexts.astype(np.int32))
+        else:
+            if (
+                not isinstance(feedback, _SpeculativeFeedback)
+                or feedback.sequence_ids != sequences
+            ):
+                raise RuntimeError("an MLX speculative continuation changed its rows")
+            contexts = None
+            anchors, positions = feedback.anchors, feedback.positions
+
+        missing = np.array(
+            [
+                row
+                for row, sequence in enumerate(sequences)
+                if sequence not in self._drafts
+            ],
+            dtype=np.int64,
+        )
+        if len(missing):
+            if contexts is None:
+                raise RuntimeError("an MLX speculative continuation lost its draft")
+            # The anchor's pair, at slot P, after prefill or a retraction.
+            zeros = mx.zeros((self.config.hidden_size,), dtype=mx.bfloat16)
+            previous = mx.stack(
+                [self._last_hidden.get(sequences[row], zeros) for row in missing]
+            )[:, None]
+            selected = mx.array(missing)
+            slots = positions[selected]
+            hidden, key, value = self._mtp_step(
+                cache_plan, missing, anchors[selected][:, None], previous, slots
+            )
+            self._cache.write_leased(
+                cache_plan,
+                missing,
+                slots[:, None],
+                bounds[missing],
+                (key,),
+                (value,),
+                MTP_GROUP,
+            )
+            proposals = self._sampler.block_tokens(
+                model.logits(hidden), plan, 0, rows=missing, positions=positions
+            )[:, 0]
+            for index, row in enumerate(missing.tolist()):
+                self._drafts[sequences[row]] = (proposals[index], hidden[index, 0])
+
+        with record_function("resin.mlx.draft"):
+            columns = [mx.stack([self._drafts[sequence][0] for sequence in sequences])]
+            draft_hidden = mx.stack(
+                [self._drafts[sequence][1] for sequence in sequences]
+            )
+            prior = None
+            for step in range(1, drafts_per_step):
+                # Chain MTP on its own hidden state and proposal, at slot P + step.
+                hidden, key, value = self._mtp_step(
+                    cache_plan,
+                    rows,
+                    columns[-1][:, None],
+                    draft_hidden[:, None],
+                    positions + step,
+                    positions + 1,
+                    prior,
+                )
+                prior = (
+                    (key, value)
+                    if prior is None
+                    else (
+                        mx.concatenate([prior[0], key], axis=1),
+                        mx.concatenate([prior[1], value], axis=1),
+                    )
+                )
+                draft_hidden = hidden[:, 0]
+                columns.append(
+                    self._sampler.block_tokens(
+                        model.logits(hidden), plan, step, positions=positions
+                    )[:, 0]
+                )
+            drafts = mx.stack(columns, axis=1).astype(mx.int32)
+            # Start drafting on the GPU while verification is built.
+            mx.async_eval(drafts)
+
+        with record_function("resin.mlx.target_verify"):
+            verify_ids = mx.concatenate([anchors[:, None], drafts], axis=1)
+            embeddings = rotary_positions = None
+            if any(batch._plan.media[int(row)] is not None for row in rows):
+                if self._media is None:
+                    raise ValueError("this Qwen3.5 runner did not load a vision tower")
+                if contexts is None:
+                    raise RuntimeError("image rows do not continue on the GPU")
+                embeddings, rotary_positions = self._media.prepare(
+                    batch._plan,
+                    rows,
+                    np.zeros((count, drafts_per_step + 1), dtype=np.int64),
+                    contexts,
+                    model.embed_tokens(verify_ids),
+                )
+            retained: list[BlockInputs] = []
+            state = self._states.gather(cache_plan, rows, exact=contexts is not None)
+            output = model(
+                verify_ids,
+                positions,
+                state,
+                self._cache.leased_history(cache_plan, rows, positions),
+                input_embeddings=embeddings,
+                rotary_positions=rotary_positions,
+                retain=retained,
+            )
+            logits = model.logits(output.hidden)
+            targets = self._sampler.block_tokens(logits, plan, positions=positions)
+            self._cache.order_after(
+                [
+                    logits,
+                    output.hidden,
+                    *output.keys,
+                    *output.values,
+                    *output.state.recurrent,
+                    *output.state.convolution,
+                    *(inputs.recurrent for inputs in retained),
+                    *(inputs.window for inputs in retained),
+                ]
+            )
+            # Matching draft prefix, on the GPU: the rest of the step is
+            # issued without waiting for it.
+            accepted = mx.cumprod(
+                (drafts == targets[:, :drafts_per_step]).astype(mx.int32), axis=1
+            ).sum(axis=1)
+            # Verify on the GPU while the commit and MTP repair are built.
+            mx.async_eval(accepted, targets)
+
+        with record_function("resin.mlx.commit"):
+            block = positions[:, None] + mx.arange(drafts_per_step + 1, dtype=mx.int32)
+            self._cache.write_leased(
+                cache_plan,
+                rows,
+                block,
+                bounds + drafts_per_step,
+                output.keys,
+                output.values,
+                KV_GROUP,
+            )
+            committed = model.commit_block(retained, accepted)
+            # A due snapshot needs the exact accepted length on the host.
+            ends = positions + accepted.astype(mx.int32) + 1
+            receipts = self._states.commit(cache_plan, rows, ends, committed)
+            selected = mx.arange(count)
+
+        with record_function("resin.mlx.draft"):
+            # Pairs (h[P + j], target[j]) fill slots P + 1 ..= P + K + 1; the
+            # accepted prefix's last one proposes the next anchor's draft.
+            hidden, key, value = self._mtp_step(
+                cache_plan, rows, targets.astype(mx.int32), output.hidden, positions + 1
+            )
+            self._cache.write_leased(
+                cache_plan,
+                rows,
+                block + 1,
+                bounds + drafts_per_step + 1,
+                (key,),
+                (value,),
+                MTP_GROUP,
+            )
+            next_hidden = hidden[selected, accepted]
+            proposals = self._sampler.chosen_tokens(
+                model.logits(next_hidden),
+                plan,
+                1,
+                drafts_per_step + 1,
+                accepted,
+                positions=positions,
+            )
+            for row, sequence in enumerate(sequences):
+                self._drafts[sequence] = (proposals[row], next_hidden[row])
+        # The next anchor is the correction or bonus token after the prefix.
+        following = _SpeculativeFeedback(
+            sequences, targets[selected, accepted].astype(mx.int32), ends
+        )
+        return _SpeculativeStep(
+            plan,
+            drafts,
+            targets,
+            accepted,
+            logits,
+            receipts,
+            self._cache.epoch,
+            following,
+            (
+                proposals,
+                next_hidden,
+                *committed.recurrent,
+                *committed.convolution,
+            ),
+        )
+
+    def _overlaps_speculation(
+        self, plan: BatchPlan, cache_plan: PagedCachePlan
+    ) -> bool:
+        """Whether a speculative step can continue from GPU feedback.
+
+        Scores, image positions and due state snapshots need host positions.
+        """
+
+        checkpoints = cache_plan.groups[STATE_GROUP].state
+        return not (
+            plan.needs_logprobs
+            or any(media is not None for media in cache_plan.batch._plan.media)
+            or (checkpoints is not None and len(checkpoints.checkpoint_slots))
+        )
+
     def _cache_plan(self, plan: BatchPlan) -> PagedCachePlan:
-        cache_plan = PagedCachePlan.from_plan(plan, self.cache_layout)
+        lookahead = (
+            self.speculative_draft_tokens + self.cache_layout.decode_write_extra_tokens
+            if self.speculative_draft_tokens
+            else 0
+        )
+        cache_plan = PagedCachePlan.from_plan(
+            plan, self.cache_layout, decode_lookahead=lookahead
+        )
         if np.any(cache_plan.token_ids >= self.vocab_size):
             raise ValueError("token id is out of range for Qwen3.5")
         if int(np.max(cache_plan.batch.post_lengths)) > self.max_seq_len:
@@ -370,15 +823,25 @@ class Qwen35MlxRunner:
         return cache_plan
 
     def enqueue(
-        self, plan: BatchPlan, *, feedback: mx.array | None = None
-    ) -> _Completion | ForwardOutput:
+        self,
+        plan: BatchPlan,
+        *,
+        feedback: mx.array | _SpeculativeFeedback | None = None,
+    ) -> _Completion | _SpeculativeCompletion | ForwardOutput:
         """Launch a decode step while the previous one still runs on the GPU.
 
         ``feedback`` holds the previous step's sampled tokens, which replace
-        the continuation plan's token IDs. The previous step's arena writes are
+        the continuation plan's token IDs; a speculative step's also holds
+        their positions. The previous step's arena writes are
         ordered after its reads and before this step's reads on the GPU.
         """
 
+        if self.speculative_draft_tokens and plan.phase == BatchPhase.DECODE:
+            if feedback is not None and not isinstance(feedback, _SpeculativeFeedback):
+                raise RuntimeError("a speculative continuation needs its feedback")
+            return self._enqueue_speculation(plan, feedback)
+        if isinstance(feedback, _SpeculativeFeedback):
+            raise RuntimeError("target-only decode received speculative feedback")
         if plan.phase != BatchPhase.DECODE or plan.needs_logprobs:
             if feedback is not None:
                 raise RuntimeError("an MLX continuation requires unscored decode")
@@ -397,6 +860,41 @@ class Qwen35MlxRunner:
         self._pending = launch
         continues = int(np.max(cache_plan.batch.post_lengths)) < self.max_seq_len
         return _Completion(self, plan, launch, tokens, continues)
+
+    def _speculative_forward(
+        self, plan: BatchPlan, cache_plan: PagedCachePlan
+    ) -> ForwardOutput:
+        with record_function("resin.mlx.speculative_decode"):
+            return self._speculative_launch(plan, cache_plan).output(self._speculation)
+
+    def _enqueue_speculation(
+        self, plan: BatchPlan, feedback: _SpeculativeFeedback | None
+    ) -> _SpeculativeCompletion | ForwardOutput:
+        """Launch a speculative step; a continuation takes GPU feedback.
+
+        The Engine's continuation plan bounds each row by the longest
+        possible previous output and leases pages for it. The previous
+        step's accepted anchors and positions replace its token IDs and
+        context lengths on the GPU.
+        """
+
+        cache_plan = self._cache_plan(plan)
+        if not self._overlaps_speculation(plan, cache_plan):
+            if feedback is not None:
+                raise RuntimeError("an MLX speculative continuation needs host state")
+            return self._speculative_forward(plan, cache_plan)
+        with record_function("resin.mlx.speculative_enqueue"):
+            step = self._speculative_launch(plan, cache_plan, feedback)
+            mx.async_eval(step.epoch, *step.arrays)
+        # The next conservative plan advances each row by one maximum output
+        # and must still fit its own verification and MTP writes.
+        span = 2 * self.runner_config.max_accepted_per_step + (
+            self.cache_layout.decode_write_extra_tokens
+        )
+        continues = (
+            int(np.max(cache_plan.batch.context_lengths)) + span <= self.max_seq_len
+        )
+        return _SpeculativeCompletion(self, step, continues)
 
 
 __all__ = ["Qwen35MlxRunner"]
