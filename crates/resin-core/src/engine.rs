@@ -2139,16 +2139,22 @@ impl<P: Clone> EngineCore<P> {
             .iter()
             .filter(|request| {
                 request.cache.as_ref().is_some_and(|pages| {
-                    if running_count > 1 {
-                        request.is_running()
-                    } else {
-                        !request.is_running()
+                    (request.is_running() && running_count > 1)
+                        || (!request.is_running()
                             && request.resident_tokens > 0
-                            && resources.pool().validate_request_idle(pages).is_ok()
-                    }
+                            && resources.pool().validate_request_idle(pages).is_ok())
                 })
             })
-            .min_by_key(|request| (request.generated.len(), Reverse(request.prompt.len())))
+            // Waiting prefix hits can pin pages outside admission estimates.
+            // Release those owners before replaying admitted work; otherwise a
+            // retracted prefill can be readmitted forever while decode stalls.
+            .min_by_key(|request| {
+                (
+                    request.is_running(),
+                    request.generated.len(),
+                    Reverse(request.prompt.len()),
+                )
+            })
             .map(|request| request.id)
         else {
             return Ok(false);

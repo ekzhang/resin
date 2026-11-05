@@ -2051,3 +2051,75 @@ fn failure_after_next_enqueue_keeps_transferred_lease_quarantined() {
         assert!(engine.close(&mut model).is_err());
     }
 }
+
+#[test]
+fn waiting_prefix_owners_are_retracted_before_running_requests_under_pressure() {
+    let mut engine = EngineCore::new(
+        RunnerConfig {
+            cache_layout: Some(
+                KvLayout::new(
+                    10,
+                    vec![KvGroupLayout::new(3, 1, KvRetention::FullContext).unwrap()],
+                )
+                .unwrap(),
+            ),
+            continuation_prefill: true,
+            ..Default::default()
+        },
+        4,
+        30,
+        SchedulerConfig {
+            max_batch_tokens: NonZeroU32::new(16),
+            prefill_chunk_size: NonZeroU32::new(2).unwrap(),
+            ..Default::default()
+        },
+        true,
+    )
+    .unwrap();
+    let mut model = Model::default();
+    let mut waiting = Vec::new();
+    for base in [10, 30, 50] {
+        let prompt: Vec<u32> = (base..base + 7).collect();
+        let seed = engine.submit(input(prompt.clone(), 1)).unwrap();
+        for _ in 0..16 {
+            if seed.done() {
+                break;
+            }
+            engine.step(&mut model).unwrap();
+        }
+        assert!(seed.done());
+        seed.take_result().unwrap();
+        let mut submission = input(prompt, 1);
+        submission.priority = -1;
+        submission.batch_key = Some(1);
+        let request = engine.submit(submission).unwrap();
+        assert_eq!(request.cached_tokens(), 6);
+        waiting.push(request);
+    }
+    let running: Vec<_> = [100, 200]
+        .into_iter()
+        .map(|base| {
+            let mut submission = input((base..base + 6).collect(), 5);
+            submission.batch_key = Some(2);
+            engine.submit(submission).unwrap()
+        })
+        .collect();
+    for _ in 0..128 {
+        if !engine.has_work() {
+            break;
+        }
+        engine.step(&mut model).unwrap();
+    }
+    assert!(
+        !engine.has_work(),
+        "finite requests must drain after evicting waiting prefix owners"
+    );
+    for request in waiting {
+        assert_eq!(request.take_result().unwrap().len(), 1);
+    }
+    for request in running {
+        assert_eq!(request.take_result().unwrap().len(), 5);
+    }
+    engine.clear_prefix_cache().unwrap();
+    assert_eq!(engine.cache_free_parent_count(), Some(10));
+}
