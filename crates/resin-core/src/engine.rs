@@ -1711,6 +1711,13 @@ impl<P: Clone> EngineCore<P> {
                 }
             };
 
+        let state_checkpoints =
+            match execution_call("state checkpoint access", || Ok(runner.state_checkpoints())) {
+                Ok(checkpoints) => checkpoints,
+                Err(error) => {
+                    return self.quarantine(batch, "runner state checkpoint access failed", error);
+                }
+            };
         if let Some(resources) = &mut self.kv_resources {
             let progress = batch
                 .rows
@@ -1739,7 +1746,7 @@ impl<P: Clone> EngineCore<P> {
                 })
                 .collect::<Vec<_>>();
             if let Err(error) =
-                resources.accept_state_checkpoints(&progress, runner.state_checkpoints())
+                resources.accept_state_checkpoints(&progress, state_checkpoints)
             {
                 return self.quarantine(
                     batch,
@@ -1750,7 +1757,7 @@ impl<P: Clone> EngineCore<P> {
             resources.finish_state_initialization(
                 &progress.iter().map(|item| item.0).collect::<Vec<_>>(),
             );
-        } else if !runner.state_checkpoints().is_empty() {
+        } else if !state_checkpoints.is_empty() {
             return self.quarantine(
                 batch,
                 "unexpected state checkpoint receipt",

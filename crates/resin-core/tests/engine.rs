@@ -510,6 +510,43 @@ fn a_panicking_native_runner_cannot_leave_a_healthy_engine() {
 }
 
 #[test]
+fn panicking_checkpoint_access_quarantines_the_accepted_transaction() {
+    struct PanickingCheckpoints;
+    impl Runner<&'static str> for PanickingCheckpoints {
+        fn forward(&mut self, _plan: ExecutionPlan<&'static str>) -> Result<OwnedTokenRows, Error> {
+            OwnedTokenRows::new(vec![2], vec![0, 1])
+        }
+        fn state_checkpoints(&self) -> &[u64] {
+            panic!("checkpoint receipt access failed after model execution");
+        }
+    }
+    for managed_cache in [false, true] {
+        let mut engine = if managed_cache {
+            engine(0, 8)
+        } else {
+            EngineCore::new(
+                RunnerConfig::default(),
+                4,
+                128,
+                SchedulerConfig::default(),
+                false,
+            )
+            .unwrap()
+        };
+        let request = engine.submit(input(vec![1], 1)).unwrap();
+        let error = engine.step(&mut PanickingCheckpoints).unwrap_err();
+        assert_eq!(error.kind, ErrorKind::Execution);
+        assert!(engine.poisoned());
+        assert!(!request.done());
+        assert!(engine.close(&mut PanickingCheckpoints).is_err());
+        if managed_cache {
+            assert_eq!(engine.cache_occupied_block_count(), Some(1));
+            assert_eq!(engine.cache_free_parent_count(), Some(15));
+        }
+    }
+}
+
+#[test]
 fn a_panicking_payload_clone_restores_the_cohort_and_releases_its_cache_access() {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, Ordering};
