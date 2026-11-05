@@ -2114,3 +2114,46 @@ fn failed_prefill_growth_releases_unadmitted_pages_before_retrying_running_work(
     engine.clear_prefix_cache().unwrap();
     assert_eq!(engine.cache_free_parent_count(), Some(3));
 }
+
+#[test]
+fn a_displaced_rejected_request_does_not_block_a_higher_priority_request() {
+    let mut engine = EngineCore::new(
+        RunnerConfig {
+            cache_layout: Some(
+                KvLayout::new(
+                    3,
+                    vec![KvGroupLayout::new(1, 1, KvRetention::FullContext).unwrap()],
+                )
+                .unwrap(),
+            ),
+            continuation_prefill: true,
+            ..Default::default()
+        },
+        3,
+        3,
+        SchedulerConfig::default(),
+        false,
+    )
+    .unwrap();
+    let mut model = Model::default();
+    let rejected = engine.submit(input(vec![1, 2, 3], 1)).unwrap();
+    model
+        .outputs
+        .push_back(Err(Error::rejected("preaccept retry")));
+    assert_eq!(
+        engine.step(&mut model).unwrap_err().kind,
+        ErrorKind::Rejected
+    );
+    let mut submission = input(vec![10], 3);
+    submission.priority = 1;
+    let higher = engine.submit(submission).unwrap();
+    for _ in 0..16 {
+        if !engine.has_work() {
+            break;
+        }
+        engine.step(&mut model).unwrap();
+    }
+    assert_eq!(higher.take_result().unwrap(), [11, 12, 13]);
+    assert_eq!(rejected.take_result().unwrap(), [4]);
+    assert_eq!(engine.cache_free_parent_count(), Some(3));
+}

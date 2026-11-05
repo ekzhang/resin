@@ -2164,7 +2164,7 @@ impl<P: Clone> EngineCore<P> {
                         request.is_running()
                     } else {
                         !request.is_running()
-                            && request.resident_tokens > 0
+                            && pages.groups().iter().any(|group| !group.pages().is_empty())
                             && resources.pool().validate_request_idle(pages).is_ok()
                     }
                 })
