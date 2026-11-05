@@ -119,3 +119,32 @@ def test_samples_follow_the_filtered_distribution():
     counts = np.bincount(tokens, minlength=4) / len(tokens)
     assert counts[2] == counts[3] == 0
     assert abs(counts[0] - 0.625) < 0.03
+
+
+def test_block_columns_and_gpu_chosen_shifts_match_single_positions():
+    """Speculation samples column j as one-token decode at that position."""
+
+    rng = np.random.default_rng(5)
+    rows, columns, vocab = 3, 4, 300
+    logits = rng.standard_normal((rows, columns, vocab)).astype(np.float32)
+    params = tuple(
+        SamplingParams(temperature=temperature, top_p=0.9, seed=seed)
+        for temperature, seed in ((1.0, 4), (0.0, 5), (0.7, 6))
+    )
+    contexts = [17, 200, 3]
+    sampler = MlxSampler()
+    block = np.array(sampler.block_tokens(mx.array(logits), _plan(params, contexts)))
+    for column in range(columns):
+        single = sampler(
+            mx.array(logits[:, column]),
+            _plan(params, [context + column for context in contexts]),
+        )
+        np.testing.assert_array_equal(block[:, column], single)
+    choice = np.array([2, 0, 3], np.int32)
+    chosen = sampler.chosen_tokens(
+        mx.array(logits[:, 0]), _plan(params, contexts), 1, columns, mx.array(choice)
+    )
+    expected = sampler.block_tokens(
+        mx.array(logits[:, :1]), _plan(params, contexts), 1 + choice
+    )[:, 0]
+    np.testing.assert_array_equal(np.array(chosen), np.array(expected))

@@ -20,7 +20,7 @@ from resin_models_mlx.qwen3_5.runner import Qwen35MlxRunner  # noqa: E402
 
 
 def _text_config(
-    *, dense: bool = False, tie_word_embeddings: bool = False
+    *, dense: bool = False, tie_word_embeddings: bool = False, mtp: bool = False
 ) -> dict[str, Any]:
     layers = [
         "full_attention" if (index + 1) % 4 == 0 else "linear_attention"
@@ -50,7 +50,7 @@ def _text_config(
         },
         "layer_types": layers,
         "full_attention_interval": 4,
-        "mtp_num_hidden_layers": 0,
+        "mtp_num_hidden_layers": int(mtp),
         "eos_token_id": 1,
         "bos_token_id": 1,
         "num_experts": 8,
@@ -80,12 +80,14 @@ def _model(
     all_experts: bool = False,
     dense: bool = False,
     tie_word_embeddings: bool = False,
+    mtp: bool = False,
 ) -> Qwen35Model:
     mx.random.seed(seed)
     model = Qwen35Model(
         Qwen35Config.from_hugging_face(
-            _text_config(dense=dense, tie_word_embeddings=tie_word_embeddings)
-        )
+            _text_config(dense=dense, tie_word_embeddings=tie_word_embeddings, mtp=mtp)
+        ),
+        include_mtp=mtp,
     )
     # Give norms and DeltaNet decay realistic, non-trivial values.
     updates = []
@@ -108,7 +110,7 @@ def _model(
     if all_experts and model.config.is_moe:
         # Random routers have near-tied experts, so BF16 rounding can flip a
         # top-k choice; routing to every expert keeps logits continuous.
-        for layer in model.layers:
+        for layer in [*model.layers, *(model.mtp.layers if mtp else ())]:
             layer.mlp.top_k = model.config.num_experts
     return model
 

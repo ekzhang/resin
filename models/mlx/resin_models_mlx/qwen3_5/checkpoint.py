@@ -82,18 +82,23 @@ def _text_prefix(names) -> str:
 
 
 def checkpoint_weights(
-    model_path: str | Path, config: Qwen35Config, *, prequantized: bool = False
+    model_path: str | Path,
+    config: Qwen35Config,
+    *,
+    prequantized: bool = False,
+    include_mtp: bool = False,
 ) -> Iterator[tuple[str, mx.array]]:
     """Yield lazily loaded tensors under the MLX model's parameter names.
 
     Experts may be stored one tensor per expert or fused as Transformers saves
-    them (``experts.gate_up_proj`` and ``experts.down_proj``). Vision tower and
-    MTP weights are outside this text runner and are skipped.
+    them (``experts.gate_up_proj`` and ``experts.down_proj``). Vision tower
+    weights are skipped, and so are bundled MTP weights unless requested.
     """
 
     tensors = _Checkpoint(model_path)
     prefix = _text_prefix(tensors.files)
     experts: dict[str, dict[int, str]] = {}
+    mtp_found = False
     for name in tensors.files:
         head = name.removeprefix("language_model.")
         if head.startswith("lm_head."):
@@ -102,9 +107,17 @@ def checkpoint_weights(
             if not config.tie_word_embeddings:
                 yield head, tensors[name]
             continue
-        if not name.startswith(prefix) or name.startswith("model.visual."):
+        scope = ""
+        if head.startswith("mtp."):
+            if not include_mtp:
+                continue
+            mtp_found = True
+            # The MTP head sits beside the text model, under ``mtp.``.
+            scope, text = "mtp.", head.removeprefix("mtp.")
+        elif not name.startswith(prefix) or name.startswith("model.visual."):
             continue
-        text = name[len(prefix) :]
+        else:
+            text = name[len(prefix) :]
         parts = text.split(".")
         if len(parts) == 7 and parts[3] == "experts":
             if prequantized:
@@ -115,7 +128,7 @@ def checkpoint_weights(
             layer, expert, projection = parts[1], int(parts[4]), parts[5]
             if projection not in _EXPERT_PROJECTIONS:
                 raise ValueError(f"unexpected expert projection {name!r}")
-            key = f"layers.{layer}.mlp.switch_mlp.{projection}.weight"
+            key = f"{scope}layers.{layer}.mlp.switch_mlp.{projection}.weight"
             experts.setdefault(key, {})[expert] = name
             continue
         if text.endswith("mlp.experts.gate_up_proj"):
@@ -126,7 +139,7 @@ def checkpoint_weights(
             # [experts, 2 * intermediate, hidden]: gate rows, then up rows.
             gate_up = tensors[name]
             middle = gate_up.shape[1] // 2
-            base = text.removesuffix("experts.gate_up_proj") + "switch_mlp."
+            base = scope + text.removesuffix("experts.gate_up_proj") + "switch_mlp."
             yield base + "gate_proj.weight", gate_up[:, :middle]
             yield base + "up_proj.weight", gate_up[:, middle:]
             continue
@@ -135,7 +148,7 @@ def checkpoint_weights(
                 raise ValueError(
                     "prequantized fused experts require MLX switch_mlp layout"
                 )
-            base = text.removesuffix("experts.down_proj") + "switch_mlp."
+            base = scope + text.removesuffix("experts.down_proj") + "switch_mlp."
             yield base + "down_proj.weight", tensors[name]
             continue
         value = tensors[name]
@@ -147,7 +160,9 @@ def checkpoint_weights(
                 raise ValueError(
                     f"unexpected Qwen3.5 convolution layout: {value.shape}"
                 )
-        yield text, value
+        yield scope + text, value
+    if include_mtp and not mtp_found:
+        raise ValueError("this Qwen3.5 checkpoint does not contain MTP weights")
 
     for key, names in experts.items():
         if sorted(names) != list(range(config.num_experts)):
@@ -173,18 +188,29 @@ def load_model(
     *,
     bits: int | None = 8,
     group_size: int = 64,
+    include_mtp: bool = False,
 ) -> tuple[Qwen35Model, Qwen35Config, dict]:
     """Load packed MLX tensors directly, or optionally quantize BF16 sources.
 
     ``bits`` and ``group_size`` apply only to unquantized sources. Packed
     checkpoints retain the precision and layout declared in their metadata.
+    ``include_mtp`` also loads the bundled MTP head, which must be present.
     """
 
     config, raw_config = load_config(model_path)
     quantization = checkpoint_quantization(raw_config)
-    model = Qwen35Model(config, norm_weights_are_offset=quantization is None)
+    model = Qwen35Model(
+        config,
+        norm_weights_are_offset=quantization is None,
+        include_mtp=include_mtp,
+    )
     weights = dict(
-        checkpoint_weights(model_path, config, prequantized=quantization is not None)
+        checkpoint_weights(
+            model_path,
+            config,
+            prequantized=quantization is not None,
+            include_mtp=include_mtp,
+        )
     )
     if quantization is not None:
         _prepare_packed_modules(model, weights, quantization)
@@ -219,6 +245,8 @@ def load_model(
     for layer in model.layers:
         mx.eval(layer.parameters())
     mx.eval(model.norm.parameters())
+    if include_mtp:
+        mx.eval(model.mtp.parameters())
     if not config.tie_word_embeddings:
         mx.eval(model.lm_head.parameters())
     model.prepare_for_inference()

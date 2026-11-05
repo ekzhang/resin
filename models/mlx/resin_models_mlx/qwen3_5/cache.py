@@ -14,6 +14,11 @@ values scatter single rows; DeltaNet snapshots use contiguous slice updates.
 Native resource operations order every write after prior readers on the GPU,
 without rebinding an immutable MLX arena value or requiring buffer donation.
 Live DeltaNet state stays outside the arena between steps (see ``state.py``).
+
+With a bundled MTP head, a third group holds its single attention layer, one
+unit per 128-token block. Its slot ``p`` holds the pair of the target's hidden
+state at ``p - 1`` and the token at ``p``, so each pair lands in the block that
+leases its token; slot 0 holds no pair and is never read.
 """
 
 from __future__ import annotations
@@ -40,6 +45,7 @@ PAGE_TOKENS = 128
 PREFILL_CHUNK_SIZE = 4096
 KV_GROUP = 0
 STATE_GROUP = 1
+MTP_GROUP = 2
 
 BF16_BYTES = 2
 FP32_BYTES = 4
@@ -64,9 +70,12 @@ class CacheGeometry:
     convolution_shape: tuple[int, int, int]
     slab_units: int
     state_units: int
+    include_mtp: bool = False
 
     @classmethod
-    def from_config(cls, config: Qwen35Config) -> CacheGeometry:
+    def from_config(
+        cls, config: Qwen35Config, *, include_mtp: bool = False
+    ) -> CacheGeometry:
         unit_elements = 2 * PAGE_TOKENS * config.num_key_value_heads * config.head_dim
         recurrent_shape = (
             config.linear_layer_count,
@@ -97,6 +106,7 @@ class CacheGeometry:
             convolution_shape=convolution_shape,
             slab_units=math.ceil(state_units / layers) * layers,
             state_units=state_units,
+            include_mtp=include_mtp,
         )
 
     @property
@@ -130,17 +140,34 @@ class CacheGeometry:
         return math.prod(self.convolution_shape)
 
     def layout(self, slab_capacity: int) -> CacheLayout:
+        groups = [
+            CacheGroupLayout(PAGE_TOKENS, blocks_per_slab=self.kv_blocks_per_slab),
+            CacheGroupLayout(
+                PREFILL_CHUNK_SIZE,
+                blocks_per_slab=self.state_blocks_per_slab,
+                family=CacheGroupFamily.STATE,
+            ),
+        ]
+        if self.include_mtp:
+            # One unit per block; a decode step's MTP pairs end one slot past
+            # its verified tokens.
+            groups.append(
+                CacheGroupLayout(PAGE_TOKENS, blocks_per_slab=self.slab_units)
+            )
         return CacheLayout(
             parent_capacity=slab_capacity,
-            groups=[
-                CacheGroupLayout(PAGE_TOKENS, blocks_per_slab=self.kv_blocks_per_slab),
-                CacheGroupLayout(
-                    PREFILL_CHUNK_SIZE,
-                    blocks_per_slab=self.state_blocks_per_slab,
-                    family=CacheGroupFamily.STATE,
-                ),
-            ],
+            groups=groups,
+            decode_write_extra_tokens=int(self.include_mtp),
         )
+
+    def group_layers(self, group: int) -> tuple[int, int]:
+        """Attention layers of a KV-like group and their within-slab unit stride."""
+
+        if group == KV_GROUP:
+            return self.full_layers, self.kv_blocks_per_slab
+        if group == MTP_GROUP and self.include_mtp:
+            return 1, 0
+        raise ValueError(f"cache group {group} holds no attention layers")
 
 
 class CacheArena:
@@ -207,11 +234,15 @@ class CacheArena:
     # Reads ---------------------------------------------------------------
 
     def _kv_bases(
-        self, plan: PagedCachePlan, rows: np.ndarray, lengths: np.ndarray
+        self,
+        plan: PagedCachePlan,
+        rows: np.ndarray,
+        lengths: np.ndarray,
+        group_index: int = KV_GROUP,
     ) -> np.ndarray:
         """Layer-zero unit per block covering ``lengths[i]`` tokens; 0 pads."""
 
-        group = plan.groups[KV_GROUP]
+        group = plan.groups[group_index]
         width = max(1, math.ceil(int(lengths.max(initial=0)) / PAGE_TOKENS))
         bases = np.zeros((len(rows), width), dtype=np.int64)
         for index, row in enumerate(rows.tolist()):
@@ -222,22 +253,38 @@ class CacheArena:
         return bases
 
     def history(
-        self, plan: PagedCachePlan, row: int, length: int
+        self,
+        plan: PagedCachePlan,
+        row: int,
+        length: int,
+        group: int = KV_GROUP,
+        skip: int = 0,
     ) -> Sequence[AttentionHistory | None]:
-        """One row's earlier tokens, gathered per layer only when it is read."""
+        """One row's earlier tokens, gathered per layer only when it is read.
 
-        layers = self.geometry.full_layers
-        if length == 0:
+        Slots before ``skip`` are excluded from the history.
+        """
+
+        layers, stride = self.geometry.group_layers(group)
+        if length <= skip:
             return (None,) * layers
-        bases = self._kv_bases(plan, np.array([row]), np.array([length]))[0]
-        return _GatheredHistory(self._units(), bases, length, self.geometry)
+        bases = self._kv_bases(plan, np.array([row]), np.array([length]), group)[0]
+        return _GatheredHistory(
+            self._units(), bases, length, self.geometry, layers, stride, skip
+        )
 
     def paged_history(
-        self, plan: PagedCachePlan, rows: np.ndarray, lengths: np.ndarray
+        self,
+        plan: PagedCachePlan,
+        rows: np.ndarray,
+        lengths: np.ndarray,
+        group: int = KV_GROUP,
+        skip: int = 0,
     ) -> PagedHistory:
         """Page tables for attending to history in place during decode."""
 
-        bases = self._kv_bases(plan, rows, lengths)
+        _, stride = self.geometry.group_layers(group)
+        bases = self._kv_bases(plan, rows, lengths, group)
         if bases.size < _MIN_DEVICE_ELEMENTS:
             # Pad rows, preserving the logical page-table width and therefore
             # the attention partition count. Only queries select live rows.
@@ -252,7 +299,8 @@ class CacheArena:
             self._units(),
             mx.array(pages),
             mx.array(history_lengths),
-            layer_stride=self.geometry.kv_blocks_per_slab,
+            layer_stride=stride,
+            skip=skip,
         )
 
     def state_start(self, slab: int, slot: int) -> int:
@@ -313,15 +361,64 @@ class CacheArena:
         """
 
         group = plan.groups[KV_GROUP]
-        slab = group.append_slab_ids[tokens]
-        slot = group.append_slotnums[tokens].astype(np.int64)
-        offset = group.append_block_offsets[tokens].astype(np.int64)
-        layers = self.geometry.full_layers
-        count = len(tokens)
-        units = self._unit(
-            slab[:, None],
-            slot[:, None] + np.arange(layers) * self.geometry.kv_blocks_per_slab,
+        self._scatter(
+            group.append_slab_ids[tokens],
+            group.append_slotnums[tokens].astype(np.int64),
+            group.append_block_offsets[tokens].astype(np.int64),
+            keys,
+            values,
+            KV_GROUP,
         )
+
+    def write_positions(
+        self,
+        plan: PagedCachePlan,
+        rows: np.ndarray,
+        positions: np.ndarray,
+        keys: tuple[mx.array, ...],
+        values: tuple[mx.array, ...],
+        group: int = KV_GROUP,
+    ) -> None:
+        """Scatter K/V for ``positions[i, j]`` of plan row ``rows[i]``.
+
+        Destinations come from the rows' leased block tables, which in decode
+        include the lookahead beyond the plan's own token. ``keys`` and
+        ``values`` hold one ``[rows, tokens, kv_heads, head_dim]`` array per
+        layer of ``group``.
+        """
+
+        view = plan.groups[group]
+        slabs, slots = [], []
+        for index, row in enumerate(rows.tolist()):
+            columns = positions[index] // PAGE_TOKENS - int(
+                view.block_table_start_indices[row]
+            )
+            table = view.block_slice(row)
+            if np.any(columns < 0) or np.any(columns >= table.stop - table.start):
+                raise ValueError(f"cache group {group} row {row} write is not leased")
+            slabs.append(view.block_slab_ids[table][columns])
+            slots.append(view.block_slotnums[table][columns])
+        self._scatter(
+            np.concatenate(slabs),
+            np.concatenate(slots).astype(np.int64),
+            (positions % PAGE_TOKENS).reshape(-1).astype(np.int64),
+            tuple(key.reshape(-1, *key.shape[2:]) for key in keys),
+            tuple(value.reshape(-1, *value.shape[2:]) for value in values),
+            group,
+        )
+
+    def _scatter(
+        self,
+        slab: np.ndarray,
+        slot: np.ndarray,
+        offset: np.ndarray,
+        keys: tuple[mx.array, ...],
+        values: tuple[mx.array, ...],
+        group: int,
+    ) -> None:
+        layers, stride = self.geometry.group_layers(group)
+        count = len(slab)
+        units = self._unit(slab[:, None], slot[:, None] + np.arange(layers) * stride)
         # Each (token, layer) writes its key row and value row in one unit.
         rows = np.arange(2)[None, None, :] * PAGE_TOKENS + offset[:, None, None]
         update = pack_key_values(keys, values, count, self.geometry.kv_width)
@@ -390,9 +487,12 @@ class _GatheredHistory(Sequence[AttentionHistory | None]):
     bases: np.ndarray
     length: int
     geometry: CacheGeometry
+    layers: int
+    stride: int
+    skip: int = 0
 
     def __len__(self) -> int:
-        return self.geometry.full_layers
+        return self.layers
 
     def __getitem__(self, layer):  # type: ignore[override]
         if not isinstance(layer, int) or not 0 <= layer < len(self):
@@ -400,16 +500,18 @@ class _GatheredHistory(Sequence[AttentionHistory | None]):
         geometry = self.geometry
         pages = mx.take(
             self.units,
-            mx.array(self.bases + layer * geometry.kv_blocks_per_slab),
+            mx.array(self.bases + layer * self.stride),
             axis=0,
         )
         shape = (1, len(self.bases) * PAGE_TOKENS, geometry.kv_heads, -1)
-        keys = pages[:, 0].reshape(shape)[:, : self.length]
-        values = pages[:, 1].reshape(shape)[:, : self.length]
+        keys = pages[:, 0].reshape(shape)[:, self.skip : self.length]
+        values = pages[:, 1].reshape(shape)[:, self.skip : self.length]
         return AttentionHistory(keys, values)
 
 
 __all__ = [
+    "KV_GROUP",
+    "MTP_GROUP",
     "PAGE_TOKENS",
     "PREFILL_CHUNK_SIZE",
     "CacheArena",

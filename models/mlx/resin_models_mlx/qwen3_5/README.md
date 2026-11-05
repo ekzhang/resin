@@ -2,8 +2,8 @@
 
 `Qwen35MlxRunner` serves dense and MoE Qwen3.5 checkpoints through Resin's
 Engine on one Apple Silicon GPU. It supports tied embeddings, paged attention,
-chunked prefill, prefix reuse, overlapping decode and image input. Speculative
-and MTP decoding are not supported.
+chunked prefill, prefix reuse, overlapping decode, image input and speculative
+decoding with the checkpoint's bundled MTP head.
 
 ## Run locally
 
@@ -98,6 +98,60 @@ source totals 3,712 lines of Python, type stubs, C++ and Metal, versus 4,817 in
 the larger implementation and 1,906 before these additions. Tests, docs and
 packaging are excluded.
 
+## MTP speculative decoding
+
+`speculative_draft_tokens=K` (`--draft-tokens` for `scripts/mlx_serve.py`)
+loads the bundled `mtp.*` head, which must be present: original Qwen
+checkpoints ship it, while `mlx-community` conversions and Ornith do not. The
+`qwen3.5-0.8b-mtp-mlx` and `qwen3.8-27b-mlx` presets use pinned BF16 sources
+quantized to 8-bit at load.
+
+Each decode step follows the CUDA runner. The previous step proposed the first
+draft; MTP chains `K - 1` more on its own hidden state. One target forward
+verifies `[anchor, drafts]`, sampling column `j` exactly as one-token decoding
+would sample that position, so greedy and seeded outputs match target-only
+decoding. The matching draft prefix and one correction or bonus token are
+returned. Verification writes K/V for every leased position, and only accepted
+positions become readable. DeltaNet state for the accepted prefix is replayed
+from the block's retained recurrence inputs with mlx-lm's masked kernel, so no
+projection or MLP runs twice. MTP then reads the verified hidden states to fill
+its own cache and propose the next anchor's draft.
+
+The MTP layer keeps a third cache group with one unit per 128-token block. Slot
+`p` pairs the target's hidden state at `p - 1` with token `p`, so every pair
+lands in the block that leases its token, and the layout declares one extra
+decode write. Slot 0 holds no pair; the paged reader skips it. Multi-token
+verification runs each block token as a row of the paged decode kernel, plus
+one partition over the block's earlier, unwritten keys, merged by log-sum-exp.
+
+A prefix hit restores no target hidden state, so the hit boundary's single MTP
+pair uses zeros; only that pair's proposals weaken. Image requests give MTP
+text rotary positions. Speculative steps are synchronous: acceptance stays on
+the GPU and each step has one host wait, but steps do not overlap through the
+Engine's enqueue path yet. Each verified token also rereads its row's history,
+so long contexts pay proportionally more attention bandwidth.
+
+November 4, 2026, Apple M4 Max with 128 GiB, MLX 0.32.4 and mlx-lm 0.32.2,
+`qwen3.8-27b-mlx` (8-bit). One process loads the model once and alternates
+target-only and speculative Engines in four ABBA windows on the same 8K
+ShareGPT cohort, 64 greedy tokens per request, prefill excluded. Cells are
+median aggregate output tokens/s, with the speedup and draft acceptance:
+
+| Batch | Target only | 1 draft             | 2 drafts            | 3 drafts            |
+| ----: | ----------: | ------------------: | ------------------: | ------------------: |
+|     1 |         8.7 | 14.3 (1.64×, 91%)   | 16.6 (1.89×, 80%)   | 17.5 (1.98×, 67%)   |
+|     2 |        15.7 | 22.4 (1.42×, 90%)   | 23.6 (1.50×, 83%)   | 23.9 (1.52×, 70%)   |
+|     4 |        24.7 | 29.1 (1.18×, 90%)   | 29.7 (1.19×, 84%)   | 33.1 (1.34×, 73%)   |
+|     8 |        32.1 | 38.1 (1.19×, 87%)   | 45.3 (1.41×, 79%)   | 42.1 (1.33×, 69%)   |
+
+Absolute rates on this machine drifted by up to 2× between processes, so only
+matched ratios are reported. Outputs are identical at batches 1 and 2. At batch
+8, every speculative divergence falls on a token where target-only decoding
+itself changes between batch 1 and batch 8, with a top-two logit gap of 0 or
+0.125. On the 0.8B checkpoint, steps are launch-bound and the 248K-token
+`lm_head` dominates, so speculation roughly breaks even (1.01× at batch 1
+with two drafts, 67% acceptance).
+
 ## Measured performance
 
 November 2, 2026, Apple M1 Pro with 16 GiB, MLX 0.32.4 and mlx-lm 0.32.2,
@@ -146,7 +200,10 @@ uv run scripts/bench.py --model qwen3.5-0.8b-mlx --backend local \
 
 The retained tests compare model/checkpoint and vision outputs with independent
 references, check essential fusion numerics and cache ordering, and exercise
-prefix reuse and overlapped decoding through the Engine.
+prefix reuse and overlapped decoding through the Engine. MTP tests require
+exact token parity with target-only decoding for one to three drafts, natural
+and synthetic full or partial acceptance, seeded sampling, stop tokens inside a
+block, checkpoint crossings, prefix hits and the context limit.
 
 ```bash
 uv run pytest models/mlx/tests tests/test_deploy_models.py \
@@ -161,4 +218,5 @@ Startup compilation stability remains unqualified: upstream MLX may create
 additional pipelines for first unseen inputs. Vision compilation is shape
 cached. The current performance measurements cover only the 0.8B checkpoint,
 4K/8K prompts and batches 1/2/4 on this M1 Pro. They do not qualify larger
-contexts, other Apple GPUs, the large Ornith preset or speculative decoding.
+contexts, other Apple GPUs or the large Ornith preset; speculative decoding is
+measured separately above.
