@@ -1648,6 +1648,61 @@ mod tests {
     }
 
     #[test]
+    fn prefix_eviction_recycles_window_pages_when_live_history_fills_the_pool() {
+        let layout = KvLayout::new(
+            6,
+            vec![
+                KvGroupLayout::new(1, 1, KvRetention::FullContext).unwrap(),
+                KvGroupLayout::new(
+                    1,
+                    1,
+                    KvRetention::SlidingWindow {
+                        tokens: NonZeroU32::new(2).unwrap(),
+                    },
+                )
+                .unwrap()
+                .with_read_window_tokens(1)
+                .unwrap(),
+            ],
+        )
+        .unwrap();
+        let mut resources = PagedKvResources::with_prefix_cache(layout).unwrap();
+        let mut state = resources
+            .attach(RequestId::new(NonZeroU64::new(1).unwrap()), 0)
+            .unwrap();
+        resources.ensure_context(&mut state, 0, 2).unwrap();
+        assert!(
+            resources
+                .publish_prefix(&mut state, &key(&[1, 2]), 2)
+                .unwrap()
+        );
+        let window = state.groups()[1]
+            .pages()
+            .iter()
+            .map(|page| page.handle())
+            .collect::<Vec<_>>();
+        resources.ensure_context(&mut state, 2, 4).unwrap();
+        assert_eq!(resources.pool().free_parent_count(), 0);
+        assert_eq!(
+            state.groups()[1]
+                .pages()
+                .iter()
+                .map(|page| page.handle())
+                .collect::<Vec<_>>(),
+            window
+        );
+        assert!(
+            state.groups()[1]
+                .pages()
+                .iter()
+                .all(|page| page.is_writable())
+        );
+        resources.retire(state).unwrap();
+        resources.clear_prefix_cache().unwrap();
+        assert_eq!(resources.pool().free_parent_count(), 6);
+    }
+
+    #[test]
     fn request_pages_grow_on_demand_and_reset_for_replay() {
         let layout = KvLayout::new(
             2,

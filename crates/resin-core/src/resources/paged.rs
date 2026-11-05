@@ -1366,7 +1366,8 @@ impl CachePool {
 
     /// Copy-on-write selected immutable pages for a request which is about to
     /// recycle sliding-window slots. Replacement placement is transactional;
-    /// the old shared references remain untouched on failure.
+    /// the old shared references remain untouched on failure. Evicted pages
+    /// held solely by this idle owner regain write permission in place.
     pub fn replace_shared_pages(
         &mut self,
         request: &mut RequestPages,
@@ -1377,24 +1378,33 @@ impl CachePool {
             return Err(CachePoolError::StaleHandle);
         }
         let mut total = 0usize;
+        let mut reusable = Vec::new();
+        reusable
+            .try_reserve_exact(replacements.len())
+            .map_err(|_| CachePoolError::MetadataAllocation)?;
         for (indices, group) in replacements.iter().zip(&request.groups) {
+            let mut reuse = Vec::new();
+            reuse
+                .try_reserve_exact(indices.len())
+                .map_err(|_| CachePoolError::MetadataAllocation)?;
             if indices.windows(2).any(|pair| pair[0] >= pair[1]) {
                 return Err(CachePoolError::DuplicateHandle);
             }
             for &index in indices {
                 let page = group.pages.get(index).ok_or(CachePoolError::StaleHandle)?;
-                if page.writable
-                    || self.validate_live_handle(page.handle)?.mode != Some(PageMode::Shared)
-                {
+                let slot = self.validate_live_handle(page.handle)?;
+                if page.writable || slot.mode != Some(PageMode::Shared) {
                     return Err(CachePoolError::StaleHandle);
                 }
+                // Evicting the final snapshot can leave only this idle owner.
+                // Reclaim its write permission without a temporary spare page.
+                let exclusive = slot.cache_refs == 0 && slot.request_refs == 1;
+                reuse.push(exclusive);
+                total = total
+                    .checked_add(usize::from(!exclusive))
+                    .ok_or(CachePoolError::DemandOverflow)?;
             }
-            total = total
-                .checked_add(indices.len())
-                .ok_or(CachePoolError::DemandOverflow)?;
-        }
-        if total == 0 {
-            return Ok(());
+            reusable.push(reuse);
         }
         self.occupied_blocks
             .checked_add(total)
@@ -1404,10 +1414,10 @@ impl CachePool {
         additions
             .try_reserve_exact(request.groups.len())
             .map_err(|_| CachePoolError::MetadataAllocation)?;
-        for (indices, group) in replacements.iter().zip(&request.groups) {
+        for (reuse, group) in reusable.iter().zip(&request.groups) {
             let mut pages = Vec::new();
             pages
-                .try_reserve_exact(indices.len())
+                .try_reserve_exact(reuse.iter().filter(|&&exclusive| !exclusive).count())
                 .map_err(|_| CachePoolError::MetadataAllocation)?;
             additions.push(GroupTable {
                 group: group.group,
@@ -1417,11 +1427,14 @@ impl CachePool {
         }
 
         let mut plan = PlacementPlan::new(self.group_packings.len(), total, self.parents.len())?;
-        for (indices, addition) in replacements.iter().zip(&mut additions) {
+        for (reuse, addition) in reusable.iter().zip(&mut additions) {
             self.plan_partition(
                 &mut plan,
                 request.writer,
-                GroupDemand::new(addition.group, indices.len()),
+                GroupDemand::new(
+                    addition.group,
+                    reuse.iter().filter(|&&exclusive| !exclusive).count(),
+                ),
                 &mut addition.pages,
             )?;
         }
@@ -1440,13 +1453,27 @@ impl CachePool {
             });
             slot.request_refs = 1;
         }
-        for ((indices, group), additions) in
-            replacements.iter().zip(&mut request.groups).zip(additions)
+        for (((indices, reuse), group), additions) in replacements
+            .iter()
+            .zip(reusable)
+            .zip(&mut request.groups)
+            .zip(additions)
         {
             if !indices.is_empty() {
                 group.snapshot = Weak::new();
             }
-            for (&index, replacement) in indices.iter().zip(additions.pages) {
+            let mut additions = additions.pages.into_iter();
+            for (&index, exclusive) in indices.iter().zip(reuse) {
+                if exclusive {
+                    self.slot_mut(group.pages[index].handle).mode = Some(PageMode::Mutable {
+                        writer: request.writer,
+                    });
+                    group.pages[index].writable = true;
+                    continue;
+                }
+                let replacement = additions
+                    .next()
+                    .expect("each shared page has a prepared replacement");
                 let old = std::mem::replace(&mut group.pages[index], replacement);
                 debug_assert!(!old.writable);
                 self.slot_mut(old.handle).request_refs -= 1;
@@ -2144,6 +2171,75 @@ mod tests {
         assert_eq!(pool.occupied_block_count(), 3);
         pool.retire_request(request).unwrap();
         assert_eq!(pool.occupied_block_count(), 0);
+    }
+
+    #[test]
+    fn evicted_shared_pages_regain_exclusive_writes_without_spare_capacity() {
+        let mut pool = CachePool::new(1, &[nz(1)]).unwrap();
+        let demands = [GroupDemand::new(GroupId::new(0), 1)];
+        let pending = pool.reserve_request(sequence(1), &demands).unwrap();
+        let mut request = pool.promote_request(pending);
+        let cached = pool.share_request_prefix(&mut request, &demands).unwrap();
+        let pending = pool
+            .reserve_request(sequence(2), &[GroupDemand::new(GroupId::new(0), 0)])
+            .unwrap();
+        let mut peer = pool.promote_request(pending);
+        pool.attach_shared_prefix(&mut peer, &cached).unwrap();
+        pool.retire_cached_prefix(cached).unwrap();
+        let handles = request_handles(&request);
+        assert!(matches!(
+            pool.replace_shared_pages(&mut request, &[vec![0]]),
+            Err(CachePoolError::InsufficientCapacity { .. })
+        ));
+        assert!(!request.groups[0].pages[0].writable);
+        pool.retire_request(peer).unwrap();
+        pool.replace_shared_pages(&mut request, &[vec![0]]).unwrap();
+        assert_eq!(request_handles(&request), handles);
+        assert!(request.groups[0].pages[0].writable);
+        assert!(request.groups[0].snapshot.upgrade().is_none());
+        let access = pool.prepare_writer_access(writer_claims(&request)).unwrap();
+        let lease = pool.acquire_writer_access(access).unwrap();
+        pool.release_writer_access(lease);
+        pool.retire_request(request).unwrap();
+        assert_eq!(pool.free_parent_count(), 1);
+    }
+
+    #[test]
+    fn failed_mixed_replacement_does_not_reactivate_an_exclusive_shared_page() {
+        let mut pool = CachePool::new(2, &[nz(1), nz(1)]).unwrap();
+        let demands = [
+            GroupDemand::new(GroupId::new(0), 1),
+            GroupDemand::new(GroupId::new(1), 1),
+        ];
+        let pending = pool.reserve_request(sequence(1), &demands).unwrap();
+        let mut request = pool.promote_request(pending);
+        let first = pool
+            .share_request_prefix(
+                &mut request,
+                &[demands[0], GroupDemand::new(GroupId::new(1), 0)],
+            )
+            .unwrap();
+        let second = pool
+            .share_request_prefix(
+                &mut request,
+                &[GroupDemand::new(GroupId::new(0), 0), demands[1]],
+            )
+            .unwrap();
+        pool.retire_cached_prefix(first).unwrap();
+        let handles = request_handles(&request);
+        assert!(matches!(
+            pool.replace_shared_pages(&mut request, &[vec![0], vec![0]]),
+            Err(CachePoolError::InsufficientCapacity { .. })
+        ));
+        assert_eq!(request_handles(&request), handles);
+        assert!(request.groups.iter().all(|group| !group.pages[0].writable));
+        pool.retire_cached_prefix(second).unwrap();
+        pool.replace_shared_pages(&mut request, &[vec![0], vec![0]])
+            .unwrap();
+        assert_eq!(request_handles(&request), handles);
+        assert!(request.groups.iter().all(|group| group.pages[0].writable));
+        pool.retire_request(request).unwrap();
+        assert_eq!(pool.free_parent_count(), 2);
     }
 
     #[test]
