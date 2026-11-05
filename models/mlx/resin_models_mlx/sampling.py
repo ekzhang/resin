@@ -49,7 +49,13 @@ class MlxSampler:
         return self.block_tokens(logits[:, None], plan)[:, 0]
 
     def chosen_tokens(
-        self, logits: mx.array, plan, first: int, candidates: int, choice: mx.array
+        self,
+        logits: mx.array,
+        plan,
+        first: int,
+        candidates: int,
+        choice: mx.array,
+        positions: mx.array | None = None,
     ) -> mx.array:
         """Sample ``[rows, vocab]`` logits at a shift chosen on the GPU.
 
@@ -59,9 +65,9 @@ class MlxSampler:
         draw is prepared, so no host round trip selects the position.
         """
 
-        return self._sample(logits[:, None], plan, first, None, (candidates, choice))[
-            :, 0
-        ]
+        return self._sample(
+            logits[:, None], plan, first, None, (candidates, choice), positions
+        )[:, 0]
 
     def block_tokens(
         self,
@@ -69,6 +75,7 @@ class MlxSampler:
         plan,
         shifts: np.ndarray | int = 0,
         rows: np.ndarray | None = None,
+        positions: mx.array | None = None,
     ) -> mx.array:
         """Sample ``[rows, columns, vocab]`` logits into ``[rows, columns]`` IDs.
 
@@ -76,11 +83,13 @@ class MlxSampler:
         the plan's own: it draws exactly what decoding one token at a time
         would draw there, which speculative verification relies on. ``rows``
         names the plan row of each logits row when they are a subset.
+        ``positions`` optionally gives each plan row's decode position on the
+        GPU, replacing the plan's context lengths in the random streams.
         """
 
-        return self._sample(logits, plan, shifts, rows, None)
+        return self._sample(logits, plan, shifts, rows, None, positions)
 
-    def _sample(self, logits, plan, shifts, rows, choices) -> mx.array:
+    def _sample(self, logits, plan, shifts, rows, choices, positions=None):
         count, columns = logits.shape[:2]
         tokens = mx.argmax(logits, axis=-1)
         values = batch_sampling_inputs(plan, logits.shape[-1])
@@ -105,24 +114,33 @@ class MlxSampler:
             flat, repeat("temperatures"), repeat("top_ps"), repeat("top_ks")
         )
         candidates = 1 if choices is None else choices[0]
-        draws = mx.concatenate(
-            [
-                mx.random.uniform(
-                    shape=(1,),
-                    key=mx.random.key(
-                        sampling_seed(
-                            values["seeds"][plan_rows[index]],
-                            values["offsets"][plan_rows[index]]
-                            + (int(shifts[index]) + column + candidate)
-                            * SAMPLING_OFFSET_STRIDE,
-                        )
-                    ),
+        draw_rows = [
+            (index, int(shifts[index]) + column + candidate)
+            for index in sampled
+            for column in range(columns)
+            for candidate in range(candidates)
+        ]
+        if positions is None:
+            keys = [
+                mx.random.key(
+                    sampling_seed(
+                        values["seeds"][plan_rows[index]],
+                        values["offsets"][plan_rows[index]]
+                        + shift * SAMPLING_OFFSET_STRIDE,
+                    )
                 )
-                for index in sampled
-                for column in range(columns)
-                for candidate in range(candidates)
+                for index, shift in draw_rows
             ]
-        )
+        else:
+            keys = _device_keys(
+                np.array(
+                    [values["seeds"][plan_rows[i]] for i, _ in draw_rows],
+                    dtype=np.uint64,
+                ),
+                positions[mx.array([int(plan_rows[i]) for i, _ in draw_rows])],
+                np.array([shift for _, shift in draw_rows]),
+            )
+        draws = mx.concatenate([mx.random.uniform(shape=(1,), key=key) for key in keys])
         if choices is not None:
             draws = mx.take_along_axis(
                 draws.reshape(len(sampled) * columns, candidates),
@@ -137,6 +155,31 @@ class MlxSampler:
         chosen = mx.take_along_axis(order, rank[:, None], axis=-1)[:, 0]
         tokens[selected] = chosen.reshape(len(sampled), columns).astype(tokens.dtype)
         return tokens
+
+
+def _u64(values) -> mx.array:
+    return mx.array(np.asarray(values, dtype=np.uint64))
+
+
+def _device_keys(seeds: np.ndarray, positions: mx.array, shifts: np.ndarray):
+    """``sampling_seed`` keys for decode positions held on the GPU.
+
+    The sampled position past ``positions[i]`` is ``positions[i] + 1 +
+    shifts[i]``, as in a decode plan's offsets. The 64-bit mix matches the
+    host function bit for bit, and MLX keys are its high and low words.
+    """
+
+    offsets = (positions.astype(mx.uint64) + _u64(shifts + 1)) * _u64(
+        SAMPLING_OFFSET_STRIDE
+    )
+    value = _u64(seeds) + offsets * _u64(0x9E3779B97F4A7C15)
+    value = (value ^ (value >> _u64(30))) * _u64(0xBF58476D1CE4E5B9)
+    value = (value ^ (value >> _u64(27))) * _u64(0x94D049BB133111EB)
+    value = (value ^ (value >> _u64(31))) & _u64((1 << 63) - 1)
+    keys = mx.stack(
+        [(value >> _u64(32)).astype(mx.uint32), value.astype(mx.uint32)], axis=1
+    )
+    return [keys[index] for index in range(keys.shape[0])]
 
 
 __all__ = ["MlxSampler", "filtered_probabilities"]

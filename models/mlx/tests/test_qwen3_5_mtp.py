@@ -35,11 +35,27 @@ def model():
     return _model(seed=7, dtype=mx.float32, all_experts=True, mtp=True)
 
 
-def _generate(runner, prompts, params, *, prefix_cache=False, context=8192):
-    with Engine(runner, context_length=context, prefix_cache=prefix_cache) as engine:
+def _generate(
+    runner,
+    prompts,
+    params,
+    *,
+    prefix_cache=False,
+    context=8192,
+    overlap=True,
+    continuations=None,
+):
+    with Engine(
+        runner,
+        context_length=context,
+        prefix_cache=prefix_cache,
+        enable_overlap=overlap,
+    ) as engine:
         requests = [engine.submit(prompt, sampling_params=params) for prompt in prompts]
         while engine.has_work():
             engine.step()
+        if continuations is not None:
+            continuations.append(engine.overlap_stats[1])
         return [request.take_result() for request in requests]
 
 
@@ -62,12 +78,16 @@ class _Oracle:
     def tokens(self, logits, plan):
         return self.block_tokens(logits[:, None], plan)[:, 0]
 
-    def chosen_tokens(self, logits, plan, first, candidates, choice):
+    def chosen_tokens(self, logits, plan, first, candidates, choice, positions=None):
         shifts = first + np.array(choice)
-        return self.block_tokens(logits[:, None], plan, shifts)[:, 0]
+        return self.block_tokens(logits[:, None], plan, shifts, positions=positions)[
+            :, 0
+        ]
 
-    def block_tokens(self, logits, plan, shifts=0, rows=None):
-        tokens = self._sampler.block_tokens(logits, plan, shifts, rows)
+    def block_tokens(self, logits, plan, shifts=0, rows=None, positions=None):
+        tokens = self._sampler.block_tokens(
+            logits, plan, shifts, rows, positions=positions
+        )
         if plan.phase == BatchPhase.PREFILL:
             for row, sequence in enumerate(plan.sequence_ids):
                 length = int(plan.context_lengths[row]) + int(
@@ -81,9 +101,11 @@ class _Oracle:
         plan_rows = np.arange(logits.shape[0]) if rows is None else np.asarray(rows)
         shifts = np.broadcast_to(np.asarray(shifts), (len(plan_rows),))
         proposals = np.array(tokens).copy()
+        # A continuation plan only bounds the positions on the GPU.
+        contexts = plan.context_lengths if positions is None else np.array(positions)
         for index, row in enumerate(plan_rows.tolist()):
             full = self._sequences[int(plan.sequence_ids[row])]
-            position = int(plan.context_lengths[row]) + 1 + int(shifts[index])
+            position = int(contexts[row]) + 1 + int(shifts[index])
             if position < len(full) and not self._miss(position):
                 proposals[index, 0] = full[position]
             else:
@@ -160,15 +182,22 @@ def test_block_commit_matches_sequential_decode(model):
 
 @pytest.mark.parametrize("drafts", [1, 2, 3])
 @pytest.mark.parametrize("proposals", ["model", "all", "partial"])
-def test_greedy_speculation_matches_target_only(model, drafts, proposals):
+@pytest.mark.parametrize("overlap", [True, False])
+def test_greedy_speculation_matches_target_only(model, drafts, proposals, overlap):
     prompts = [_prompt(length, seed=length) for length in PROMPTS]
     params = SamplingParams(max_output_tokens=24, temperature=0.0)
-    expected = _generate(_runner(model, 0), prompts, params)
+    expected = _generate(_runner(model, 0), prompts, params, overlap=False)
     runner = _runner(model, drafts)
     if proposals != "model":
         miss = (lambda position: position % 3 == 0) if proposals == "partial" else None
         _with_oracle(runner, prompts, expected, *(() if miss is None else (miss,)))
-    assert _generate(runner, prompts, params) == expected
+    continuations = []
+    assert (
+        _generate(runner, prompts, params, overlap=overlap, continuations=continuations)
+        == expected
+    )
+    # Overlapped steps continue from GPU positions, not the plan's bound.
+    assert (continuations[0] > 0) == overlap
     stats = runner.speculative_stats()
     if proposals == "all":
         assert stats["acceptance_rate"] > 0.85
@@ -184,11 +213,14 @@ def test_seeded_sampling_speculation_matches_target_only(model, proposals):
     params = SamplingParams(
         max_output_tokens=20, temperature=0.9, top_p=0.95, top_k=40, seed=1234
     )
-    expected = _generate(_runner(model, 0), prompts, params)
+    expected = _generate(_runner(model, 0), prompts, params, overlap=False)
     runner = _runner(model, 2)
     if proposals == "partial":
         _with_oracle(runner, prompts, expected, lambda position: position % 4 == 1)
-    assert _generate(runner, prompts, params) == expected
+    # Continuations derive random streams from GPU positions.
+    continuations = []
+    assert _generate(runner, prompts, params, continuations=continuations) == expected
+    assert continuations[0] > 0
 
 
 def test_stop_token_inside_an_accepted_block(model):

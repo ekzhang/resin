@@ -192,6 +192,8 @@ class CacheArena:
         )
         self._epoch = self._storage.initial_epoch()
         self._readers: list[mx.array] = []
+        # One step's lease tables, rebuilt only when the plan changes.
+        self._leases: tuple[PagedCachePlan, dict] | None = None
         # Finish one-time allocation/zeroing before a native serving actor can
         # use the runner from a different thread.
         mx.eval(self._epoch)
@@ -234,15 +236,11 @@ class CacheArena:
     # Reads ---------------------------------------------------------------
 
     def _kv_bases(
-        self,
-        plan: PagedCachePlan,
-        rows: np.ndarray,
-        lengths: np.ndarray,
-        group_index: int = KV_GROUP,
+        self, plan: PagedCachePlan, rows: np.ndarray, lengths: np.ndarray
     ) -> np.ndarray:
         """Layer-zero unit per block covering ``lengths[i]`` tokens; 0 pads."""
 
-        group = plan.groups[group_index]
+        group = plan.groups[KV_GROUP]
         width = max(1, math.ceil(int(lengths.max(initial=0)) / PAGE_TOKENS))
         bases = np.zeros((len(rows), width), dtype=np.int64)
         for index, row in enumerate(rows.tolist()):
@@ -253,38 +251,22 @@ class CacheArena:
         return bases
 
     def history(
-        self,
-        plan: PagedCachePlan,
-        row: int,
-        length: int,
-        group: int = KV_GROUP,
-        skip: int = 0,
+        self, plan: PagedCachePlan, row: int, length: int
     ) -> Sequence[AttentionHistory | None]:
-        """One row's earlier tokens, gathered per layer only when it is read.
+        """One row's earlier tokens, gathered per layer only when it is read."""
 
-        Slots before ``skip`` are excluded from the history.
-        """
-
-        layers, stride = self.geometry.group_layers(group)
-        if length <= skip:
+        layers = self.geometry.full_layers
+        if length == 0:
             return (None,) * layers
-        bases = self._kv_bases(plan, np.array([row]), np.array([length]), group)[0]
-        return _GatheredHistory(
-            self._units(), bases, length, self.geometry, layers, stride, skip
-        )
+        bases = self._kv_bases(plan, np.array([row]), np.array([length]))[0]
+        return _GatheredHistory(self._units(), bases, length, self.geometry)
 
     def paged_history(
-        self,
-        plan: PagedCachePlan,
-        rows: np.ndarray,
-        lengths: np.ndarray,
-        group: int = KV_GROUP,
-        skip: int = 0,
+        self, plan: PagedCachePlan, rows: np.ndarray, lengths: np.ndarray
     ) -> PagedHistory:
         """Page tables for attending to history in place during decode."""
 
-        _, stride = self.geometry.group_layers(group)
-        bases = self._kv_bases(plan, rows, lengths, group)
+        bases = self._kv_bases(plan, rows, lengths)
         if bases.size < _MIN_DEVICE_ELEMENTS:
             # Pad rows, preserving the logical page-table width and therefore
             # the attention partition count. Only queries select live rows.
@@ -299,9 +281,72 @@ class CacheArena:
             self._units(),
             mx.array(pages),
             mx.array(history_lengths),
+            layer_stride=self.geometry.kv_blocks_per_slab,
+        )
+
+    def leased_history(
+        self,
+        plan: PagedCachePlan,
+        rows: np.ndarray,
+        lengths: mx.array,
+        group: int = KV_GROUP,
+        skip: int = 0,
+    ) -> PagedHistory:
+        """Decode history whose ``lengths`` stay on the GPU.
+
+        Page tables cover each row's whole lease, which bounds any length a
+        continuation can reach; the kernels read only the first ``lengths``.
+        """
+
+        _, stride = self.geometry.group_layers(group)
+        bases, _ = self._lease_bases(plan, rows, group)
+        capacity = max(len(rows), math.ceil(_MIN_DEVICE_ELEMENTS / bases.shape[1]))
+        pages = np.zeros((capacity, bases.shape[1]), dtype=np.int32)
+        pages[: len(rows)] = bases
+        padding = max(_MIN_DEVICE_ELEMENTS, len(rows)) - len(rows)
+        lengths = lengths.astype(mx.int32)
+        if padding:
+            lengths = mx.concatenate([lengths, mx.zeros((padding,), mx.int32)])
+        return PagedHistory(
+            self._units(),
+            mx.array(pages),
+            lengths,
             layer_stride=stride,
             skip=skip,
         )
+
+    def _lease_bases(
+        self, plan: PagedCachePlan, rows: np.ndarray, group_index: int
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """Layer-zero unit of every leased block, from logical block zero.
+
+        Also returns each row's leased block count; shorter rows pad with 0.
+        """
+
+        if self._leases is None or self._leases[0] is not plan:
+            self._leases = (plan, {})
+        memo = self._leases[1]
+        key = (group_index, rows.tobytes())
+        if key not in memo:
+            memo[key] = self._build_lease_bases(plan, rows, group_index)
+        return memo[key]
+
+    def _build_lease_bases(
+        self, plan: PagedCachePlan, rows: np.ndarray, group_index: int
+    ) -> tuple[np.ndarray, np.ndarray]:
+        view = plan.groups[group_index]
+        if np.any(view.block_table_start_indices[rows] != 0):
+            raise ValueError(f"cache group {group_index} lease does not start at 0")
+        counts = [
+            view.block_slice(row).stop - view.block_slice(row).start
+            for row in rows.tolist()
+        ]
+        bases = np.zeros((len(rows), max(1, max(counts, default=1))), dtype=np.int64)
+        for index, row in enumerate(rows.tolist()):
+            bases[index, : counts[index]] = self._unit(
+                view.block_slabs(row), view.block_slots(row).astype(np.int64)
+            )
+        return bases, np.array(counts, dtype=np.int64)
 
     def state_start(self, slab: int, slot: int) -> int:
         """First unit of the STATE block at ``(slab, slot)``."""
@@ -407,6 +452,47 @@ class CacheArena:
             group,
         )
 
+    def write_leased(
+        self,
+        plan: PagedCachePlan,
+        rows: np.ndarray,
+        positions: mx.array,
+        limits: np.ndarray,
+        keys: tuple[mx.array, ...],
+        values: tuple[mx.array, ...],
+        group: int = KV_GROUP,
+    ) -> None:
+        """``write_positions`` for int32 ``positions`` held on the GPU.
+
+        Addresses come from the rows' leases without a host round trip.
+        ``limits`` bounds each row's positions on the host, as a continuation
+        plan bounds its GPU positions, so a write outside the lease fails here
+        instead of landing in another block.
+        """
+
+        layers, stride = self.geometry.group_layers(group)
+        bases, counts = self._lease_bases(plan, rows, group)
+        if np.any(np.asarray(limits) >= counts * PAGE_TOKENS):
+            raise ValueError("write is not leased")
+        blocks = mx.minimum(positions // PAGE_TOKENS, bases.shape[1] - 1)
+        units = mx.take_along_axis(mx.array(bases.astype(np.int32)), blocks, axis=1)
+        count = positions.size
+        units = units.reshape(-1, 1) + mx.array(
+            (np.arange(layers) * stride).astype(np.int32)
+        )
+        offsets = (positions % PAGE_TOKENS).reshape(-1, 1, 1)
+        indices = (
+            units[:, :, None] * (2 * PAGE_TOKENS)
+            + offsets
+            + mx.array(np.array([0, PAGE_TOKENS], dtype=np.int32))
+        )
+        self._scatter_indices(
+            indices.reshape(-1),
+            tuple(key.reshape(-1, *key.shape[2:]) for key in keys),
+            tuple(value.reshape(-1, *value.shape[2:]) for value in values),
+            count,
+        )
+
     def _scatter(
         self,
         slab: np.ndarray,
@@ -421,11 +507,22 @@ class CacheArena:
         units = self._unit(slab[:, None], slot[:, None] + np.arange(layers) * stride)
         # Each (token, layer) writes its key row and value row in one unit.
         rows = np.arange(2)[None, None, :] * PAGE_TOKENS + offset[:, None, None]
-        update = pack_key_values(keys, values, count, self.geometry.kv_width)
         indices = units[:, :, None] * (2 * PAGE_TOKENS) + rows
+        self._scatter_indices(
+            mx.array(indices.reshape(-1).astype(np.int32)), keys, values, count
+        )
+
+    def _scatter_indices(
+        self,
+        indices: mx.array,
+        keys: tuple[mx.array, ...],
+        values: tuple[mx.array, ...],
+        count: int,
+    ) -> None:
+        update = pack_key_values(keys, values, count, self.geometry.kv_width)
         self._epoch = self._storage.scatter_rows(
             self._epoch,
-            mx.array(indices.reshape(-1).astype(np.int32)),
+            indices,
             update.reshape(-1, self.geometry.kv_width).astype(mx.bfloat16),
             after=self._readers,
         )
@@ -487,12 +584,9 @@ class _GatheredHistory(Sequence[AttentionHistory | None]):
     bases: np.ndarray
     length: int
     geometry: CacheGeometry
-    layers: int
-    stride: int
-    skip: int = 0
 
     def __len__(self) -> int:
-        return self.layers
+        return self.geometry.full_layers
 
     def __getitem__(self, layer):  # type: ignore[override]
         if not isinstance(layer, int) or not 0 <= layer < len(self):
@@ -500,12 +594,12 @@ class _GatheredHistory(Sequence[AttentionHistory | None]):
         geometry = self.geometry
         pages = mx.take(
             self.units,
-            mx.array(self.bases + layer * self.stride),
+            mx.array(self.bases + layer * geometry.kv_blocks_per_slab),
             axis=0,
         )
         shape = (1, len(self.bases) * PAGE_TOKENS, geometry.kv_heads, -1)
-        keys = pages[:, 0].reshape(shape)[:, self.skip : self.length]
-        values = pages[:, 1].reshape(shape)[:, self.skip : self.length]
+        keys = pages[:, 0].reshape(shape)[:, : self.length]
+        values = pages[:, 1].reshape(shape)[:, : self.length]
         return AttentionHistory(keys, values)
 
 

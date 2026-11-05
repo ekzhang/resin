@@ -46,8 +46,15 @@ class LiveStates:
     def __len__(self) -> int:
         return len(self._rows)
 
-    def gather(self, plan: PagedCachePlan, rows: np.ndarray) -> LinearState:
-        """State before each of ``rows`` runs, in plan row order."""
+    def gather(
+        self, plan: PagedCachePlan, rows: np.ndarray, *, exact: bool = True
+    ) -> LinearState:
+        """State before each of ``rows`` runs, in plan row order.
+
+        A continuation plan's context lengths only bound the GPU positions
+        its feedback carries; ``exact=False`` then skips validating the held
+        state's position, which would wait for the previous step.
+        """
 
         batch = plan.batch
         restore = plan.groups[STATE_GROUP].state
@@ -73,7 +80,7 @@ class LiveStates:
             else:
                 sequence = int(batch.sequence_ids[row])
                 entry = self._rows.get(sequence)
-                if entry is None or int(entry[0]) != context:
+                if entry is None or (exact and int(entry[0]) != context):
                     raise RuntimeError(
                         f"sequence {sequence} has no live recurrent state at "
                         f"position {context}"

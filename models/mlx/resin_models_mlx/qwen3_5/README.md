@@ -110,7 +110,12 @@ Each decode step follows the CUDA runner. The previous step proposed the first
 draft; MTP chains `K - 1` more on its own hidden state. One target forward
 verifies `[anchor, drafts]`, sampling column `j` exactly as one-token decoding
 would sample that position, so greedy and seeded outputs match target-only
-decoding. The matching draft prefix and one correction or bonus token are
+decoding up to BF16 rounding: verification multiplies `K + 1` rows per
+sequence, so a near-tie can resolve differently, just as target-only decoding
+changes with batch size. On the 0.8B checkpoint, every greedy divergence from
+one to three drafts falls on a token whose top-two logit gap is at most 0.25,
+and at batch 1 each is a position where target-only decoding itself differs
+between batches 1 and 4. The matching draft prefix and one correction or bonus token are
 returned. Verification writes K/V for every leased position, and only accepted
 positions become readable. DeltaNet state for the accepted prefix is replayed
 from the block's retained recurrence inputs with mlx-lm's masked kernel, so no
@@ -124,11 +129,18 @@ decode write. Slot 0 holds no pair; the paged reader skips it. Multi-token
 verification runs each block token as a row of the paged decode kernel, plus
 one partition over the block's earlier, unwritten keys, merged by log-sum-exp.
 
-A prefix hit restores no target hidden state, so the hit boundary's single MTP
-pair uses zeros; only that pair's proposals weaken. Image requests give MTP
-text rotary positions. Speculative steps are synchronous: acceptance stays on
-the GPU and each step has one host wait, but steps do not overlap through the
-Engine's enqueue path yet. Each verified token also rereads its row's history,
+Speculative steps overlap through the Engine's enqueue path. A step's
+feedback holds each row's next anchor and position on the GPU; the Engine's
+continuation plan only bounds those positions and leases pages for the
+longest possible output. History lengths, cache write addresses, rotary
+offsets and sampling streams therefore all derive from GPU positions, and the
+page tables cover the whole lease. Logprob, image and state-snapshot steps run
+synchronously.
+
+A prefix hit restores no target hidden state, so the hit boundary's MTP pair
+uses zeros. That pair stays in the MTP cache and slightly weakens later
+proposals. Image requests give MTP the image placeholder embeddings and text
+rotary positions. Both cost only acceptance, never output. Each verified token also rereads its row's history,
 so long contexts pay proportionally more attention bandwidth.
 
 November 4, 2026, Apple M4 Max with 128 GiB, MLX 0.32.4 and mlx-lm 0.32.2,
@@ -144,13 +156,22 @@ median aggregate output tokens/s, with the speedup and draft acceptance:
 |     4 |        24.7 | 29.1 (1.18×, 90%)   | 29.7 (1.19×, 84%)   | 33.1 (1.34×, 73%)   |
 |     8 |        32.1 | 38.1 (1.19×, 87%)   | 45.3 (1.41×, 79%)   | 42.1 (1.33×, 69%)   |
 
-Absolute rates on this machine drifted by up to 2× between processes, so only
-matched ratios are reported. Outputs are identical at batches 1 and 2. At batch
+This 14-inch laptop throttles its GPU after about two minutes of sustained
+decode, so these are throttled rates and only matched ratios are compared.
+From a cool start, target-only decoding runs at 14.9 tokens/s at batch 1,
+and two drafts run at 31.3 (2.10×). Outputs are identical at batches 1 and 2. At batch
 8, every speculative divergence falls on a token where target-only decoding
 itself changes between batch 1 and batch 8, with a top-two logit gap of 0 or
-0.125. On the 0.8B checkpoint, steps are launch-bound and the 248K-token
-`lm_head` dominates, so speculation roughly breaks even (1.01× at batch 1
-with two drafts, 67% acceptance).
+0.125.
+
+The table times synchronous speculative steps. A second matched run added
+overlapped steps: on the 27B they stayed within 1% of synchronous steps
+wherever windows were stable, because each step is GPU-bound. The two noisy
+batch-8 cells, with one and three drafts, measured 0.85× and 1.08×. The 0.8B
+checkpoint is launch-bound and its 248K-token `lm_head` dominates, so overlap
+matters there. With overlap, speculation reaches 1.10× (one draft) and 1.22×
+(two drafts) over target-only decoding at batch 1, against 0.83× and 0.96×
+for synchronous steps. At batch 4 it reaches 0.94–0.95×.
 
 ## Measured performance
 
@@ -200,7 +221,7 @@ uv run scripts/bench.py --model qwen3.5-0.8b-mlx --backend local \
 
 The retained tests compare model/checkpoint and vision outputs with independent
 references, check essential fusion numerics and cache ordering, and exercise
-prefix reuse and overlapped decoding through the Engine. MTP tests require
+prefix reuse and overlapped decoding through the Engine. MTP tests use an FP32 model and require
 exact token parity with target-only decoding for one to three drafts, natural
 and synthetic full or partial acceptance, seeded sampling, stop tokens inside a
 block, checkpoint crossings, prefix hits and the context limit.

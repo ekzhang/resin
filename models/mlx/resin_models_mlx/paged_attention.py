@@ -25,6 +25,8 @@ PARTITION_TOKENS = 512
 SMALL_BATCH_ROWS = 4
 SIMDGROUPS = 4
 PREFETCH = 4
+# MLX 0.32.4 binds kernel arguments below eight elements as constants.
+_MIN_METADATA_ROWS = 8
 _HEADS_PER_THREADGROUP = 4
 # Bound the query and output registers held by each lane. Four 256-wide
 # heads plus prefetched K/V spill on M1 Pro; two heads with one K/V pair
@@ -123,13 +125,25 @@ def paged_block_attention(
     rows, tokens, heads, head_dim = queries.shape
     kv_heads = keys.shape[2]
     flat = rows * tokens
+    flat_pages = mx.repeat(pages[:rows], tokens, axis=0)
+    flat_lengths = mx.repeat(lengths[:rows], tokens, axis=0)
+    if flat < _MIN_METADATA_ROWS:
+        # Unread padding rows keep metadata out of constant address space,
+        # whose different kernel ABI would compile another variant.
+        padding = _MIN_METADATA_ROWS - flat
+        flat_pages = mx.concatenate(
+            [flat_pages, mx.zeros((padding, pages.shape[1]), pages.dtype)]
+        )
+        flat_lengths = mx.concatenate(
+            [flat_lengths, mx.zeros((padding,), lengths.dtype)]
+        )
     outputs, maxima, sums = _partials(
         queries.reshape(flat, heads, head_dim),
         keys.reshape(flat, kv_heads, head_dim),
         values.reshape(flat, kv_heads, head_dim),
         units,
-        mx.repeat(pages[:rows], tokens, axis=0),
-        mx.repeat(lengths[:rows], tokens, axis=0),
+        flat_pages,
+        flat_lengths,
         layer,
         scale,
         skip,
