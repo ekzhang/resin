@@ -2051,3 +2051,66 @@ fn failure_after_next_enqueue_keeps_transferred_lease_quarantined() {
         assert!(engine.close(&mut model).is_err());
     }
 }
+
+#[test]
+fn failed_prefill_growth_releases_unadmitted_pages_before_retrying_running_work() {
+    let mut engine = EngineCore::new(
+        RunnerConfig {
+            cache_layout: Some(
+                KvLayout::new(
+                    3,
+                    vec![KvGroupLayout::new(1, 1, KvRetention::FullContext).unwrap()],
+                )
+                .unwrap(),
+            ),
+            continuation_prefill: true,
+            ..Default::default()
+        },
+        3,
+        3,
+        SchedulerConfig {
+            max_batch_tokens: NonZeroU32::new(16),
+            prefill_chunk_size: NonZeroU32::new(6).unwrap(),
+            schedule_conservativeness: 0.0,
+        },
+        true,
+    )
+    .unwrap();
+    let mut model = Model::default();
+    let warm = engine.submit(input(vec![10, 11], 1)).unwrap();
+    for _ in 0..2 {
+        engine.step(&mut model).unwrap();
+    }
+    assert!(warm.done());
+    let mut submission = input(vec![20], 3);
+    submission.batch_key = Some(2);
+    let running = engine.submit(submission).unwrap();
+    engine.step(&mut model).unwrap();
+    let cached = engine.submit(input(vec![10, 11], 2)).unwrap();
+    assert_eq!(cached.cached_tokens(), 1);
+    let waiting: Vec<_> = [30, 40]
+        .into_iter()
+        .map(|token| {
+            let mut submission = input(vec![token], 2);
+            submission.priority = -1;
+            submission.batch_key = Some(2);
+            engine.submit(submission).unwrap()
+        })
+        .collect();
+    // The first waiting row can grow, then the second is blocked by the
+    // unrelated cached owner. Retrying must release both unadmitted rows.
+    for _ in 0..32 {
+        if !engine.has_work() {
+            break;
+        }
+        engine.step(&mut model).unwrap();
+    }
+    assert!(!engine.has_work());
+    assert_eq!(running.take_result().unwrap(), [21, 22, 23]);
+    assert_eq!(cached.take_result().unwrap(), [12, 13]);
+    for request in waiting {
+        assert_eq!(request.take_result().unwrap().len(), 2);
+    }
+    engine.clear_prefix_cache().unwrap();
+    assert_eq!(engine.cache_free_parent_count(), Some(3));
+}

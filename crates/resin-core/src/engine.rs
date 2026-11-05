@@ -1473,7 +1473,28 @@ impl<P: Clone> EngineCore<P> {
             None
         };
         if let Some(error) = growth_error {
+            // Earlier waiting rows may have grown before a later row failed.
+            // They have not executed and must not pin pages outside admission
+            // estimates when a retraction changes the next dispatch cohort.
+            let rollback_error = self.kv_resources.as_mut().and_then(|resources| {
+                scheduled
+                    .iter_mut()
+                    .filter(|request| !request.is_running() && request.resident_tokens == 0)
+                    .find_map(|request| {
+                        resources
+                            .reset(
+                                request
+                                    .cache
+                                    .as_mut()
+                                    .expect("managed request has cache state"),
+                            )
+                            .err()
+                    })
+            });
             self.scheduler.restore_rejected(scheduled);
+            if let Some(error) = rollback_error {
+                return Err(Error::from(error));
+            }
             if matches!(error, CachePoolError::InsufficientCapacity { .. })
                 && self.storage_pending()
             {
