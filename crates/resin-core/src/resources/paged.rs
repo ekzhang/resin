@@ -91,6 +91,10 @@ impl GroupDemand {
     pub const fn new(group: GroupId, blocks: usize) -> Self {
         Self { group, blocks }
     }
+
+    pub(crate) const fn blocks(self) -> usize {
+        self.blocks
+    }
 }
 
 /// One ordered physical table for one input demand. Duplicate group demands
@@ -875,6 +879,34 @@ impl CachePool {
                 .checked_add(1)
                 .ok_or(CachePoolError::WriterIdExhausted)?,
         );
+        let groups = self.reserve_pages(writer, demands)?;
+        self.last_writer_id = writer.0;
+        Ok(PendingRequestPages {
+            pool_id: self.id,
+            sequence,
+            writer,
+            groups,
+        })
+    }
+
+    /// Make a fully reserved request executable. Private token provenance makes
+    /// this transition infallible.
+    pub fn promote_request(&mut self, pending: PendingRequestPages) -> RequestPages {
+        self.assert_pending_request(&pending);
+        self.promote_pages(pending.writer, &pending.groups);
+        RequestPages {
+            pool_id: pending.pool_id,
+            sequence: pending.sequence,
+            writer: pending.writer,
+            groups: pending.groups,
+        }
+    }
+
+    fn reserve_pages(
+        &mut self,
+        writer: WriterId,
+        demands: &[GroupDemand],
+    ) -> Result<Vec<GroupTable<PageRef>>, CachePoolError> {
         let mut total_blocks = 0usize;
         for demand in demands {
             self.blocks_per_slab(demand.group)?;
@@ -917,38 +949,16 @@ impl CachePool {
         // Every fallible operation completed in prepared metadata.
         // Publishing touches only planned parents and performs no allocation.
         self.commit_plan(plan);
-        self.last_writer_id = writer.0;
-        Ok(PendingRequestPages {
-            pool_id: self.id,
-            sequence,
-            writer,
-            groups,
-        })
+        Ok(groups)
     }
 
-    /// Make a fully reserved request executable. Private token provenance makes
-    /// this transition infallible.
-    pub fn promote_request(&mut self, pending: PendingRequestPages) -> RequestPages {
-        self.assert_pending_request(&pending);
-        for page in pending.groups.iter().flat_map(|group| &group.pages) {
+    fn promote_pages(&mut self, writer: WriterId, groups: &[GroupTable<PageRef>]) {
+        for page in groups.iter().flat_map(|group| &group.pages) {
             let slot = self.slot_mut(page.handle);
-            debug_assert_eq!(
-                slot.mode,
-                Some(PageMode::Reserved {
-                    writer: pending.writer
-                })
-            );
+            debug_assert_eq!(slot.mode, Some(PageMode::Reserved { writer }));
             debug_assert_eq!(slot.request_refs, 0);
-            slot.mode = Some(PageMode::Mutable {
-                writer: pending.writer,
-            });
+            slot.mode = Some(PageMode::Mutable { writer });
             slot.request_refs = 1;
-        }
-        RequestPages {
-            pool_id: pending.pool_id,
-            sequence: pending.sequence,
-            writer: pending.writer,
-            groups: pending.groups,
         }
     }
 
@@ -958,7 +968,8 @@ impl CachePool {
         requests: &[(&RequestPages, Vec<GroupDemand>)],
     ) -> Result<bool, CachePoolError> {
         let mut totals = vec![0usize; self.group_packings.len()];
-        for (_, demands) in requests {
+        for (request, demands) in requests {
+            self.validate_request_idle(request)?;
             for demand in demands {
                 let total = totals
                     .get_mut(demand.group.index() as usize)
@@ -985,7 +996,6 @@ impl CachePool {
         let mut plan =
             PlacementPlan::new(self.group_packings.len(), total_blocks, self.parents.len())?;
         for (request, demands) in requests {
-            self.validate_request_idle(request)?;
             for &demand in demands {
                 let mut pages = Vec::new();
                 pages
@@ -1023,9 +1033,8 @@ impl CachePool {
                 .ok_or(CachePoolError::DemandOverflow)
         })?;
         self.prepare_validation_capacity(request_blocks)?;
-        let mut total_blocks = 0usize;
-        let mut additions = Vec::new();
-        additions
+        let mut growth = Vec::new();
+        growth
             .try_reserve_exact(demands.len())
             .map_err(|_| CachePoolError::MetadataAllocation)?;
         for (demand, group) in demands.iter().zip(&mut request.groups) {
@@ -1037,54 +1046,13 @@ impl CachePool {
                 .pages
                 .try_reserve_exact(additional)
                 .map_err(|_| CachePoolError::MetadataAllocation)?;
-            total_blocks = total_blocks
-                .checked_add(additional)
-                .ok_or(CachePoolError::DemandOverflow)?;
-            let mut pages = Vec::new();
-            pages
-                .try_reserve_exact(additional)
-                .map_err(|_| CachePoolError::MetadataAllocation)?;
-            additions.push(GroupTable {
-                group: demand.group,
-                pages,
-                snapshot: Weak::new(),
-            });
+            growth.push(GroupDemand::new(demand.group, additional));
         }
-        if total_blocks == 0 {
+        if growth.iter().all(|demand| demand.blocks == 0) {
             return Ok(());
         }
-        self.occupied_blocks
-            .checked_add(total_blocks)
-            .ok_or(CachePoolError::DemandOverflow)?;
-
-        let mut plan =
-            PlacementPlan::new(self.group_packings.len(), total_blocks, self.parents.len())?;
-        for ((addition, demand), group) in additions.iter_mut().zip(demands).zip(&request.groups) {
-            let additional = demand.blocks - group.pages.len();
-            self.plan_partition(
-                &mut plan,
-                request.writer,
-                GroupDemand::new(addition.group, additional),
-                &mut addition.pages,
-            )?;
-        }
-        debug_assert_eq!(plan.block_count, total_blocks);
-
-        self.commit_plan(plan);
-        for page in additions.iter().flat_map(|group| &group.pages) {
-            let slot = self.slot_mut(page.handle);
-            debug_assert_eq!(
-                slot.mode,
-                Some(PageMode::Reserved {
-                    writer: request.writer
-                })
-            );
-            debug_assert_eq!(slot.request_refs, 0);
-            slot.mode = Some(PageMode::Mutable {
-                writer: request.writer,
-            });
-            slot.request_refs = 1;
-        }
+        let additions = self.reserve_pages(request.writer, &growth)?;
+        self.promote_pages(request.writer, &additions);
         for (group, mut addition) in request.groups.iter_mut().zip(additions) {
             group.pages.append(&mut addition.pages);
         }
@@ -1364,9 +1332,20 @@ impl CachePool {
         Ok(())
     }
 
+    /// Decide physical copy demand after authenticating the enclosing owner.
+    /// A shared page can regain writes in place once every other owner retires.
+    pub(crate) fn copy_required(&self, page: &PageRef) -> Result<bool, CachePoolError> {
+        let slot = self.validate_live_handle(page.handle)?;
+        if page.writable || slot.mode != Some(PageMode::Shared) {
+            return Err(CachePoolError::StaleHandle);
+        }
+        Ok(slot.cache_refs != 0 || slot.request_refs != 1)
+    }
+
     /// Copy-on-write selected immutable pages for a request which is about to
     /// recycle sliding-window slots. Replacement placement is transactional;
-    /// the old shared references remain untouched on failure.
+    /// the old shared references remain untouched on failure. Evicted pages
+    /// held solely by this idle owner regain write permission in place.
     pub fn replace_shared_pages(
         &mut self,
         request: &mut RequestPages,
@@ -1376,77 +1355,58 @@ impl CachePool {
         if replacements.len() != request.groups.len() {
             return Err(CachePoolError::StaleHandle);
         }
-        let mut total = 0usize;
+        let mut reusable = Vec::new();
+        reusable
+            .try_reserve_exact(replacements.len())
+            .map_err(|_| CachePoolError::MetadataAllocation)?;
         for (indices, group) in replacements.iter().zip(&request.groups) {
+            let mut reuse = Vec::new();
+            reuse
+                .try_reserve_exact(indices.len())
+                .map_err(|_| CachePoolError::MetadataAllocation)?;
             if indices.windows(2).any(|pair| pair[0] >= pair[1]) {
                 return Err(CachePoolError::DuplicateHandle);
             }
             for &index in indices {
                 let page = group.pages.get(index).ok_or(CachePoolError::StaleHandle)?;
-                if page.writable
-                    || self.validate_live_handle(page.handle)?.mode != Some(PageMode::Shared)
-                {
-                    return Err(CachePoolError::StaleHandle);
-                }
+                let exclusive = !self.copy_required(page)?;
+                reuse.push(exclusive);
             }
-            total = total
-                .checked_add(indices.len())
-                .ok_or(CachePoolError::DemandOverflow)?;
+            reusable.push(reuse);
         }
-        if total == 0 {
-            return Ok(());
-        }
-        self.occupied_blocks
-            .checked_add(total)
-            .ok_or(CachePoolError::DemandOverflow)?;
-
-        let mut additions = Vec::new();
-        additions
+        let mut demands = Vec::new();
+        demands
             .try_reserve_exact(request.groups.len())
             .map_err(|_| CachePoolError::MetadataAllocation)?;
-        for (indices, group) in replacements.iter().zip(&request.groups) {
-            let mut pages = Vec::new();
-            pages
-                .try_reserve_exact(indices.len())
-                .map_err(|_| CachePoolError::MetadataAllocation)?;
-            additions.push(GroupTable {
-                group: group.group,
-                pages,
-                snapshot: Weak::new(),
-            });
+        for (reuse, group) in reusable.iter().zip(&request.groups) {
+            demands.push(GroupDemand::new(
+                group.group,
+                reuse.iter().filter(|&&exclusive| !exclusive).count(),
+            ));
         }
-
-        let mut plan = PlacementPlan::new(self.group_packings.len(), total, self.parents.len())?;
-        for (indices, addition) in replacements.iter().zip(&mut additions) {
-            self.plan_partition(
-                &mut plan,
-                request.writer,
-                GroupDemand::new(addition.group, indices.len()),
-                &mut addition.pages,
-            )?;
-        }
-        debug_assert_eq!(plan.block_count, total);
-        self.commit_plan(plan);
-        for page in additions.iter().flat_map(|group| &group.pages) {
-            let slot = self.slot_mut(page.handle);
-            debug_assert_eq!(
-                slot.mode,
-                Some(PageMode::Reserved {
-                    writer: request.writer
-                })
-            );
-            slot.mode = Some(PageMode::Mutable {
-                writer: request.writer,
-            });
-            slot.request_refs = 1;
-        }
-        for ((indices, group), additions) in
-            replacements.iter().zip(&mut request.groups).zip(additions)
+        let additions = self.reserve_pages(request.writer, &demands)?;
+        self.promote_pages(request.writer, &additions);
+        for (((indices, reuse), group), additions) in replacements
+            .iter()
+            .zip(reusable)
+            .zip(&mut request.groups)
+            .zip(additions)
         {
             if !indices.is_empty() {
                 group.snapshot = Weak::new();
             }
-            for (&index, replacement) in indices.iter().zip(additions.pages) {
+            let mut additions = additions.pages.into_iter();
+            for (&index, exclusive) in indices.iter().zip(reuse) {
+                if exclusive {
+                    self.slot_mut(group.pages[index].handle).mode = Some(PageMode::Mutable {
+                        writer: request.writer,
+                    });
+                    group.pages[index].writable = true;
+                    continue;
+                }
+                let replacement = additions
+                    .next()
+                    .expect("each shared page has a prepared replacement");
                 let old = std::mem::replace(&mut group.pages[index], replacement);
                 debug_assert!(!old.writable);
                 self.slot_mut(old.handle).request_refs -= 1;
@@ -2144,6 +2104,75 @@ mod tests {
         assert_eq!(pool.occupied_block_count(), 3);
         pool.retire_request(request).unwrap();
         assert_eq!(pool.occupied_block_count(), 0);
+    }
+
+    #[test]
+    fn evicted_shared_pages_regain_exclusive_writes_without_spare_capacity() {
+        let mut pool = CachePool::new(1, &[nz(1)]).unwrap();
+        let demands = [GroupDemand::new(GroupId::new(0), 1)];
+        let pending = pool.reserve_request(sequence(1), &demands).unwrap();
+        let mut request = pool.promote_request(pending);
+        let cached = pool.share_request_prefix(&mut request, &demands).unwrap();
+        let pending = pool
+            .reserve_request(sequence(2), &[GroupDemand::new(GroupId::new(0), 0)])
+            .unwrap();
+        let mut peer = pool.promote_request(pending);
+        pool.attach_shared_prefix(&mut peer, &cached).unwrap();
+        pool.retire_cached_prefix(cached).unwrap();
+        let handles = request_handles(&request);
+        assert!(matches!(
+            pool.replace_shared_pages(&mut request, &[vec![0]]),
+            Err(CachePoolError::InsufficientCapacity { .. })
+        ));
+        assert!(!request.groups[0].pages[0].writable);
+        pool.retire_request(peer).unwrap();
+        pool.replace_shared_pages(&mut request, &[vec![0]]).unwrap();
+        assert_eq!(request_handles(&request), handles);
+        assert!(request.groups[0].pages[0].writable);
+        assert!(request.groups[0].snapshot.upgrade().is_none());
+        let access = pool.prepare_writer_access(writer_claims(&request)).unwrap();
+        let lease = pool.acquire_writer_access(access).unwrap();
+        pool.release_writer_access(lease);
+        pool.retire_request(request).unwrap();
+        assert_eq!(pool.free_parent_count(), 1);
+    }
+
+    #[test]
+    fn failed_mixed_replacement_does_not_reactivate_an_exclusive_shared_page() {
+        let mut pool = CachePool::new(2, &[nz(1), nz(1)]).unwrap();
+        let demands = [
+            GroupDemand::new(GroupId::new(0), 1),
+            GroupDemand::new(GroupId::new(1), 1),
+        ];
+        let pending = pool.reserve_request(sequence(1), &demands).unwrap();
+        let mut request = pool.promote_request(pending);
+        let first = pool
+            .share_request_prefix(
+                &mut request,
+                &[demands[0], GroupDemand::new(GroupId::new(1), 0)],
+            )
+            .unwrap();
+        let second = pool
+            .share_request_prefix(
+                &mut request,
+                &[GroupDemand::new(GroupId::new(0), 0), demands[1]],
+            )
+            .unwrap();
+        pool.retire_cached_prefix(first).unwrap();
+        let handles = request_handles(&request);
+        assert!(matches!(
+            pool.replace_shared_pages(&mut request, &[vec![0], vec![0]]),
+            Err(CachePoolError::InsufficientCapacity { .. })
+        ));
+        assert_eq!(request_handles(&request), handles);
+        assert!(request.groups.iter().all(|group| !group.pages[0].writable));
+        pool.retire_cached_prefix(second).unwrap();
+        pool.replace_shared_pages(&mut request, &[vec![0], vec![0]])
+            .unwrap();
+        assert_eq!(request_handles(&request), handles);
+        assert!(request.groups.iter().all(|group| group.pages[0].writable));
+        pool.retire_request(request).unwrap();
+        assert_eq!(pool.free_parent_count(), 2);
     }
 
     #[test]

@@ -510,6 +510,104 @@ fn a_panicking_native_runner_cannot_leave_a_healthy_engine() {
 }
 
 #[test]
+fn panicking_checkpoint_access_quarantines_the_accepted_transaction() {
+    struct PanickingCheckpoints;
+    impl Runner<&'static str> for PanickingCheckpoints {
+        fn forward(&mut self, _plan: ExecutionPlan<&'static str>) -> Result<OwnedTokenRows, Error> {
+            OwnedTokenRows::new(vec![2], vec![0, 1])
+        }
+        fn state_checkpoints(&self) -> &[u64] {
+            panic!("checkpoint receipt access failed after model execution");
+        }
+    }
+    for managed_cache in [false, true] {
+        let mut engine = if managed_cache {
+            engine(0, 8)
+        } else {
+            EngineCore::new(
+                RunnerConfig::default(),
+                4,
+                128,
+                SchedulerConfig::default(),
+                false,
+            )
+            .unwrap()
+        };
+        let request = engine.submit(input(vec![1], 1)).unwrap();
+        let error = engine.step(&mut PanickingCheckpoints).unwrap_err();
+        assert_eq!(error.kind, ErrorKind::Execution);
+        assert!(engine.poisoned());
+        assert!(!request.done());
+        assert!(engine.close(&mut PanickingCheckpoints).is_err());
+        if managed_cache {
+            assert_eq!(engine.cache_occupied_block_count(), Some(1));
+            assert_eq!(engine.cache_free_parent_count(), Some(15));
+        }
+    }
+}
+
+#[test]
+fn malformed_output_and_receipt_panic_quarantine_before_any_result_is_published() {
+    use std::cell::RefCell;
+    struct InvalidReceiptRunner {
+        accesses: RefCell<Vec<&'static str>>,
+    }
+    impl Runner<&'static str> for InvalidReceiptRunner {
+        fn forward(&mut self, _plan: ExecutionPlan<&'static str>) -> Result<OwnedTokenRows, Error> {
+            OwnedTokenRows::new(vec![], vec![0, 0])
+        }
+        fn logprobs(&self) -> Option<resin_core::logprobs::LogprobView<'_>> {
+            self.accesses.borrow_mut().push("generated");
+            None
+        }
+        fn prompt_logprobs(&self) -> Option<resin_core::logprobs::LogprobView<'_>> {
+            self.accesses.borrow_mut().push("prompt");
+            None
+        }
+        fn state_checkpoints(&self) -> &[u64] {
+            self.accesses.borrow_mut().push("checkpoints");
+            panic!("receipt access panicked despite malformed output");
+        }
+        fn release(&mut self, _ids: &[u64]) -> Result<(), Error> {
+            self.accesses.borrow_mut().push("release");
+            panic!("accepted ownership must remain quarantined");
+        }
+    }
+    for managed_cache in [false, true] {
+        let mut engine = if managed_cache {
+            engine(0, 8)
+        } else {
+            EngineCore::new(
+                RunnerConfig::default(),
+                4,
+                128,
+                SchedulerConfig::default(),
+                false,
+            )
+            .unwrap()
+        };
+        let request = engine.submit(input(vec![1], 1)).unwrap();
+        let mut runner = InvalidReceiptRunner {
+            accesses: RefCell::new(Vec::new()),
+        };
+        let error = engine.step(&mut runner).unwrap_err();
+        assert_eq!(error.kind, ErrorKind::Execution);
+        assert_eq!(
+            *runner.accesses.borrow(),
+            ["generated", "prompt", "checkpoints"]
+        );
+        assert!(engine.poisoned());
+        assert!(!request.done());
+        assert!(request.take_result().is_err());
+        assert!(engine.close(&mut runner).is_err());
+        if managed_cache {
+            assert_eq!(engine.cache_occupied_block_count(), Some(1));
+            assert_eq!(engine.cache_free_parent_count(), Some(15));
+        }
+    }
+}
+
+#[test]
 fn a_panicking_payload_clone_restores_the_cohort_and_releases_its_cache_access() {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, Ordering};
@@ -2050,4 +2148,182 @@ fn failure_after_next_enqueue_keeps_transferred_lease_quarantined() {
         assert!(!request.done());
         assert!(engine.close(&mut model).is_err());
     }
+}
+
+#[test]
+fn waiting_prefix_owners_are_retracted_before_running_requests_under_pressure() {
+    let mut engine = EngineCore::new(
+        RunnerConfig {
+            cache_layout: Some(
+                KvLayout::new(
+                    10,
+                    vec![KvGroupLayout::new(3, 1, KvRetention::FullContext).unwrap()],
+                )
+                .unwrap(),
+            ),
+            continuation_prefill: true,
+            ..Default::default()
+        },
+        4,
+        30,
+        SchedulerConfig {
+            max_batch_tokens: NonZeroU32::new(16),
+            prefill_chunk_size: NonZeroU32::new(2).unwrap(),
+            ..Default::default()
+        },
+        true,
+    )
+    .unwrap();
+    let mut model = Model::default();
+    let mut waiting = Vec::new();
+    for base in [10, 30, 50] {
+        let prompt: Vec<u32> = (base..base + 7).collect();
+        let seed = engine.submit(input(prompt.clone(), 1)).unwrap();
+        for _ in 0..16 {
+            if seed.done() {
+                break;
+            }
+            engine.step(&mut model).unwrap();
+        }
+        assert!(seed.done());
+        seed.take_result().unwrap();
+        let mut submission = input(prompt, 1);
+        submission.priority = -1;
+        submission.batch_key = Some(1);
+        let request = engine.submit(submission).unwrap();
+        assert_eq!(request.cached_tokens(), 6);
+        waiting.push(request);
+    }
+    let running: Vec<_> = [100, 200]
+        .into_iter()
+        .map(|base| {
+            let mut submission = input((base..base + 6).collect(), 5);
+            submission.batch_key = Some(2);
+            engine.submit(submission).unwrap()
+        })
+        .collect();
+    for _ in 0..128 {
+        if !engine.has_work() {
+            break;
+        }
+        engine.step(&mut model).unwrap();
+    }
+    assert!(
+        !engine.has_work(),
+        "finite requests must drain after evicting waiting prefix owners"
+    );
+    for request in waiting {
+        assert_eq!(request.take_result().unwrap().len(), 1);
+    }
+    for request in running {
+        assert_eq!(request.take_result().unwrap().len(), 5);
+    }
+    engine.clear_prefix_cache().unwrap();
+    assert_eq!(engine.cache_free_parent_count(), Some(10));
+}
+
+#[test]
+fn failed_prefill_growth_releases_unadmitted_pages_before_retrying_running_work() {
+    let mut engine = EngineCore::new(
+        RunnerConfig {
+            cache_layout: Some(
+                KvLayout::new(
+                    3,
+                    vec![KvGroupLayout::new(1, 1, KvRetention::FullContext).unwrap()],
+                )
+                .unwrap(),
+            ),
+            continuation_prefill: true,
+            ..Default::default()
+        },
+        3,
+        3,
+        SchedulerConfig {
+            max_batch_tokens: NonZeroU32::new(16),
+            prefill_chunk_size: NonZeroU32::new(6).unwrap(),
+            schedule_conservativeness: 0.0,
+        },
+        true,
+    )
+    .unwrap();
+    let mut model = Model::default();
+    let warm = engine.submit(input(vec![10, 11], 1)).unwrap();
+    for _ in 0..2 {
+        engine.step(&mut model).unwrap();
+    }
+    assert!(warm.done());
+    let mut submission = input(vec![20], 3);
+    submission.batch_key = Some(2);
+    let running = engine.submit(submission).unwrap();
+    engine.step(&mut model).unwrap();
+    let cached = engine.submit(input(vec![10, 11], 2)).unwrap();
+    assert_eq!(cached.cached_tokens(), 1);
+    let waiting: Vec<_> = [30, 40]
+        .into_iter()
+        .map(|token| {
+            let mut submission = input(vec![token], 2);
+            submission.priority = -1;
+            submission.batch_key = Some(2);
+            engine.submit(submission).unwrap()
+        })
+        .collect();
+    // The first waiting row can grow, then the second is blocked by the
+    // unrelated cached owner. Retrying must release both unadmitted rows.
+    for _ in 0..32 {
+        if !engine.has_work() {
+            break;
+        }
+        engine.step(&mut model).unwrap();
+    }
+    assert!(!engine.has_work());
+    assert_eq!(running.take_result().unwrap(), [21, 22, 23]);
+    assert_eq!(cached.take_result().unwrap(), [12, 13]);
+    for request in waiting {
+        assert_eq!(request.take_result().unwrap().len(), 2);
+    }
+    engine.clear_prefix_cache().unwrap();
+    assert_eq!(engine.cache_free_parent_count(), Some(3));
+}
+
+#[test]
+fn a_displaced_rejected_request_does_not_block_a_higher_priority_request() {
+    let mut engine = EngineCore::new(
+        RunnerConfig {
+            cache_layout: Some(
+                KvLayout::new(
+                    3,
+                    vec![KvGroupLayout::new(1, 1, KvRetention::FullContext).unwrap()],
+                )
+                .unwrap(),
+            ),
+            continuation_prefill: true,
+            ..Default::default()
+        },
+        3,
+        3,
+        SchedulerConfig::default(),
+        false,
+    )
+    .unwrap();
+    let mut model = Model::default();
+    let rejected = engine.submit(input(vec![1, 2, 3], 1)).unwrap();
+    model
+        .outputs
+        .push_back(Err(Error::rejected("preaccept retry")));
+    assert_eq!(
+        engine.step(&mut model).unwrap_err().kind,
+        ErrorKind::Rejected
+    );
+    let mut submission = input(vec![10], 3);
+    submission.priority = 1;
+    let higher = engine.submit(submission).unwrap();
+    for _ in 0..16 {
+        if !engine.has_work() {
+            break;
+        }
+        engine.step(&mut model).unwrap();
+    }
+    assert_eq!(higher.take_result().unwrap(), [11, 12, 13]);
+    assert_eq!(rejected.take_result().unwrap(), [4]);
+    assert_eq!(engine.cache_free_parent_count(), Some(3));
 }

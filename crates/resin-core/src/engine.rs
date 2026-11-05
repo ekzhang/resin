@@ -366,6 +366,22 @@ pub trait Runner<P> {
         Ok(())
     }
 }
+struct RunnerReceipt<'a> {
+    logprobs: Option<LogprobView<'a>>,
+    prompt_logprobs: Option<LogprobView<'a>>,
+    state_checkpoints: &'a [u64],
+}
+
+fn read_runner_receipt<P>(runner: &impl Runner<P>) -> Result<RunnerReceipt<'_>> {
+    execution_call("receipt access", || {
+        Ok(RunnerReceipt {
+            logprobs: runner.logprobs(),
+            prompt_logprobs: runner.prompt_logprobs(),
+            state_checkpoints: runner.state_checkpoints(),
+        })
+    })
+}
+
 #[derive(Debug)]
 struct Request<P> {
     metrics: Option<RequestMetricsState>,
@@ -1304,258 +1320,253 @@ impl<P: Clone> EngineCore<P> {
         overlap: bool,
     ) -> Result<Option<(Batch<P>, ExecutionPlan<P>)>> {
         self.raise_if_open()?;
-        self.poll_storage(false)?;
-        if self.scheduler.is_empty() {
-            return Ok(None);
-        }
+        loop {
+            self.poll_storage(false)?;
+            if self.scheduler.is_empty() {
+                return Ok(None);
+            }
 
-        let (scheduled_rows, selection, mut decode_reservation_lookahead) = {
-            let (selected_requests, mut selection) = self.selected_cohort()?;
-            if selected_requests.is_empty() {
-                return Ok(None);
-            }
-            if phase.is_some_and(|phase| selected_requests[0].phase() != phase) {
-                return Ok(None);
-            }
-            let scheduled_rows = schedule_requests(&selected_requests, self.planning_config())?;
-            if scheduled_rows.is_empty() {
-                return Err(Error::internal(
-                    "scheduler produced no token-bearing rows for a nonempty cohort",
-                ));
-            }
-            if scheduled_rows
-                .iter()
-                .zip(&selected_requests)
-                .any(|(row, request)| {
-                    row.phase == Phase::Prefill
-                        && !row.sample
-                        && (row.token_start() != 0
-                            || row.token_end() != Some(request.prompt_length()))
-                })
-                && !self.runner_config.continuation_prefill
-            {
-                return Err(Error::invalid(
-                    "prefill_chunk_size creates continuation rows but runner_config.continuation_prefill is false",
-                ));
-            }
-            selection.truncate(scheduled_rows.len());
-            let maximum = u64::from(self.runner_config.max_accepted_per_step);
-            let reserve_continuation = overlap
-                && self.runner_config.cache_layout.is_some()
-                && scheduled_rows
+            let (scheduled_rows, selection, mut decode_reservation_lookahead) = {
+                let (selected_requests, mut selection) = self.selected_cohort()?;
+                if selected_requests.is_empty() {
+                    return Ok(None);
+                }
+                if phase.is_some_and(|phase| selected_requests[0].phase() != phase) {
+                    return Ok(None);
+                }
+                let scheduled_rows = schedule_requests(&selected_requests, self.planning_config())?;
+                if scheduled_rows.is_empty() {
+                    return Err(Error::internal(
+                        "scheduler produced no token-bearing rows for a nonempty cohort",
+                    ));
+                }
+                if scheduled_rows
                     .iter()
                     .zip(&selected_requests)
-                    .all(|(row, request)| {
-                        row.phase == Phase::Decode
-                            && request
-                                .max_output_tokens
-                                .saturating_sub(request.generated.len())
-                                as u64
-                                > 2 * maximum
-                    });
-            let lookahead = if reserve_continuation {
-                let layout = self.runner_config.cache_layout.as_ref().unwrap();
-                let writes = u64::from(self.runner_config.decode_write_tokens().unwrap());
-                let page = layout
-                    .groups()
-                    .iter()
-                    .filter(|group| !group.is_recurrent())
-                    .map(|group| u64::from(group.block_tokens().get()))
-                    .max()
-                    .unwrap_or(0);
-                // Reserve one history page of progress plus the two-step
-                // physical write envelope. The plan's actual CSR, rather than
-                // a second runner setting, authenticates the resulting lease.
-                let mut span = page + maximum + writes;
-                for group in layout.groups() {
-                    if let Some(limit) = group.max_write_tokens() {
-                        span = span.min(u64::from(limit.get()));
-                    }
+                    .any(|(row, request)| {
+                        row.phase == Phase::Prefill
+                            && !row.sample
+                            && (row.token_start() != 0
+                                || row.token_end() != Some(request.prompt_length()))
+                    })
+                    && !self.runner_config.continuation_prefill
+                {
+                    return Err(Error::invalid(
+                        "prefill_chunk_size creates continuation rows but runner_config.continuation_prefill is false",
+                    ));
                 }
-                for (row, request) in scheduled_rows.iter().zip(&selected_requests) {
-                    let remaining = request
-                        .max_output_tokens
-                        .saturating_sub(request.generated.len())
-                        as u64;
-                    span = span
-                        .min(u64::from(
-                            self.context_length.get().saturating_sub(row.token_start()),
-                        ))
-                        .min(remaining - 1 + writes);
+                selection.truncate(scheduled_rows.len());
+                let maximum = u64::from(self.runner_config.max_accepted_per_step);
+                let reserve_continuation = overlap
+                    && self.runner_config.cache_layout.is_some()
+                    && scheduled_rows
+                        .iter()
+                        .zip(&selected_requests)
+                        .all(|(row, request)| {
+                            row.phase == Phase::Decode
+                                && request
+                                    .max_output_tokens
+                                    .saturating_sub(request.generated.len())
+                                    as u64
+                                    > 2 * maximum
+                        });
+                let lookahead = if reserve_continuation {
+                    let layout = self.runner_config.cache_layout.as_ref().unwrap();
+                    let writes = u64::from(self.runner_config.decode_write_tokens().unwrap());
+                    let page = layout
+                        .groups()
+                        .iter()
+                        .filter(|group| !group.is_recurrent())
+                        .map(|group| u64::from(group.block_tokens().get()))
+                        .max()
+                        .unwrap_or(0);
+                    // Reserve one history page of progress plus the two-step
+                    // physical write envelope. The plan's actual CSR, rather than
+                    // a second runner setting, authenticates the resulting lease.
+                    let mut span = page + maximum + writes;
                     for group in layout.groups() {
                         if let Some(limit) = group.max_write_tokens() {
-                            let start = u64::from(row.token_start());
-                            let block = u64::from(group.block_tokens().get());
-                            // Every advertised page is pinned in full. Keep
-                            // its rounded tail inside the WINDOW write guard.
-                            let end = (start + u64::from(limit.get())) / block * block;
-                            span = span.min(end.saturating_sub(start));
+                            span = span.min(u64::from(limit.get()));
                         }
                     }
-                }
-                if span >= maximum + writes {
-                    (span - 1) as u32
+                    for (row, request) in scheduled_rows.iter().zip(&selected_requests) {
+                        let remaining = request
+                            .max_output_tokens
+                            .saturating_sub(request.generated.len())
+                            as u64;
+                        span = span
+                            .min(u64::from(
+                                self.context_length.get().saturating_sub(row.token_start()),
+                            ))
+                            .min(remaining - 1 + writes);
+                        for group in layout.groups() {
+                            if let Some(limit) = group.max_write_tokens() {
+                                let start = u64::from(row.token_start());
+                                let block = u64::from(group.block_tokens().get());
+                                // Every advertised page is pinned in full. Keep
+                                // its rounded tail inside the WINDOW write guard.
+                                let end = (start + u64::from(limit.get())) / block * block;
+                                span = span.min(end.saturating_sub(start));
+                            }
+                        }
+                    }
+                    if span >= maximum + writes {
+                        (span - 1) as u32
+                    } else {
+                        self.runner_config.decode_write_lookahead()
+                    }
                 } else {
                     self.runner_config.decode_write_lookahead()
-                }
-            } else {
-                self.runner_config.decode_write_lookahead()
-            };
-            (scheduled_rows, selection, lookahead)
-        };
-        let batch_id = self.next_batch_id;
-        self.next_batch_id = self
-            .next_batch_id
-            .checked_add(1)
-            .ok_or_else(|| Error::internal("batch id space is exhausted"))?;
-        for row in &scheduled_rows {
-            let end = row
-                .token_end()
-                .ok_or_else(|| Error::invalid("scheduled token range overflows u32"))?;
-            if row.phase == Phase::Decode && end.checked_add(decode_reservation_lookahead).is_none()
-            {
-                return Err(Error::invalid("decode cache write lookahead overflows u32"));
-            }
-        }
-        let mut scheduled = self.scheduler.take_selected(selection);
-
-        if decode_reservation_lookahead > self.runner_config.decode_write_lookahead() {
-            let resources = self.kv_resources.as_ref().expect("reservation has a cache");
-            let requests = scheduled
-                .iter()
-                .zip(&scheduled_rows)
-                .map(|(request, row)| {
-                    (
-                        request
-                            .cache
-                            .as_ref()
-                            .expect("managed request has cache state"),
-                        row.token_start(),
-                        row.token_end().expect("validated scheduled range")
-                            + decode_reservation_lookahead,
-                    )
-                })
-                .collect::<Vec<_>>();
-            match resources.can_ensure_contexts(&requests) {
-                Ok(true) => {}
-                Ok(false) => {
-                    decode_reservation_lookahead = self.runner_config.decode_write_lookahead()
-                }
-                Err(error) => {
-                    self.scheduler.restore_rejected(scheduled);
-                    return Err(Error::from(error));
-                }
-            }
-        }
-
-        let growth_error = if let Some(resources) = self.kv_resources.as_mut() {
-            let mut growth_error = None;
-            for (request, row) in scheduled.iter_mut().zip(&scheduled_rows) {
-                let scheduled_end = row.token_end().expect("validated scheduled range");
-                let context = if row.phase == Phase::Decode {
-                    scheduled_end
-                        .checked_add(decode_reservation_lookahead)
-                        .expect("validated decode lookahead")
-                } else {
-                    scheduled_end
                 };
-                let pages = request
-                    .cache
-                    .as_mut()
-                    .expect("managed requests keep their cache state");
-                if let Err(error) = resources.ensure_context(pages, row.token_start(), context) {
-                    growth_error = Some(error);
-                    break;
+                (scheduled_rows, selection, lookahead)
+            };
+            let batch_id = self.next_batch_id;
+            self.next_batch_id = self
+                .next_batch_id
+                .checked_add(1)
+                .ok_or_else(|| Error::internal("batch id space is exhausted"))?;
+            for row in &scheduled_rows {
+                let end = row
+                    .token_end()
+                    .ok_or_else(|| Error::invalid("scheduled token range overflows u32"))?;
+                if row.phase == Phase::Decode
+                    && end.checked_add(decode_reservation_lookahead).is_none()
+                {
+                    return Err(Error::invalid("decode cache write lookahead overflows u32"));
                 }
             }
-            growth_error
-        } else {
-            None
-        };
-        if let Some(error) = growth_error {
-            self.scheduler.restore_rejected(scheduled);
-            if matches!(error, CachePoolError::InsufficientCapacity { .. })
-                && self.storage_pending()
-            {
-                return Ok(None);
-            }
-            if matches!(error, CachePoolError::InsufficientCapacity { .. })
-                && self.retract_one(runner)?
-            {
-                return self.prepare_batch(runner, phase, overlap);
-            }
-            return Err(Error::from(error));
-        }
+            let mut scheduled = self.scheduler.take_selected(selection);
 
-        let mut acquired_kv = match self.kv_resources.as_mut() {
-            Some(resources) => {
-                let requests = scheduled
-                    .iter()
-                    .map(|request| RequestResourceRef {
-                        request_id: core_request_id(request.id),
-                        state: request
-                            .cache
-                            .as_ref()
-                            .expect("managed requests keep their cache state"),
-                    })
-                    .collect::<Vec<_>>();
-                match resources.acquire(&requests, &scheduled_rows, decode_reservation_lookahead) {
-                    Ok(acquired) => Some(acquired),
-                    Err(error) => {
-                        self.scheduler.restore_rejected(scheduled);
-                        return Err(Error::from(error));
+            // A prepared cohort resolves in one place. Before runner acceptance,
+            // failure releases access and discards uncommitted cold allocations;
+            // resident/replay state stays owned by its request for the next attempt.
+            let mut acquired_kv = None;
+            let mut capacity_miss = false;
+            let plan = (|| {
+                if let Some(resources) = self.kv_resources.as_mut() {
+                    if decode_reservation_lookahead > self.runner_config.decode_write_lookahead() {
+                        let requests = scheduled
+                            .iter()
+                            .zip(&scheduled_rows)
+                            .map(|(request, row)| {
+                                (
+                                    request
+                                        .cache
+                                        .as_ref()
+                                        .expect("managed request has cache state"),
+                                    row.token_start(),
+                                    row.token_end().expect("validated scheduled range")
+                                        + decode_reservation_lookahead,
+                                )
+                            })
+                            .collect::<Vec<_>>();
+                        if !resources.can_ensure_contexts(&requests)? {
+                            decode_reservation_lookahead =
+                                self.runner_config.decode_write_lookahead();
+                        }
                     }
-                }
-            }
-            None => {
-                if scheduled.iter().any(|request| request.cache.is_some()) {
-                    self.scheduler.restore_rejected(scheduled);
+                    for (request, row) in scheduled.iter_mut().zip(&scheduled_rows) {
+                        let end = row.token_end().expect("validated scheduled range");
+                        let context = end
+                            + if row.phase == Phase::Decode {
+                                decode_reservation_lookahead
+                            } else {
+                                0
+                            };
+                        resources
+                            .ensure_context(
+                                request
+                                    .cache
+                                    .as_mut()
+                                    .expect("managed request has cache state"),
+                                row.token_start(),
+                                context,
+                            )
+                            .map_err(|error| {
+                                capacity_miss =
+                                    matches!(error, CachePoolError::InsufficientCapacity { .. });
+                                Error::from(error)
+                            })?;
+                    }
+                    let requests = scheduled
+                        .iter()
+                        .map(|request| RequestResourceRef {
+                            request_id: core_request_id(request.id),
+                            state: request
+                                .cache
+                                .as_ref()
+                                .expect("managed request has cache state"),
+                        })
+                        .collect::<Vec<_>>();
+                    acquired_kv = Some(resources.acquire(
+                        &requests,
+                        &scheduled_rows,
+                        decode_reservation_lookahead,
+                    )?);
+                } else if scheduled.iter().any(|request| request.cache.is_some()) {
                     return Err(Error::internal(
                         "unmanaged Engine request unexpectedly owns KV resource state",
                     ));
                 }
-                None
-            }
-        };
-
-        // Payload cloning is caller code too. It runs before runner execution,
-        // so an unwind must release access and restore the selected requests.
-        let plan = catch_unwind(AssertUnwindSafe(|| {
-            build_plan(
-                batch_id,
-                &scheduled,
-                &scheduled_rows,
-                acquired_kv.as_mut().map(|acquired| &mut acquired.groups),
-            )
-        }))
-        .unwrap_or_else(|_| {
-            Err(Error::rejected(
-                "payload cloning panicked before runner execution",
-            ))
-        });
-        let plan = match plan {
-            Ok(plan) => plan,
-            Err(error) => {
-                self.release_kv_access(acquired_kv.take().map(|access| access.lease));
-                self.scheduler.restore_rejected(scheduled);
-                return Err(error);
-            }
-        };
-        let batch = Batch {
-            prepared_at: self.metrics.as_ref().map(|_| Instant::now()),
-            rows: scheduled
-                .into_iter()
-                .zip(scheduled_rows)
-                .map(|(request, scheduled)| BatchRow {
-                    request,
-                    scheduled,
-                    terminal: false,
+                // Cloning payloads is caller code, before execution can have effects.
+                catch_unwind(AssertUnwindSafe(|| {
+                    build_plan(
+                        batch_id,
+                        &scheduled,
+                        &scheduled_rows,
+                        acquired_kv.as_mut().map(|access| &mut access.groups),
+                    )
+                }))
+                .unwrap_or_else(|_| {
+                    Err(Error::rejected(
+                        "payload cloning panicked before runner execution",
+                    ))
                 })
-                .collect(),
-            resources: acquired_kv.map(|access| access.lease),
-        };
+            })();
+            let plan = match plan {
+                Ok(plan) => plan,
+                Err(error) => {
+                    self.release_kv_access(acquired_kv.take().map(|access| access.lease));
+                    let rollback = self.kv_resources.as_mut().map_or(Ok(()), |resources| {
+                        scheduled
+                            .iter_mut()
+                            .filter(|request| !request.is_running() && request.resident_tokens == 0)
+                            .try_for_each(|request| {
+                                resources.reset(
+                                    request
+                                        .cache
+                                        .as_mut()
+                                        .expect("managed request has cache state"),
+                                )
+                            })
+                    });
+                    self.scheduler.restore_rejected(scheduled);
+                    rollback?;
+                    if capacity_miss && self.storage_pending() {
+                        return Ok(None);
+                    }
+                    if capacity_miss && self.retract_one(runner)? {
+                        continue;
+                    }
+                    return Err(error);
+                }
+            };
+            let batch = Batch {
+                prepared_at: self.metrics.as_ref().map(|_| Instant::now()),
+                rows: scheduled
+                    .into_iter()
+                    .zip(scheduled_rows)
+                    .map(|(request, scheduled)| BatchRow {
+                        request,
+                        scheduled,
+                        terminal: false,
+                    })
+                    .collect(),
+                resources: acquired_kv.map(|access| access.lease),
+            };
 
-        Ok(Some((batch, plan)))
+            return Ok(Some((batch, plan)));
+        }
     }
 
     fn complete_batch<E>(
@@ -1568,9 +1579,13 @@ impl<P: Clone> EngineCore<P> {
     ) -> Result<Vec<E>> {
         // Validate the complete execution result before terminal output limits
         // can hide writes beyond the leased capacity or extra prefill tokens.
-        let logprobs = match execution_call("logprob access", || Ok(runner.logprobs())) {
-            Ok(scores) => scores,
-            Err(error) => return self.quarantine(batch, "runner logprob access failed", error),
+        let RunnerReceipt {
+            logprobs,
+            prompt_logprobs,
+            state_checkpoints,
+        } = match read_runner_receipt(runner) {
+            Ok(receipt) => receipt,
+            Err(error) => return self.quarantine(batch, "runner receipt access failed", error),
         };
         if let Err(error) = self
             .validate_runner_output(&batch.rows, output_token_ids)
@@ -1583,13 +1598,6 @@ impl<P: Clone> EngineCore<P> {
             .first()
             .is_some_and(|row| row.scheduled.phase == Phase::Decode);
 
-        let prompt_logprobs =
-            match execution_call("prompt logprob access", || Ok(runner.prompt_logprobs())) {
-                Ok(scores) => scores,
-                Err(error) => {
-                    return self.quarantine(batch, "runner prompt logprob access failed", error);
-                }
-            };
         let prompt_counts = batch
             .rows
             .iter()
@@ -1738,9 +1746,7 @@ impl<P: Clone> EngineCore<P> {
                     )
                 })
                 .collect::<Vec<_>>();
-            if let Err(error) =
-                resources.accept_state_checkpoints(&progress, runner.state_checkpoints())
-            {
+            if let Err(error) = resources.accept_state_checkpoints(&progress, state_checkpoints) {
                 return self.quarantine(
                     batch,
                     "invalid state checkpoint receipt",
@@ -1750,7 +1756,7 @@ impl<P: Clone> EngineCore<P> {
             resources.finish_state_initialization(
                 &progress.iter().map(|item| item.0).collect::<Vec<_>>(),
             );
-        } else if !runner.state_checkpoints().is_empty() {
+        } else if !state_checkpoints.is_empty() {
             return self.quarantine(
                 batch,
                 "unexpected state checkpoint receipt",
@@ -2139,16 +2145,19 @@ impl<P: Clone> EngineCore<P> {
             .iter()
             .filter(|request| {
                 request.cache.as_ref().is_some_and(|pages| {
-                    if running_count > 1 {
-                        request.is_running()
-                    } else {
-                        !request.is_running()
-                            && request.resident_tokens > 0
-                            && resources.pool().validate_request_idle(pages).is_ok()
-                    }
+                    resources.reclaimable(pages) && (!request.is_running() || running_count > 1)
                 })
             })
-            .min_by_key(|request| (request.generated.len(), Reverse(request.prompt.len())))
+            // Waiting prefix hits can pin pages outside admission estimates.
+            // Release those owners before replaying admitted work; otherwise a
+            // retracted prefill can be readmitted forever while decode stalls.
+            .min_by_key(|request| {
+                (
+                    request.is_running(),
+                    request.generated.len(),
+                    Reverse(request.prompt.len()),
+                )
+            })
             .map(|request| request.id)
         else {
             return Ok(false);

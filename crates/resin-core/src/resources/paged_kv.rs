@@ -105,6 +105,11 @@ pub struct PagedKvResources {
     last_snapshot_id: u64,
 }
 
+struct ContextPlan {
+    demands: Vec<GroupDemand>,
+    replacements: Vec<Vec<usize>>,
+}
+
 #[derive(Debug)]
 struct StateResources {
     pending: bool,
@@ -443,6 +448,74 @@ impl PagedKvResources {
         Ok(state)
     }
 
+    /// Plan growth and writable slots together, using the post-growth ring size.
+    fn context_plan(
+        &self,
+        state: &RequestPages,
+        start: u32,
+        context: u32,
+    ) -> Result<ContextPlan, CachePoolError> {
+        self.validate_write_span(start, context)?;
+        let mut demands = Vec::with_capacity(self.layout.groups().len());
+        let mut replacements = Vec::with_capacity(self.layout.groups().len());
+        for (index, (group, table)) in self
+            .layout
+            .groups()
+            .iter()
+            .copied()
+            .zip(state.groups())
+            .enumerate()
+        {
+            // Wide leases may leave idle spare pages; owner growth never shrinks.
+            let page_count = (group.active_blocks(context).1 as usize).max(table.pages().len());
+            demands.push(GroupDemand::new(GroupId::new(index as u32), page_count));
+            let first = start / group.block_tokens().get();
+            // A cyclic table is visited at most once, even for long prefills.
+            let count = context
+                .div_ceil(group.block_tokens().get())
+                .saturating_sub(first)
+                .min(page_count as u32);
+            let mut indices = Vec::new();
+            for logical in first..first + count {
+                let address =
+                    page_index(group, page_count, logical).ok_or(CachePoolError::StaleHandle)?;
+                if table
+                    .pages()
+                    .get(address)
+                    .is_some_and(|page| !page.is_writable())
+                {
+                    if group.retention() == KvRetention::FullContext && !group.is_recurrent() {
+                        return Err(CachePoolError::PageNotWritable);
+                    }
+                    indices.push(address);
+                }
+            }
+            indices.sort_unstable();
+            indices.dedup();
+            replacements.push(indices);
+        }
+        Ok(ContextPlan {
+            demands,
+            replacements,
+        })
+    }
+
+    fn allocate_with_eviction(
+        &mut self,
+        mut allocate: impl FnMut(&mut CachePool) -> Result<(), CachePoolError>,
+    ) -> Result<(), CachePoolError> {
+        loop {
+            match allocate(&mut self.pool) {
+                Err(error @ CachePoolError::InsufficientCapacity { .. }) => {
+                    if !self.evict_one_prefix()? {
+                        return Err(error);
+                    }
+                }
+                result => return result,
+            }
+        }
+    }
+
     /// Grow one request just enough to address `context` tokens.
     pub fn ensure_context(
         &mut self,
@@ -450,83 +523,12 @@ impl PagedKvResources {
         token_start: u32,
         context: u32,
     ) -> Result<(), CachePoolError> {
-        self.validate_write_span(token_start, context)?;
-        // A previous wide lease can end beyond this step's ordinary span.
-        // Keep its idle spare pages; grow_request must never shrink owners.
-        let demands = self
-            .layout
-            .groups()
-            .iter()
-            .zip(state.groups())
-            .enumerate()
-            .map(|(index, (group, table))| {
-                GroupDemand::new(
-                    GroupId::new(index as u32),
-                    (group.active_blocks(context).1 as usize).max(table.pages().len()),
-                )
-            })
-            .collect::<Vec<_>>();
-        loop {
-            match self.pool.grow_request(state, &demands) {
-                Ok(()) => break,
-                Err(error @ CachePoolError::InsufficientCapacity { .. }) => {
-                    if !self.evict_one_prefix()? {
-                        return Err(error);
-                    }
-                }
-                Err(error) => return Err(error),
-            }
-        }
-
-        let mut replacements = vec![Vec::new(); self.layout.groups().len()];
-        for (group_index, group) in self.layout.groups().iter().copied().enumerate() {
-            let table = &state.groups()[group_index];
-            let first = token_start / group.block_tokens().get();
-            let count = context
-                .div_ceil(group.block_tokens().get())
-                .saturating_sub(first);
-            // A cyclic table can be visited at most once. In particular, a
-            // long prefill must not scan every token to discover COW pages.
-            let count = if group.is_recurrent() || group.max_write_tokens().is_some() {
-                count.min(table.pages().len() as u32)
-            } else {
-                count
-            };
-            for logical in first..first + count {
-                let index = page_index(group, table.pages().len(), logical).ok_or(
-                    CachePoolError::InsufficientCapacity {
-                        group: GroupId::new(group_index as u32),
-                        requested: logical as usize + 1,
-                        available: table.pages().len(),
-                    },
-                )?;
-                let page = &table.pages()[index];
-                if !page.is_writable() {
-                    if group.retention() == KvRetention::FullContext && !group.is_recurrent() {
-                        return Err(CachePoolError::PageNotWritable);
-                    }
-                    replacements[group_index].push(index);
-                }
-            }
-            replacements[group_index].sort_unstable();
-            replacements[group_index].dedup();
-        }
-        // grow_request already authenticated the whole idle owner above. An
-        // unchanged ring needs no second full-history validation or mutation.
-        if replacements.iter().all(Vec::is_empty) {
+        let plan = self.context_plan(state, token_start, context)?;
+        self.allocate_with_eviction(|pool| pool.grow_request(state, &plan.demands))?;
+        if plan.replacements.iter().all(Vec::is_empty) {
             return Ok(());
         }
-        loop {
-            match self.pool.replace_shared_pages(state, &replacements) {
-                Ok(()) => return Ok(()),
-                Err(error @ CachePoolError::InsufficientCapacity { .. }) => {
-                    if !self.evict_one_prefix()? {
-                        return Err(error);
-                    }
-                }
-                Err(error) => return Err(error),
-            }
-        }
+        self.allocate_with_eviction(|pool| pool.replace_shared_pages(state, &plan.replacements))
     }
 
     /// Check optional cohort growth/COW before changing any request. Prefix
@@ -537,26 +539,19 @@ impl PagedKvResources {
     ) -> Result<bool, CachePoolError> {
         let mut allocations = Vec::with_capacity(requests.len());
         for &(state, start, context) in requests {
-            self.validate_write_span(start, context)?;
-            let mut additions = Vec::with_capacity(self.layout.groups().len());
-            for (index, group) in self.layout.groups().iter().copied().enumerate() {
-                let pages = state.groups()[index].pages();
-                let (_, wanted) = group.active_blocks(context);
-                let page_count = (wanted as usize).max(pages.len());
-                let mut extra = page_count - pages.len();
-                let first = start / group.block_tokens().get();
-                let count = context
-                    .div_ceil(group.block_tokens().get())
-                    .saturating_sub(first)
-                    .min(page_count as u32);
-                for logical in first..first + count {
-                    let address = page_index(group, page_count, logical)
-                        .ok_or(CachePoolError::StaleHandle)?;
-                    if pages.get(address).is_some_and(|page| !page.is_writable()) {
-                        extra += 1;
-                    }
+            let plan = self.context_plan(state, start, context)?;
+            let mut additions = Vec::with_capacity(plan.demands.len());
+            for ((table, demand), indices) in state
+                .groups()
+                .iter()
+                .zip(plan.demands)
+                .zip(plan.replacements)
+            {
+                let mut extra = demand.blocks() - table.pages().len();
+                for index in indices {
+                    extra += usize::from(self.pool.copy_required(&table.pages()[index])?);
                 }
-                additions.push(GroupDemand::new(GroupId::new(index as u32), extra));
+                additions.push(GroupDemand::new(table.group(), extra));
             }
             allocations.push((state, additions));
         }
@@ -696,6 +691,12 @@ impl PagedKvResources {
 
     pub fn prefix_alignment(&self) -> Option<u32> {
         self.prefix_cache.as_ref().map(PrefixCache::alignment)
+    }
+
+    /// Idle physical ownership is reclaimable even before any logical progress.
+    pub(crate) fn reclaimable(&self, state: &RequestPages) -> bool {
+        state.groups().iter().any(|group| !group.pages().is_empty())
+            && self.pool.validate_request_idle(state).is_ok()
     }
 
     /// Drop resident KV while retaining the request's allocator identity.
@@ -1645,6 +1646,173 @@ mod tests {
         assert!(resources.acquire(&requests, &[step], 0).is_err());
         resources.release(access.lease);
         resources.retire(state).unwrap();
+    }
+
+    #[test]
+    fn optional_growth_matches_exclusive_window_reuse_after_snapshot_eviction() {
+        let layout = KvLayout::new(
+            2,
+            vec![
+                KvGroupLayout::new(
+                    1,
+                    1,
+                    KvRetention::SlidingWindow {
+                        tokens: NonZeroU32::new(2).unwrap(),
+                    },
+                )
+                .unwrap()
+                .with_read_window_tokens(1)
+                .unwrap(),
+            ],
+        )
+        .unwrap();
+        let mut resources = PagedKvResources::with_prefix_cache(layout).unwrap();
+        let mut source = resources
+            .attach(RequestId::new(NonZeroU64::new(1).unwrap()), 0)
+            .unwrap();
+        resources.ensure_context(&mut source, 0, 2).unwrap();
+        resources
+            .publish_prefix(&mut source, &key(&[1, 2]), 2)
+            .unwrap();
+        let mut peer = resources
+            .attach(RequestId::new(NonZeroU64::new(2).unwrap()), 0)
+            .unwrap();
+        assert_eq!(
+            resources
+                .restore_prefix(&mut peer, &key(&[1, 2, 3]))
+                .unwrap(),
+            2
+        );
+        resources.clear_prefix_cache().unwrap();
+        let handles = source.groups()[0]
+            .pages()
+            .iter()
+            .map(|page| page.handle())
+            .collect::<Vec<_>>();
+        assert!(!resources.can_ensure_contexts(&[(&source, 2, 4)]).unwrap());
+        assert!(matches!(
+            resources.ensure_context(&mut source, 2, 4),
+            Err(CachePoolError::InsufficientCapacity { .. })
+        ));
+        resources.retire(peer).unwrap();
+        assert!(resources.can_ensure_contexts(&[(&source, 2, 4)]).unwrap());
+        assert!(
+            source.groups()[0]
+                .pages()
+                .iter()
+                .all(|page| !page.is_writable())
+        );
+        resources.ensure_context(&mut source, 2, 4).unwrap();
+        assert_eq!(
+            source.groups()[0]
+                .pages()
+                .iter()
+                .map(|page| page.handle())
+                .collect::<Vec<_>>(),
+            handles
+        );
+        assert!(
+            source.groups()[0]
+                .pages()
+                .iter()
+                .all(|page| page.is_writable())
+        );
+        resources.retire(source).unwrap();
+        assert_eq!(resources.pool().free_parent_count(), 2);
+    }
+
+    #[test]
+    fn optional_growth_checks_busy_ownership_even_with_free_parents() {
+        let layout = KvLayout::new(
+            8,
+            vec![KvGroupLayout::new(1, 1, KvRetention::FullContext).unwrap()],
+        )
+        .unwrap();
+        let mut resources = PagedKvResources::new(layout).unwrap();
+        let mut state = resources
+            .attach(RequestId::new(NonZeroU64::new(1).unwrap()), 0)
+            .unwrap();
+        assert!(!resources.reclaimable(&state));
+        resources.ensure_context(&mut state, 0, 1).unwrap();
+        assert!(resources.reclaimable(&state));
+        let claims = state
+            .groups()
+            .iter()
+            .flat_map(|group| group.pages())
+            .map(|page| state.access_claim(page))
+            .collect();
+        let prepared = resources.pool.prepare_writer_access(claims).unwrap();
+        let lease = resources.pool.acquire_writer_access(prepared).unwrap();
+        assert!(!resources.reclaimable(&state));
+        assert!(matches!(
+            resources.can_ensure_contexts(&[(&state, 1, 2)]),
+            Err(CachePoolError::AccessConflict)
+        ));
+        assert!(matches!(
+            resources.ensure_context(&mut state, 1, 2),
+            Err(CachePoolError::AccessConflict)
+        ));
+        resources.pool.release_writer_access(lease);
+        assert!(resources.reclaimable(&state));
+        assert!(resources.can_ensure_contexts(&[(&state, 1, 2)]).unwrap());
+        resources.ensure_context(&mut state, 1, 2).unwrap();
+        resources.retire(state).unwrap();
+        assert_eq!(resources.pool().free_parent_count(), 8);
+    }
+
+    #[test]
+    fn prefix_eviction_recycles_window_pages_when_live_history_fills_the_pool() {
+        let layout = KvLayout::new(
+            6,
+            vec![
+                KvGroupLayout::new(1, 1, KvRetention::FullContext).unwrap(),
+                KvGroupLayout::new(
+                    1,
+                    1,
+                    KvRetention::SlidingWindow {
+                        tokens: NonZeroU32::new(2).unwrap(),
+                    },
+                )
+                .unwrap()
+                .with_read_window_tokens(1)
+                .unwrap(),
+            ],
+        )
+        .unwrap();
+        let mut resources = PagedKvResources::with_prefix_cache(layout).unwrap();
+        let mut state = resources
+            .attach(RequestId::new(NonZeroU64::new(1).unwrap()), 0)
+            .unwrap();
+        resources.ensure_context(&mut state, 0, 2).unwrap();
+        assert!(
+            resources
+                .publish_prefix(&mut state, &key(&[1, 2]), 2)
+                .unwrap()
+        );
+        let window = state.groups()[1]
+            .pages()
+            .iter()
+            .map(|page| page.handle())
+            .collect::<Vec<_>>();
+        resources.ensure_context(&mut state, 2, 4).unwrap();
+        assert_eq!(resources.pool().free_parent_count(), 0);
+        assert_eq!(
+            state.groups()[1]
+                .pages()
+                .iter()
+                .map(|page| page.handle())
+                .collect::<Vec<_>>(),
+            window
+        );
+        assert!(
+            state.groups()[1]
+                .pages()
+                .iter()
+                .all(|page| page.is_writable())
+        );
+        resources.retire(state).unwrap();
+        resources.clear_prefix_cache().unwrap();
+        assert_eq!(resources.pool().free_parent_count(), 6);
     }
 
     #[test]
