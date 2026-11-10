@@ -1,8 +1,3 @@
-#![expect(
-    clippy::clone_on_copy,
-    reason = "PyO3 0.29 from_py_object emits Clone::clone for Copy enums"
-)]
-
 use std::num::{NonZeroU32, NonZeroUsize};
 use std::sync::{Arc, OnceLock};
 
