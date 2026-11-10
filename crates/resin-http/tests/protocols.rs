@@ -1139,6 +1139,116 @@ async fn responses_and_anthropic_streams_emit_protocol_events() {
     assert!(events.contains("event: message_stop"));
 }
 
+#[tokio::test]
+async fn anthropic_streams_balance_blocks_across_content_transitions() {
+    for kinds in [
+        vec![],
+        vec!["text", "text", "thinking"],
+        vec!["thinking", "thinking", "text"],
+        vec!["text", "thinking", "text", "thinking"],
+        vec!["thinking", "text", "tool_use", "thinking", "text"],
+        vec!["text", "thinking", "tool_use", "tool_use", "text"],
+    ] {
+        let expected = kinds
+            .chunk_by(|a, b| a == b && *a != "tool_use")
+            .map(|group| {
+                (
+                    group[0],
+                    if group[0] == "tool_use" {
+                        "{}".into()
+                    } else {
+                        "x".repeat(group.len())
+                    },
+                )
+            })
+            .collect::<Vec<_>>();
+        let (jobs, mut receiver) = mpsc::channel::<GenerationJob>(1);
+        tokio::spawn(async move {
+            let job = receiver.recv().await.unwrap();
+            let mut tool_index = 0;
+            for kind in kinds {
+                let event = match kind {
+                    "text" => GenerationEvent::TextDelta {
+                        delta: "x".into(),
+                        logprobs: vec![],
+                    },
+                    "thinking" => GenerationEvent::ReasoningDelta("x".into()),
+                    "tool_use" => {
+                        job.events
+                            .send(GenerationEvent::ToolCallStart {
+                                index: tool_index,
+                                id: format!("call_{tool_index}"),
+                                name: "tool".into(),
+                            })
+                            .await
+                            .unwrap();
+                        let event = GenerationEvent::ToolCallArgumentsDelta {
+                            index: tool_index,
+                            delta: "{}".into(),
+                        };
+                        tool_index += 1;
+                        event
+                    }
+                    _ => unreachable!(),
+                };
+                job.events.send(event).await.unwrap();
+            }
+            job.events
+                .send(GenerationEvent::Finished {
+                    reason: FinishReason::Stop,
+                    input_tokens: 1,
+                    cached_tokens: 0,
+                    output_tokens: 1,
+                    elapsed_ms: 1.0,
+                    generation_elapsed_ms: 1.0,
+                    time_to_first_token_ms: 0.0,
+                })
+                .await
+                .unwrap();
+        });
+        let app = router("test-model", jobs, None, RouteConfig::default(), None);
+        let events = stream_events(app, generation_request("/v1/messages", true)).await;
+        let mut blocks = Vec::<(String, String, bool)>::new();
+        for event in events {
+            match event["type"].as_str().unwrap() {
+                "content_block_start" => {
+                    assert_eq!(event["index"], blocks.len(), "{event}");
+                    blocks.push((
+                        event["content_block"]["type"].as_str().unwrap().into(),
+                        String::new(),
+                        false,
+                    ));
+                }
+                "content_block_delta" => {
+                    let (kind, text, stopped) =
+                        &mut blocks[event["index"].as_u64().unwrap() as usize];
+                    assert!(!*stopped, "delta after stop: {event}");
+                    let (delta_type, field) = match kind.as_str() {
+                        "text" => ("text_delta", "text"),
+                        "thinking" => ("thinking_delta", "thinking"),
+                        "tool_use" => ("input_json_delta", "partial_json"),
+                        _ => unreachable!(),
+                    };
+                    assert_eq!(event["delta"]["type"], delta_type);
+                    text.push_str(event["delta"][field].as_str().unwrap());
+                }
+                "content_block_stop" => {
+                    let stopped = &mut blocks[event["index"].as_u64().unwrap() as usize].2;
+                    assert!(!*stopped, "duplicate stop: {event}");
+                    *stopped = true;
+                }
+                _ => {}
+            }
+        }
+        assert_eq!(blocks.len(), expected.len());
+        for ((kind, text, stopped), (expected_kind, expected_text)) in blocks.iter().zip(expected) {
+            assert_eq!(kind, expected_kind);
+            assert_eq!(text, &expected_text);
+            assert!(stopped);
+        }
+    }
+}
+
 fn generation_request(path: &str, stream: bool) -> Request<Body> {
     let body = if path == "/v1/responses" {
         json!({"model": "test-model", "input": "hi", "stream": stream})

@@ -322,13 +322,18 @@ fn messages_stream(
     request: ConversationRequest,
     mut receiver: mpsc::Receiver<GenerationEvent>,
 ) -> Sse<impl futures_core::Stream<Item = Result<Event, Infallible>>> {
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum TextBlock {
+        Thinking,
+        Text,
+    }
+
     let output = stream! {
         let mut terminated = false;
         let mut stop_sequence: Option<String> = None;
         let mut input_tokens = 0;
         let mut block_index = 0_usize;
-        let mut reasoning_open = false;
-        let mut text_open = false;
+        let mut open_block = None;
         let mut tool_indices = Vec::<usize>::new();
         let mut has_tool_calls = false;
         while let Some(event) = receiver.recv().await {
@@ -341,35 +346,32 @@ fn messages_stream(
                     }));
                 }
                 GenerationEvent::ReasoningDelta(delta) => {
-                    if !reasoning_open {
-                        reasoning_open = true;
+                    if open_block != Some(TextBlock::Thinking) {
+                        if open_block.is_some() {
+                            yield named_event("content_block_stop", json!({"type": "content_block_stop", "index": block_index}));
+                            block_index += 1;
+                        }
+                        open_block = Some(TextBlock::Thinking);
                         yield named_event("content_block_start", json!({"type": "content_block_start", "index": block_index, "content_block": {"type": "thinking", "thinking": "", "signature": ""}}));
                     }
                     yield named_event("content_block_delta", json!({"type": "content_block_delta", "index": block_index, "delta": {"type": "thinking_delta", "thinking": delta}}));
                 }
                 GenerationEvent::TextDelta { delta, .. } => {
-                    if reasoning_open && !text_open {
-                        yield named_event("content_block_stop", json!({"type": "content_block_stop", "index": block_index}));
-                        block_index += 1;
-                        reasoning_open = false;
-                    }
-                    if !text_open {
-                        text_open = true;
+                    if open_block != Some(TextBlock::Text) {
+                        if open_block.is_some() {
+                            yield named_event("content_block_stop", json!({"type": "content_block_stop", "index": block_index}));
+                            block_index += 1;
+                        }
+                        open_block = Some(TextBlock::Text);
                         yield named_event("content_block_start", json!({"type": "content_block_start", "index": block_index, "content_block": {"type": "text", "text": ""}}));
                     }
                     yield named_event("content_block_delta", json!({"type": "content_block_delta", "index": block_index, "delta": {"type": "text_delta", "text": delta}}));
                 }
                 GenerationEvent::ToolCallStart { index, id, name } => {
                     has_tool_calls = true;
-                    if reasoning_open {
+                    if open_block.take().is_some() {
                         yield named_event("content_block_stop", json!({"type": "content_block_stop", "index": block_index}));
                         block_index += 1;
-                        reasoning_open = false;
-                    }
-                    if text_open {
-                        yield named_event("content_block_stop", json!({"type": "content_block_stop", "index": block_index}));
-                        block_index += 1;
-                        text_open = false;
                     }
                     if tool_indices.len() <= index { tool_indices.resize(index + 1, usize::MAX); }
                     tool_indices[index] = block_index;
@@ -384,7 +386,7 @@ fn messages_stream(
                 GenerationEvent::StopSequence(sequence) => { stop_sequence = Some(sequence); }
                 GenerationEvent::Finished { reason, output_tokens, .. } => {
                     terminated = true;
-                    if reasoning_open || text_open {
+                    if open_block.is_some() {
                         yield named_event("content_block_stop", json!({"type": "content_block_stop", "index": block_index}));
                     }
                     for index in tool_indices.into_iter().filter(|index| *index != usize::MAX) {
