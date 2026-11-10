@@ -86,7 +86,10 @@ known-first-party = [
 ]
 
 [tool.pytest.ini_options]
-pythonpath = [".", "models/cuda", "models/mlx", "models/torch"]
+# Backend suites may share test filenames. Keep shared test helpers importable
+# without letting pytest import collected modules by their bare filenames.
+addopts = ["--import-mode=importlib"]
+pythonpath = [".", "tests", "models/cuda", "models/cuda/tests", "models/mlx", "models/torch"]
 testpaths = ["tests", "models/cuda/tests", "models/mlx/tests", "models/torch/tests"]
 
 [tool.uv]

@@ -53,5 +53,7 @@ jobs:
           PYTHONPATH="$("$PYO3_PYTHON" -c 'import sysconfig; print(sysconfig.get_path("platlib"))')"
           export PYTHONPATH
           uv run --no-sync cargo test --locked --workspace --all-targets
+      - name: Collect all Python test suites together
+        run: uv run --no-sync pytest --collect-only -q
       - name: MLX tests
         run: uv run --no-sync pytest -q models/mlx/tests
