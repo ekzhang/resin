@@ -494,30 +494,122 @@ fn responses_request(
     })
 }
 
-fn response_input_messages(input: Value) -> RequestResult<Vec<Value>> {
-    match input {
-        Value::String(text) => Ok(vec![json!({"role": "user", "content": text})]),
-        Value::Array(items) => items
-            .into_iter()
-            .map(|item| {
-                let item_type = item.get("type").and_then(Value::as_str);
-                match item_type {
-                    Some("function_call_output") => Ok(json!({
-                        "role": "tool",
-                        "tool_call_id": item.get("call_id").cloned().unwrap_or(Value::Null),
-                        "content": item.get("output").cloned().unwrap_or(Value::Null),
-                    })),
-                    Some("message") | None if item.get("role").is_some() => Ok(item),
-                    _ => Err(invalid_request(
-                        "Responses input currently supports message and function_call_output items",
-                    )),
-                }
-            })
-            .collect(),
-        _ => Err(invalid_request(
-            "input must be a string or an array of input items",
-        )),
+#[derive(Default)]
+struct ResponseAssistant {
+    content: Vec<Value>,
+    reasoning: String,
+    calls: Vec<Value>,
+}
+
+impl ResponseAssistant {
+    fn into_message(self) -> Value {
+        let mut message = json!({"role": "assistant", "content": self.content});
+        if !self.reasoning.is_empty() {
+            message["reasoning_content"] = json!(self.reasoning);
+        }
+        if !self.calls.is_empty() {
+            message["tool_calls"] = json!(self.calls);
+        }
+        message
     }
+}
+
+fn response_item_string<'a>(item: &'a Value, field: &str) -> RequestResult<&'a str> {
+    item[field]
+        .as_str()
+        .filter(|value| field == "arguments" || !value.is_empty())
+        .ok_or_else(|| invalid_request(format!("Responses input item requires string {field}")))
+}
+
+fn response_input_messages(input: Value) -> RequestResult<Vec<Value>> {
+    let items = match input {
+        Value::String(text) => return Ok(vec![json!({"role": "user", "content": text})]),
+        Value::Array(items) => items,
+        _ => {
+            return Err(invalid_request(
+                "input must be a string or an array of input items",
+            ));
+        }
+    };
+    let mut messages = Vec::new();
+    let mut assistant = None::<ResponseAssistant>;
+    let mut call_names = BTreeMap::new();
+    for item in items {
+        match item.get("type").and_then(Value::as_str) {
+            Some("reasoning") => {
+                let summary = item["summary"]
+                    .as_array()
+                    .ok_or_else(|| invalid_request("reasoning input requires a summary array"))?;
+                let turn = assistant.get_or_insert_default();
+                for part in summary {
+                    if part["type"] != "summary_text" {
+                        return Err(invalid_request(
+                            "reasoning summary must contain summary_text blocks",
+                        ));
+                    }
+                    let text = part["text"]
+                        .as_str()
+                        .ok_or_else(|| invalid_request("reasoning summary requires text"))?;
+                    turn.reasoning.push_str(text);
+                }
+            }
+            Some("function_call") => {
+                let id = response_item_string(&item, "call_id")?;
+                let name = response_item_string(&item, "name")?;
+                let arguments = response_item_string(&item, "arguments")?;
+                call_names.insert(id.to_owned(), name.to_owned());
+                assistant.get_or_insert_default().calls.push(json!({
+                    "id": id, "type": "function", "function": {"name": name, "arguments": arguments},
+                }));
+            }
+            Some("message") if item["role"] == "assistant" => {
+                let content = match &item["content"] {
+                    Value::String(text) => vec![json!({"type": "text", "text": text})],
+                    Value::Array(parts) => parts.clone(),
+                    _ => {
+                        return Err(invalid_request(
+                            "assistant message content must be text or an array of blocks",
+                        ));
+                    }
+                };
+                assistant.get_or_insert_default().content.extend(content);
+            }
+            kind => {
+                // Responses output splits one assistant turn into several items.
+                // Flush that turn before a tool result or the next input message.
+                if let Some(turn) = assistant.take() {
+                    messages.push(turn.into_message());
+                }
+                match kind {
+                    Some("function_call_output") => {
+                        let id = response_item_string(&item, "call_id")?;
+                        let output = &item["output"];
+                        if !output.is_string() && !output.is_array() {
+                            return Err(invalid_request(
+                                "function_call_output requires text or an array of blocks",
+                            ));
+                        }
+                        let mut message =
+                            json!({"role": "tool", "tool_call_id": id, "content": output});
+                        if let Some(name) = call_names.get(id) {
+                            message["name"] = json!(name);
+                        }
+                        messages.push(message);
+                    }
+                    Some("message") | None if item.get("role").is_some() => messages.push(item),
+                    _ => {
+                        return Err(invalid_request(
+                            "Responses input supports message, reasoning, function_call and function_call_output items",
+                        ));
+                    }
+                }
+            }
+        }
+    }
+    if let Some(turn) = assistant {
+        messages.push(turn.into_message());
+    }
+    Ok(messages)
 }
 
 async fn responses_response(

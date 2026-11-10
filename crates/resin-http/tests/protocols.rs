@@ -1104,6 +1104,101 @@ async fn tool_calls_map_to_responses_and_anthropic_shapes() {
 }
 
 #[tokio::test]
+async fn responses_output_round_trips_into_tool_continuations() {
+    let (_, tool_response) =
+        json_response(tool_router(), generation_request("/v1/responses", false)).await;
+    let (_, text_response) =
+        json_response(test_router(), generation_request("/v1/responses", false)).await;
+    let call = &tool_response["output"][1];
+    let mut input = vec![json!({"role": "user", "content": "weather?"})];
+    input.extend(tool_response["output"].as_array().unwrap().clone());
+    input.push(
+        json!({"type": "function_call", "call_id": "second", "name": "clock", "arguments": "{}"}),
+    );
+    // Parallel results may return in a different order than their calls.
+    input.push(json!({"type": "function_call_output", "call_id": "second", "output": "noon"}));
+    input.push(
+        json!({"type": "function_call_output", "call_id": call["call_id"], "output": "sunny"}),
+    );
+    input.extend(text_response["output"].as_array().unwrap().clone());
+    input.push(json!({"role": "user", "content": "thanks"}));
+    let request = Request::post("/v1/responses")
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(
+            json!({"model": "test-model", "input": input}).to_string(),
+        ))
+        .unwrap();
+    let (status, response) = json_response(recording_router(1), request).await;
+    assert_eq!(status, StatusCode::OK, "{response}");
+    let normalized: Value = serde_json::from_str(
+        response["output"][0]["content"][0]["text"]
+            .as_str()
+            .unwrap(),
+    )
+    .unwrap();
+    let messages = normalized["messages"].as_array().unwrap();
+    assert_eq!(messages.len(), 6);
+    assert_eq!(messages[1]["role"], "assistant");
+    assert_eq!(messages[1]["reasoning_content"], "check weather");
+    assert_eq!(messages[1]["tool_calls"][0]["id"], call["call_id"]);
+    assert_eq!(
+        messages[1]["tool_calls"][0]["function"]["arguments"],
+        call["arguments"]
+    );
+    assert_eq!(messages[1]["tool_calls"][1]["function"]["name"], "clock");
+    assert_eq!(
+        messages[2],
+        json!({"role": "tool", "tool_call_id": "second", "name": "clock", "content": "noon"})
+    );
+    assert_eq!(messages[3]["name"], "weather");
+    assert_eq!(messages[3]["content"], "sunny");
+    assert_eq!(messages[4]["reasoning_content"], "brief thought");
+    assert_eq!(
+        messages[4]["content"],
+        text_response["output"][1]["content"]
+    );
+    assert_eq!(messages[5], json!({"role": "user", "content": "thanks"}));
+}
+
+#[tokio::test]
+async fn responses_reject_malformed_history_before_admission_or_counting() {
+    for item in [
+        json!({"type": "function_call", "name": "tool", "arguments": "{}"}),
+        json!({"type": "function_call", "call_id": "id", "name": "", "arguments": "{}"}),
+        json!({"type": "function_call", "call_id": "id", "name": "tool", "arguments": {}}),
+        json!({"type": "function_call_output", "output": "ok"}),
+        json!({"type": "function_call_output", "call_id": "id", "output": null}),
+        json!({"type": "reasoning"}),
+        json!({"type": "reasoning", "summary": [{"type": "summary_text"}]}),
+        json!({"type": "reasoning", "summary": [{"type": "text", "text": "thought"}]}),
+        json!({"type": "message", "role": "assistant", "content": 42}),
+        json!({"type": "unsupported"}),
+    ] {
+        let (jobs, mut receiver) = mpsc::channel::<GenerationJob>(1);
+        let counter: TokenCounter = Arc::new(|_, _| panic!("invalid history reached renderer"));
+        let app = router(
+            "test-model",
+            jobs,
+            Some(counter),
+            RouteConfig::default(),
+            None,
+        );
+        for path in ["/v1/responses", "/v1/responses/input_tokens"] {
+            let request = Request::post(path)
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    json!({"model": "test-model", "input": [item]}).to_string(),
+                ))
+                .unwrap();
+            let (status, body) = json_response(app.clone(), request).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{item}: {body}");
+            assert_eq!(body["error"]["type"], "invalid_request_error");
+        }
+        assert!(receiver.try_recv().is_err());
+    }
+}
+
+#[tokio::test]
 async fn responses_and_anthropic_streams_emit_protocol_events() {
     let responses_request = Request::post("/v1/responses")
         .header(header::CONTENT_TYPE, "application/json")
