@@ -2,6 +2,7 @@
 
 import hashlib
 import math
+from concurrent.futures import CancelledError
 
 import numpy as np
 
@@ -18,6 +19,9 @@ class _Operation:
             return None
         try:
             value = self.future.result()
+        except CancelledError:
+            # Lookups borrow nothing; canceled transfers may still use their buffers.
+            return None if self.buffers else 0
         except Exception:
             return 0 if self.future.done() else None
         return None if value is None else self.finish(value)

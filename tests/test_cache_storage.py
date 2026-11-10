@@ -245,6 +245,94 @@ def test_failed_read_fence_preserves_unretired_buffers():
     assert retained() is not None
 
 
+@pytest.mark.parametrize("transfer", ["load", "store"])
+@pytest.mark.parametrize(
+    "completion", ["cancel", "unknown", "success", "failure", "error"]
+)
+def test_transfer_retirement_controls_buffer_reuse(transfer, completion):
+    pending, borrowed = Future(), []
+
+    class Storage:
+        def lookup(self, keys):
+            future = Future()
+            future.set_result((transfer == "load" and not borrowed,) * len(keys))
+            return future
+
+        def transfer(self, keys, buffers):
+            if not borrowed:
+                borrowed.extend(r for regions in buffers for r in regions.values())
+                return pending
+            future = Future()
+            future.set_result(False)
+            return future
+
+        load = store = transfer
+
+    engine, runner, arena = make_engine(Storage(), fill=73, capacity=2)
+    request = engine.submit(
+        [1, 2, 3], sampling_params=SamplingParams(max_output_tokens=1)
+    )
+    for _ in range(10):
+        engine.step()
+        if borrowed:
+            break
+    assert borrowed
+    engine.cancel(request)
+    engine.clear_prefix_cache()
+    if completion == "cancel":
+        assert pending.cancel()
+    elif completion == "error":
+        pending.set_exception(RuntimeError("transfer failed after retirement"))
+    else:
+        pending.set_result(
+            {"unknown": None, "success": True, "failure": False}[completion]
+        )
+    engine.next_phase()
+    unretired = completion in ("cancel", "unknown")
+    assert engine.metrics_snapshot().cache["storage_pending"] == int(unretired)
+
+    # Model writes must never reuse a slab still borrowed by the provider.
+    engine.submit([8, 9, 10], sampling_params=SamplingParams(max_output_tokens=1))
+    for _ in range(4):
+        previous = len(runner.plans)
+        engine.step()
+        if len(runner.plans) > previous:
+            for slab in runner.plans[-1].cache_groups[0].append_slab_ids:
+                arena[int(slab)] = 7
+    assert all(r.item() == 73 for r in borrowed) == unretired
+    if unretired:
+        with pytest.raises(RuntimeError, match="incompatible access lease"):
+            engine.close()
+        assert engine.poisoned
+        retained = ref(borrowed[0])
+        borrowed.clear()
+        del engine, runner, arena
+        assert retained() is not None
+    else:
+        engine.close()
+
+
+def test_cancelled_lookup_is_a_cache_miss():
+    class Storage(MemoryCacheStorage):
+        def lookup(self, keys):
+            future = Future()
+            assert future.cancel()
+            return future
+
+    store = Storage(max_bytes=0)
+    engine, _, _ = make_engine(store)
+    with engine:
+        request = engine.submit(
+            [1, 2, 3], sampling_params=SamplingParams(max_output_tokens=1)
+        )
+        for _ in range(10):
+            engine.step()
+            if request.done:
+                break
+        assert request.done and request.cached_tokens == 0
+    store.close()
+
+
 @pytest.mark.parametrize(
     ("running", "limit", "expected"), [(1, None, 2), (4, None, 4), (4, 1, 1)]
 )

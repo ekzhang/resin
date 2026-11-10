@@ -166,7 +166,10 @@ Providers must order GPU copies after the work that produced their inputs. A
 separate CUDA stream alone does not establish that ordering. Resolve a transfer
 with `True`, `False` or an exception only after all borrowed-buffer accesses have
 finished. `future.done()` must also return promptly. Cancellation is not proof of
-completion.
+completion: a canceled transfer future is treated like `None`, retaining borrowed
+buffers even during shutdown. To report a safely aborted transfer, resolve its
+future with `False` after buffer accesses have stopped. A canceled lookup is a
+cache miss because it borrows no buffers.
 
 Completion covers the borrowed buffers. A provider can manage several tiers by
 staging data in its own allocation, then continuing remote I/O against that copy
