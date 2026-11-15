@@ -10,8 +10,8 @@ pub use crate::output::{OwnedTokenRows, TokenRows};
 use crate::resources::kv::{KvGroupPlan, KvLayout};
 use crate::resources::paged::{CachePoolError, RequestPages, WriterAccessLease};
 use crate::resources::paged_kv::{
-    CacheMetrics, PagedKvError, PagedKvResources, PrefixKey, PrefixStorage, PrefixStoragePolicy,
-    RequestResourceRef,
+    CacheMetrics, PagedKvError, PagedKvResources, PrefixIdentity, PrefixKey, PrefixStorage,
+    PrefixStoragePolicy, RequestResourceRef,
 };
 use crate::{
     Phase, PlanningConfig, PlanningError, RequestId, RequestProgress, Schedulable, Scheduler,
@@ -395,8 +395,7 @@ struct Request<P> {
     turn_ordinal: u128,
     running: bool,
     prompt: Vec<u32>,
-    cache_prompt: Option<Vec<u32>>,
-    cache_namespace: Vec<u32>,
+    cache_identity: Option<PrefixIdentity>,
     atomic_prefill_spans: Vec<(u32, u32)>,
     resident_tokens: u32,
     generated: Vec<u32>,
@@ -969,23 +968,27 @@ impl<P: Clone> EngineCore<P> {
             .transpose()?;
         // Media may provide a same-length, digest-derived identity stream
         // in place of the raw token IDs.
-        let cache_tokens = cache_prompt.as_deref().unwrap_or(&token_ids);
-        let cache_namespace = PrefixKey::namespace(cache_salt.as_deref());
         // KV entries do not retain predecessor distributions. Scoring must run
         // the prompt once, even when an ordinary request could reuse its KV.
-        let cache_identity =
-            (!prompt_logprobs).then(|| PrefixKey::new(cache_tokens, &cache_namespace));
+        let cache_identity = self.prefix_alignment().map(|alignment| {
+            PrefixIdentity::new(
+                cache_prompt.unwrap_or_else(|| token_ids.clone()),
+                PrefixKey::namespace(cache_salt.as_deref()),
+                alignment,
+            )
+        });
         let resident_tokens = match (&mut self.kv_resources, &mut pages, cache_identity.as_ref()) {
-            (Some(resources), Some(pages), Some(identity)) => resources
-                .restore_prefix(pages, identity)
+            (Some(resources), Some(pages), Some(identity)) if !prompt_logprobs => resources
+                .restore_prefix(pages, &identity.key())
                 .map_err(Error::from)?,
             _ => 0,
         };
-        let storage_pending = resident_tokens == 0
+        let storage_pending = !prompt_logprobs
+            && resident_tokens == 0
             && cache_identity.as_ref().is_some_and(|identity| {
                 self.kv_resources
                     .as_mut()
-                    .is_some_and(|r| r.start_storage(request_id, identity))
+                    .is_some_and(|r| r.start_storage(request_id, &identity.key()))
             });
         lease_state
             .lock()
@@ -1011,8 +1014,7 @@ impl<P: Clone> EngineCore<P> {
             turn_ordinal: 0,
             running: false,
             prompt: token_ids,
-            cache_prompt,
-            cache_namespace,
+            cache_identity,
             atomic_prefill_spans,
             resident_tokens,
             generated: Vec::new(),
@@ -1977,7 +1979,10 @@ impl<P: Clone> EngineCore<P> {
         batch: &mut Batch<P>,
         progress: &[PreparedProgress],
     ) -> Result<()> {
-        let Some(alignment) = self.prefix_alignment() else {
+        let Some(resources) = &mut self.kv_resources else {
+            return Ok(());
+        };
+        let Some(alignment) = resources.prefix_alignment() else {
             return Ok(());
         };
         let has_recurrent_state = self
@@ -1990,9 +1995,7 @@ impl<P: Clone> EngineCore<P> {
                 continue;
             }
             let checkpoints = if has_recurrent_state {
-                self.kv_resources
-                    .as_ref()
-                    .expect("managed cache resources")
+                resources
                     .ready_state_checkpoints(row.request.id)
                     .into_iter()
                     .filter(|(_, length)| *length <= progress.resident_tokens)
@@ -2006,40 +2009,23 @@ impl<P: Clone> EngineCore<P> {
             if checkpoints.is_empty() {
                 continue;
             }
-            let mut tokens = Vec::new();
-            tokens
-                .try_reserve_exact(
-                    row.request
-                        .prompt
-                        .len()
-                        .saturating_add(row.request.generated.len())
-                        .saturating_add(progress.sampled_tokens.len()),
-                )
-                .map_err(|_| Error::memory("could not publish prefix token identity"))?;
-            tokens.extend_from_slice(
-                row.request
-                    .cache_prompt
-                    .as_deref()
-                    .unwrap_or(&row.request.prompt),
-            );
-            tokens.extend_from_slice(&row.request.generated);
-            tokens.extend_from_slice(&progress.sampled_tokens);
+            let request = &mut row.request;
+            let Some(identity) = &request.cache_identity else {
+                continue;
+            };
+            let identity = identity.key();
+            let endpoint = checkpoints.iter().map(|(_, length)| *length).max().unwrap() as usize;
+            if endpoint > identity.len() {
+                return Err(Error::internal(
+                    "resident KV progress exceeds the request token history",
+                ));
+            }
             for (reservation_id, length) in checkpoints {
-                if length as usize > tokens.len() {
-                    return Err(Error::internal(
-                        "resident KV progress exceeds the request token history",
-                    ));
-                }
-                let resources = self
-                    .kv_resources
-                    .as_mut()
-                    .expect("prefix alignment requires managed resources");
-                let pages = row
-                    .request
+                let pages = request
                     .cache
                     .as_mut()
                     .expect("prefix-enabled requests own managed pages");
-                let key = PrefixKey::new(&tokens[..length as usize], &row.request.cache_namespace);
+                let key = identity.prefix(length as usize);
                 if has_recurrent_state {
                     resources
                         .publish_state_prefix(pages, reservation_id, &key)
@@ -2375,6 +2361,13 @@ impl<P: Clone> EngineCore<P> {
             } else {
                 token_end
             };
+            // Track accepted output even when an overlapping continuation defers
+            // prefix publication. Snapshots still stop at resident_tokens.
+            if scheduled.sample
+                && let Some(identity) = &mut request.cache_identity
+            {
+                identity.extend(token_ids);
+            }
             prepared.push(PreparedProgress {
                 resident_tokens,
                 sampled_tokens: if scheduled.sample {
@@ -2602,8 +2595,7 @@ mod tests {
             turn_ordinal: 0,
             running: false,
             prompt: prompt.to_vec(),
-            cache_prompt: None,
-            cache_namespace: Vec::new(),
+            cache_identity: None,
             atomic_prefill_spans: Vec::new(),
             resident_tokens: if generated.is_empty() {
                 0

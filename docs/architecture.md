@@ -23,7 +23,7 @@ The Rust Engine owns:
 - request progress and completion;
 - one unified paged cache allocator;
 - full-history, sliding-window, and recurrent-state retention;
-- exact-token LRU prefix reuse;
+- SHA-256 prefix identities with LRU checkpoint reuse;
 - cache reader/writer leases across runner execution and commit;
 - retry or quarantine decisions after runner failures.
 
@@ -128,19 +128,15 @@ per slab, and construct the final layout.
 
 ## Prefix reuse
 
-The prefix cache stores immutable page snapshots in an exact-token block trie.
-Its checkpoint alignment is the least common multiple of every group block size,
-so a hit restores attention, sliding-window, and recurrent state at the same
-token boundary. Cached pages consume the same fungible pool and are evicted LRU
-when live allocation needs capacity. Successive History snapshots share immutable
-page-table segments instead of copying every ancestor's references. Window and
-State snapshots remain bounded. Each request owns a private live STATE slot;
-immutable prefix snapshots use separate slots in the same pool. A prefix hit
-copies its snapshot into the new live slot once. Only an exactly materialized
-accepted prefix can become a snapshot; a verification step that crosses an
-alignment without producing that intermediate state skips the checkpoint.
-Snapshot allocation is optional and cannot block decode. Trie nodes carry direct
-LRU links, so eviction does not scan all cached entries.
+With `prefix_cache=True`, the Engine resumes requests from the longest usable
+cached prefix. A flat SHA-256 index maps request namespaces and text or media
+identities to immutable checkpoints. Checkpoint alignment is the least common
+multiple of all cache groups' block sizes.
+
+The Engine evicts least-recently-used checkpoints under memory pressure, and
+shared pages remain allocated until their last owner releases them. See the
+[paged cache guide](cache-pool.md) for layout, execution, and reuse details, and
+[prefix storage](cache-storage.md) for asynchronous storage tiers.
 
 ## Speculative decoding
 

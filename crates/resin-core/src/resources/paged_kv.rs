@@ -13,7 +13,7 @@ use super::paged::{
     RequestPages, RetireRequestFailure, SequenceId, WriterAccessLease,
 };
 use super::prefix::PrefixCache;
-pub use super::prefix::PrefixKey;
+pub use super::prefix::{PrefixIdentity, PrefixKey};
 
 /// A point-in-time inventory of the shared physical cache pool.
 ///

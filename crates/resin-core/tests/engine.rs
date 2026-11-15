@@ -297,6 +297,58 @@ fn output_limit_inside_speculative_block_does_not_publish_intermediate_state() {
 }
 
 #[test]
+fn growing_prefix_identity_keeps_media_namespace_and_accepted_decode_suffix() {
+    let mut engine = EngineCore::new(
+        RunnerConfig {
+            cache_layout: Some(
+                KvLayout::new(
+                    32,
+                    vec![KvGroupLayout::new(2, 1, KvRetention::FullContext).unwrap()],
+                )
+                .unwrap(),
+            ),
+            continuation_prefill: true,
+            max_accepted_per_step: 3,
+            ..Default::default()
+        },
+        4,
+        32,
+        SchedulerConfig::default(),
+        true,
+    )
+    .unwrap();
+    let mut model = Model::default();
+    let mut seed = input(vec![10, 11, 12], 6);
+    seed.cache_key = Some(vec![100, 101, 102]);
+    seed.cache_salt = Some("media".into());
+    let request = engine.submit(seed).unwrap();
+    while engine.next_phase().unwrap() == Some(resin_core::Phase::Prefill) {
+        engine.step(&mut model).unwrap();
+    }
+    model.outputs.push_back(Ok(vec![vec![14, 15, 16]]));
+    engine.step(&mut model).unwrap();
+    model.outputs.push_back(Ok(vec![vec![17, 18]]));
+    engine.step(&mut model).unwrap();
+    assert_eq!(request.take_result().unwrap(), [13, 14, 15, 16, 17, 18]);
+
+    for length in [6, 8] {
+        let mut tokens: Vec<u32> = (10..10 + length).collect();
+        tokens.push(99);
+        let mut identity = tokens.clone();
+        identity[..3].copy_from_slice(&[100, 101, 102]);
+        let mut continuation = input(tokens.clone(), 1);
+        continuation.cache_key = Some(identity);
+        continuation.cache_salt = Some("media".into());
+        assert_eq!(engine.submit(continuation).unwrap().cached_tokens(), length);
+
+        let mut wrong_identity = input(tokens, 1);
+        wrong_identity.cache_salt = Some("media".into());
+        assert_eq!(engine.submit(wrong_identity).unwrap().cached_tokens(), 0);
+    }
+    engine.close(&mut model).unwrap();
+}
+
+#[test]
 fn a_native_model_uses_the_complete_lifecycle_without_python() {
     let mut engine = engine(0, 2);
     let mut model = Model::default();
@@ -917,6 +969,49 @@ fn cross_page_engine(prefix_cache: bool) -> EngineCore<&'static str> {
         prefix_cache,
     )
     .unwrap()
+}
+
+#[test]
+fn drained_continuation_prefix_includes_previously_accepted_output() {
+    let mut engine = cross_page_engine(true);
+    let mut model = Model::default();
+    let mut seed = input(vec![1; 31], 40);
+    seed.cache_salt = Some("session".into());
+    let request = engine.submit(seed).unwrap();
+    while engine.next_phase().unwrap() == Some(resin_core::Phase::Prefill) {
+        engine.step(&mut model).unwrap();
+    }
+    let plan = engine
+        .prepare_overlap_step(&mut model, None)
+        .unwrap()
+        .unwrap();
+    assert!(engine.retain_continuation(&plan));
+    engine.continuation_plan().unwrap().unwrap();
+    // This accepted suffix cannot publish while its successor holds the lease.
+    engine
+        .complete_continuing_step_with(&mut model, TokenRows::new(&[3, 4, 5, 6], &[0, 4]), Ok)
+        .unwrap();
+    engine
+        .complete_step_with(&mut model, TokenRows::new(&[7], &[0, 1]), Ok)
+        .unwrap();
+
+    // Draining publishes 36 resident tokens; the last sampled token is not KV yet.
+    let mut tokens = vec![1; 31];
+    tokens.extend([2, 3, 4, 5, 6, 99]);
+    let mut resumed = input(tokens.clone(), 1);
+    resumed.cache_salt = Some("session".into());
+    assert_eq!(engine.submit(resumed).unwrap().cached_tokens(), 36);
+
+    let mut wrong_namespace = input(tokens.clone(), 1);
+    wrong_namespace.cache_salt = Some("other".into());
+    assert_eq!(engine.submit(wrong_namespace).unwrap().cached_tokens(), 0);
+    tokens[32] = 999; // Change a token accepted during the overlapping step.
+    let mut wrong_tokens = input(tokens, 1);
+    wrong_tokens.cache_salt = Some("session".into());
+    // The earlier prompt checkpoint is reusable, but the 36-token suffix is not.
+    assert_eq!(engine.submit(wrong_tokens).unwrap().cached_tokens(), 28);
+    engine.close(&mut model).unwrap();
+    assert_eq!(request.take_result().unwrap(), [2, 3, 4, 5, 6, 7]);
 }
 
 #[test]
