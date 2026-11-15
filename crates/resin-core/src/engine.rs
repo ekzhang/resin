@@ -1241,8 +1241,8 @@ impl<P: Clone> EngineCore<P> {
                     group.append_block_offsets[row] = 0;
                     continue;
                 }
-                group.append_block_offsets[row] = position % layout.block_tokens().get();
-                let logical = position / layout.block_tokens().get();
+                group.append_block_offsets[row] = position % layout.block_tokens();
+                let logical = position / layout.block_tokens();
                 let relative = logical
                     .checked_sub(group.block_table_start_indices[row])
                     .ok_or_else(|| Error::internal("continuation precedes its KV lease"))?;

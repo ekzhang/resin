@@ -92,7 +92,7 @@ pub fn schedule_ready_prefix(
             } else {
                 proposed_end
             };
-            let checkpoint_end = checkpoint_limit / alignment.get() * alignment.get();
+            let checkpoint_end = checkpoint_limit / alignment * alignment.get();
             if checkpoint_end > request.logical_context && checkpoint_end < proposed_end {
                 count = checkpoint_end - request.logical_context;
             }
