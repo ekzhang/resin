@@ -70,6 +70,28 @@ def resolve_model(
     return download(str(model), revision)
 
 
+def resolve_hub_model(
+    model: str | Path,
+    revision: str | None,
+    *,
+    default: tuple[str, str],
+    files: Collection[str],
+) -> Path:
+    """Resolve locally, or download selected files with a pinned default revision."""
+
+    def download(repo_id: str, selected: str | None) -> Path:
+        from huggingface_hub import snapshot_download
+
+        return Path(
+            snapshot_download(
+                repo_id=repo_id, revision=selected, allow_patterns=list(files)
+            )
+        )
+
+    selected = default[1] if revision is None and str(model) == default[0] else revision
+    return resolve_model(model, selected, download)
+
+
 def read_config(model_path: Path) -> dict[str, Any]:
     config_path = model_path / "config.json"
     if not config_path.exists():

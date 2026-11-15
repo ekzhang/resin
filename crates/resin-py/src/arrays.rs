@@ -20,3 +20,22 @@ pub(crate) fn readonly_view<'py, T: Element>(
 pub(crate) fn owned_vec<T: Copy + Element>(values: PyArrayLike1<'_, T>) -> Vec<T> {
     values.as_array().iter().copied().collect()
 }
+
+// Declare the element type and backing field once for each immutable array.
+// Custom properties and methods remain ordinary Rust in the same impl.
+macro_rules! array_methods {
+    (impl $class:ident {
+        arrays { $($(#[$doc:meta])* $name:ident: $element:ty => $($field:ident).+;)* }
+        $($methods:item)*
+    }) => {
+        #[pyo3::pymethods]
+        impl $class {
+            $($(#[$doc])* #[getter]
+            fn $name<'py>(this: pyo3::Bound<'py, Self>) -> pyo3::Bound<'py, numpy::PyArray1<$element>> {
+                $crate::arrays::readonly_view(this.clone().into_any(), &this.get().$($field).+)
+            })*
+            $($methods)*
+        }
+    };
+}
+pub(crate) use array_methods;

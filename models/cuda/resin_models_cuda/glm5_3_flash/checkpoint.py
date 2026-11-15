@@ -5,7 +5,7 @@ from pathlib import Path
 import torch
 
 from resin.backend.cuda.parallel import TensorParallelLayout
-from resin.backend.loading import MODEL_FILES, read_config, resolve_model
+from resin.backend.loading import MODEL_FILES, read_config, resolve_hub_model
 from resin.models.glm5_3_flash.config import Glm53Config
 from resin_models_cuda.glm5_3_flash.model import (
     Bf16Experts,
@@ -22,22 +22,13 @@ DEFAULT_MODEL = "nvidia/GLM-5.3-Flash-NVFP4"
 DEFAULT_REVISION = "da920bb0b9f4a06727223a349e55468e38352348"
 
 
-def _download_model(repo_id, revision):
-    from huggingface_hub import snapshot_download
-
-    return Path(
-        snapshot_download(
-            repo_id=repo_id,
-            revision=revision,
-            allow_patterns=[*MODEL_FILES, "*.json", "*.jinja", "tokenizer*"],
-        )
-    )
-
-
 def resolve_model_path(model=DEFAULT_MODEL, revision=None):
-    if revision is None and str(model) == DEFAULT_MODEL:
-        revision = DEFAULT_REVISION
-    return resolve_model(model, revision, _download_model)
+    return resolve_hub_model(
+        model,
+        revision,
+        default=(DEFAULT_MODEL, DEFAULT_REVISION),
+        files=(*MODEL_FILES, "*.json", "*.jinja", "tokenizer*"),
+    )
 
 
 def expert_partition(config, parallel_groups):

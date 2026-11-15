@@ -5,29 +5,31 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Self
 
+from resin.models.hf_config import PositiveInt, invalid_dimensions
+
 
 @dataclass(frozen=True, slots=True, kw_only=True)
 class DeepSeekV41Config:
-    vocab_size: int
-    hidden_size: int
-    num_hidden_layers: int
-    num_attention_heads: int
+    vocab_size: PositiveInt
+    hidden_size: PositiveInt
+    num_hidden_layers: PositiveInt
+    num_attention_heads: PositiveInt
     num_key_value_heads: int
-    head_dim: int
-    q_lora_rank: int
-    o_lora_rank: int
-    o_groups: int
-    rope_head_dim: int
-    sliding_window: int
+    head_dim: PositiveInt
+    q_lora_rank: PositiveInt
+    o_lora_rank: PositiveInt
+    o_groups: PositiveInt
+    rope_head_dim: PositiveInt
+    sliding_window: PositiveInt
     compress_ratios: tuple[int, ...]
     kv_source_layers: tuple[int, ...]
     index_source_layers: tuple[int, ...]
-    index_topk: int
+    index_topk: PositiveInt
     index_head_dim: int
-    num_routed_experts: int
-    num_experts_per_token: int
-    moe_intermediate_size: int
-    hc_mult: int
+    num_routed_experts: PositiveInt
+    num_experts_per_token: PositiveInt
+    moe_intermediate_size: PositiveInt
+    hc_mult: PositiveInt
     expert_dtype: str
     candidate_source_layer: int
     candidate_topk_blocks: int
@@ -82,26 +84,8 @@ class DeepSeekV41Config:
         return config
 
     def validate(self) -> None:
-        for name in (
-            "vocab_size",
-            "hidden_size",
-            "num_hidden_layers",
-            "num_attention_heads",
-            "head_dim",
-            "q_lora_rank",
-            "o_lora_rank",
-            "o_groups",
-            "rope_head_dim",
-            "sliding_window",
-            "index_topk",
-            "num_routed_experts",
-            "num_experts_per_token",
-            "moe_intermediate_size",
-            "hc_mult",
-        ):
-            value = getattr(self, name)
-            if type(value) is not int or value <= 0:
-                raise ValueError(f"{name} must be a positive integer")
+        for name in invalid_dimensions(self, strict=True):
+            raise ValueError(f"{name} must be a positive integer")
         if (
             self.head_dim != 512
             or self.index_head_dim != 128

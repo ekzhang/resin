@@ -335,6 +335,20 @@ class BenchmarkRunner:
         return (0, 0) if stats is None else (stats.drafts, stats.accepted)
 
 
+def _counter_totals(samples):
+    """Merge sparse counters identically across ranks and measurement steps."""
+    result = {}
+    for name in ("graph_counts", "runner_counts", "overlap_counts"):
+        total = Counter()
+        for sample in samples:
+            total.update(sample.get(name, {}))
+        if name == "overlap_counts":
+            total = {key: total[key] for key in ("enqueues", "continuations")}
+        if total or name != "runner_counts":
+            result[name] = dict(total)
+    return result
+
+
 def distributed_reducer(groups):
     """Reduce unique attention-replica driver counters after each timed step."""
 
@@ -360,26 +374,7 @@ def distributed_reducer(groups):
                     "sequences",
                 )
             },
-            "graph_counts": {
-                key: sum(v.get("graph_counts", {}).get(key, 0) for v in values)
-                for key in {key for v in values for key in v.get("graph_counts", {})}
-            },
-            **(
-                {
-                    "runner_counts": {
-                        key: sum(v.get("runner_counts", {}).get(key, 0) for v in values)
-                        for key in {
-                            key for v in values for key in v.get("runner_counts", {})
-                        }
-                    }
-                }
-                if any(v.get("runner_counts") for v in values)
-                else {}
-            ),
-            "overlap_counts": {
-                key: sum(v.get("overlap_counts", {}).get(key, 0) for v in values)
-                for key in ("enqueues", "continuations")
-            },
+            **_counter_totals(values),
             "context_start_min": min(v["context_start_min"] for v in values),
             "context_start_max": max(v["context_start_max"] for v in values),
             "context_end_min": min(v["context_end_min"] for v in values),
@@ -822,33 +817,7 @@ def run_sweep(
                     "measured_context_start_max": samples[0]["context_start_max"],
                     "measured_context_end_min": samples[-1]["context_end_min"],
                     "measured_context_end_max": samples[-1]["context_end_max"],
-                    "graph_counts": {
-                        key: sum(s["graph_counts"].get(key, 0) for s in samples)
-                        for key in {key for s in samples for key in s["graph_counts"]}
-                    },
-                    **(
-                        {
-                            "runner_counts": {
-                                key: sum(
-                                    s.get("runner_counts", {}).get(key, 0)
-                                    for s in samples
-                                )
-                                for key in {
-                                    key
-                                    for s in samples
-                                    for key in s.get("runner_counts", {})
-                                }
-                            }
-                        }
-                        if any(s.get("runner_counts") for s in samples)
-                        else {}
-                    ),
-                    "overlap_counts": {
-                        key: sum(
-                            s.get("overlap_counts", {}).get(key, 0) for s in samples
-                        )
-                        for key in ("enqueues", "continuations")
-                    },
+                    **_counter_totals(samples),
                     "metadata": dict(metadata or {}),
                 }
             )

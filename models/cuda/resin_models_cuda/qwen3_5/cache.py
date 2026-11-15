@@ -10,12 +10,13 @@ import torch
 from torch import Tensor
 
 from resin import CacheGroupFamily, CacheGroupLayout, CacheLayout
-from resin.backend.cache_storage import byte_regions
+from resin.backend.cache_storage import layered_cache_buffers
 from resin.backend.cuda.slab import (
     DevicePageGroup,
     GraphPageTableArena,
     SlabDeviceCache,
     stage_page_groups,
+    state_view_factory,
 )
 from resin.backend.plans import PagedCachePlan
 from resin.backend.resources import CachePoolBinding
@@ -316,16 +317,12 @@ class CacheArena(GraphPageTableArena):
         )
         # The shared restore/checkpoint helper copies the complete state atom:
         # FP32 recurrence, BF16 convolution windows and the preceding hidden.
-        self.state_blocks = {
-            STATE_GROUP: torch.as_strided(
-                self.storage,
-                (physical, geometry.state_blocks_per_slab, geometry.state_bytes),
-                (geometry.slab_bytes, geometry.state_bytes, 1),
-            )
-        }
+        state_view = state_view_factory(
+            self.storage, geometry.state_blocks_per_slab, geometry.state_bytes
+        )
+        self.state_blocks = {STATE_GROUP: state_view(torch.uint8, geometry.state_bytes)}
 
         kv = self.storage.view(kv_dtype)
-        bf16 = self.storage.view(torch.bfloat16)
         page_elements = PAGE_TOKENS * geometry.kv_heads * geometry.head_dim
         page_shape = (
             physical * geometry.slab_units,
@@ -344,110 +341,45 @@ class CacheArena(GraphPageTableArena):
             kv, page_shape, page_stride, storage_offset=page_elements
         )
 
-        fp32 = self.storage.view(torch.float32)
-        recurrent_shape = (
-            physical,
-            geometry.state_blocks_per_slab,
+        self.recurrent_states = state_view(
+            torch.float32,
             geometry.linear_layers,
             geometry.linear_value_heads,
             geometry.linear_key_head_dim,
             geometry.linear_value_head_dim,
         )
-        recurrent_layer = (
-            geometry.linear_value_heads
-            * geometry.linear_key_head_dim
-            * geometry.linear_value_head_dim
+        self.convolution_states = state_view(
+            torch.bfloat16,
+            geometry.linear_layers,
+            geometry.conv_dim,
+            geometry.conv_state_length,
+            offset=geometry.recurrent_bytes,
         )
-        self.recurrent_states = torch.as_strided(
-            fp32,
-            recurrent_shape,
-            (
-                geometry.slab_bytes // FP32_BYTES,
-                geometry.state_bytes // FP32_BYTES,
-                recurrent_layer,
-                geometry.linear_key_head_dim * geometry.linear_value_head_dim,
-                geometry.linear_value_head_dim,
-                1,
-            ),
-        )
-
-        convolution_layer = geometry.conv_dim * geometry.conv_state_length
-        self.convolution_states = torch.as_strided(
-            bf16,
-            (
-                physical,
-                geometry.state_blocks_per_slab,
-                geometry.linear_layers,
-                geometry.conv_dim,
-                geometry.conv_state_length,
-            ),
-            (
-                geometry.slab_bytes // BF16_BYTES,
-                geometry.state_bytes // BF16_BYTES,
-                convolution_layer,
-                geometry.conv_state_length,
-                1,
-            ),
-            storage_offset=geometry.recurrent_bytes // BF16_BYTES,
-        )
-        self.target_hidden_states = torch.as_strided(
-            bf16,
-            (
-                physical,
-                geometry.state_blocks_per_slab,
-                geometry.hidden_size,
-            ),
-            (
-                geometry.slab_bytes // BF16_BYTES,
-                geometry.state_bytes // BF16_BYTES,
-                1,
-            ),
-            storage_offset=(
-                geometry.recurrent_bytes // BF16_BYTES + geometry.convolution_elements
-            ),
+        self.target_hidden_states = state_view(
+            torch.bfloat16,
+            geometry.hidden_size,
+            offset=geometry.recurrent_bytes
+            + geometry.convolution_elements * BF16_BYTES,
         )
 
     def cache_storage_buffers(self, groups, *, prefix_length):
-        buffers, geometry = [], self.geometry
-        for group, (_, addresses) in enumerate(groups):
-            for slab, slot in addresses:
-                if group == STATE_GROUP:
-                    tensors = {
-                        name: getattr(self, name)[slab, slot]
-                        for name in (
-                            "recurrent_states",
-                            "convolution_states",
-                            "target_hidden_states",
-                        )
-                    }
-                else:
-                    layers = geometry.full_layers if group == TARGET_GROUP else 1
-                    tensors = {
-                        f"{name}/{layer}": values[
-                            slab * geometry.slab_units + slot * layers + layer
-                        ]
-                        for name, values in (
-                            ("keys", self.keys),
-                            ("values", self.values),
-                        )
-                        for layer in range(layers)
-                    }
-                buffers.append(byte_regions(tensors))
-        return tuple(buffers)
+        return layered_cache_buffers(
+            self,
+            groups,
+            page_fields=("keys", "values"),
+            page_layers=(self.geometry.full_layers, None, 1),
+            state_fields=(
+                "recurrent_states",
+                "convolution_states",
+                "target_hidden_states",
+            ),
+        )
 
     def reset_null(self) -> None:
         self.storage[0].zero_()
 
     def tensorize(self, plan: PagedCachePlan, staging: Any) -> DeviceCache:
-        return DeviceCache(
-            self.geometry,
-            stage_page_groups(plan, staging),
-            self.keys,
-            self.values,
-            self.recurrent_states,
-            self.convolution_states,
-            self.target_hidden_states,
-        )
+        return self._make_graph_cache(stage_page_groups(plan, staging))
 
     def _make_graph_cache(self, groups) -> DeviceCache:
         return DeviceCache(

@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, cast
+from typing import Any
 
 import torch
 from torch import Tensor
@@ -20,6 +20,7 @@ from resin.backend.cuda.slab import (
     GraphPageTableArena,
     SlabDeviceCache,
     stage_page_groups,
+    state_view_factory,
 )
 from resin.backend.plans import PagedCachePlan
 from resin.backend.resources import CachePoolBinding
@@ -149,23 +150,15 @@ class CacheArena(GraphPageTableArena):
         self.values = torch.as_strided(
             flat, page_shape, page_stride, storage_offset=page_elements
         )
-        self.states = torch.as_strided(
-            flat,
-            (
-                physical,
-                STATE_BLOCKS_PER_SLAB,
-                42,
-                STATE_LENGTH,
-                STATE_WIDTH_PER_LAYER,
-            ),
-            (
-                SLAB_ELEMENTS,
-                STATE_ELEMENTS,
-                STATE_LENGTH * STATE_WIDTH_PER_LAYER,
-                STATE_WIDTH_PER_LAYER,
-                1,
-            ),
+        state_view = state_view_factory(
+            self.storage,
+            STATE_BLOCKS_PER_SLAB,
+            STATE_ELEMENTS * self.storage.element_size(),
         )
+        self.states = state_view(
+            torch.bfloat16, 42, STATE_LENGTH, STATE_WIDTH_PER_LAYER
+        )
+
         self.state_blocks = {STATE_GROUP: self.states.flatten(2)}
 
     def cache_storage_buffers(self, groups, *, prefix_length):
@@ -215,18 +208,7 @@ class CacheArena(GraphPageTableArena):
         self.storage[0].zero_()
 
     def tensorize(self, plan: PagedCachePlan, staging: Any) -> DeviceCache:
-        return DeviceCache(
-            self.geometry,
-            cast(
-                tuple[
-                    DevicePageGroup, DevicePageGroup, DevicePageGroup, DevicePageGroup
-                ],
-                stage_page_groups(plan, staging),
-            ),
-            self.keys,
-            self.values,
-            self.states,
-        )
+        return self._make_graph_cache(stage_page_groups(plan, staging))
 
     def _make_graph_cache(self, groups) -> DeviceCache:
         return DeviceCache(

@@ -10,13 +10,14 @@ import torch
 from torch import Tensor
 
 from resin import CacheGroupFamily, CacheGroupLayout, CacheLayout
-from resin.backend.cache_storage import byte_regions
+from resin.backend.cache_storage import layered_cache_buffers
 from resin.backend.cuda.slab import (
     GraphPageTableArena,
     SlabDeviceCache,
     graph_scratch_address,
     graph_scratch_parent_count,
     stage_page_groups,
+    state_view_factory,
 )
 from resin.backend.resources import CachePoolBinding
 
@@ -388,7 +389,7 @@ class CacheArena(GraphPageTableArena):
         self.storage = torch.zeros(
             (physical, geometry.slab_bytes), dtype=torch.uint8, device=device
         )
-        bf16, fp32 = self.storage.view(torch.bfloat16), self.storage.view(torch.float32)
+        bf16 = self.storage.view(torch.bfloat16)
         pages = physical * geometry.slab_units
         latent_storage = self.storage.view(geometry.latent_dtype)
         self.latent = latent_storage.as_strided(
@@ -410,57 +411,35 @@ class CacheArena(GraphPageTableArena):
             geometry.head_dim,
             geometry.conv_history,
         )
-        state_slots = geometry.packings[1]
-        self.state_blocks = {
-            STATE_GROUP: self.storage.as_strided(
-                (physical, state_slots, geometry.state_bytes),
-                (geometry.slab_bytes, geometry.state_bytes, 1),
-            )
-        }
-        self.recurrent_states = fp32.as_strided(
-            (physical, state_slots, n, h, d, d),
-            (
-                geometry.slab_bytes // 4,
-                geometry.state_bytes // 4,
-                h * d * d,
-                d * d,
-                d,
-                1,
-            ),
+        state_view = state_view_factory(
+            self.storage, geometry.packings[1], geometry.state_bytes
         )
-        self.convolution_states = bf16.as_strided(
-            (physical, state_slots, n, 3, h * d, c),
-            (
-                geometry.slab_bytes // 2,
-                geometry.state_bytes // 2,
-                3 * h * d * c,
-                h * d * c,
-                c,
-                1,
-            ),
-            geometry.recurrent_elements * 2,
+        self.state_blocks = {STATE_GROUP: state_view(torch.uint8, geometry.state_bytes)}
+        self.recurrent_states = state_view(torch.float32, n, h, d, d)
+        self.convolution_states = state_view(
+            torch.bfloat16, n, 3, h * d, c, offset=geometry.recurrent_elements * 4
         )
-        self.target_hidden_states = bf16.as_strided(
-            (physical, state_slots, geometry.hidden_size),
-            (geometry.slab_bytes // 2, geometry.state_bytes // 2, 1),
-            geometry.recurrent_elements * 2 + geometry.convolution_elements,
+        self.target_hidden_states = state_view(
+            torch.bfloat16,
+            geometry.hidden_size,
+            offset=geometry.recurrent_elements * 4 + geometry.convolution_elements * 2,
         )
 
         f, d = len(geometry.full_layers), geometry.index_dim
-        self.index_tail_keys = bf16.as_strided(
-            (physical, state_slots, f, 4, d),
-            (geometry.slab_bytes // 2, geometry.state_bytes // 2, 4 * d, d, 1),
-            geometry.base_state_bytes // 2,
+        self.index_tail_keys = state_view(
+            torch.bfloat16, f, 4, d, offset=geometry.base_state_bytes
         )
-        self.index_tail_gates = fp32.as_strided(
-            (physical, state_slots, f, 4, d),
-            (geometry.slab_bytes // 4, geometry.state_bytes // 4, 4 * d, d, 1),
-            (geometry.base_state_bytes + geometry.tail_elements * 2) // 4,
+        self.index_tail_gates = state_view(
+            torch.float32,
+            f,
+            4,
+            d,
+            offset=geometry.base_state_bytes + geometry.tail_elements * 2,
         )
-        self.index_tail_ends = self.storage.view(torch.int64).as_strided(
-            (physical, state_slots, f),
-            (geometry.slab_bytes // 8, geometry.state_bytes // 8, 1),
-            (geometry.base_state_bytes + geometry.tail_elements * 6) // 8,
+        self.index_tail_ends = state_view(
+            torch.int64,
+            f,
+            offset=geometry.base_state_bytes + geometry.tail_elements * 6,
         )
 
         self.dsa_workspace = None
@@ -470,35 +449,20 @@ class CacheArena(GraphPageTableArena):
             self.dsa_workspace = DsaWorkspace(device)
 
     def cache_storage_buffers(self, groups, *, prefix_length):
-        buffers, geometry = [], self.geometry
-        for group, (_, addresses) in enumerate(groups):
-            for slab, slot in addresses:
-                if group == STATE_GROUP:
-                    tensors = {
-                        name: getattr(self, name)[slab, slot]
-                        for name in (
-                            "recurrent_states",
-                            "convolution_states",
-                            "target_hidden_states",
-                            "index_tail_keys",
-                            "index_tail_gates",
-                            "index_tail_ends",
-                        )
-                    }
-                else:
-                    layers = len(geometry.full_layers)
-                    tensors = {
-                        f"{name}/{layer}": values[
-                            slab * geometry.slab_units + slot * layers + layer
-                        ]
-                        for name, values in (
-                            ("latent", self.latent),
-                            ("pooled_keys", self.pooled_keys),
-                        )
-                        for layer in range(layers)
-                    }
-                buffers.append(byte_regions(tensors))
-        return tuple(buffers)
+        return layered_cache_buffers(
+            self,
+            groups,
+            page_fields=("latent", "pooled_keys"),
+            page_layers=(len(self.geometry.full_layers), None),
+            state_fields=(
+                "recurrent_states",
+                "convolution_states",
+                "target_hidden_states",
+                "index_tail_keys",
+                "index_tail_gates",
+                "index_tail_ends",
+            ),
+        )
 
     def _graph_padding_address(self, index, row):
         return graph_scratch_address(

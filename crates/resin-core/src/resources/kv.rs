@@ -1,5 +1,4 @@
 use std::collections::HashSet;
-use std::fmt;
 use std::num::NonZeroU32;
 
 pub const MAX_KERNEL_VALUE: u32 = i32::MAX as u32;
@@ -346,7 +345,8 @@ impl KvLayout {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, thiserror::Error)]
+#[error("{0}")]
 pub struct KvLayoutError(String);
 
 impl KvLayoutError {
@@ -354,14 +354,6 @@ impl KvLayoutError {
         Self(message.into())
     }
 }
-
-impl fmt::Display for KvLayoutError {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str(&self.0)
-    }
-}
-
-impl std::error::Error for KvLayoutError {}
 
 /// Restore a private live row from an immutable snapshot, or zero it with source slab zero.
 #[derive(Clone, Debug, Eq, PartialEq, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
@@ -561,16 +553,9 @@ impl KvGroupPlan {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
+#[error("{0}")]
 pub struct KvPlanError(&'static str);
-
-impl fmt::Display for KvPlanError {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str(self.0)
-    }
-}
-
-impl std::error::Error for KvPlanError {}
 
 #[cfg(test)]
 mod tests {

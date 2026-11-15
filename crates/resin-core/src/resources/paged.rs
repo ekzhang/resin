@@ -337,127 +337,60 @@ impl WriterAccessLease {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, thiserror::Error)]
 pub enum CachePoolError {
+    #[error("cache pool parent capacity must be positive")]
     InvalidParentCapacity,
+    #[error("cache pool requires at least one cache group")]
     EmptyGroupLayout,
+    #[error("cache pool has too many groups")]
     TooManyGroups,
+    #[error("cache pool id space is exhausted")]
     PoolIdExhausted,
+    #[error("cache pool writer id space is exhausted")]
     WriterIdExhausted,
+    #[error("could not allocate cache-pool metadata")]
     MetadataAllocation,
-    UnknownGroup {
-        group: GroupId,
-    },
+    #[error("cache group {} is not declared", .group.index())]
+    UnknownGroup { group: GroupId },
+    #[error("cache block demand overflows usize")]
     DemandOverflow,
+    #[error("cache group {} requested {requested} blocks but only {available} fit", .group.index())]
     InsufficientCapacity {
         group: GroupId,
         requested: usize,
         available: usize,
     },
-    InvalidWriteSpan {
-        requested: u32,
-        maximum: u32,
-    },
-    ParentGenerationExhausted {
-        parent: u32,
-    },
+    #[error("cache write span {requested} exceeds window-safe maximum {maximum}")]
+    InvalidWriteSpan { requested: u32, maximum: u32 },
+    #[error("cache parent {parent} generation is exhausted")]
+    ParentGenerationExhausted { parent: u32 },
+    #[error("cache allocation belongs to a different pool")]
     ForeignPool,
+    #[error("cache page handle is stale")]
     StaleHandle,
+    #[error("cache page names group {}, but its parent is bound to group {}", .handle_group.index(), .bound_group.index())]
     ParentGroupMismatch {
         handle_group: GroupId,
         bound_group: GroupId,
     },
+    #[error("cache allocation contains a duplicate page handle")]
     DuplicateHandle,
+    #[error("writer access belongs to another pool")]
     ForeignAccess,
+    #[error("cache page belongs to a different request writer")]
     WrongWriter,
+    #[error("cache page has no exclusive mutable request owner")]
     PageNotWritable,
+    #[error("one cache page has incompatible duplicate access claims")]
     DuplicateAccessClaim,
+    #[error("cache page already has an incompatible access lease")]
     AccessConflict,
+    #[error("cache page write completion epoch is exhausted")]
     WriteEpochExhausted,
-    WriteEpochChanged {
-        expected: u64,
-        actual: u64,
-    },
+    #[error("cache page write epoch changed from {expected} to {actual} after access preparation")]
+    WriteEpochChanged { expected: u64, actual: u64 },
 }
-
-impl fmt::Display for CachePoolError {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::InvalidParentCapacity => {
-                formatter.write_str("cache pool parent capacity must be positive")
-            }
-            Self::EmptyGroupLayout => {
-                formatter.write_str("cache pool requires at least one cache group")
-            }
-            Self::TooManyGroups => formatter.write_str("cache pool has too many groups"),
-            Self::PoolIdExhausted => formatter.write_str("cache pool id space is exhausted"),
-            Self::WriterIdExhausted => {
-                formatter.write_str("cache pool writer id space is exhausted")
-            }
-            Self::MetadataAllocation => {
-                formatter.write_str("could not allocate cache-pool metadata")
-            }
-            Self::UnknownGroup { group } => {
-                write!(formatter, "cache group {} is not declared", group.index())
-            }
-            Self::DemandOverflow => formatter.write_str("cache block demand overflows usize"),
-            Self::InsufficientCapacity {
-                group,
-                requested,
-                available,
-            } => write!(
-                formatter,
-                "cache group {} requested {requested} blocks but only {available} fit",
-                group.index()
-            ),
-            Self::InvalidWriteSpan { requested, maximum } => write!(
-                formatter,
-                "cache write span {requested} exceeds window-safe maximum {maximum}"
-            ),
-            Self::ParentGenerationExhausted { parent } => {
-                write!(formatter, "cache parent {parent} generation is exhausted")
-            }
-            Self::ForeignPool => {
-                formatter.write_str("cache allocation belongs to a different pool")
-            }
-            Self::StaleHandle => formatter.write_str("cache page handle is stale"),
-            Self::ParentGroupMismatch {
-                handle_group,
-                bound_group,
-            } => write!(
-                formatter,
-                "cache page names group {}, but its parent is bound to group {}",
-                handle_group.index(),
-                bound_group.index()
-            ),
-            Self::DuplicateHandle => {
-                formatter.write_str("cache allocation contains a duplicate page handle")
-            }
-            Self::ForeignAccess => formatter.write_str("writer access belongs to another pool"),
-            Self::WrongWriter => {
-                formatter.write_str("cache page belongs to a different request writer")
-            }
-            Self::PageNotWritable => {
-                formatter.write_str("cache page has no exclusive mutable request owner")
-            }
-            Self::DuplicateAccessClaim => {
-                formatter.write_str("one cache page has incompatible duplicate access claims")
-            }
-            Self::AccessConflict => {
-                formatter.write_str("cache page already has an incompatible access lease")
-            }
-            Self::WriteEpochExhausted => {
-                formatter.write_str("cache page write completion epoch is exhausted")
-            }
-            Self::WriteEpochChanged { expected, actual } => write!(
-                formatter,
-                "cache page write epoch changed from {expected} to {actual} after access preparation"
-            ),
-        }
-    }
-}
-
-impl std::error::Error for CachePoolError {}
 
 /// A failed retirement returns the exact move-only request token unchanged.
 #[derive(Debug)]

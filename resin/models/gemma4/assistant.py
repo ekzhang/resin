@@ -13,6 +13,7 @@ from torch.nn import functional as F
 from resin.backend.layers import RMSNorm
 from resin.models.gemma4.config import FULL_ATTENTION, SLIDING_ATTENTION
 from resin.models.gemma4.model import RotaryEmbedding, apply_rotary
+from resin.models.hf_config import parse_hf_config, require_options
 
 
 @dataclass(frozen=True, slots=True)
@@ -50,13 +51,7 @@ class Gemma4AssistantConfig:
         }
         if raw.get("model_type") != "gemma4_assistant":
             raise ValueError("expected a Gemma 4 assistant checkpoint")
-        mismatched = {
-            key: (text.get(key), expected)
-            for key, expected in required.items()
-            if text.get(key) != expected
-        }
-        if mismatched:
-            raise ValueError(f"unsupported Gemma 4 assistant options: {mismatched}")
+        require_options(text, required, "Gemma 4 assistant")
         if raw.get("use_ordered_embeddings", False):
             raise ValueError("ordered Gemma 4 assistant embeddings are unsupported")
         layer_types = tuple(text.get("layer_types") or ())
@@ -72,20 +67,11 @@ class Gemma4AssistantConfig:
         rope = text.get("rope_parameters") or {}
         local_rope = rope.get(SLIDING_ATTENTION) or {}
         global_rope = rope.get(FULL_ATTENTION) or {}
-        config = cls(
+        config = parse_hf_config(
+            cls,
+            text,
+            coerce=True,
             backbone_hidden_size=int(raw["backbone_hidden_size"]),
-            vocab_size=int(text["vocab_size"]),
-            hidden_size=int(text["hidden_size"]),
-            intermediate_size=int(text["intermediate_size"]),
-            num_hidden_layers=int(text["num_hidden_layers"]),
-            num_attention_heads=int(text["num_attention_heads"]),
-            num_key_value_heads=int(text["num_key_value_heads"]),
-            num_global_key_value_heads=int(text["num_global_key_value_heads"]),
-            head_dim=int(text["head_dim"]),
-            global_head_dim=int(text["global_head_dim"]),
-            sliding_window=int(text["sliding_window"]),
-            max_position_embeddings=int(text["max_position_embeddings"]),
-            rms_norm_eps=float(text["rms_norm_eps"]),
             layer_types=layer_types,
             local_rope_theta=float(local_rope["rope_theta"]),
             global_rope_theta=float(global_rope["rope_theta"]),
@@ -194,6 +180,8 @@ class Gemma4AssistantTextModel(nn.Module):
 class Gemma4AssistantForCausalLM(nn.Module):
     """Four dense Q-only layers sharing the target model's last local/global K/V."""
 
+    _scale_inplace = True
+
     def __init__(self, config: Gemma4AssistantConfig) -> None:
         super().__init__()
         self.config = config
@@ -214,6 +202,9 @@ class Gemma4AssistantForCausalLM(nn.Module):
     def materialize_buffers(self, device: torch.device) -> None:
         self.model.rotary_emb.materialize(device)
 
+    def logits(self, hidden: Tensor) -> Tensor:
+        return F.linear(hidden, self.model.embed_tokens.weight)
+
     def forward_step(
         self,
         inputs_embeds: Tensor,
@@ -229,6 +220,7 @@ class Gemma4AssistantForCausalLM(nn.Module):
             kind: self.model.rotary_emb(positions, kind, hidden.dtype)
             for kind in set(self.config.layer_types)
         }
+        scale = torch.Tensor.mul_ if self._scale_inplace else torch.mul
         for layer in self.model.layers:
             residual = hidden
             normalized = layer.input_layernorm(hidden)
@@ -244,11 +236,11 @@ class Gemma4AssistantForCausalLM(nn.Module):
             hidden = layer.pre_feedforward_layernorm(hidden)
             hidden = layer.mlp(hidden)
             hidden = residual + layer.post_feedforward_layernorm(hidden)
-            hidden *= layer.layer_scalar
+            hidden = scale(hidden, layer.layer_scalar)
 
         hidden = self.model.norm(hidden)
         projected = self.post_projection(hidden)
-        logits = F.linear(hidden, self.model.embed_tokens.weight)
+        logits = self.logits(hidden)
         return logits, projected
 
 

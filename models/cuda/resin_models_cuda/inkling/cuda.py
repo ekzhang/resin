@@ -23,12 +23,12 @@ from resin.backend.cuda.metrics import observe_execution
 from resin.backend.cuda.runner import (
     CudaRunner,
     capture_sampling_inputs,
+    forward_paged,
     graph_sample,
     pad_sampling_inputs,
     validate_hybrid_plan,
 )
 from resin.backend.cuda.scoring import format_output, prompt_scores, score_completion
-from resin.backend.cuda.staging import TensorStager
 from resin.backend.cuda.state import execute_state
 from resin.backend.cuda.vision_cache import VisionFeatureCache
 from resin.backend.plans import PagedCachePlan
@@ -627,24 +627,13 @@ class InklingCudaRunner(CudaRunner):
                 self.speculative_draft_tokens if plan.phase == BatchPhase.DECODE else 0
             ),
         )
-        with self._cuda_failure:
-            if plan.phase == BatchPhase.DECODE:
-                graph_output = self._graph_forward(plan, cache_plan)
-                if graph_output is not None:
-                    return graph_output
-            staging = TensorStager(self.device)
-            cache = self._cache.tensorize(cache_plan, staging)
-            token_ids = staging.device("token_ids", plan.token_ids, torch.long)
-            positions = staging.device("positions", plan.positions, torch.long)
-            with (
-                torch.inference_mode(),
-                use_default_dtype(torch.bfloat16),
-                torch.device(self.device),
-            ):
-                if plan.phase == BatchPhase.PREFILL:
-                    with self._prefill_graphs():
-                        return self._prefill(plan, rows, cache, token_ids, positions)
-                return self._speculative_decode(plan, cache, token_ids, positions)
+        return forward_paged(self, plan, rows, cache_plan)
+
+    def _eager_forward(self, plan, rows, cache, token_ids, positions):
+        if plan.phase == BatchPhase.PREFILL:
+            with self._prefill_graphs():
+                return self._prefill(plan, rows, cache, token_ids, positions)
+        return self._speculative_decode(plan, cache, token_ids, positions)
 
     def release(self, sequence_ids: list[int]) -> None:
         """The Engine retires each sequence's slabs after this callback."""

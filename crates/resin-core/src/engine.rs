@@ -18,7 +18,6 @@ use crate::{
     Selection, SequenceStep, TokenRange, schedule_ready_prefix,
 };
 use std::cmp::Reverse;
-use std::fmt;
 use std::num::{NonZeroU32, NonZeroU64, NonZeroUsize};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -36,7 +35,8 @@ pub enum ErrorKind {
     Execution,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, thiserror::Error)]
+#[error("{message}")]
 pub struct Error {
     pub kind: ErrorKind,
     message: String,
@@ -75,12 +75,6 @@ impl Error {
         }
     }
 }
-impl fmt::Display for Error {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(&self.message)
-    }
-}
-impl std::error::Error for Error {}
 impl From<CachePoolError> for Error {
     fn from(error: CachePoolError) -> Self {
         match error {

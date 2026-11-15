@@ -4,8 +4,6 @@
 //! `[EP, EXPERT_TP]` over the same ranks. Unassigned attention ranks replicate
 //! the same shard within a request replica; they do not create new schedulers.
 
-use std::{error::Error, fmt};
-
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
 pub struct Parallelism {
     world_size: usize,
@@ -15,30 +13,21 @@ pub struct Parallelism {
     ep: usize,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
 pub enum ParallelismError {
+    #[error("parallel sizes must be positive integers")]
     InvalidSizes,
+    #[error("world_size must be divisible by ep")]
     ExpertNotDivisible,
+    #[error("world_size must be divisible by attn_dp * cp * attn_tp")]
     AttentionNotDivisible,
+    #[error("attn_dp * cp * attn_tp exceeds usize")]
     AttentionSizeOverflow,
+    #[error("rank is outside the topology")]
     InvalidRank,
+    #[error("coordinates are outside the topology")]
     InvalidCoordinates,
 }
-
-impl fmt::Display for ParallelismError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(match self {
-            Self::InvalidSizes => "parallel sizes must be positive integers",
-            Self::ExpertNotDivisible => "world_size must be divisible by ep",
-            Self::AttentionNotDivisible => "world_size must be divisible by attn_dp * cp * attn_tp",
-            Self::AttentionSizeOverflow => "attn_dp * cp * attn_tp exceeds usize",
-            Self::InvalidRank => "rank is outside the topology",
-            Self::InvalidCoordinates => "coordinates are outside the topology",
-        })
-    }
-}
-
-impl Error for ParallelismError {}
 
 impl Default for Parallelism {
     fn default() -> Self {

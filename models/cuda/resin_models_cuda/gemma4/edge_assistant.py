@@ -16,6 +16,7 @@ from resin.models.gemma4.assistant import (
     Gemma4AssistantForCausalLM,
 )
 from resin.models.gemma4.config import FULL_ATTENTION, SLIDING_ATTENTION
+from resin.models.hf_config import parse_hf_config, require_options
 
 DEFAULT_ASSISTANT = "google/gemma-4-E2B-it-assistant"
 DEFAULT_ASSISTANT_REVISION = "2d874ef7d29f9a30599a1e4b3c1cbc9595f005df"
@@ -42,34 +43,20 @@ class Gemma4EdgeAssistantConfig(Gemma4AssistantConfig):
         }
         if raw.get("model_type") != "gemma4_assistant":
             raise ValueError("expected a Gemma 4 assistant checkpoint")
-        mismatched = {
-            key: (text.get(key), expected)
-            for key, expected in required.items()
-            if text.get(key) != expected
-        }
-        if mismatched:
-            raise ValueError(f"unsupported E2B assistant options: {mismatched}")
+        require_options(text, required, "E2B assistant")
         if not raw.get("use_ordered_embeddings"):
             raise ValueError("the E2B assistant requires its ordered vocabulary head")
         rope = text.get("rope_parameters") or {}
         local = rope.get(SLIDING_ATTENTION) or {}
         global_ = rope.get(FULL_ATTENTION) or {}
-        config = cls(
+        config = parse_hf_config(
+            cls,
+            text,
+            coerce=True,
             backbone_hidden_size=int(raw["backbone_hidden_size"]),
-            vocab_size=int(text["vocab_size"]),
-            hidden_size=int(text["hidden_size"]),
-            intermediate_size=int(text["intermediate_size"]),
-            num_hidden_layers=int(text["num_hidden_layers"]),
-            num_attention_heads=int(text["num_attention_heads"]),
-            num_key_value_heads=int(text["num_key_value_heads"]),
             num_global_key_value_heads=int(
                 text.get("num_global_key_value_heads") or text["num_key_value_heads"]
             ),
-            head_dim=int(text["head_dim"]),
-            global_head_dim=int(text["global_head_dim"]),
-            sliding_window=int(text["sliding_window"]),
-            max_position_embeddings=int(text["max_position_embeddings"]),
-            rms_norm_eps=float(text["rms_norm_eps"]),
             layer_types=tuple(text["layer_types"]),
             local_rope_theta=float(local["rope_theta"]),
             global_rope_theta=float(global_["rope_theta"]),
@@ -159,39 +146,10 @@ class Gemma4EdgeAssistantForCausalLM(Gemma4AssistantForCausalLM):
         super().__init__(config)
         self.masked_embedding = Gemma4EdgeMaskedEmbedder(config)
 
-    def forward_step(
-        self,
-        inputs_embeds: Tensor,
-        positions: Tensor,
-        *,
-        local_wrapper,
-        global_wrapper,
-        local_kv: tuple[Tensor, Tensor],
-        global_kv: tuple[Tensor, Tensor],
-    ) -> tuple[Tensor, Tensor]:
-        hidden = self.pre_projection(inputs_embeds)
-        embeddings = {
-            kind: self.model.rotary_emb(positions, kind, hidden.dtype)
-            for kind in set(self.config.layer_types)
-        }
-        for layer in self.model.layers:
-            residual = hidden
-            normalized = layer.input_layernorm(hidden)
-            cos, sin = embeddings[layer.self_attn.layer_type]
-            query = layer.self_attn.project_q(normalized, cos, sin)
-            local = layer.self_attn.is_local
-            wrapper = local_wrapper if local else global_wrapper
-            attended = wrapper.run(query, local_kv if local else global_kv)
-            hidden = layer.self_attn.o_proj(attended.reshape(len(hidden), -1))
-            hidden = residual + layer.post_attention_layernorm(hidden)
-            residual = hidden
-            hidden = layer.mlp(layer.pre_feedforward_layernorm(hidden))
-            hidden = residual + layer.post_feedforward_layernorm(hidden)
-            hidden = hidden * layer.layer_scalar
-        hidden = self.model.norm(hidden)
-        projected = self.post_projection(hidden)
-        logits = self.masked_embedding(hidden, self.model.embed_tokens.weight)
-        return logits, projected
+    _scale_inplace = False
+
+    def logits(self, hidden: Tensor) -> Tensor:
+        return self.masked_embedding(hidden, self.model.embed_tokens.weight)
 
 
 def load_edge_assistant(model_path: str | Path, *, device, **_kwargs):

@@ -12,7 +12,7 @@ from resin.backend.loading import (
     assign_model_tensor,
     prepare_model,
     read_config,
-    resolve_model,
+    resolve_hub_model,
 )
 from resin.backend.safetensors import SafetensorReader, indexed_tensor_files
 from resin.models.gemma4.assistant import (
@@ -28,25 +28,13 @@ DEFAULT_ASSISTANT = "google/gemma-4-31B-it-assistant"
 DEFAULT_ASSISTANT_REVISION = "627c5ec1458b9086b841a91e0512fd31fd2fbbf1"
 
 
-def _download_assistant(repo_id: str, revision: str | None) -> Path:
-    from huggingface_hub import snapshot_download
-
-    return Path(
-        snapshot_download(
-            repo_id=repo_id,
-            revision=revision,
-            allow_patterns=["config.json", "model.safetensors"],
-        )
-    )
-
-
 def resolve_assistant_path(model: str | Path, revision: str | None = None) -> Path:
-    selected = (
-        DEFAULT_ASSISTANT_REVISION
-        if revision is None and str(model) == DEFAULT_ASSISTANT
-        else revision
+    return resolve_hub_model(
+        model,
+        revision,
+        default=(DEFAULT_ASSISTANT, DEFAULT_ASSISTANT_REVISION),
+        files=("config.json", "model.safetensors"),
     )
-    return resolve_model(model, selected, _download_assistant)
 
 
 def build_meta_assistant(

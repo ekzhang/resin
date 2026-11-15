@@ -137,33 +137,34 @@ impl<T: Schedulable> Scheduler<T> {
         let mut selected = std::iter::repeat_with(|| None)
             .take(selection.selected.len())
             .collect::<Vec<Option<T>>>();
-        // Dispatch order may put an admitted row before an older waiting row.
-        // Walk the queue in index order, retaining each row's dispatch position.
+        // Compact the ready queue in place; dispatch may put an admitted row
+        // before an older waiting row, so retain each row's original position.
         let mut locations = selection
             .selected
             .into_iter()
             .enumerate()
             .collect::<Vec<_>>();
         locations.sort_unstable_by_key(|(_, identity)| identity.index);
-        let mut locations = locations.into_iter().peekable();
-        let mut remaining = Vec::with_capacity(self.ready.len() - selected.len());
-        for (index, item) in self.ready.drain(..).enumerate() {
-            if locations
+        let mut remaining = locations.iter().peekable();
+        let mut index = 0;
+        let taken = self.ready.extract_if(.., |_| {
+            let take = remaining
                 .peek()
-                .is_some_and(|(_, identity)| identity.index == index)
-            {
-                let (position, identity) = locations.next().expect("selected location was peeked");
-                assert_eq!(item.turn_ordinal(), identity.turn);
-                selected[position] = Some(item);
-            } else {
-                remaining.push(item);
+                .is_some_and(|(_, identity)| identity.index == index);
+            if take {
+                remaining.next();
             }
+            index += 1;
+            take
+        });
+        for ((position, identity), item) in locations.iter().zip(taken) {
+            assert_eq!(item.turn_ordinal(), identity.turn);
+            selected[*position] = Some(item);
         }
         assert!(
             selected.iter().all(Option::is_some),
             "selected index is out of range"
         );
-        self.ready = remaining;
         self.bump_epoch();
         selected
             .into_iter()

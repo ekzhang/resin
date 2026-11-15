@@ -5,23 +5,30 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any
 
+from resin.models.hf_config import (
+    PositiveInt,
+    invalid_dimensions,
+    parse_hf_config,
+    require_options,
+)
+
 SLIDING_ATTENTION = "sliding_attention"
 FULL_ATTENTION = "full_attention"
 
 
 @dataclass(frozen=True, slots=True)
 class Gemma4Nvfp4Config:
-    vocab_size: int
-    hidden_size: int
-    intermediate_size: int
-    num_hidden_layers: int
-    num_attention_heads: int
-    num_key_value_heads: int
-    num_global_key_value_heads: int
-    head_dim: int
-    global_head_dim: int
-    sliding_window: int
-    max_position_embeddings: int
+    vocab_size: PositiveInt
+    hidden_size: PositiveInt
+    intermediate_size: PositiveInt
+    num_hidden_layers: PositiveInt
+    num_attention_heads: PositiveInt
+    num_key_value_heads: PositiveInt
+    num_global_key_value_heads: PositiveInt
+    head_dim: PositiveInt
+    global_head_dim: PositiveInt
+    sliding_window: PositiveInt
+    max_position_embeddings: PositiveInt
     rms_norm_eps: float
     layer_types: tuple[str, ...]
     image_token_id: int
@@ -32,24 +39,10 @@ class Gemma4Nvfp4Config:
     local_rope_theta: float
     global_rope_theta: float
     global_partial_rotary_factor: float
-    group_size: int
+    group_size: PositiveInt
 
     def __post_init__(self) -> None:
-        dimensions = {
-            "vocab_size": self.vocab_size,
-            "hidden_size": self.hidden_size,
-            "intermediate_size": self.intermediate_size,
-            "num_hidden_layers": self.num_hidden_layers,
-            "num_attention_heads": self.num_attention_heads,
-            "num_key_value_heads": self.num_key_value_heads,
-            "num_global_key_value_heads": self.num_global_key_value_heads,
-            "head_dim": self.head_dim,
-            "global_head_dim": self.global_head_dim,
-            "sliding_window": self.sliding_window,
-            "max_position_embeddings": self.max_position_embeddings,
-            "group_size": self.group_size,
-        }
-        invalid = [name for name, value in dimensions.items() if value <= 0]
+        invalid = list(invalid_dimensions(self))
         if invalid:
             raise ValueError(f"Gemma 4 dimensions must be positive: {invalid}")
         if len(self.layer_types) != self.num_hidden_layers:
@@ -82,17 +75,7 @@ class Gemma4Nvfp4Config:
     def history_blocks_per_parent(self) -> int:
         """Pack global pages into a parent the same size as one local page."""
 
-        local = self.local_layer_count * self.num_key_value_heads * self.head_dim
-        global_ = (
-            self.global_layer_count
-            * self.num_global_key_value_heads
-            * self.global_head_dim
-        )
-        if not global_ or local % global_:
-            raise ValueError(
-                "local/global KV geometry does not share an integral parent"
-            )
-        return local // global_
+        return _history_blocks_per_parent(self)
 
     @classmethod
     def from_dict(cls, config: dict[str, Any]) -> Gemma4Nvfp4Config:
@@ -116,13 +99,7 @@ class Gemma4Nvfp4Config:
             "tie_word_embeddings": True,
             "use_bidirectional_attention": "vision",
         }
-        mismatched = {
-            key: (text.get(key), expected)
-            for key, expected in required.items()
-            if text.get(key) != expected
-        }
-        if mismatched:
-            raise ValueError(f"unsupported Gemma 4 text options: {mismatched}")
+        require_options(text, required, "Gemma 4 text")
         if not config.get("tie_word_embeddings", False):
             raise ValueError("the NVFP4 runner requires tied input/output embeddings")
 
@@ -154,30 +131,31 @@ class Gemma4Nvfp4Config:
 
         eos = config.get("eos_token_id", text.get("eos_token_id"))
         eos_ids = (eos,) if isinstance(eos, int) else tuple(eos or ())
-        return cls(
-            vocab_size=text["vocab_size"],
-            hidden_size=text["hidden_size"],
-            intermediate_size=text["intermediate_size"],
-            num_hidden_layers=text["num_hidden_layers"],
-            num_attention_heads=text["num_attention_heads"],
-            num_key_value_heads=text["num_key_value_heads"],
-            num_global_key_value_heads=text["num_global_key_value_heads"],
-            head_dim=text["head_dim"],
-            global_head_dim=text["global_head_dim"],
-            sliding_window=text["sliding_window"],
-            max_position_embeddings=text["max_position_embeddings"],
+        return parse_hf_config(
+            cls,
+            text,
             rms_norm_eps=text.get("rms_norm_eps", 1e-6),
             layer_types=tuple(text["layer_types"]),
             image_token_id=config["image_token_id"],
             video_token_id=config["video_token_id"],
-            pad_token_id=text["pad_token_id"],
             eos_token_ids=eos_ids,
-            final_logit_softcapping=text["final_logit_softcapping"],
             local_rope_theta=local_rope.get("rope_theta", 10_000.0),
             global_rope_theta=global_rope["rope_theta"],
             global_partial_rotary_factor=global_rope.get("partial_rotary_factor", 1.0),
             group_size=weights["group_size"],
         )
+
+
+def _history_blocks_per_parent(config) -> int:
+    local = config.local_layer_count * config.num_key_value_heads * config.head_dim
+    global_ = (
+        config.global_layer_count
+        * config.num_global_key_value_heads
+        * config.global_head_dim
+    )
+    if not global_ or local % global_:
+        raise ValueError("local/global KV geometry does not share an integral parent")
+    return local // global_
 
 
 __all__ = [

@@ -5,26 +5,36 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any
 
-from resin.models.gemma4.config import FULL_ATTENTION, SLIDING_ATTENTION
+from resin.models.gemma4.config import (
+    FULL_ATTENTION,
+    SLIDING_ATTENTION,
+    _history_blocks_per_parent,
+)
+from resin.models.hf_config import (
+    PositiveInt,
+    invalid_dimensions,
+    parse_hf_config,
+    require_options,
+)
 
 
 @dataclass(frozen=True, slots=True)
 class Gemma4EdgeConfig:
-    vocab_size: int
-    hidden_size: int
-    intermediate_size: int
-    num_hidden_layers: int
-    num_attention_heads: int
-    num_key_value_heads: int
-    num_global_key_value_heads: int
-    head_dim: int
-    global_head_dim: int
-    sliding_window: int
-    max_position_embeddings: int
+    vocab_size: PositiveInt
+    hidden_size: PositiveInt
+    intermediate_size: PositiveInt
+    num_hidden_layers: PositiveInt
+    num_attention_heads: PositiveInt
+    num_key_value_heads: PositiveInt
+    num_global_key_value_heads: PositiveInt
+    head_dim: PositiveInt
+    global_head_dim: PositiveInt
+    sliding_window: PositiveInt
+    max_position_embeddings: PositiveInt
     rms_norm_eps: float
     layer_types: tuple[str, ...]
-    hidden_size_per_layer_input: int
-    vocab_size_per_layer_input: int
+    hidden_size_per_layer_input: PositiveInt
+    vocab_size_per_layer_input: PositiveInt
     num_kv_shared_layers: int
     use_double_wide_mlp: bool
     pad_token_id: int
@@ -37,23 +47,8 @@ class Gemma4EdgeConfig:
     video_token_id: int = 258884
 
     def __post_init__(self) -> None:
-        for name in (
-            "vocab_size",
-            "hidden_size",
-            "intermediate_size",
-            "num_hidden_layers",
-            "num_attention_heads",
-            "num_key_value_heads",
-            "num_global_key_value_heads",
-            "head_dim",
-            "global_head_dim",
-            "sliding_window",
-            "max_position_embeddings",
-            "hidden_size_per_layer_input",
-            "vocab_size_per_layer_input",
-        ):
-            if getattr(self, name) <= 0:
-                raise ValueError(f"{name} must be positive")
+        for name in invalid_dimensions(self):
+            raise ValueError(f"{name} must be positive")
         if len(self.layer_types) != self.num_hidden_layers:
             raise ValueError("layer_types must contain one item per hidden layer")
         if set(self.layer_types) - {SLIDING_ATTENTION, FULL_ATTENTION}:
@@ -86,17 +81,7 @@ class Gemma4EdgeConfig:
 
     @property
     def history_blocks_per_parent(self) -> int:
-        local = self.local_layer_count * self.num_key_value_heads * self.head_dim
-        global_ = (
-            self.global_layer_count
-            * self.num_global_key_value_heads
-            * self.global_head_dim
-        )
-        if not global_ or local % global_:
-            raise ValueError(
-                "local/global KV geometry does not share an integral parent"
-            )
-        return local // global_
+        return _history_blocks_per_parent(self)
 
     def cache_source_layer(self, index: int) -> int:
         if index < self.num_kv_producer_layers:
@@ -125,13 +110,7 @@ class Gemma4EdgeConfig:
             "tie_word_embeddings": True,
             "use_bidirectional_attention": None,
         }
-        mismatched = {
-            key: (text.get(key), value)
-            for key, value in required.items()
-            if text.get(key) != value
-        }
-        if mismatched:
-            raise ValueError(f"unsupported E2B text options: {mismatched}")
+        require_options(text, required, "E2B text")
         if raw.get("quantization_config") or not raw.get("tie_word_embeddings"):
             raise ValueError("E2B runner requires original BF16 tied-embedding weights")
         rope = text.get("rope_parameters") or {}
@@ -143,24 +122,9 @@ class Gemma4EdgeConfig:
         ):
             raise ValueError("unsupported E2B rotary configuration")
         eos = raw.get("eos_token_id", text.get("eos_token_id"))
-        dimensions = (
-            "vocab_size",
-            "hidden_size",
-            "intermediate_size",
-            "num_hidden_layers",
-            "num_attention_heads",
-            "num_key_value_heads",
-            "head_dim",
-            "global_head_dim",
-            "sliding_window",
-            "max_position_embeddings",
-            "hidden_size_per_layer_input",
-            "vocab_size_per_layer_input",
-            "num_kv_shared_layers",
-            "pad_token_id",
-        )
-        return cls(
-            **{key: text[key] for key in dimensions},
+        return parse_hf_config(
+            cls,
+            text,
             num_global_key_value_heads=text.get("num_global_key_value_heads")
             or text["num_key_value_heads"],
             layer_types=tuple(text["layer_types"]),

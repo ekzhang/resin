@@ -3,7 +3,7 @@
 use std::num::NonZeroU32;
 use std::sync::Arc;
 
-use numpy::{PyArray1, PyArrayLike1};
+use numpy::PyArrayLike1;
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use pyo3::types::PyTuple;
@@ -456,133 +456,110 @@ impl CacheGroupPlan {
     }
 }
 
-#[pymethods]
-impl CacheGroupPlan {
-    #[new]
-    #[pyo3(signature = (
-        *,
-        group_index,
-        block_indptr: "Sequence[int] | npt.NDArray[np.uint32]",
-        block_slab_ids: "Sequence[int] | npt.NDArray[np.uint32]",
-        block_slotnums: "Sequence[int] | npt.NDArray[np.uint32]",
-        block_table_start_indices: "Sequence[int] | npt.NDArray[np.uint32]",
-        append_slab_ids: "Sequence[int] | npt.NDArray[np.uint32]",
-        append_slotnums: "Sequence[int] | npt.NDArray[np.uint32]",
-        append_block_offsets: "Sequence[int] | npt.NDArray[np.uint32]",
-        blocks_per_slab = 1,
-        state = None
-    ))]
-    #[allow(clippy::too_many_arguments)]
-    fn new(
-        py: Python<'_>,
-        group_index: u32,
-        block_indptr: PyArrayLike1<'_, u32>,
-        block_slab_ids: PyArrayLike1<'_, u32>,
-        block_slotnums: PyArrayLike1<'_, u32>,
-        block_table_start_indices: PyArrayLike1<'_, u32>,
-        append_slab_ids: PyArrayLike1<'_, u32>,
-        append_slotnums: PyArrayLike1<'_, u32>,
-        append_block_offsets: PyArrayLike1<'_, u32>,
-        blocks_per_slab: u32,
-        state: Option<Py<CacheStatePlan>>,
-    ) -> PyResult<Self> {
-        let plan = KvGroupPlan {
+crate::arrays::array_methods! {
+    impl CacheGroupPlan {
+        arrays {
+            /// CSR row pointer into the block-address arrays. Its length is one more
+            /// than the batch sequence count.
+            block_indptr: u32 => inner.block_indptr;
+            /// One-based slab ID for each flattened block-table entry. Pair with
+            /// `block_slotnums`; slab zero is reserved as null.
+            block_slab_ids: u32 => inner.block_slab_ids;
+            /// Zero-based slot number for each flattened block-table entry. Pair with
+            /// `block_slab_ids`.
+            block_slotnums: u32 => inner.block_slotnums;
+            /// Absolute logical-block index at which each sequence's table row starts.
+            /// This is zero for full-attention history and advances for sliding-window
+            /// rows. Private live state always uses zero. It has one entry per sequence and is unrelated to
+            /// the physical slab ID.
+            block_table_start_indices: u32 => inner.block_table_start_indices;
+            /// One-based slab ID of each token's write target. Entry `k`
+            /// corresponds to `BatchPlan.token_ids[k]`.
+            append_slab_ids: u32 => inner.append_slab_ids;
+            /// Zero-based slot number of each token's write target. Entry `k`
+            /// corresponds to `BatchPlan.token_ids[k]`.
+            append_slotnums: u32 => inner.append_slotnums;
+            /// Token offset within each token's destination block. Entry `k`
+            /// corresponds to `BatchPlan.token_ids[k]` and is less than the matching
+            /// `CacheGroupLayout.block_tokens`.
+            append_block_offsets: u32 => inner.append_block_offsets;
+        }
+
+        #[new]
+        #[pyo3(signature = (
+            *,
             group_index,
-            blocks_per_slab,
-            block_indptr: crate::arrays::owned_vec(block_indptr),
-            block_slab_ids: crate::arrays::owned_vec(block_slab_ids),
-            block_slotnums: crate::arrays::owned_vec(block_slotnums),
-            block_table_start_indices: crate::arrays::owned_vec(block_table_start_indices),
-            append_slab_ids: crate::arrays::owned_vec(append_slab_ids),
-            append_slotnums: crate::arrays::owned_vec(append_slotnums),
-            append_block_offsets: crate::arrays::owned_vec(append_block_offsets),
-            state: state.as_ref().map(|state| state.borrow(py).inner.clone()),
-        };
-        plan.validate().map_err(plan_error)?;
-        Ok(Self::from_inner(plan))
-    }
+            block_indptr: "Sequence[int] | npt.NDArray[np.uint32]",
+            block_slab_ids: "Sequence[int] | npt.NDArray[np.uint32]",
+            block_slotnums: "Sequence[int] | npt.NDArray[np.uint32]",
+            block_table_start_indices: "Sequence[int] | npt.NDArray[np.uint32]",
+            append_slab_ids: "Sequence[int] | npt.NDArray[np.uint32]",
+            append_slotnums: "Sequence[int] | npt.NDArray[np.uint32]",
+            append_block_offsets: "Sequence[int] | npt.NDArray[np.uint32]",
+            blocks_per_slab = 1,
+            state = None
+        ))]
+        #[allow(clippy::too_many_arguments)]
+        fn new(
+            py: Python<'_>,
+            group_index: u32,
+            block_indptr: PyArrayLike1<'_, u32>,
+            block_slab_ids: PyArrayLike1<'_, u32>,
+            block_slotnums: PyArrayLike1<'_, u32>,
+            block_table_start_indices: PyArrayLike1<'_, u32>,
+            append_slab_ids: PyArrayLike1<'_, u32>,
+            append_slotnums: PyArrayLike1<'_, u32>,
+            append_block_offsets: PyArrayLike1<'_, u32>,
+            blocks_per_slab: u32,
+            state: Option<Py<CacheStatePlan>>,
+        ) -> PyResult<Self> {
+            let plan = KvGroupPlan {
+                group_index,
+                blocks_per_slab,
+                block_indptr: crate::arrays::owned_vec(block_indptr),
+                block_slab_ids: crate::arrays::owned_vec(block_slab_ids),
+                block_slotnums: crate::arrays::owned_vec(block_slotnums),
+                block_table_start_indices: crate::arrays::owned_vec(block_table_start_indices),
+                append_slab_ids: crate::arrays::owned_vec(append_slab_ids),
+                append_slotnums: crate::arrays::owned_vec(append_slotnums),
+                append_block_offsets: crate::arrays::owned_vec(append_block_offsets),
+                state: state.as_ref().map(|state| state.borrow(py).inner.clone()),
+            };
+            plan.validate().map_err(plan_error)?;
+            Ok(Self::from_inner(plan))
+        }
 
-    /// Zero-based index of this plan's matching CacheGroupLayout. BatchPlan
-    /// orders group plans by this index and rejects gaps or reordering.
-    #[getter]
-    fn group_index(&self) -> u32 {
-        self.inner.group_index
-    }
+        /// Zero-based index of this plan's matching CacheGroupLayout. BatchPlan
+        /// orders group plans by this index and rejects gaps or reordering.
+        #[getter]
+        fn group_index(&self) -> u32 {
+            self.inner.group_index
+        }
 
-    /// Number of this group's blocks packed into one slab. Valid slot numbers
-    /// are `0 <= slotnum < blocks_per_slab`.
-    #[getter]
-    fn blocks_per_slab(&self) -> u32 {
-        self.inner.blocks_per_slab
-    }
+        /// Number of this group's blocks packed into one slab. Valid slot numbers
+        /// are `0 <= slotnum < blocks_per_slab`.
+        #[getter]
+        fn blocks_per_slab(&self) -> u32 {
+            self.inner.blocks_per_slab
+        }
 
-    #[getter]
-    fn state(&self) -> Option<CacheStatePlan> {
-        self.inner
-            .state
-            .clone()
-            .map(|inner| CacheStatePlan { inner })
-    }
+        #[getter]
+        fn state(&self) -> Option<CacheStatePlan> {
+            self.inner
+                .state
+                .clone()
+                .map(|inner| CacheStatePlan { inner })
+        }
 
-    /// CSR row pointer into the block-address arrays. Its length is one more
-    /// than the batch sequence count.
-    #[getter]
-    fn block_indptr<'py>(this: Bound<'py, Self>) -> Bound<'py, PyArray1<u32>> {
-        crate::arrays::readonly_view(this.clone().into_any(), &this.get().inner.block_indptr)
-    }
 
-    /// One-based slab ID for each flattened block-table entry. Pair with
-    /// `block_slotnums`; slab zero is reserved as null.
-    #[getter]
-    fn block_slab_ids<'py>(this: Bound<'py, Self>) -> Bound<'py, PyArray1<u32>> {
-        crate::arrays::readonly_view(this.clone().into_any(), &this.get().inner.block_slab_ids)
-    }
 
-    /// Zero-based slot number for each flattened block-table entry. Pair with
-    /// `block_slab_ids`.
-    #[getter]
-    fn block_slotnums<'py>(this: Bound<'py, Self>) -> Bound<'py, PyArray1<u32>> {
-        crate::arrays::readonly_view(this.clone().into_any(), &this.get().inner.block_slotnums)
-    }
 
-    /// Absolute logical-block index at which each sequence's table row starts.
-    /// This is zero for full-attention history and advances for sliding-window
-    /// rows. Private live state always uses zero. It has one entry per sequence and is unrelated to
-    /// the physical slab ID.
-    #[getter]
-    fn block_table_start_indices<'py>(this: Bound<'py, Self>) -> Bound<'py, PyArray1<u32>> {
-        crate::arrays::readonly_view(
-            this.clone().into_any(),
-            &this.get().inner.block_table_start_indices,
-        )
-    }
 
-    /// One-based slab ID of each token's write target. Entry `k`
-    /// corresponds to `BatchPlan.token_ids[k]`.
-    #[getter]
-    fn append_slab_ids<'py>(this: Bound<'py, Self>) -> Bound<'py, PyArray1<u32>> {
-        crate::arrays::readonly_view(this.clone().into_any(), &this.get().inner.append_slab_ids)
-    }
 
-    /// Zero-based slot number of each token's write target. Entry `k`
-    /// corresponds to `BatchPlan.token_ids[k]`.
-    #[getter]
-    fn append_slotnums<'py>(this: Bound<'py, Self>) -> Bound<'py, PyArray1<u32>> {
-        crate::arrays::readonly_view(this.clone().into_any(), &this.get().inner.append_slotnums)
-    }
 
-    /// Token offset within each token's destination block. Entry `k`
-    /// corresponds to `BatchPlan.token_ids[k]` and is less than the matching
-    /// `CacheGroupLayout.block_tokens`.
-    #[getter]
-    fn append_block_offsets<'py>(this: Bound<'py, Self>) -> Bound<'py, PyArray1<u32>> {
-        crate::arrays::readonly_view(
-            this.clone().into_any(),
-            &this.get().inner.append_block_offsets,
-        )
-    }
 
-    fn __repr__(&self) -> String {
-        self.repr_string()
+        fn __repr__(&self) -> String {
+            self.repr_string()
+        }
     }
 }

@@ -1285,14 +1285,7 @@ class Gemma4CudaRunner(CudaRunner):
                 )
 
     @staticmethod
-    def _graph_page_inputs(
-        name: str,
-        plan: PagedAttentionPlan,
-        *,
-        active_rows: int,
-        graph_rows: int,
-        width: int,
-    ) -> dict[str, object]:
+    def _pack_graph_pages(name, plan, active_rows, graph_rows, width, padding_last=1):
         row_widths = np.diff(plan.kv_indptr)
         if len(row_widths) != active_rows or np.any(row_widths > width):
             raise GraphInputError(f"{name} page table exceeds CUDA graph shape")
@@ -1308,22 +1301,36 @@ class Gemma4CudaRunner(CudaRunner):
                 count = 1
             cursor += count
             indptr[row + 1] = cursor
-        last_page_lengths = np.ones(graph_rows, dtype=np.int32)
-        last_page_lengths[:active_rows] = plan.last_page_lengths
+        last = np.full(graph_rows, padding_last, dtype=np.int32)
+        last[:active_rows] = plan.last_page_lengths
+        return {
+            f"{name}_kv_indptr": indptr,
+            f"{name}_page_indices": indices,
+            f"{name}_last_page_lengths": last,
+        }
+
+    @classmethod
+    def _graph_page_inputs(
+        cls,
+        name: str,
+        plan: PagedAttentionPlan,
+        *,
+        active_rows: int,
+        graph_rows: int,
+        width: int,
+    ) -> dict[str, object]:
+        inputs = cls._pack_graph_pages(name, plan, active_rows, graph_rows, width)
         append_pages = np.zeros(graph_rows, dtype=np.int64)
         append_offsets = np.arange(graph_rows, dtype=np.int64) % PAGE_SIZE
         append_pages[:active_rows] = plan.append_slots // PAGE_SIZE
         append_offsets[:active_rows] = plan.append_slots % PAGE_SIZE
-        return {
-            f"{name}_kv_indptr": indptr,
-            f"{name}_page_indices": indices,
-            f"{name}_last_page_lengths": last_page_lengths,
-            f"{name}_append_pages": append_pages,
-            f"{name}_append_offsets": append_offsets,
-        }
+        inputs[f"{name}_append_pages"] = append_pages
+        inputs[f"{name}_append_offsets"] = append_offsets
+        return inputs
 
-    @staticmethod
+    @classmethod
     def _spec_graph_page_inputs(
+        cls,
         name: str,
         assistant: PagedAttentionPlan,
         verify: PagedAttentionPlan,
@@ -1333,35 +1340,18 @@ class Gemma4CudaRunner(CudaRunner):
         page_width: int,
         query_width: int,
     ) -> dict[str, object]:
-        def pack_pages(
-            plan: PagedAttentionPlan, prefix: str, *, padding_last: int = 1
-        ) -> dict[str, object]:
-            row_widths = np.diff(plan.kv_indptr)
-            if len(row_widths) != active_rows or np.any(row_widths > page_width):
-                raise GraphInputError(f"{prefix} page table exceeds CUDA graph shape")
-            indices = np.zeros(graph_rows * page_width, dtype=np.int32)
-            indptr = np.zeros(graph_rows + 1, dtype=np.int32)
-            cursor = 0
-            for row in range(graph_rows):
-                if row < active_rows:
-                    start, end = map(int, plan.kv_indptr[row : row + 2])
-                    count = end - start
-                    indices[cursor : cursor + count] = plan.page_indices[start:end]
-                else:
-                    count = 1
-                cursor += count
-                indptr[row + 1] = cursor
-            last = np.full(graph_rows, padding_last, dtype=np.int32)
-            last[:active_rows] = plan.last_page_lengths
-            return {
-                f"{prefix}_kv_indptr": indptr,
-                f"{prefix}_page_indices": indices,
-                f"{prefix}_last_page_lengths": last,
-            }
-
-        inputs = pack_pages(assistant, f"assistant_{name}")
+        inputs = cls._pack_graph_pages(
+            f"assistant_{name}", assistant, active_rows, graph_rows, page_width
+        )
         inputs.update(
-            pack_pages(verify, f"verify_{name}", padding_last=query_width + 1)
+            cls._pack_graph_pages(
+                f"verify_{name}",
+                verify,
+                active_rows,
+                graph_rows,
+                page_width,
+                query_width + 1,
+            )
         )
         append_pages = np.zeros(graph_rows * query_width, dtype=np.int64)
         append_offsets = np.zeros(graph_rows * query_width, dtype=np.int64)
@@ -1377,19 +1367,30 @@ class Gemma4CudaRunner(CudaRunner):
                 append_offsets[start:end] = slots % PAGE_SIZE
             else:
                 append_offsets[start:end] = np.arange(1, query_width + 1)
-        inputs.update(
-            {
-                f"verify_{name}_append_pages": append_pages,
-                f"verify_{name}_append_offsets": append_offsets,
-            }
-        )
+        inputs[f"verify_{name}_append_pages"] = append_pages
+        inputs[f"verify_{name}_append_offsets"] = append_offsets
         return inputs
 
     def _graph_forward(
         self, native: BatchPlan, batch: Gemma4BatchPlan
     ) -> ForwardOutput | None:
+        return self._replay_decode_graph(native, batch, speculative=False)
+
+    def _speculative_graph_forward(
+        self, native: BatchPlan, batch: Gemma4BatchPlan
+    ) -> ForwardOutput | None:
+        return self._replay_decode_graph(native, batch, speculative=True)
+
+    def _replay_decode_graph(self, native, batch, *, speculative):
         if not self._cuda_graph_mode_enabled("decode"):
             return None
+        if speculative:
+            sequence_ids = [int(value) for value in native.sequence_ids]
+            if any(
+                sequence_id not in self._target_hidden for sequence_id in sequence_ids
+            ):
+                self._cuda_graph_fallback("decode", "target_hidden")
+                return None
         active_rows = native.num_sequences
         history_width = int(np.diff(batch.global_.kv_indptr).max())
         local_width = int(np.diff(batch.local.kv_indptr).max())
@@ -1405,28 +1406,53 @@ class Gemma4CudaRunner(CudaRunner):
             return None
         graph_rows, graph_history_width = shape
         padding_rows = graph_rows - active_rows
-        inputs: dict[str, object] = {
-            "token_ids": np.pad(batch.token_ids, (0, padding_rows)),
-            "positions": np.pad(batch.positions, (0, padding_rows)),
-        }
-        inputs.update(
-            self._graph_page_inputs(
-                "local",
-                batch.local,
-                active_rows=active_rows,
-                graph_rows=graph_rows,
-                width=self.local_graph_page_capacity,
+        token_ids = np.zeros(graph_rows, dtype=batch.token_ids.dtype)
+        positions = np.full(graph_rows, int(speculative), dtype=batch.positions.dtype)
+        token_ids[:active_rows] = batch.token_ids
+        positions[:active_rows] = batch.positions
+        inputs: dict[str, object] = {"token_ids": token_ids, "positions": positions}
+        if speculative:
+            width = self.speculative_draft_tokens + 1
+            assistant = gemma4_assistant_context(
+                batch, local_window_tokens=self.sliding_window
             )
-        )
-        inputs.update(
-            self._graph_page_inputs(
-                "global",
-                batch.global_,
-                active_rows=active_rows,
-                graph_rows=graph_rows,
-                width=graph_history_width,
+            verify = expand_gemma4_decode_batch(
+                batch,
+                np.zeros((active_rows, self.speculative_draft_tokens), dtype=np.int64),
             )
-        )
+            inputs.update(
+                {
+                    "target_hidden": self._gather_target_hidden(
+                        sequence_ids, graph_rows
+                    ),
+                    "verify_qo_indptr": np.arange(
+                        0, (graph_rows + 1) * width, width, dtype=np.int32
+                    ),
+                }
+            )
+        for name, page_width in (
+            ("local", self.local_graph_page_capacity),
+            ("global", graph_history_width),
+        ):
+            if speculative:
+                pages = self._spec_graph_page_inputs(
+                    name,
+                    assistant.local if name == "local" else assistant.global_,
+                    verify.local if name == "local" else verify.global_,
+                    active_rows=active_rows,
+                    graph_rows=graph_rows,
+                    page_width=page_width,
+                    query_width=width,
+                )
+            else:
+                pages = self._graph_page_inputs(
+                    name,
+                    batch.local if name == "local" else batch.global_,
+                    active_rows=active_rows,
+                    graph_rows=graph_rows,
+                    width=page_width,
+                )
+            inputs.update(pages)
         inputs.update(
             pad_sampling_inputs(
                 self._sampler, native, self.config.vocab_size, padding_rows
@@ -1434,80 +1460,10 @@ class Gemma4CudaRunner(CudaRunner):
         )
         self._prepare_graph_attention(shape, inputs)
         output = self._run_cuda_graph("decode", shape, inputs)
-        if native.needs_logprobs:
-            return format_output(self._graph_logits[shape], output, native)
-        return token_output(output[:active_rows])
-
-    def _speculative_graph_forward(
-        self, native: BatchPlan, batch: Gemma4BatchPlan
-    ) -> ForwardOutput | None:
-        if not self._cuda_graph_mode_enabled("decode"):
-            return None
-        sequence_ids = [int(value) for value in native.sequence_ids]
-        if any(sequence_id not in self._target_hidden for sequence_id in sequence_ids):
-            self._cuda_graph_fallback("decode", "target_hidden")
-            return None
-        active_rows = native.num_sequences
-        history_width = int(np.diff(batch.global_.kv_indptr).max())
-        local_width = int(np.diff(batch.local.kv_indptr).max())
-        if local_width > self.local_graph_page_capacity:
-            raise GraphInputError("local page table exceeds CUDA graph shape")
-        shape = self._select_cuda_graph(
-            "decode",
-            match=lambda candidate: (
-                candidate[0] >= active_rows and candidate[1] >= history_width
-            ),
-        )
-        if shape is None:
-            return None
-        graph_rows, graph_history_width = shape
-        padding_rows = graph_rows - active_rows
-        width = self.speculative_draft_tokens + 1
-        assistant = gemma4_assistant_context(
-            batch, local_window_tokens=self.sliding_window
-        )
-        verify = expand_gemma4_decode_batch(
-            batch,
-            np.zeros((active_rows, self.speculative_draft_tokens), dtype=np.int64),
-        )
-        hidden = self._gather_target_hidden(sequence_ids, graph_rows)
-        inputs: dict[str, object] = {
-            "token_ids": np.pad(batch.token_ids, (0, padding_rows)),
-            "positions": np.pad(batch.positions, (0, padding_rows), constant_values=1),
-            "target_hidden": hidden,
-            "verify_qo_indptr": np.arange(
-                0, (graph_rows + 1) * width, width, dtype=np.int32
-            ),
-        }
-        inputs.update(
-            self._spec_graph_page_inputs(
-                "local",
-                assistant.local,
-                verify.local,
-                active_rows=active_rows,
-                graph_rows=graph_rows,
-                page_width=self.local_graph_page_capacity,
-                query_width=width,
-            )
-        )
-        inputs.update(
-            self._spec_graph_page_inputs(
-                "global",
-                assistant.global_,
-                verify.global_,
-                active_rows=active_rows,
-                graph_rows=graph_rows,
-                page_width=graph_history_width,
-                query_width=width,
-            )
-        )
-        inputs.update(
-            pad_sampling_inputs(
-                self._sampler, native, self.config.vocab_size, padding_rows
-            )
-        )
-        self._prepare_graph_attention(shape, inputs)
-        self._run_cuda_graph("decode", shape, inputs)
+        if not speculative:
+            if native.needs_logprobs:
+                return format_output(self._graph_logits[shape], output, native)
+            return token_output(output[:active_rows])
         accepted = self._graph_acceptance[shape]
         self._store_accepted_hidden(
             sequence_ids,

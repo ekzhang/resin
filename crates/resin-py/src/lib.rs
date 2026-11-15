@@ -38,7 +38,7 @@ mod runner;
 use cache::{
     CacheGroupFamily, CacheGroupLayout, CacheGroupPlan, CacheLayout, CacheRetention, CacheStatePlan,
 };
-use output::{BorrowedLogprobs, BorrowedOutput, ForwardOutput};
+use output::{BorrowedOutput, BorrowedScores, ForwardOutput};
 use parallelism::Parallelism;
 use resin_core::engine::{self as core, CompletionReason};
 use resin_core::logprobs::DEFAULT_MAX_TOP_LOGPROBS;
@@ -602,311 +602,279 @@ impl BatchPlan {
         Ok(())
     }
 }
-#[pymethods]
-impl BatchPlan {
-    #[pyo3(signature = () -> "npt.NDArray[np.uint8]")]
-    fn _to_wire<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyArray1<u8>>> {
-        Ok(PyArray1::from_vec(py, self.encode_wire()?))
-    }
+crate::arrays::array_methods! {
+    impl BatchPlan {
+        arrays {
+            /// Stable request identifier for each sequence.
+            sequence_ids: u64 => sequence_ids;
+            /// Number of tokens already processed for each sequence.
+            context_lengths: u32 => context_lengths;
+            /// Final history endpoint for each prefill, including retracted generated inputs.
+            /// Only meaningful during prefill; constant across that history's chunks.
+            prefill_lengths: u32 => prefill_lengths;
+            /// Flattened scheduled token IDs, grouped by sequence.
+            token_ids: u32 => token_ids;
+            /// Offsets into `token_ids` for each sequence.
+            token_indptr: u32 => token_indptr;
+            /// Which sequences should generate a sampled token. Used for chunked
+            /// prefill, when some sequences only advance the cache.
+            sampling_mask: bool => sampling_mask;
+            prompt_score_indices: u32 => prompt_score_indices;
+            prompt_score_token_ids: u32 => prompt_score_token_ids;
+            prompt_score_indptr: u32 => prompt_score_indptr;
+            prompt_score_top_counts: u32 => prompt_score_top_counts;
+            prompt_target_indptr: u32 => prompt_target_indptr;
+            prompt_target_token_ids: u32 => prompt_target_token_ids;
+        }
 
-    #[staticmethod]
-    #[pyo3(signature = (
-        data: "npt.NDArray[np.uint8]",
-        requests: "dict[int, Any]",
-        pending: "dict[int, Any]"
-    ))]
-    fn _from_wire(
-        data: PyReadonlyArray1<'_, u8>,
-        requests: &Bound<'_, PyDict>,
-        pending: &Bound<'_, PyDict>,
-    ) -> PyResult<Self> {
-        let bytes = data.as_slice().map_err(|_| {
-            PyValueError::new_err("plan wire data must be a contiguous uint8 array")
-        })?;
-        Self::decode_wire(bytes)?.restore_requests(requests, pending)
-    }
+        #[pyo3(signature = () -> "npt.NDArray[np.uint8]")]
+        fn _to_wire<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyArray1<u8>>> {
+            Ok(PyArray1::from_vec(py, self.encode_wire()?))
+        }
 
-    #[new]
-    #[pyo3(signature = (
-        *,
-        sequence_ids: "Sequence[int] | npt.NDArray[np.uint64]",
-        context_lengths: "Sequence[int] | npt.NDArray[np.uint32]",
-        token_ids: "Sequence[int] | npt.NDArray[np.uint32]",
-        token_indptr: "Sequence[int] | npt.NDArray[np.uint32]",
-        prefill_lengths: "Sequence[int] | npt.NDArray[np.uint32] | None" = None,
-        phase = BatchPhase::Prefill,
-        batch_id = 0,
-        batch_key = None,
-        cache_groups = None,
-        sampling_mask: "Sequence[bool] | npt.NDArray[np.bool_] | None" = None,
-        sampling_params = None,
-        media: "Sequence[MediaInput | None] | None" = None,
-        prompt_score_indices: "Sequence[int] | npt.NDArray[np.uint32] | None" = None,
-        prompt_score_token_ids: "Sequence[int] | npt.NDArray[np.uint32] | None" = None,
-        prompt_score_indptr: "Sequence[int] | npt.NDArray[np.uint32] | None" = None,
-        prompt_score_top_counts: "Sequence[int] | npt.NDArray[np.uint32] | None" = None,
-        prompt_target_indptr: "Sequence[int] | npt.NDArray[np.uint32] | None" = None,
-        prompt_target_token_ids: "Sequence[int] | npt.NDArray[np.uint32] | None" = None
-    ))]
-    #[allow(clippy::too_many_arguments)]
-    fn new(
-        py: Python<'_>,
-        sequence_ids: PyArrayLike1<'_, u64>,
-        context_lengths: PyArrayLike1<'_, u32>,
-        token_ids: PyArrayLike1<'_, u32>,
-        token_indptr: PyArrayLike1<'_, u32>,
-        prefill_lengths: Option<PyArrayLike1<'_, u32>>,
-        phase: BatchPhase,
-        batch_id: u64,
-        batch_key: Option<u64>,
-        cache_groups: Option<Vec<Py<CacheGroupPlan>>>,
-        sampling_mask: Option<PyArrayLike1<'_, bool>>,
-        sampling_params: Option<Vec<Py<SamplingParams>>>,
-        media: Option<Vec<Option<Py<PyAny>>>>,
-        prompt_score_indices: Option<PyArrayLike1<'_, u32>>,
-        prompt_score_token_ids: Option<PyArrayLike1<'_, u32>>,
-        prompt_score_indptr: Option<PyArrayLike1<'_, u32>>,
-        prompt_score_top_counts: Option<PyArrayLike1<'_, u32>>,
-        prompt_target_indptr: Option<PyArrayLike1<'_, u32>>,
-        prompt_target_token_ids: Option<PyArrayLike1<'_, u32>>,
-    ) -> PyResult<Self> {
-        let sequence_ids = arrays::owned_vec(sequence_ids);
-        let context_lengths = arrays::owned_vec(context_lengths);
-        let token_ids = arrays::owned_vec(token_ids);
-        let token_indptr = arrays::owned_vec(token_indptr);
-        // Malformed CSR inputs are rejected by checked() below; deriving the
-        // default prefill endpoint must not underflow before that validation.
-        let prefill_lengths = prefill_lengths.map(arrays::owned_vec).unwrap_or_else(|| {
-            context_lengths
-                .iter()
-                .zip(token_indptr.windows(2))
-                .map(|(context, range)| context.saturating_add(range[1].saturating_sub(range[0])))
-                .collect()
-        });
-        let sequence_count = sequence_ids.len();
-        let cache_groups = cache_groups
-            .unwrap_or_default()
-            .into_iter()
-            .map(|group| group.borrow(py).clone())
-            .collect();
-        let sampling_mask = sampling_mask
-            .map(arrays::owned_vec)
-            .unwrap_or_else(|| vec![true; sequence_count]);
-        let mut sampling_params = sampling_params
-            .map(|params| {
+        #[staticmethod]
+        #[pyo3(signature = (
+            data: "npt.NDArray[np.uint8]",
+            requests: "dict[int, Any]",
+            pending: "dict[int, Any]"
+        ))]
+        fn _from_wire(
+            data: PyReadonlyArray1<'_, u8>,
+            requests: &Bound<'_, PyDict>,
+            pending: &Bound<'_, PyDict>,
+        ) -> PyResult<Self> {
+            let bytes = data.as_slice().map_err(|_| {
+                PyValueError::new_err("plan wire data must be a contiguous uint8 array")
+            })?;
+            Self::decode_wire(bytes)?.restore_requests(requests, pending)
+        }
+
+        #[new]
+        #[pyo3(signature = (
+            *,
+            sequence_ids: "Sequence[int] | npt.NDArray[np.uint64]",
+            context_lengths: "Sequence[int] | npt.NDArray[np.uint32]",
+            token_ids: "Sequence[int] | npt.NDArray[np.uint32]",
+            token_indptr: "Sequence[int] | npt.NDArray[np.uint32]",
+            prefill_lengths: "Sequence[int] | npt.NDArray[np.uint32] | None" = None,
+            phase = BatchPhase::Prefill,
+            batch_id = 0,
+            batch_key = None,
+            cache_groups = None,
+            sampling_mask: "Sequence[bool] | npt.NDArray[np.bool_] | None" = None,
+            sampling_params = None,
+            media: "Sequence[MediaInput | None] | None" = None,
+            prompt_score_indices: "Sequence[int] | npt.NDArray[np.uint32] | None" = None,
+            prompt_score_token_ids: "Sequence[int] | npt.NDArray[np.uint32] | None" = None,
+            prompt_score_indptr: "Sequence[int] | npt.NDArray[np.uint32] | None" = None,
+            prompt_score_top_counts: "Sequence[int] | npt.NDArray[np.uint32] | None" = None,
+            prompt_target_indptr: "Sequence[int] | npt.NDArray[np.uint32] | None" = None,
+            prompt_target_token_ids: "Sequence[int] | npt.NDArray[np.uint32] | None" = None
+        ))]
+        #[allow(clippy::too_many_arguments)]
+        fn new(
+            py: Python<'_>,
+            sequence_ids: PyArrayLike1<'_, u64>,
+            context_lengths: PyArrayLike1<'_, u32>,
+            token_ids: PyArrayLike1<'_, u32>,
+            token_indptr: PyArrayLike1<'_, u32>,
+            prefill_lengths: Option<PyArrayLike1<'_, u32>>,
+            phase: BatchPhase,
+            batch_id: u64,
+            batch_key: Option<u64>,
+            cache_groups: Option<Vec<Py<CacheGroupPlan>>>,
+            sampling_mask: Option<PyArrayLike1<'_, bool>>,
+            sampling_params: Option<Vec<Py<SamplingParams>>>,
+            media: Option<Vec<Option<Py<PyAny>>>>,
+            prompt_score_indices: Option<PyArrayLike1<'_, u32>>,
+            prompt_score_token_ids: Option<PyArrayLike1<'_, u32>>,
+            prompt_score_indptr: Option<PyArrayLike1<'_, u32>>,
+            prompt_score_top_counts: Option<PyArrayLike1<'_, u32>>,
+            prompt_target_indptr: Option<PyArrayLike1<'_, u32>>,
+            prompt_target_token_ids: Option<PyArrayLike1<'_, u32>>,
+        ) -> PyResult<Self> {
+            let sequence_ids = arrays::owned_vec(sequence_ids);
+            let context_lengths = arrays::owned_vec(context_lengths);
+            let token_ids = arrays::owned_vec(token_ids);
+            let token_indptr = arrays::owned_vec(token_indptr);
+            // Malformed CSR inputs are rejected by checked() below; deriving the
+            // default prefill endpoint must not underflow before that validation.
+            let prefill_lengths = prefill_lengths.map(arrays::owned_vec).unwrap_or_else(|| {
+                context_lengths
+                    .iter()
+                    .zip(token_indptr.windows(2))
+                    .map(|(context, range)| context.saturating_add(range[1].saturating_sub(range[0])))
+                    .collect()
+            });
+            let sequence_count = sequence_ids.len();
+            let cache_groups = cache_groups
+                .unwrap_or_default()
+                .into_iter()
+                .map(|group| group.borrow(py).clone())
+                .collect();
+            let sampling_mask = sampling_mask
+                .map(arrays::owned_vec)
+                .unwrap_or_else(|| vec![true; sequence_count]);
+            let mut sampling_params = sampling_params
+                .map(|params| {
+                    params
+                        .into_iter()
+                        .map(|params| params.borrow(py).clone())
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_else(|| vec![SamplingParams::default(); sequence_count]);
+            for (params, sequence_id) in sampling_params.iter_mut().zip(&sequence_ids) {
                 params
-                    .into_iter()
-                    .map(|params| params.borrow(py).clone())
-                    .collect::<Vec<_>>()
-            })
-            .unwrap_or_else(|| vec![SamplingParams::default(); sequence_count]);
-        for (params, sequence_id) in sampling_params.iter_mut().zip(&sequence_ids) {
-            params
-                .seed
-                .get_or_insert_with(|| default_sampling_seed(0, *sequence_id));
-        }
-        let media = media
-            .unwrap_or_else(|| (0..sequence_count).map(|_| None).collect())
-            .into_iter()
-            .map(|payload| payload.map(Arc::new))
-            .collect();
-        let prompt_score_indices = prompt_score_indices
-            .map(arrays::owned_vec)
-            .unwrap_or_default();
-        let predecessor_count = prompt_score_indices.len();
-        Self::checked(Self {
-            prompt_score_indices,
-            prompt_score_top_counts: prompt_score_top_counts
-                .map(arrays::owned_vec)
-                .unwrap_or_else(|| vec![0; predecessor_count]),
-            prompt_target_indptr: prompt_target_indptr.map(arrays::owned_vec).unwrap_or_else(
-                || {
-                    if predecessor_count == 0 {
-                        Vec::new()
-                    } else {
-                        vec![0; predecessor_count + 1]
-                    }
-                },
-            ),
-            prompt_target_token_ids: prompt_target_token_ids
-                .map(arrays::owned_vec)
-                .unwrap_or_default(),
-            prompt_score_token_ids: prompt_score_token_ids
-                .map(arrays::owned_vec)
-                .unwrap_or_default(),
-            prompt_score_indptr: prompt_score_indptr
-                .map(arrays::owned_vec)
-                .unwrap_or_else(|| vec![0; sequence_count + 1]),
-            sequence_ids,
-            context_lengths,
-            prefill_lengths,
-            token_ids,
-            token_indptr,
-            phase,
-            batch_id,
-            batch_key,
-            cache_groups,
-            sampling_mask,
-            sampling_params,
-            media,
-            positions: OnceLock::new(),
-        })
-    }
-
-    /// Stable request identifier for each sequence.
-    #[getter]
-    fn sequence_ids<'py>(this: Bound<'py, Self>) -> Bound<'py, PyArray1<u64>> {
-        arrays::readonly_view(this.clone().into_any(), &this.get().sequence_ids)
-    }
-
-    /// Number of tokens already processed for each sequence.
-    #[getter]
-    fn context_lengths<'py>(this: Bound<'py, Self>) -> Bound<'py, PyArray1<u32>> {
-        arrays::readonly_view(this.clone().into_any(), &this.get().context_lengths)
-    }
-
-    /// Final history endpoint for each prefill, including retracted generated inputs.
-    /// Only meaningful during prefill; constant across that history's chunks.
-    #[getter]
-    fn prefill_lengths<'py>(this: Bound<'py, Self>) -> Bound<'py, PyArray1<u32>> {
-        arrays::readonly_view(this.clone().into_any(), &this.get().prefill_lengths)
-    }
-
-    /// Flattened scheduled token IDs, grouped by sequence.
-    #[getter]
-    fn token_ids<'py>(this: Bound<'py, Self>) -> Bound<'py, PyArray1<u32>> {
-        arrays::readonly_view(this.clone().into_any(), &this.get().token_ids)
-    }
-
-    /// Offsets into `token_ids` for each sequence.
-    #[getter]
-    fn token_indptr<'py>(this: Bound<'py, Self>) -> Bound<'py, PyArray1<u32>> {
-        arrays::readonly_view(this.clone().into_any(), &this.get().token_indptr)
-    }
-
-    /// Absolute position of every flattened scheduled token.
-    #[getter]
-    fn positions<'py>(this: Bound<'py, Self>) -> Bound<'py, PyArray1<u32>> {
-        let plan = this.get();
-        let positions = plan.positions.get_or_init(|| {
-            let mut positions = Vec::with_capacity(plan.token_ids.len());
-            for (context, range) in plan
-                .context_lengths
-                .iter()
-                .zip(plan.token_indptr.windows(2))
-            {
-                positions.extend(*context..*context + range[1] - range[0]);
+                    .seed
+                    .get_or_insert_with(|| default_sampling_seed(0, *sequence_id));
             }
-            positions
-        });
-        arrays::readonly_view(this.clone().into_any(), positions)
-    }
-
-    /// Ordered physical placement plans corresponding to CacheLayout groups.
-    /// There is one plan per layout group, not one plan per sequence; each plan
-    /// contains one block-table row for every sequence in this batch.
-    #[getter]
-    fn cache_groups(&self, py: Python<'_>) -> PyResult<Py<PyTuple>> {
-        Ok(PyTuple::new(py, self.cache_groups.iter().cloned())?.unbind())
-    }
-
-    /// Which sequences should generate a sampled token. Used for chunked
-    /// prefill, when some sequences only advance the cache.
-    #[getter]
-    fn sampling_mask<'py>(this: Bound<'py, Self>) -> Bound<'py, PyArray1<bool>> {
-        arrays::readonly_view(this.clone().into_any(), &this.get().sampling_mask)
-    }
-
-    /// Check natively so token-only graph replay does not box per-row policies.
-    #[getter]
-    fn needs_logprobs(&self) -> bool {
-        self.sampling_mask
-            .iter()
-            .zip(&self.sampling_params)
-            .any(|(sample, params)| *sample && params.logprobs)
-    }
-    #[getter]
-    fn needs_prompt_logprobs(&self) -> bool {
-        !self.prompt_score_indices.is_empty()
-    }
-    #[getter]
-    fn prompt_score_indices<'py>(this: Bound<'py, Self>) -> Bound<'py, PyArray1<u32>> {
-        arrays::readonly_view(this.clone().into_any(), &this.get().prompt_score_indices)
-    }
-    #[getter]
-    fn prompt_score_token_ids<'py>(this: Bound<'py, Self>) -> Bound<'py, PyArray1<u32>> {
-        arrays::readonly_view(this.clone().into_any(), &this.get().prompt_score_token_ids)
-    }
-    #[getter]
-    fn prompt_score_indptr<'py>(this: Bound<'py, Self>) -> Bound<'py, PyArray1<u32>> {
-        arrays::readonly_view(this.clone().into_any(), &this.get().prompt_score_indptr)
-    }
-    #[getter]
-    fn prompt_score_top_counts<'py>(this: Bound<'py, Self>) -> Bound<'py, PyArray1<u32>> {
-        arrays::readonly_view(this.clone().into_any(), &this.get().prompt_score_top_counts)
-    }
-    #[getter]
-    fn prompt_target_indptr<'py>(this: Bound<'py, Self>) -> Bound<'py, PyArray1<u32>> {
-        arrays::readonly_view(this.clone().into_any(), &this.get().prompt_target_indptr)
-    }
-    #[getter]
-    fn prompt_target_token_ids<'py>(this: Bound<'py, Self>) -> Bound<'py, PyArray1<u32>> {
-        arrays::readonly_view(this.clone().into_any(), &this.get().prompt_target_token_ids)
-    }
-
-    /// Effective sampling parameters, one per sequence.
-    #[getter]
-    fn sampling_params(&self, py: Python<'_>) -> PyResult<Py<PyTuple>> {
-        Ok(PyTuple::new(py, self.sampling_params.iter().cloned())?.unbind())
-    }
-
-    /// Opaque runner inputs, one per sequence. The scheduler never inspects them.
-    #[getter]
-    fn media(&self, py: Python<'_>) -> PyResult<Py<PyTuple>> {
-        let payloads = self
-            .media
-            .iter()
-            .map(|payload| {
-                payload
-                    .as_ref()
-                    .map_or_else(|| py.None(), |payload| payload.clone_ref(py))
+            let media = media
+                .unwrap_or_else(|| (0..sequence_count).map(|_| None).collect())
+                .into_iter()
+                .map(|payload| payload.map(Arc::new))
+                .collect();
+            let prompt_score_indices = prompt_score_indices
+                .map(arrays::owned_vec)
+                .unwrap_or_default();
+            let predecessor_count = prompt_score_indices.len();
+            Self::checked(Self {
+                prompt_score_indices,
+                prompt_score_top_counts: prompt_score_top_counts
+                    .map(arrays::owned_vec)
+                    .unwrap_or_else(|| vec![0; predecessor_count]),
+                prompt_target_indptr: prompt_target_indptr.map(arrays::owned_vec).unwrap_or_else(
+                    || {
+                        if predecessor_count == 0 {
+                            Vec::new()
+                        } else {
+                            vec![0; predecessor_count + 1]
+                        }
+                    },
+                ),
+                prompt_target_token_ids: prompt_target_token_ids
+                    .map(arrays::owned_vec)
+                    .unwrap_or_default(),
+                prompt_score_token_ids: prompt_score_token_ids
+                    .map(arrays::owned_vec)
+                    .unwrap_or_default(),
+                prompt_score_indptr: prompt_score_indptr
+                    .map(arrays::owned_vec)
+                    .unwrap_or_else(|| vec![0; sequence_count + 1]),
+                sequence_ids,
+                context_lengths,
+                prefill_lengths,
+                token_ids,
+                token_indptr,
+                phase,
+                batch_id,
+                batch_key,
+                cache_groups,
+                sampling_mask,
+                sampling_params,
+                media,
+                positions: OnceLock::new(),
             })
-            .collect::<Vec<_>>();
-        Ok(PyTuple::new(py, payloads)?.unbind())
-    }
-
-    /// Number of sequences (batch size).
-    #[getter]
-    fn num_sequences(&self) -> usize {
-        self.sequence_ids.len()
-    }
-
-    /// Number of flattened scheduled tokens.
-    #[getter]
-    fn num_tokens(&self) -> usize {
-        self.token_ids.len()
-    }
-
-    /// Return the half-open range in `token_ids` for one sequence.
-    fn token_range(&self, sequence_index: usize) -> PyResult<(usize, usize)> {
-        if sequence_index >= self.sequence_ids.len() {
-            return Err(PyValueError::new_err("sequence index is out of range"));
         }
-        Ok((
-            self.token_indptr[sequence_index] as usize,
-            self.token_indptr[sequence_index + 1] as usize,
-        ))
-    }
 
-    fn __repr__(&self) -> String {
-        format!(
-            "BatchPlan(batch_id={}, phase=BatchPhase.{}, sequences={}, tokens={}, cache_groups={})",
-            self.batch_id,
-            self.phase.as_str(),
-            self.sequence_ids.len(),
-            self.token_ids.len(),
-            self.cache_groups.len()
-        )
+
+
+
+
+
+        /// Absolute position of every flattened scheduled token.
+        #[getter]
+        fn positions<'py>(this: Bound<'py, Self>) -> Bound<'py, PyArray1<u32>> {
+            let plan = this.get();
+            let positions = plan.positions.get_or_init(|| {
+                let mut positions = Vec::with_capacity(plan.token_ids.len());
+                for (context, range) in plan
+                    .context_lengths
+                    .iter()
+                    .zip(plan.token_indptr.windows(2))
+                {
+                    positions.extend(*context..*context + range[1] - range[0]);
+                }
+                positions
+            });
+            arrays::readonly_view(this.clone().into_any(), positions)
+        }
+
+        /// Ordered physical placement plans corresponding to CacheLayout groups.
+        /// There is one plan per layout group, not one plan per sequence; each plan
+        /// contains one block-table row for every sequence in this batch.
+        #[getter]
+        fn cache_groups(&self, py: Python<'_>) -> PyResult<Py<PyTuple>> {
+            Ok(PyTuple::new(py, self.cache_groups.iter().cloned())?.unbind())
+        }
+
+
+        /// Check natively so token-only graph replay does not box per-row policies.
+        #[getter]
+        fn needs_logprobs(&self) -> bool {
+            self.sampling_mask
+                .iter()
+                .zip(&self.sampling_params)
+                .any(|(sample, params)| *sample && params.logprobs)
+        }
+        #[getter]
+        fn needs_prompt_logprobs(&self) -> bool {
+            !self.prompt_score_indices.is_empty()
+        }
+
+        /// Effective sampling parameters, one per sequence.
+        #[getter]
+        fn sampling_params(&self, py: Python<'_>) -> PyResult<Py<PyTuple>> {
+            Ok(PyTuple::new(py, self.sampling_params.iter().cloned())?.unbind())
+        }
+
+        /// Opaque runner inputs, one per sequence. The scheduler never inspects them.
+        #[getter]
+        fn media(&self, py: Python<'_>) -> PyResult<Py<PyTuple>> {
+            let payloads = self
+                .media
+                .iter()
+                .map(|payload| {
+                    payload
+                        .as_ref()
+                        .map_or_else(|| py.None(), |payload| payload.clone_ref(py))
+                })
+                .collect::<Vec<_>>();
+            Ok(PyTuple::new(py, payloads)?.unbind())
+        }
+
+        /// Number of sequences (batch size).
+        #[getter]
+        fn num_sequences(&self) -> usize {
+            self.sequence_ids.len()
+        }
+
+        /// Number of flattened scheduled tokens.
+        #[getter]
+        fn num_tokens(&self) -> usize {
+            self.token_ids.len()
+        }
+
+        /// Return the half-open range in `token_ids` for one sequence.
+        fn token_range(&self, sequence_index: usize) -> PyResult<(usize, usize)> {
+            if sequence_index >= self.sequence_ids.len() {
+                return Err(PyValueError::new_err("sequence index is out of range"));
+            }
+            Ok((
+                self.token_indptr[sequence_index] as usize,
+                self.token_indptr[sequence_index + 1] as usize,
+            ))
+        }
+
+        fn __repr__(&self) -> String {
+            format!(
+                "BatchPlan(batch_id={}, phase=BatchPhase.{}, sequences={}, tokens={}, cache_groups={})",
+                self.batch_id,
+                self.phase.as_str(),
+                self.sequence_ids.len(),
+                self.token_ids.len(),
+                self.cache_groups.len()
+            )
+        }
     }
 }
 
@@ -1068,22 +1036,18 @@ fn core_error(error: core::Error) -> PyErr {
 /// Only language conversion and callback invocation belong in this adapter.
 struct PythonRunner<'a, 'py> {
     py: Python<'py>,
-    forward: &'a Py<PyAny>,
     release: Option<&'a Py<PyAny>>,
     error: Option<PyErr>,
-    logprobs: Option<BorrowedLogprobs<'py>>,
-    prompt_logprobs: Option<BorrowedLogprobs<'py>>,
+    scores: Option<BorrowedScores<'py>>,
     state_checkpoints: Vec<u64>,
 }
 impl<'a, 'py> PythonRunner<'a, 'py> {
-    fn new(py: Python<'py>, forward: &'a Py<PyAny>, release: Option<&'a Py<PyAny>>) -> Self {
+    fn new(py: Python<'py>, release: Option<&'a Py<PyAny>>) -> Self {
         Self {
             py,
-            forward,
             release,
             error: None,
-            logprobs: None,
-            prompt_logprobs: None,
+            scores: None,
             state_checkpoints: Vec::new(),
         }
     }
@@ -1104,37 +1068,20 @@ impl<'a, 'py> PythonRunner<'a, 'py> {
 impl<'py> core::Runner<RequestPayload> for PythonRunner<'_, 'py> {
     fn forward(
         &mut self,
-        plan: core::ExecutionPlan<RequestPayload>,
+        _plan: core::ExecutionPlan<RequestPayload>,
     ) -> core::Result<core::OwnedTokenRows> {
-        let plan = Py::new(self.py, planning::from_core(plan))
-            .map_err(|error| self.failed(error, false))?;
-        let output = self
-            .forward
-            .bind(self.py)
-            .call1((&plan,))
-            .map_err(|error| {
-                let accepted = runner_error_is_post_accept(self.py, &error);
-                self.failed(error, accepted)
-            })?;
-        let plan = plan.borrow(self.py);
-        let output = extract_runner_output(&output).map_err(|error| self.failed(error, true))?;
-        let tokens = output
-            .tokens
-            .view()
-            .map_err(|error| self.failed(error, true))?;
-        validate_requested_logprobs(tokens, output.logprobs.as_ref(), &plan)
-            .map_err(|error| self.failed(error, true))?;
-        let tokens = tokens.to_owned();
-        self.logprobs = output.logprobs;
-        self.prompt_logprobs = output.prompt_logprobs;
-        self.state_checkpoints = output.state_checkpoints;
-        Ok(tokens)
+        // Python execution uses prepare/complete so NumPy output stays borrowed.
+        Err(core::Error::internal(
+            "Python Engine invokes its runner directly",
+        ))
     }
     fn logprobs(&self) -> Option<core::LogprobView<'_>> {
-        self.logprobs.as_ref().map(BorrowedLogprobs::view)
+        self.scores.as_ref().and_then(BorrowedScores::logprobs)
     }
     fn prompt_logprobs(&self) -> Option<core::LogprobView<'_>> {
-        self.prompt_logprobs.as_ref().map(BorrowedLogprobs::view)
+        self.scores
+            .as_ref()
+            .and_then(BorrowedScores::prompt_logprobs)
     }
     fn state_checkpoints(&self) -> &[u64] {
         &self.state_checkpoints
@@ -1271,12 +1218,7 @@ impl Engine {
             return Ok(events);
         }
 
-        let forward = self.runner_forward.clone_ref(py);
-        let release = self
-            .runner_release
-            .as_ref()
-            .map(|value| value.clone_ref(py));
-        let mut runner = PythonRunner::new(py, &forward, release.as_ref());
+        let mut runner = PythonRunner::new(py, self.runner_release.as_ref());
         let overlap_admission = self.overlap && allow_overlap && self.runner_enqueue.is_some();
         let prepared = if overlap_admission {
             self.core
@@ -1290,6 +1232,7 @@ impl Engine {
         else {
             return Ok(events);
         };
+        drop(runner);
         let can_enqueue = overlap_admission
             && plan.phase == resin_core::Phase::Decode
             && self.core.retain_continuation(&plan);
@@ -1342,25 +1285,19 @@ impl Engine {
         output: &Bound<'_, PyAny>,
         continuing: bool,
     ) -> PyResult<Vec<Py<TokenEvent>>> {
-        let forward = self.runner_forward.clone_ref(py);
-        let release = self
-            .runner_release
-            .as_ref()
-            .map(|value| value.clone_ref(py));
-        let mut runner = PythonRunner::new(py, &forward, release.as_ref());
+        let mut runner = PythonRunner::new(py, self.runner_release.as_ref());
         let tokens;
         let output = match extract_runner_output(output) {
             Ok(output) => {
                 tokens = output.tokens;
-                runner.logprobs = output.logprobs;
-                runner.prompt_logprobs = output.prompt_logprobs;
+                runner.scores = Some(output.scores);
                 runner.state_checkpoints = output.state_checkpoints;
                 tokens
                     .view()
                     .and_then(|tokens| {
                         validate_requested_logprobs(
                             tokens,
-                            runner.logprobs.as_ref(),
+                            runner.scores.as_ref().and_then(BorrowedScores::logprobs),
                             &plan.borrow(py),
                         )?;
                         Ok(tokens)
@@ -1403,12 +1340,7 @@ impl Engine {
     }
 
     fn fail_output(&mut self, py: Python<'_>, error: PyErr, accepted: bool) -> PyErr {
-        let forward = self.runner_forward.clone_ref(py);
-        let release = self
-            .runner_release
-            .as_ref()
-            .map(|value| value.clone_ref(py));
-        let mut runner = PythonRunner::new(py, &forward, release.as_ref());
+        let mut runner = PythonRunner::new(py, self.runner_release.as_ref());
         let accepted = accepted || runner_error_is_post_accept(py, &error);
         let failure = runner.failed(error, accepted);
         let result = self.core.complete_step_with(&mut runner, Err(failure), Ok);
@@ -1761,7 +1693,7 @@ impl Engine {
         }
         self.deferred_events
             .retain(|event| event.borrow(py).request_id != request.inner.id());
-        let mut runner = PythonRunner::new(py, &self.runner_forward, self.runner_release.as_ref());
+        let mut runner = PythonRunner::new(py, self.runner_release.as_ref());
         let result = self.core.cancel(&mut runner, &request.inner);
         runner.result(result)
     }
@@ -1770,7 +1702,7 @@ impl Engine {
             self.harvest(py, false)?;
         }
         self.deferred_events.clear();
-        let mut runner = PythonRunner::new(py, &self.runner_forward, self.runner_release.as_ref());
+        let mut runner = PythonRunner::new(py, self.runner_release.as_ref());
         let result = self.core.close(&mut runner);
         runner.result(result)
     }
@@ -1948,7 +1880,7 @@ fn extract_runner_output<'py>(output: &Bound<'py, PyAny>) -> PyResult<BorrowedOu
 
 fn validate_requested_logprobs(
     tokens: core::TokenRows<'_>,
-    logprobs: Option<&BorrowedLogprobs<'_>>,
+    view: Option<core::LogprobView<'_>>,
     plan: &BatchPlan,
 ) -> PyResult<()> {
     if tokens.len() != plan.sequence_ids.len() {
@@ -1958,7 +1890,6 @@ fn validate_requested_logprobs(
             plan.sequence_ids.len()
         )));
     }
-    let view = logprobs.map(BorrowedLogprobs::view);
     for (row, params) in plan.sampling_params.iter().enumerate() {
         if !params.logprobs || !plan.sampling_mask[row] {
             continue;

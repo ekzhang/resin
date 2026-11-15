@@ -1,6 +1,6 @@
 //! Typed media expansions and token placement, independent of model preprocessing.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 
 use resin_recipe::{Encoder, Error, Prompt, PromptSpan};
 
@@ -37,22 +37,6 @@ impl MediaTokens {
     }
 }
 
-enum EncodingSpan {
-    Text(String),
-    Special(String),
-    Media(usize),
-}
-fn text(spans: &mut Vec<EncodingSpan>, value: &str) {
-    if value.is_empty() {
-        return;
-    }
-    if let Some(EncodingSpan::Text(previous)) = spans.last_mut() {
-        previous.push_str(value);
-    } else {
-        spans.push(EncodingSpan::Text(value.into()));
-    }
-}
-
 type EncodedMedia = (Vec<u32>, Vec<(usize, usize)>);
 
 /// Encode trusted media slots and return their absolute (position, length) in input order.
@@ -65,55 +49,52 @@ pub(crate) fn encode(
     if media.is_empty() {
         return Ok((prompt.encode(encoder)?, Vec::new()));
     }
-    let mut replacements: HashMap<&str, Vec<usize>> = HashMap::new();
+    let mut replacements: HashMap<&str, VecDeque<usize>> = HashMap::new();
     for (index, span) in media.iter().enumerate() {
         replacements
             .entry(&span.placeholder)
             .or_default()
-            .push(index);
+            .push_back(index);
     }
-    let mut used: HashMap<&str, usize> = HashMap::new();
-    let mut spans = Vec::new();
+    let mut ids = Vec::new();
+    let mut placements = vec![(0, 0); media.len()];
+    let mut text = String::new();
+    let flush = |text: &mut String, ids: &mut Vec<u32>| -> Result<(), Error> {
+        if !text.is_empty() {
+            ids.extend(encoder.encode_text(text)?);
+            text.clear();
+        }
+        Ok(())
+    };
     for span in prompt.spans {
         match span {
-            PromptSpan::Text(value) => text(&mut spans, &value),
+            PromptSpan::Text(value) => text.push_str(&value),
             PromptSpan::Special(token) => {
-                if let Some((marker, indices)) = replacements.get_key_value(token.as_str()) {
-                    let count = used.entry(marker).or_default();
-                    let index = *indices.get(*count).ok_or_else(|| {
+                if let Some(indices) = replacements.get_mut(token.as_str()) {
+                    let index = indices.pop_front().ok_or_else(|| {
                         Error::new(format!("missing media expansion for {token}"))
                     })?;
-                    *count += 1;
                     let replacement = &media[index];
-                    text(&mut spans, &replacement.prefix);
-                    spans.push(EncodingSpan::Media(index));
-                    text(&mut spans, &replacement.suffix);
+                    text.push_str(&replacement.prefix);
+                    flush(&mut text, &mut ids)?;
+                    placements[index] = (ids.len(), replacement.token_ids.len());
+                    ids.extend_from_slice(&replacement.token_ids);
+                    text.push_str(&replacement.suffix);
                 } else {
-                    spans.push(EncodingSpan::Special(token));
+                    flush(&mut text, &mut ids)?;
+                    ids.push(encoder.special_id(&token)?);
                 }
             }
         }
     }
     for (marker, indices) in replacements {
-        if used.get(marker).copied().unwrap_or(0) != indices.len() {
+        if !indices.is_empty() {
             return Err(Error::new(format!(
                 "media expansion count does not match {marker}"
             )));
         }
     }
-    let mut ids = Vec::new();
-    let mut placements = vec![(0, 0); media.len()];
-    for span in spans {
-        match span {
-            EncodingSpan::Text(value) => ids.extend(encoder.encode_text(&value)?),
-            EncodingSpan::Special(token) => ids.push(encoder.special_id(&token)?),
-            EncodingSpan::Media(index) => {
-                let tokens = &media[index].token_ids;
-                placements[index] = (ids.len(), tokens.len());
-                ids.extend_from_slice(tokens);
-            }
-        }
-    }
+    flush(&mut text, &mut ids)?;
     Ok((ids, placements))
 }
 

@@ -1291,27 +1291,12 @@ pub struct PagedKvBatch {
     pub lease: WriterAccessLease,
 }
 
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
 pub enum PagedKvError {
-    Cache(CachePoolError),
+    #[error(transparent)]
+    Cache(#[from] CachePoolError),
+    #[error("{0}")]
     Invalid(String),
-}
-
-impl fmt::Display for PagedKvError {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Cache(error) => error.fmt(formatter),
-            Self::Invalid(message) => formatter.write_str(message),
-        }
-    }
-}
-
-impl std::error::Error for PagedKvError {}
-
-impl From<CachePoolError> for PagedKvError {
-    fn from(error: CachePoolError) -> Self {
-        Self::Cache(error)
-    }
 }
 
 impl From<KvPlanError> for PagedKvError {

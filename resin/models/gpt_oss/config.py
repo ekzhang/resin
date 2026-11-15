@@ -5,26 +5,28 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any
 
+from resin.models.hf_config import PositiveInt, invalid_dimensions, parse_hf_config
+
 
 @dataclass(frozen=True, slots=True)
 class GptOssConfig:
-    vocab_size: int
-    hidden_size: int
-    intermediate_size: int
-    num_hidden_layers: int
-    num_attention_heads: int
-    num_key_value_heads: int
-    num_local_experts: int
-    num_experts_per_tok: int
-    head_dim: int
-    sliding_window: int
+    vocab_size: PositiveInt
+    hidden_size: PositiveInt
+    intermediate_size: PositiveInt
+    num_hidden_layers: PositiveInt
+    num_attention_heads: PositiveInt
+    num_key_value_heads: PositiveInt
+    num_local_experts: PositiveInt
+    num_experts_per_tok: PositiveInt
+    head_dim: PositiveInt
+    sliding_window: PositiveInt
     rms_norm_eps: float
     rope_theta: float
-    initial_context_length: int
+    initial_context_length: PositiveInt
     rope_scaling_factor: float
     rope_beta_fast: float
     rope_beta_slow: float
-    max_position_embeddings: int
+    max_position_embeddings: PositiveInt
     swiglu_limit: float
     attention_bias: bool
     layer_types: tuple[str, ...]
@@ -34,21 +36,7 @@ class GptOssConfig:
     eos_token_id: int | None = None
 
     def __post_init__(self) -> None:
-        dimensions = {
-            "vocab_size": self.vocab_size,
-            "hidden_size": self.hidden_size,
-            "intermediate_size": self.intermediate_size,
-            "num_hidden_layers": self.num_hidden_layers,
-            "num_attention_heads": self.num_attention_heads,
-            "num_key_value_heads": self.num_key_value_heads,
-            "num_local_experts": self.num_local_experts,
-            "num_experts_per_tok": self.num_experts_per_tok,
-            "head_dim": self.head_dim,
-            "sliding_window": self.sliding_window,
-            "initial_context_length": self.initial_context_length,
-            "max_position_embeddings": self.max_position_embeddings,
-        }
-        invalid = [name for name, value in dimensions.items() if value <= 0]
+        invalid = list(invalid_dimensions(self))
         if invalid:
             raise ValueError(f"GPT-OSS dimensions must be positive: {invalid}")
         if self.num_attention_heads % self.num_key_value_heads:
@@ -105,19 +93,14 @@ class GptOssConfig:
         if config.get("tie_word_embeddings", False):
             raise ValueError("GPT-OSS requires untied input and output embeddings")
 
-        return cls(
-            vocab_size=config["vocab_size"],
-            hidden_size=config["hidden_size"],
-            intermediate_size=config["intermediate_size"],
-            num_hidden_layers=config["num_hidden_layers"],
-            num_attention_heads=config["num_attention_heads"],
-            num_key_value_heads=config["num_key_value_heads"],
+        return parse_hf_config(
+            cls,
+            config,
             num_local_experts=num_experts,
             num_experts_per_tok=top_k,
             head_dim=config.get(
                 "head_dim", config["hidden_size"] // config["num_attention_heads"]
             ),
-            sliding_window=config["sliding_window"],
             rms_norm_eps=config.get("rms_norm_eps", 1e-5),
             rope_theta=rope.get("rope_theta", config.get("rope_theta", 150_000.0)),
             initial_context_length=rope.get(
@@ -133,8 +116,6 @@ class GptOssConfig:
             swiglu_limit=config.get("swiglu_limit", 7.0),
             attention_bias=config.get("attention_bias", True),
             layer_types=tuple(layer_types),
-            attention_dropout=config.get("attention_dropout", 0.0),
-            initializer_range=config.get("initializer_range", 0.02),
             pad_token_id=config.get("pad_token_id"),
             eos_token_id=config.get("eos_token_id"),
         )

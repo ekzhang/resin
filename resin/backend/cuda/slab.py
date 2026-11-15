@@ -153,32 +153,30 @@ def stage_page_groups(
     return tuple(groups)
 
 
-def _graph_page_widths(layout: CacheLayout, sequence_capacity: int) -> tuple[int, ...]:
-    if sequence_capacity <= 0:
-        raise ValueError("graph sequence capacity must be positive")
-    widths = []
-    for group in layout.groups:
-        blocks = math.ceil(sequence_capacity / group.block_tokens)
-        if group.retention is CacheRetention.WINDOW:
-            blocks = min(blocks, cast(int, group.window_resident_block_count))
-        elif group.family is CacheGroupFamily.STATE:
-            blocks = 1
-        widths.append(max(blocks, 1))
-    return tuple(widths)
+def state_view_factory(storage: torch.Tensor, slots: int, state_bytes: int):
+    """Build typed aliases of contiguous fields inside each packed state slot.
 
+    Shapes describe one field; offsets and the outer slot strides are in bytes.
+    The returned tensors share the arena allocation and add no device storage.
+    """
+    parent_bytes = storage.stride(0) * storage.element_size()
+    typed = {storage.dtype: storage}
 
-def _empty_page_groups(
-    device: str | torch.device, batch_size: int, widths: Sequence[int]
-) -> tuple[DevicePageGroup, ...]:
-    def empty(*shape: int) -> torch.Tensor:
-        return torch.empty(shape, dtype=torch.int32, device=device)
-
-    return tuple(
-        DevicePageGroup(
-            empty(batch_size, width), empty(batch_size, width), empty(batch_size)
+    def view(dtype: torch.dtype, *shape: int, offset: int = 0) -> torch.Tensor:
+        strides, stride = [], 1
+        for extent in reversed(shape):
+            strides.append(stride)
+            stride *= extent
+        size = dtype.itemsize
+        if dtype not in typed:
+            typed[dtype] = storage.view(dtype)
+        return typed[dtype].as_strided(
+            (storage.shape[0], slots, *shape),
+            (parent_bytes // size, state_bytes // size, *reversed(strides)),
+            offset // size,
         )
-        for width in widths
-    )
+
+    return view
 
 
 def graph_scratch_parent_count(packings: Sequence[int], batch_size: int) -> int:
@@ -194,72 +192,6 @@ def graph_scratch_address(
     preceding = graph_scratch_parent_count(packings[:group], batch_size)
     parent, slot = divmod(row, packings[group])
     return parent_capacity + preceding + parent + 1, slot
-
-
-def _page_group_device_inputs(
-    groups: Sequence[DevicePageGroup], *, names: tuple[str, str, str] = _SLAB_NAMES
-) -> dict[str, torch.Tensor]:
-    return {
-        f"cache.{index}.{name}": value
-        for index, group in enumerate(groups)
-        for name, value in zip(
-            names, (group.slab_ids, group.slotnums, group.first_blocks), strict=True
-        )
-    }
-
-
-def _page_group_capture_inputs(
-    widths: Sequence[int],
-    batch_size: int,
-    *,
-    names: tuple[str, str, str] = _SLAB_NAMES,
-    padding_address: Callable[[int, int], tuple[int, int]] = lambda _index, _row: (
-        0,
-        0,
-    ),
-) -> dict[str, object]:
-    inputs = {}
-    for index, width in enumerate(widths):
-        addresses = [padding_address(index, row) for row in range(batch_size)]
-        for field in (0, 1):
-            inputs[f"cache.{index}.{names[field]}"] = tuple(
-                address[field] for address in addresses for _ in range(width)
-            )
-        inputs[f"cache.{index}.{names[2]}"] = (0,) * batch_size
-    return inputs
-
-
-def _page_group_plan_inputs(
-    groups: Sequence[DevicePageGroup],
-    plan: PagedCachePlan,
-    *,
-    label: str,
-    names: tuple[str, str, str] = _SLAB_NAMES,
-    padding_address: Callable[[int, int], tuple[int, int]] = lambda _index, _row: (
-        0,
-        0,
-    ),
-) -> dict[str, object]:
-    inputs = {}
-    for index, (target, source) in enumerate(zip(groups, plan.groups, strict=True)):
-        shape = tuple(target.slab_ids.shape)
-        if plan.rows > shape[0]:
-            raise ValueError(f"{label} cache batch exceeds CUDA graph capacity")
-        ids, slots = np.zeros(shape, dtype=np.uint32), np.zeros(shape, dtype=np.uint32)
-        # Padded requests may still write dummy tokens during graph replay.
-        # Use capture's scratch storage without making absent live history valid.
-        for row in range(plan.rows, shape[0]):
-            ids[row], slots[row] = padding_address(index, row)
-        for row in range(plan.rows):
-            row_ids, row_slots = source.block_slabs(row), source.block_slots(row)
-            if len(row_ids) > shape[1]:
-                raise ValueError(f"{label} cache table exceeds CUDA graph capacity")
-            ids[row, : len(row_ids)], slots[row, : len(row_slots)] = row_ids, row_slots
-        first = np.zeros(shape[0], dtype=np.uint32)
-        first[: plan.rows] = source.block_table_start_indices
-        for name, value in zip(names, (ids, slots, first)):
-            inputs[f"cache.{index}.{name}"] = value
-    return inputs
 
 
 PARENT_PAGE_NAMES = _PARENT_NAMES
@@ -280,7 +212,17 @@ class GraphPageTableArena:
         return 0, 0
 
     def _graph_widths(self, sequence_capacity: int) -> tuple[int, ...]:
-        return _graph_page_widths(self.layout, sequence_capacity)
+        if sequence_capacity <= 0:
+            raise ValueError("graph sequence capacity must be positive")
+        widths = []
+        for group in self.layout.groups:
+            blocks = math.ceil(sequence_capacity / group.block_tokens)
+            if group.retention is CacheRetention.WINDOW:
+                blocks = min(blocks, cast(int, group.window_resident_block_count))
+            elif group.family is CacheGroupFamily.STATE:
+                blocks = 1
+            widths.append(max(blocks, 1))
+        return tuple(widths)
 
     def graph_can_fit_plan(self, plan: PagedCachePlan, shape: tuple[int, ...]) -> bool:
         """Fit the complete native lease, including currently unreadable tail pages."""
@@ -292,38 +234,84 @@ class GraphPageTableArena:
         )
 
     def graph_cache(self, batch_size: int, sequence_capacity: int):
-        groups = _empty_page_groups(
-            self.device,
-            batch_size,
-            self._graph_widths(sequence_capacity),
+        def empty(*shape: int) -> torch.Tensor:
+            return torch.empty(shape, dtype=torch.int32, device=self.device)
+
+        return self._make_graph_cache(
+            tuple(
+                DevicePageGroup(
+                    empty(batch_size, width),
+                    empty(batch_size, width),
+                    empty(batch_size),
+                    layout.family is CacheGroupFamily.STATE,
+                )
+                for width, layout in zip(
+                    self._graph_widths(sequence_capacity),
+                    self.layout.groups,
+                    strict=True,
+                )
+            )
         )
-        groups = tuple(
-            replace(group, live_state=layout.family is CacheGroupFamily.STATE)
-            for group, layout in zip(groups, self.layout.groups, strict=True)
-        )
-        return self._make_graph_cache(groups)
 
     def graph_device_inputs(self, cache) -> dict[str, torch.Tensor]:
-        return _page_group_device_inputs(cache.groups, names=self.graph_input_names)
+        return {
+            f"cache.{index}.{name}": value
+            for index, group in enumerate(cache.groups)
+            for name, value in zip(
+                self.graph_input_names,
+                (group.slab_ids, group.slotnums, group.first_blocks),
+                strict=True,
+            )
+        }
 
     def graph_shape_capture_inputs(
         self, batch_size: int, sequence_capacity: int
     ) -> dict[str, object]:
-        return _page_group_capture_inputs(
-            self._graph_widths(sequence_capacity),
-            batch_size,
-            names=self.graph_input_names,
-            padding_address=self._graph_padding_address,
-        )
+        inputs = {}
+        for index, width in enumerate(self._graph_widths(sequence_capacity)):
+            addresses = [
+                self._graph_padding_address(index, row) for row in range(batch_size)
+            ]
+            for field in (0, 1):
+                inputs[f"cache.{index}.{self.graph_input_names[field]}"] = tuple(
+                    address[field] for address in addresses for _ in range(width)
+                )
+            inputs[f"cache.{index}.{self.graph_input_names[2]}"] = (0,) * batch_size
+        return inputs
 
     def graph_plan_inputs(self, cache, plan: PagedCachePlan) -> dict[str, object]:
-        return _page_group_plan_inputs(
-            cache.groups,
-            plan,
-            label=self.graph_label,
-            names=self.graph_input_names,
-            padding_address=self._graph_padding_address,
-        )
+        inputs = {}
+        for index, (target, source) in enumerate(
+            zip(cache.groups, plan.groups, strict=True)
+        ):
+            shape = tuple(target.slab_ids.shape)
+            if plan.rows > shape[0]:
+                raise ValueError(
+                    f"{self.graph_label} cache batch exceeds CUDA graph capacity"
+                )
+            ids, slots = (
+                np.zeros(shape, dtype=np.uint32),
+                np.zeros(shape, dtype=np.uint32),
+            )
+            # Padded requests may still write dummy tokens during graph replay.
+            # Use capture's scratch storage without making absent live history valid.
+            for row in range(plan.rows, shape[0]):
+                ids[row], slots[row] = self._graph_padding_address(index, row)
+            for row in range(plan.rows):
+                row_ids, row_slots = source.block_slabs(row), source.block_slots(row)
+                if len(row_ids) > shape[1]:
+                    raise ValueError(
+                        f"{self.graph_label} cache table exceeds CUDA graph capacity"
+                    )
+                ids[row, : len(row_ids)], slots[row, : len(row_slots)] = (
+                    row_ids,
+                    row_slots,
+                )
+            first = np.zeros(shape[0], dtype=np.uint32)
+            first[: plan.rows] = source.block_table_start_indices
+            for name, value in zip(self.graph_input_names, (ids, slots, first)):
+                inputs[f"cache.{index}.{name}"] = value
+        return inputs
 
 
 __all__ = [

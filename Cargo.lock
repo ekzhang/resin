@@ -1597,6 +1597,7 @@ dependencies = [
  "rkyv",
  "serde",
  "sha2",
+ "thiserror",
 ]
 
 [[package]]

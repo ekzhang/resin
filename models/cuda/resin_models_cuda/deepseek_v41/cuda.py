@@ -44,6 +44,7 @@ from resin.backend.cuda.parallel import (
 from resin.backend.cuda.runner import (
     CudaRunner,
     capture_sampling_inputs,
+    forward_paged,
     pad_sampling_inputs,
 )
 from resin.backend.cuda.scoring import format_output, prompt_scores, score_completion
@@ -1468,38 +1469,25 @@ class DeepSeekV41CudaRunner(CudaRunner):
             raise RuntimeError("explicit rank groups require forward_distributed")
         rows = self._validate_plan(plan)
         cache_plan = self._cache_plan(plan)
-        with self._cuda_failure:
-            if plan.phase == BatchPhase.DECODE:
-                graph_output = self._graph_forward(plan, cache_plan)
-                if graph_output is not None:
-                    return graph_output
-            staging = TensorStager(self.device)
-            cache = self._cache.tensorize(cache_plan, staging)
-            token_ids = staging.device("token_ids", plan.token_ids, torch.long)
-            positions = staging.device("positions", plan.positions, torch.long)
-            with (
-                torch.inference_mode(),
-                use_default_dtype(torch.bfloat16),
-                torch.device(self.device),
-            ):
-                if plan.phase == BatchPhase.PREFILL:
-                    with self._prefill_graphs():
-                        logits, scores = self._prefill(
-                            plan, rows, cache, token_ids, positions
-                        )
-                elif self.speculative_draft_tokens:
-                    return self._speculative_decode(plan, cache, token_ids, positions)
-                else:
-                    input_ids = token_ids.view(plan.num_sequences, 1)
-                    logits = self._model.forward_decode(
-                        input_ids,
-                        positions,
-                        int(np.max(plan.positions)) + 1,
-                        cache=cache,
-                    )
-                    scores = None
-                output = self._sample_target(logits, plan, 0)
-            return format_output(logits, output, plan, prompt_logprobs=scores)
+        return forward_paged(self, plan, rows, cache_plan)
+
+    def _eager_forward(self, plan, rows, cache, token_ids, positions):
+        if plan.phase == BatchPhase.PREFILL:
+            with self._prefill_graphs():
+                logits, scores = self._prefill(plan, rows, cache, token_ids, positions)
+        elif self.speculative_draft_tokens:
+            return self._speculative_decode(plan, cache, token_ids, positions)
+        else:
+            input_ids = token_ids.view(plan.num_sequences, 1)
+            logits = self._model.forward_decode(
+                input_ids,
+                positions,
+                int(np.max(plan.positions)) + 1,
+                cache=cache,
+            )
+            scores = None
+        output = self._sample_target(logits, plan, 0)
+        return format_output(logits, output, plan, prompt_logprobs=scores)
 
     def validate_distributed(
         self, plan: BatchPlan | None, context: StepContext

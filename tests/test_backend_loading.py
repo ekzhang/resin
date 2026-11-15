@@ -1,7 +1,41 @@
 import pytest
 import torch
 
-from resin.backend.loading import load_safetensor_weights, prepare_model, resolve_dtype
+from resin.backend.loading import (
+    load_safetensor_weights,
+    prepare_model,
+    resolve_dtype,
+    resolve_hub_model,
+)
+
+
+def test_hub_resolution_keeps_local_paths_pins_and_file_selection(
+    tmp_path, monkeypatch
+):
+    calls = []
+
+    def download(**kwargs):
+        calls.append(kwargs)
+        return str(tmp_path)
+
+    monkeypatch.setattr("huggingface_hub.snapshot_download", download)
+    options = {
+        "default": ("org/model", "pinned"),
+        "files": ("config.json", "*.safetensors"),
+    }
+    assert resolve_hub_model(tmp_path, None, **options) == tmp_path
+    assert calls == []
+    for model, revision, expected in (
+        ("org/model", None, "pinned"),
+        ("org/model", "custom", "custom"),
+        ("org/other", None, None),
+    ):
+        assert resolve_hub_model(model, revision, **options) == tmp_path
+        assert calls[-1] == {
+            "repo_id": model,
+            "revision": expected,
+            "allow_patterns": ["config.json", "*.safetensors"],
+        }
 
 
 def test_resolve_dtype_accepts_torch_dtypes_names_and_none() -> None:

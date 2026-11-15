@@ -212,40 +212,46 @@ pub(crate) struct Qwen35Media {
     #[pyo3(get, name = "rope_delta")]
     delta: i64,
 }
-media_methods! {
-    impl Qwen35Media {
-        #[new]
-        #[pyo3(signature=(*, token_ids, image_positions, pixel_values, image_grid_thw, spatial_merge_size, image_token_id))]
-        #[allow(clippy::too_many_arguments)]
-        fn new(
-            py: Python<'_>,
-            token_ids: Vec<u32>,
-            image_positions: Vec<usize>,
-            pixel_values: &Bound<'_, PyAny>,
-            image_grid_thw: &Bound<'_, PyAny>,
-            spatial_merge_size: usize,
-            image_token_id: u32,
-        ) -> PyResult<Self> {
-            Self::build(
-                py,
-                token_ids,
-                image_positions,
-                tensor(pixel_values)?,
-                tensor(image_grid_thw)?,
-                spatial_merge_size,
-                image_token_id,
-            )
+// Both packed-image families expose the same constructor and position getters.
+macro_rules! packed_image_methods {
+    ($class:ident) => {
+        media_methods! {
+            impl $class {
+                #[new]
+                #[pyo3(signature=(*, token_ids, image_positions, pixel_values, image_grid_thw, spatial_merge_size, image_token_id))]
+                #[allow(clippy::too_many_arguments)]
+                fn new(
+                    py: Python<'_>,
+                    token_ids: Vec<u32>,
+                    image_positions: Vec<usize>,
+                    pixel_values: &Bound<'_, PyAny>,
+                    image_grid_thw: &Bound<'_, PyAny>,
+                    spatial_merge_size: usize,
+                    image_token_id: u32,
+                ) -> PyResult<Self> {
+                    Self::build(
+                        py,
+                        token_ids,
+                        image_positions,
+                        tensor(pixel_values)?,
+                        tensor(image_grid_thw)?,
+                        spatial_merge_size,
+                        image_token_id,
+                    )
+                }
+                #[getter]
+                fn image_positions(&self, py: Python<'_>) -> PyResult<Py<PyTuple>> {
+                    tuple(py, self.positions.iter().copied())
+                }
+                #[getter]
+                fn token_spans(&self, py: Python<'_>) -> PyResult<Py<PyTuple>> {
+                    spans(py, [])
+                }
+            }
         }
-        #[getter]
-        fn image_positions(&self, py: Python<'_>) -> PyResult<Py<PyTuple>> {
-            tuple(py, self.positions.iter().copied())
-        }
-        #[getter]
-        fn token_spans(&self, py: Python<'_>) -> PyResult<Py<PyTuple>> {
-            spans(py, [])
-        }
-    }
+    };
 }
+packed_image_methods!(Qwen35Media);
 
 #[pyclass(frozen, module = "resin._resin")]
 pub(crate) struct Glm53FlashMedia {
@@ -260,40 +266,7 @@ pub(crate) struct Glm53FlashMedia {
     #[pyo3(get, name = "image_grid_thw")]
     grids: Py<PyArrayDyn<i64>>,
 }
-media_methods! {
-    impl Glm53FlashMedia {
-        #[new]
-        #[pyo3(signature=(*, token_ids, image_positions, pixel_values, image_grid_thw, spatial_merge_size, image_token_id))]
-        #[allow(clippy::too_many_arguments)]
-        fn new(
-            py: Python<'_>,
-            token_ids: Vec<u32>,
-            image_positions: Vec<usize>,
-            pixel_values: &Bound<'_, PyAny>,
-            image_grid_thw: &Bound<'_, PyAny>,
-            spatial_merge_size: usize,
-            image_token_id: u32,
-        ) -> PyResult<Self> {
-            Self::build(
-                py,
-                token_ids,
-                image_positions,
-                tensor(pixel_values)?,
-                tensor(image_grid_thw)?,
-                spatial_merge_size,
-                image_token_id,
-            )
-        }
-        #[getter]
-        fn image_positions(&self, py: Python<'_>) -> PyResult<Py<PyTuple>> {
-            tuple(py, self.positions.iter().copied())
-        }
-        #[getter]
-        fn token_spans(&self, py: Python<'_>) -> PyResult<Py<PyTuple>> {
-            spans(py, [])
-        }
-    }
-}
+packed_image_methods!(Glm53FlashMedia);
 
 #[pyclass(frozen, module = "resin._resin")]
 pub(crate) struct Gemma4Media {

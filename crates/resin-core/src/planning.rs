@@ -1,4 +1,3 @@
-use std::fmt;
 use std::num::NonZeroU32;
 
 use crate::{Phase, SequenceStep, TokenRange};
@@ -20,32 +19,17 @@ pub struct RequestProgress {
     pub atomic_prefill_spans: Vec<(u32, u32)>,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
 pub enum PlanningError {
+    #[error("scheduler selected requests from different phases")]
     MixedPhases,
+    #[error("prefill cursor must be before prompt length")]
     InvalidPrefillProgress,
+    #[error("an atomic prefill span exceeds the current row token budget")]
     AtomicPrefillSpanExceedsBudget,
+    #[error("scheduled token range overflows u32")]
     TokenRangeOverflow,
 }
-
-impl fmt::Display for PlanningError {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::MixedPhases => {
-                formatter.write_str("scheduler selected requests from different phases")
-            }
-            Self::InvalidPrefillProgress => {
-                formatter.write_str("prefill cursor must be before prompt length")
-            }
-            Self::AtomicPrefillSpanExceedsBudget => {
-                formatter.write_str("an atomic prefill span exceeds the current row token budget")
-            }
-            Self::TokenRangeOverflow => formatter.write_str("scheduled token range overflows u32"),
-        }
-    }
-}
-
-impl std::error::Error for PlanningError {}
 
 /// Choose the token range for each request in the current dispatch.
 ///

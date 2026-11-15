@@ -92,6 +92,21 @@ def test_qwen35_parser_accepts_text_config_directly() -> None:
     assert config.vocab_size == 248320
 
 
+def test_checkpoint_scalars_keep_coercions_defaults_and_required_fields() -> None:
+    values = _qwen38()
+    expected = Qwen35Config.from_hugging_face(values)
+    text = values["text_config"]
+    for key in ("hidden_size", "num_hidden_layers", "rms_norm_eps"):
+        text[key] = str(text[key])
+    text["attention_bias"] = None
+    text.pop("mamba_ssm_dtype")
+    text["unused_checkpoint_option"] = "ignored"
+    assert Qwen35Config.from_hugging_face(values) == expected
+    del text["hidden_size"]
+    with pytest.raises(KeyError, match="hidden_size"):
+        Qwen35Config.from_hugging_face(values)
+
+
 def test_qwen35_rejects_incompatible_gate_semantics() -> None:
     values = copy.deepcopy(_qwen38())
     values["text_config"]["attn_output_gate"] = False  # type: ignore[index]

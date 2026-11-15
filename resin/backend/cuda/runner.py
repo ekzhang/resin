@@ -31,6 +31,7 @@ from resin.backend.cuda.sampling import (
     FusedSampler,
     SamplingTensors,
 )
+from resin.backend.cuda.staging import TensorStager
 from resin.backend.cuda.tensor_graphs import (
     CudaGraphTensorRegion,
     TensorSpec,
@@ -40,6 +41,7 @@ from resin.backend.metrics import RunnerMetrics
 from resin.backend.resources import CachePoolBinding
 from resin.backend.sampling import SAMPLING_OFFSET_STRIDE
 from resin.backend.topology import ParallelismCapabilities
+from resin.backend.torch import use_default_dtype
 from resin.protocols import Runner
 
 _SAMPLING_DEFAULTS = (1.0, 1.0, None, 0, 0, False)
@@ -683,6 +685,25 @@ class CudaRunner(Runner):
         if executor is None:
             raise RuntimeError("CUDA graph modes have not been configured")
         return executor
+
+
+def forward_paged(runner, plan, rows, cache_plan):
+    """Replay captured decode or stage one eager paged-model invocation."""
+    with runner._cuda_failure:
+        if plan.phase == BatchPhase.DECODE:
+            graph_output = runner._graph_forward(plan, cache_plan)
+            if graph_output is not None:
+                return graph_output
+        staging = TensorStager(runner.device)
+        cache = runner._cache.tensorize(cache_plan, staging)
+        token_ids = staging.device("token_ids", plan.token_ids, torch.long)
+        positions = staging.device("positions", plan.positions, torch.long)
+        with (
+            torch.inference_mode(),
+            use_default_dtype(torch.bfloat16),
+            torch.device(runner.device),
+        ):
+            return runner._eager_forward(plan, rows, cache, token_ids, positions)
 
 
 def capture_sampling_inputs(

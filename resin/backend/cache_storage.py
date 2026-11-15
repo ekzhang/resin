@@ -18,3 +18,26 @@ def byte_regions(tensors):
         for name, tensor in tensors.items()
         if tensor.numel()
     }
+
+
+def layered_cache_buffers(arena, groups, *, page_fields, page_layers, state_fields):
+    """Export layered pages and complete state fields from one shared slab arena."""
+    pages = tuple((name, getattr(arena, name)) for name in page_fields)
+    buffers = []
+    slab_units = arena.geometry.slab_units
+    for group, (_, addresses) in enumerate(groups):
+        layers = page_layers[group]
+        for slab, slot in addresses:
+            if layers is None:
+                tensors = {
+                    name: getattr(arena, name)[slab, slot] for name in state_fields
+                }
+            else:
+                base = slab * slab_units + slot * layers
+                tensors = {
+                    f"{name}/{layer}": values[base + layer]
+                    for name, values in pages
+                    for layer in range(layers)
+                }
+            buffers.append(byte_regions(tensors))
+    return tuple(buffers)

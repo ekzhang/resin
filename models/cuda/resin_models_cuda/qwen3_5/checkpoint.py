@@ -13,7 +13,7 @@ from resin.backend.loading import (
     assign_model_tensor,
     prepare_model,
     read_config,
-    resolve_model,
+    resolve_hub_model,
 )
 from resin.backend.safetensors import SafetensorReader, indexed_tensor_files
 from resin.backend.torch import use_default_dtype
@@ -45,27 +45,13 @@ TOKENIZER_FILES = (
 )
 
 
-def _download_model(repo_id: str, revision: str | None) -> Path:
-    from huggingface_hub import snapshot_download
-
-    return Path(
-        snapshot_download(
-            repo_id=repo_id,
-            revision=revision,
-            allow_patterns=[*MODEL_FILES, *TOKENIZER_FILES],
-        )
-    )
-
-
 def resolve_model_path(model: str | Path, revision: str | None = None) -> Path:
-    """Resolve a local directory or download a pinned Hub checkpoint."""
-
-    selected = (
-        DEFAULT_REVISION
-        if revision is None and str(model) == DEFAULT_MODEL
-        else revision
+    return resolve_hub_model(
+        model,
+        revision,
+        default=(DEFAULT_MODEL, DEFAULT_REVISION),
+        files=(*MODEL_FILES, *TOKENIZER_FILES),
     )
-    return resolve_model(model, selected, _download_model)
 
 
 def load_config(model_path: str | Path) -> tuple[Qwen35Config, dict]:
