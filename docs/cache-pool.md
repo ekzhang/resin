@@ -1,136 +1,124 @@
 # Unified paged cache
 
-Each Engine owns one pool of equal-sized physical slabs. A runner declares an
-ordered `CacheLayout`; every `CacheGroupLayout` explains how one model state is
-packed into those slabs:
+Each Engine owns a pool of equal-sized physical slabs shared by all of a model's
+cache groups. The Engine manages allocation, prefix reuse, and resource
+lifetimes. The runner allocates the device arena and maps physical cache
+addresses into model tensors.
 
-- `family=HISTORY` stores token-addressed attention or rolling history.
-- `family=STATE` stores one private live recurrent state per request.
-- `retention=HISTORY` keeps full logical token history for History groups.
-  For State groups, `block_tokens` specifies prefix checkpoint alignment.
-- `retention=WINDOW` keeps a bounded chronological suffix.
-- `window_tokens` is that suffix's physical retention budget;
-  `read_window_tokens` is the logical window including the current token.
-  It defaults to `window_tokens`. To write a chunk of `Q` tokens while its
-  earliest query reads a window of `W` tokens, reserve at least `W + Q - 1`
-  retained tokens and declare `read_window_tokens=W`.
-- `blocks_per_slab` says how many blocks of that type fit in one slab.
+## Cache layout
 
-Slabs are fungible. They are not divided into fixed History, Window, or State
-regions. Allocation binds a free slab to whichever group currently needs it,
-and retirement returns it to the common pool. Admission estimates the slab
-demand for every request and group, including packing, before admitting work.
+A runner declares an ordered `CacheLayout` with one `CacheGroupLayout` for each
+kind of model state:
 
-The runner allocates the matching device arena once and receives its pool ID and
-frozen layout through `bind_resources`. A `BatchPlan` does not repeat that
-identity. It contains only the ordered `CacheGroupPlan`s whose structured
-physical addresses refer to the already-bound arena.
+| `family`  | `retention` | Stored state                                                                       |
+| --------- | ----------- | ---------------------------------------------------------------------------------- |
+| `HISTORY` | `HISTORY`   | Full token history, such as attention keys and values.                             |
+| `HISTORY` | `WINDOW`    | A bounded chronological suffix of attention or rolling history.                    |
+| `STATE`   | `HISTORY`   | One private live recurrent state per request, with optional immutable checkpoints. |
+
+For History groups, `block_tokens` is the number of token positions covered by a
+block. For State groups, it specifies checkpoint alignment. `blocks_per_slab`
+declares how many blocks of that group fit in one physical slab.
+
+An allocated slab belongs to one group. When its blocks are released, the slab
+returns to the common pool and can serve any group. Admission accounts for each
+request's demand across all groups, including their packing into slabs.
+
+The runner receives the pool ID and frozen layout through `bind_resources`.
+Subsequent batch plans address this bound arena.
+
+Use `CacheLayout(replay_suffix_tokens=N)` when a model needs at least `N` prompt
+inputs recomputed after restoring a cached prefix. The Engine always leaves at
+least one input for execution.
+
+### Window retention
+
+A Window group declares two lengths:
+
+- `read_window_tokens` is the logical read window, including the current token.
+- `window_tokens` is the physical retention budget. `read_window_tokens` defaults
+  to this value when omitted.
+
+A chunk of `Q` writes with a read window of `W` requires
+`window_tokens >= W + Q - 1`. The retained span contains both the earliest
+query's history and every write in the chunk. For example, a 128-token read
+window and 64-token chunk require at least 191 retained tokens.
+
+The Engine caps prefill chunks at the smallest
+`window_tokens - read_window_tokens + 1` across Window groups and rejects decode
+lookahead that exceeds it. Larger chunks therefore require a larger retention
+budget per live request.
 
 ## Batch plans
 
-`BatchPlan.cache_groups` has one plan per declared block type—such as full
-attention, sliding-window attention, or recurrent state—not one per sequence.
-The cache is a pool of equally sized physical slabs. Each slab in use is
-assigned to one cache group and fits that group's `blocks_per_slab` blocks.
-A physical block is identified by `(slab_id, slotnum)`. A cached token location is
-`(block, block_offset)`, equivalently `(slab_id, slotnum, block_offset)`. Each
-group plan covers every batch sequence and has one CSR block table:
+`BatchPlan.cache_groups` contains one `CacheGroupPlan` per declared group, in
+layout order. Each group plan describes all sequences in the batch. A physical
+block has address `(slab_id, slotnum)`; a token location adds `block_offset`.
+Slab zero is reserved for inactive/null rows, and live slab IDs are one-based.
 
-- `block_indptr` slices the parallel `block_slab_ids` and
-  `block_slotnums` arrays by sequence.
-- `block_table_start_indices[i]` is the absolute chunk index represented by
-  sequence `i`'s first table entry. For a group with 64-token blocks, block 37
-  covers token positions 2368 through 2431. Full-history rows begin at zero;
-  sliding-window rows advance when earlier chunks are evicted.
-- `append_slab_ids`, `append_slotnums`, and `append_block_offsets` give one
-  exact cached-token write location per scheduled token.
+Each plan contains a CSR block table and explicit write locations:
 
-The Engine allocates blocks, performs copy-on-write decisions, and holds the
-reader/writer lease through synchronous execution and native commit. Model code maps
-each `(slab_id, slotnum)` pair into its model-specific tensor row. Slab zero is
-reserved for inactive/null rows; live slab IDs are one-based. Keeping the
-address structured prevents runners from assuming a different packing than the
-allocator.
+- `block_indptr` slices the parallel `block_slab_ids` and `block_slotnums`
+  arrays by sequence.
+- `block_table_start_indices[i]` is the absolute logical block index of sequence
+  `i`'s first table entry. With 64-token blocks, index 37 covers positions
+  2368–2431. Full-history rows begin at zero; Window rows advance as older
+  blocks are evicted.
+- `append_slab_ids`, `append_slotnums`, and `append_block_offsets` specify the
+  write location for each scheduled token.
 
-For overlapped decode, the Engine derives a wider immutable write span from the
-maximum per-step advance and cache geometry. It bounds that span by window,
-context, output, and capacity limits, falling back to a single step when needed.
-The plan's page tables describe the actual lease. The runner must derive readable page
-counts, indices, and lengths from accepted GPU positions inside that span;
-reserved tail pages are not yet readable history. Native ownership and page
-addresses stay fixed until outstanding completions have been harvested.
+`BatchPlan.prefill_lengths` gives each request's final prefill endpoint across
+chunks. It includes generated inputs when reconstructing a retracted request.
 
-For hybrid models the STATE address remains fixed across checkpoint boundaries,
-so a wider attention lease can cross those boundaries without a recurrent-state
-drain. The state descriptor supplies one-time initialization or restore copies
-and optional snapshot destinations. The runner commits its accepted live state,
-then copies it into a snapshot only when the accepted cache-valid prefix equals
-that destination's reserved prefix. The shared CUDA `execute_state` wrapper
-performs these transfers outside model graphs and attaches completion receipts.
+## Execution and resource lifetimes
+
+The Engine allocates blocks, applies copy-on-write to shared history, and holds
+reader/writer leases through execution and native commit. Physical addresses
+remain stable for the lifetime of a lease. Completion and cancellation release
+resources only after outstanding accesses have finished.
+
+Overlapped decode can reserve a write span covering several steps. The Engine
+bounds it by cache geometry, window retention, context length, output budget,
+and available capacity. Page tables describe the reserved span; the runner uses
+accepted GPU positions to determine which pages and token positions are readable.
+
+A recurrent group's private live slot stays fixed across checkpoint boundaries.
+Its state descriptor supplies initialization or restore copies and optional
+snapshot destinations. The runner updates the live state and reports snapshots
+only for destinations matching the exact accepted prefix. The shared CUDA
+`execute_state` wrapper performs these transfers outside model graphs and
+attaches completion receipts.
 
 ## Prefix caching
 
-`Engine(..., prefix_cache=True)` enables an exact-token block trie with LRU
-entries. Prefixes are published only at an alignment shared by every cache
-group. A hit attaches immutable references to the cached pages and schedules
-only the unmatched suffix.
+A checkpoint holds the model state needed to continue from a token prefix. With
+`Engine(..., prefix_cache=True)`, a new request can reuse a matching checkpoint
+and compute only the remaining suffix.
 
-A model can declare `CacheLayout(replay_suffix_tokens=N)` when a restored
-history needs its final `N` inputs recomputed. Prefix lookup caps the hit at
-`prefill_length - N` before applying cache alignment. The scheduler does not
-interpret those inputs or choose model layers. `BatchPlan.prefill_lengths`
-provides each request's final prefill endpoint across chunks, including
-generated inputs when reconstructing a retracted request. Scored prompts still
-take the full prefill path.
+The Engine finds the longest usable checkpoint through a flat SHA-256 index of
+prefix identities. Reuse requires matching text or media identity and the same
+cache namespace. Checkpoint endpoints align to the least common multiple of all
+groups' `block_tokens`, so every group resumes at the same token position.
 
-Live requests have priority over cached entries. When allocation needs more
-slabs, the least-recently-used prefix is evicted. Shared token history uses
-copy-on-write before mutation. A State prefix hit keeps its immutable snapshot
-pinned while copying it once into a fresh private live slot.
+On a hit, the request shares the checkpoint's immutable history pages and copies
+any recurrent state into its own private live slot.
 
-Live state and optional snapshots use the same native pool. Snapshot allocation
-may fail without delaying decode. A speculative step that crosses a checkpoint
-without materializing that exact intermediate state skips it. Reports identify
-reserved snapshot destinations; the Engine validates ownership and exact prefix
-length, requires all State groups, and publishes only after outstanding consumers
-have drained. Terminal output truncation never relabels later state as an earlier
-prefix. Cancellation retains physical resources until all queued work finishes.
+Cached checkpoints use the same slab pool as live requests. When requests need
+more capacity, the Engine evicts least-recently-used checkpoints. Pages remain
+allocated until their last owner releases them.
 
-[Prefix storage](cache-storage.md) adds asynchronous tiers to the device cache.
+[Prefix storage](cache-storage.md) extends reuse beyond the device pool with
+asynchronous storage tiers.
 
 ## Physical sizing
 
-CUDA runners use the shared
-[`plan_cache_capacity`](../resin/backend/capacity.py) helper to choose slab capacity
-from free VRAM after model load and before cache allocation and CUDA graph
-capture, subject to their memory-utilization targets and workspace reservations.
-Runners may also bound that capacity explicitly. The slab byte size is the
-largest group allocation. Smaller groups set `blocks_per_slab` from their exact
-byte ratio, so the allocator can compare all demand in slab units.
+The runner chooses a slab byte size that accommodates its cache groups and
+declares each group's `blocks_per_slab`. Packing may include padding; the Engine
+accounts for all demand in slab units.
 
-DeepSeek-V4.1 packs its smaller compressed-history and rolling state groups into
-the same slab size. GPT-OSS uses full-history and sliding attention groups with
-equal-sized pages.
-
-Slab zero is reserved as the device null target. Positive slab IDs are stable for
-the lifetime of the Engine-issued lease.
-
-Window read history and all scheduled writes share one chronological table.
-The Engine caps prefill chunks by the smallest `window_tokens -
-read_window_tokens + 1` across Window groups and rejects decode lookahead that
-exceeds it. The same bound is checked before native cache growth or copy-on-write.
-This prevents a later write in a chunk from overwriting the earlier queries'
-history, including when a prefix hit shares those pages with another request.
-
-DeepSeek-V4.1 defaults to 4096-token prefill chunks and reserves this guard band
-for sliding attention and compressor tails. The runner's `prefill_chunk_size`
-parameter controls both execution size and retained capacity. This preserves
-vectorized prefill but uses more cache memory per live request than a decode-only
-tail; the scheduler accounts for that physical demand. A future separate
-transient prefill workspace could reduce the retained footprint.
-
-With DSpark enabled, draft attention reads the preceding 128 main-hidden rows
-before target verification consumes the current anchor. Its shared attention
-group therefore declares a 129-token read envelope. This preserves that oldest
-row even for short, unaligned verification blocks; default 4096-token chunks
-use the same number of physical blocks after rounding.
+CUDA runners normally use
+[`plan_cache_capacity`](../resin/backend/capacity.py) after loading weights and
+before allocating the cache or capturing CUDA graphs. The helper uses free VRAM,
+the memory-utilization target, workspace reservations, and slab size to determine
+usable capacity after reserving the null slab. Runners can also impose an
+explicit capacity limit.

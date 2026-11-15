@@ -332,7 +332,7 @@ impl KvLayout {
                         "shared prefix must align to full-history blocks",
                     ));
                 }
-                let shared_blocks = u64::from(shared_prefix_tokens / group.block_tokens.get());
+                let shared_blocks = u64::from(shared_prefix_tokens / group.block_tokens);
                 let extra_copies = u64::try_from(context_lengths.len().saturating_sub(1))
                     .map_err(|_| overflow())?;
                 blocks -= shared_blocks

@@ -6,8 +6,10 @@ license = "Apache-2.0"
 description = "Pure Rust scheduling and resource ownership for Resin"
 
 [dependencies]
+lru = { version = "0.19", default-features = false }
 rkyv.workspace = true
 serde.workspace = true
+sha2 = { version = "0.10", features = ["asm"] }
 
 [dev-dependencies]
 prometheus-client.workspace = true
