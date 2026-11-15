@@ -237,7 +237,7 @@ impl PagedKvResources {
             if let Some(pages) = pages {
                 let count = u32::from(request != 0 && result != 0) * key.len() as u32;
                 if count != 0 {
-                    self.finish_state_initialization(&[request]);
+                    self.finish_state_initialization([request]);
                 }
                 if let Some(pages) = ready(request, count, Some(pages)) {
                     self.pool.retire_request(pages).map_err(|f| f.error)?;
@@ -321,11 +321,11 @@ impl PagedKvResources {
                 .pool
                 .reserve_request(SequenceId::new(u64::MAX), &self.demands(0))?;
             let mut source = self.pool.promote_request(pending);
-            if let Err(error) = self.pool.attach_shared_prefix(&mut source, pages) {
-                self.pool.retire_request(source).map_err(|f| f.error)?;
-                return Err(error);
-            }
-            if let Err(error) = self.pool.retain_shared_request_pages(&mut source, &keep) {
+            if let Err(error) = self
+                .pool
+                .attach_shared_prefix(&mut source, pages)
+                .and_then(|()| self.pool.retain_shared_request_pages(&mut source, &keep))
+            {
                 self.pool.retire_request(source).map_err(|f| f.error)?;
                 return Err(error);
             }
@@ -645,16 +645,25 @@ impl PagedKvResources {
         }
         let demands = self.demands(resident_tokens);
         let pages = self.pool.share_request_prefix(state, &demands)?;
-        self.store_prefix(&pages, &key.prefix(length), false)?;
+        self.cache_prefix(pages, &key.prefix(length))?;
+        Ok(true)
+    }
+
+    fn cache_prefix(
+        &mut self,
+        pages: CachedPages,
+        key: &PrefixKey<'_>,
+    ) -> Result<(), CachePoolError> {
+        self.store_prefix(&pages, key, false)?;
         let replaced = self
             .prefix_cache
             .as_mut()
-            .expect("cache enablement was checked")
-            .insert(&key.prefix(length), pages);
+            .ok_or(CachePoolError::StaleHandle)?
+            .insert(key, pages);
         if let Some(replaced) = replaced {
             self.pool.retire_cached_prefix(replaced)?;
         }
-        Ok(true)
+        Ok(())
     }
 
     pub fn evict_one_prefix(&mut self) -> Result<bool, CachePoolError> {
@@ -768,9 +777,12 @@ impl PagedKvResources {
         Ok(())
     }
 
-    pub(crate) fn finish_state_initialization(&mut self, request_ids: &[u64]) {
+    pub(crate) fn finish_state_initialization(
+        &mut self,
+        request_ids: impl IntoIterator<Item = u64>,
+    ) {
         for id in request_ids {
-            if let Some(state) = self.state_resources.get_mut(id) {
+            if let Some(state) = self.state_resources.get_mut(&id) {
                 state.pending = false;
             }
         }
@@ -778,7 +790,7 @@ impl PagedKvResources {
 
     pub(crate) fn accept_state_checkpoints(
         &mut self,
-        progress: &[(u64, u32, u32, bool)],
+        progress: impl IntoIterator<Item = (u64, u32, u32, bool)>,
         checkpoints: &[u64],
     ) -> Result<(), PagedKvError> {
         if checkpoints.is_empty() {
@@ -789,7 +801,7 @@ impl PagedKvResources {
             return Err(Self::invalid("duplicate state checkpoint receipt"));
         }
         let mut accepted = Vec::with_capacity(ids.len());
-        for &(request_id, physical, visible, terminal) in progress {
+        for (request_id, physical, visible, terminal) in progress {
             if let Some(state) = self.state_resources.get(&request_id) {
                 for (index, snapshot) in state.snapshots.iter().enumerate() {
                     if !ids.contains(&snapshot.id) {
@@ -816,17 +828,33 @@ impl PagedKvResources {
         Ok(())
     }
 
-    pub(crate) fn ready_state_checkpoints(&self, request_id: u64) -> Vec<(u64, u32)> {
-        self.state_resources
-            .get(&request_id)
-            .into_iter()
-            .flat_map(|state| &state.snapshots)
-            .filter(|slot| slot.ready)
-            .map(|slot| (slot.id, slot.prefix_length))
-            .collect()
+    pub(crate) fn publish_ready_prefixes(
+        &mut self,
+        state: &mut RequestPages,
+        key: &PrefixKey<'_>,
+        resident_tokens: u32,
+    ) -> Result<(), CachePoolError> {
+        if self.state_demands.is_empty() {
+            self.publish_prefix(state, key, resident_tokens)?;
+        } else {
+            while let Some((id, length)) = self
+                .state_resources
+                .get(&state.sequence().get())
+                .and_then(|resources| {
+                    resources
+                        .snapshots
+                        .iter()
+                        .find(|slot| slot.ready && slot.prefix_length <= resident_tokens)
+                        .map(|slot| (slot.id, slot.prefix_length))
+                })
+            {
+                self.publish_state_prefix(state, id, &key.prefix(length as usize))?;
+            }
+        }
+        Ok(())
     }
 
-    pub(crate) fn publish_state_prefix(
+    fn publish_state_prefix(
         &mut self,
         state: &mut RequestPages,
         reservation_id: u64,
@@ -883,16 +911,7 @@ impl PagedKvResources {
             .pool
             .combine_state_snapshots(history, copied, &self.state_groups)?;
         snapshot.ready = false;
-        self.store_prefix(&pages, key, false)?;
-        let replaced = self
-            .prefix_cache
-            .as_mut()
-            .ok_or(CachePoolError::StaleHandle)?
-            .insert(key, pages);
-        if let Some(replaced) = replaced {
-            self.pool.retire_cached_prefix(replaced)?;
-        }
-        Ok(())
+        self.cache_prefix(pages, key)
     }
 
     fn demands(&self, context: u32) -> Vec<GroupDemand> {
@@ -1077,35 +1096,37 @@ impl PagedKvResources {
                 }
 
                 for position in step.token_start()..post_length {
-                    let logical = position / group.block_tokens();
-                    let page = page_for(group, table.pages(), logical).ok_or_else(|| {
-                        Self::invalid(format!(
+                    let (logical, offset) = if group.is_recurrent() {
+                        (0, 0)
+                    } else {
+                        (
+                            position / group.block_tokens(),
+                            position % group.block_tokens(),
+                        )
+                    };
+                    let relative = logical.checked_sub(first).filter(|&index| index < count)
+                        .ok_or_else(|| Self::invalid(format!(
                             "request {} cache group {group_index} is missing logical block {logical}",
                             request.request_id.get()
-                        ))
-                    })?;
-                    let (slab_id, slotnum) = self.pool.physical_address(page.handle())?;
-                    append_slab_ids.push(slab_id);
-                    append_slotnums.push(slotnum);
-                    append_offsets.push(if group.is_recurrent() {
-                        0
-                    } else {
-                        position % group.block_tokens()
-                    });
+                        )))?;
+                    let address = indptr[row] as usize + relative as usize;
+                    append_slab_ids.push(block_slab_ids[address]);
+                    append_slotnums.push(block_slotnums[address]);
+                    append_offsets.push(offset);
                 }
             }
-            let mut plan = KvGroupPlan::new(
-                group_index as u32,
-                indptr,
+            let plan = KvGroupPlan {
+                group_index: group_index as u32,
+                blocks_per_slab: group.blocks_per_slab().get(),
+                block_indptr: indptr,
                 block_slab_ids,
                 block_slotnums,
-                first_blocks,
+                block_table_start_indices: first_blocks,
                 append_slab_ids,
                 append_slotnums,
-                append_offsets,
-                group.blocks_per_slab(),
-            )?;
-            plan.state = state_plan;
+                append_block_offsets: append_offsets,
+                state: state_plan,
+            };
             plan.validate()?;
             groups.push(plan);
         }
@@ -2332,34 +2353,39 @@ mod tests {
         let progress = [(first_id.get(), 128, 128, false)];
         assert!(
             resources
-                .accept_state_checkpoints(&progress, &[receipt + 1])
+                .accept_state_checkpoints(progress, &[receipt + 1])
                 .is_err()
         );
         assert!(
             resources
-                .accept_state_checkpoints(&[(first_id.get(), 127, 128, false)], &[receipt])
+                .accept_state_checkpoints([(first_id.get(), 127, 128, false)], &[receipt])
                 .is_err()
         );
         assert!(
             resources
-                .accept_state_checkpoints(&progress, &[receipt, receipt])
+                .accept_state_checkpoints(progress, &[receipt, receipt])
                 .is_err()
         );
         assert!(
             resources
-                .accept_state_checkpoints(&[(first_id.get() + 1, 128, 128, false)], &[receipt])
+                .accept_state_checkpoints([(first_id.get() + 1, 128, 128, false)], &[receipt])
                 .is_err()
         );
         assert!(
             resources
-                .accept_state_checkpoints(&progress, &[receipt, receipt + 1])
+                .accept_state_checkpoints(progress, &[receipt, receipt + 1])
                 .is_err()
         );
-        assert!(resources.ready_state_checkpoints(first_id.get()).is_empty());
+        assert!(
+            resources.state_resources[&first_id.get()]
+                .snapshots
+                .iter()
+                .all(|slot| !slot.ready)
+        );
         resources
-            .accept_state_checkpoints(&progress, &[receipt])
+            .accept_state_checkpoints(progress, &[receipt])
             .unwrap();
-        resources.finish_state_initialization(&[first_id.get()]);
+        resources.finish_state_initialization([first_id.get()]);
         resources.release(access.lease);
         resources
             .publish_state_prefix(&mut first, receipt, &key(&(0..128).collect::<Vec<_>>()))
@@ -2505,7 +2531,7 @@ mod tests {
             let copies = &access.groups[0].state.as_ref().unwrap().restore_copies;
             assert_eq!(copies.len(), usize::from(attempt < 2));
             if attempt == 1 {
-                resources.finish_state_initialization(&[id.get()]);
+                resources.finish_state_initialization([id.get()]);
             }
             // Attempt0 models a pre-accept rejection, which must not consume
             // the zero/restore instruction. Attempt1 actually commits it.
@@ -2553,9 +2579,9 @@ mod tests {
         let slot = &access.groups[0].state.as_ref().unwrap().checkpoint_slots[0];
         let receipt = slot.reservation_id;
         resources
-            .accept_state_checkpoints(&[(first_id.get(), 2, 2, false)], &[receipt])
+            .accept_state_checkpoints([(first_id.get(), 2, 2, false)], &[receipt])
             .unwrap();
-        resources.finish_state_initialization(&[first_id.get()]);
+        resources.finish_state_initialization([first_id.get()]);
         resources.release(access.lease);
         resources
             .publish_state_prefix(&mut first, receipt, &key(&[1, 2]))
@@ -2648,9 +2674,9 @@ mod tests {
             ));
             assert_eq!(resources.state_resources[&id.get()].snapshots.len(), 1);
             resources
-                .accept_state_checkpoints(&[(id.get(), 4, 4, false)], &[receipt])
+                .accept_state_checkpoints([(id.get(), 4, 4, false)], &[receipt])
                 .unwrap();
-            resources.finish_state_initialization(&[id.get()]);
+            resources.finish_state_initialization([id.get()]);
             resources.release(access.lease);
             resources
                 .publish_state_prefix(&mut request, receipt, &key(&[1, 2, 3, 4]))

@@ -75,39 +75,32 @@ pub fn schedule_ready_prefix(
                 .min(config.prefill_chunk_size.get()),
             Phase::Decode => 1,
         };
-        let mut count = remaining_batch_tokens.map_or(desired, |budget| desired.min(budget));
+        let count = remaining_batch_tokens.map_or(desired, |budget| desired.min(budget));
+        let hard_end = request
+            .logical_context
+            .checked_add(count)
+            .ok_or(PlanningError::TokenRangeOverflow)?;
+        let mut end = hard_end;
         if request.phase == Phase::Prefill
             && let Some(alignment) = config.checkpoint_alignment
         {
-            let proposed_end = request
-                .logical_context
-                .checked_add(count)
-                .ok_or(PlanningError::TokenRangeOverflow)?;
             // A cached request must replay at least one token to recover its
             // logits. At prompt end, therefore stop at the final checkpoint
             // strictly before the input boundary. Intermediate chunks merely
             // round down to a checkpoint without forcing tiny per-block calls.
-            let checkpoint_limit = if proposed_end == request.prefill_length {
-                proposed_end.saturating_sub(1)
+            let checkpoint_limit = if hard_end == request.prefill_length {
+                hard_end.saturating_sub(1)
             } else {
-                proposed_end
+                hard_end
             };
             let checkpoint_end = checkpoint_limit / alignment * alignment.get();
-            if checkpoint_end > request.logical_context && checkpoint_end < proposed_end {
-                count = checkpoint_end - request.logical_context;
+            if checkpoint_end > request.logical_context && checkpoint_end < hard_end {
+                end = checkpoint_end;
             }
         }
-        let mut end = request
-            .logical_context
-            .checked_add(count)
-            .ok_or(PlanningError::TokenRangeOverflow)?;
         if request.phase == Phase::Prefill {
             for &(span_start, span_end) in &request.atomic_prefill_spans {
                 if span_start < end && end < span_end {
-                    let hard_end = request
-                        .logical_context
-                        .checked_add(desired.min(remaining_batch_tokens.unwrap_or(desired)))
-                        .ok_or(PlanningError::TokenRangeOverflow)?;
                     if span_end <= hard_end {
                         end = span_end;
                     } else if span_start > request.logical_context {

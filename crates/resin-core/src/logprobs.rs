@@ -42,63 +42,40 @@ pub fn validate_indptr(indptr: &[u32], rows: usize, values: usize) -> Result<()>
 }
 
 impl LogprobView<'_> {
-    pub fn validate_required_lengths(&self, lengths: &[usize]) -> Result<()> {
-        validate_indptr(self.indptr, lengths.len(), self.values.len())?;
-        if self
-            .indptr
-            .windows(2)
-            .zip(lengths)
-            .any(|(pair, &count)| (pair[1] - pair[0]) as usize != count)
-            || self
-                .values
-                .iter()
-                .any(|value| value.is_nan() || *value > 0.0)
-        {
-            return Err(Error::execution(
-                "prompt logprobs must cover every requested predecessor with non-positive scores",
-            ));
-        }
-        self.validate_columns()
-    }
-
-    /// Validate both distribution alternatives and exact per-position targets.
-    pub fn validate_prompt(
+    /// Validate scores against the requested top count and target IDs at each position.
+    pub fn validate_prompt<'a>(
         &self,
-        lengths: &[usize],
-        top_counts: &[u32],
-        target_indptr: &[u32],
-        target_ids: &[u32],
+        rows: impl ExactSizeIterator<Item = impl ExactSizeIterator<Item = (u32, &'a [u32])>>,
     ) -> Result<()> {
-        self.validate_required_lengths(lengths)?;
-        if !self.values.is_empty() || !target_indptr.is_empty() || !target_ids.is_empty() {
-            validate_indptr(target_indptr, self.values.len(), target_ids.len())?;
-        }
-        if top_counts.len() != self.values.len() {
-            return Err(Error::execution(
-                "prompt top counts must cover every predecessor",
-            ));
-        }
-        for (index, &requested) in top_counts.iter().enumerate() {
-            let count = self
-                .top
-                .map_or(0, |top| top.indptr[index + 1] - top.indptr[index]);
-            if (requested == 0 && count != 0)
-                || (requested > 0 && (count == 0 || count > requested))
-            {
+        validate_indptr(self.indptr, rows.len(), self.values.len())?;
+        self.validate_columns()
+            .map_err(|error| Error::execution(format!("invalid prompt logprobs: {error}")))?;
+        for (pair, requested) in self.indptr.windows(2).zip(rows) {
+            if (pair[1] - pair[0]) as usize != requested.len() {
                 return Err(Error::execution(
-                    "runner did not return requested prompt top logprobs",
+                    "prompt logprobs must cover every requested predecessor with non-positive scores",
                 ));
             }
-            let expected =
-                &target_ids[target_indptr[index] as usize..target_indptr[index + 1] as usize];
-            let actual = self.targets.map_or(&[][..], |targets| {
-                &targets.token_ids
-                    [targets.indptr[index] as usize..targets.indptr[index + 1] as usize]
-            });
-            if actual != expected {
-                return Err(Error::execution(
-                    "prompt target logprob IDs must match requested positions",
-                ));
+            for (index, (top_count, expected)) in (pair[0] as usize..).zip(requested) {
+                let count = self
+                    .top
+                    .map_or(0, |top| top.indptr[index + 1] - top.indptr[index]);
+                if (top_count == 0 && count != 0)
+                    || (top_count > 0 && (count == 0 || count > top_count))
+                {
+                    return Err(Error::execution(
+                        "runner did not return requested prompt top logprobs",
+                    ));
+                }
+                let actual = self.targets.map_or(&[][..], |targets| {
+                    &targets.token_ids
+                        [targets.indptr[index] as usize..targets.indptr[index + 1] as usize]
+                });
+                if actual != expected {
+                    return Err(Error::execution(
+                        "prompt target logprob IDs must match requested positions",
+                    ));
+                }
             }
         }
         Ok(())
@@ -186,7 +163,7 @@ mod tests {
             }),
         };
         scores
-            .validate_prompt(&[2], &[1, 0], &[0, 2, 3], &[9, 9, 4])
+            .validate_prompt([[(1, &[9, 9][..]), (0, &[4][..])].into_iter()].into_iter())
             .unwrap();
         assert_eq!(
             scores.token(0, 0).unwrap().target_logprobs,
@@ -194,17 +171,17 @@ mod tests {
         );
         assert!(
             scores
-                .validate_prompt(&[2], &[1, 0], &[0, 2, 3], &[9, 4, 9])
+                .validate_prompt([[(1, &[9, 4][..]), (0, &[9][..])].into_iter()].into_iter())
                 .is_err()
         );
         assert!(
             scores
-                .validate_prompt(&[2], &[0, 0], &[0, 2, 3], &[9, 9, 4])
+                .validate_prompt([[(0, &[9, 9][..]), (0, &[4][..])].into_iter()].into_iter())
                 .is_err()
         );
         assert!(
             scores
-                .validate_prompt(&[2], &[1, 1], &[0, 2, 3], &[9, 9, 4])
+                .validate_prompt([[(1, &[9, 9][..]), (1, &[4][..])].into_iter()].into_iter())
                 .is_err()
         );
         for invalid in [f32::NAN, f32::INFINITY, 0.1] {
@@ -218,7 +195,7 @@ mod tests {
             };
             assert!(
                 invalid_scores
-                    .validate_prompt(&[2], &[1, 0], &[0, 2, 3], &[9, 9, 4])
+                    .validate_prompt([[(1, &[9, 9][..]), (0, &[4][..])].into_iter()].into_iter())
                     .is_err()
             );
         }
@@ -231,7 +208,7 @@ mod tests {
         };
         assert!(
             malformed
-                .validate_prompt(&[2], &[1, 0], &[0, 2, 3], &[9, 9, 4])
+                .validate_prompt([[(1, &[9, 9][..]), (0, &[4][..])].into_iter()].into_iter())
                 .is_err()
         );
     }

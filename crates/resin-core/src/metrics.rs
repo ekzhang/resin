@@ -22,7 +22,7 @@ pub struct RunnerMetricsSnapshot {
 /// Completed-request counters exclude cancellations. Live counters include all
 /// successfully committed work, including work for subsequently cancelled
 /// requests. Prefill compute includes replay after memory retraction.
-#[derive(Clone, Debug, serde::Serialize)]
+#[derive(Clone, Debug, Default, serde::Serialize)]
 pub struct EngineMetricsSnapshot {
     pub accepted_requests: u64,
     pub completed_requests: u64,
@@ -50,35 +50,6 @@ pub struct EngineMetricsSnapshot {
     /// One observation per completed request with at least two output tokens.
     pub request_time_per_output_token_seconds: Histogram,
     pub e2e_request_latency_seconds: Histogram,
-}
-
-impl Default for EngineMetricsSnapshot {
-    fn default() -> Self {
-        Self {
-            accepted_requests: 0,
-            completed_requests: 0,
-            aborted_requests: 0,
-            retracted_requests: 0,
-            prompt_tokens: 0,
-            cached_tokens: 0,
-            generation_tokens: 0,
-            prefill_compute_tokens: 0,
-            prefill_cache_tokens: 0,
-            decode_tokens: 0,
-            waiting_requests: 0,
-            running_requests: 0,
-            elapsed_seconds: 0.0,
-            scheduler_idle_seconds: 0.0,
-            prompt_tokens_histogram: Histogram::default(),
-            uncached_prompt_tokens_histogram: Histogram::default(),
-            generation_tokens_histogram: Histogram::default(),
-            queue_time_seconds: Histogram::default(),
-            time_to_first_token_seconds: Histogram::default(),
-            inter_token_latency_seconds: Histogram::default(),
-            request_time_per_output_token_seconds: Histogram::default(),
-            e2e_request_latency_seconds: Histogram::default(),
-        }
-    }
 }
 
 /// Request-local timestamps and counts retained until retirement.

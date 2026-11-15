@@ -14,6 +14,14 @@ use std::sync::{Arc, Mutex, Weak};
 
 static NEXT_POOL_ID: AtomicU64 = AtomicU64::new(1);
 
+fn metadata_vec<T>(capacity: usize) -> Result<Vec<T>, CachePoolError> {
+    let mut values = Vec::new();
+    values
+        .try_reserve_exact(capacity)
+        .map_err(|_| CachePoolError::MetadataAllocation)?;
+    Ok(values)
+}
+
 /// Ordered cache-group identity.  The runner declaration and native layout use
 /// the same index; there is no process-global group registry.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -586,10 +594,7 @@ impl PlannedParent {
         debug_assert!(parent.slots.is_empty());
         debug_assert!(parent.partial_index.is_none());
 
-        let mut slots = Vec::new();
-        slots
-            .try_reserve_exact(packing as usize)
-            .map_err(|_| CachePoolError::MetadataAllocation)?;
+        let mut slots = metadata_vec(packing as usize)?;
         slots.resize(packing as usize, PageSlot::default());
         Ok(Self {
             parent: parent_id,
@@ -709,10 +714,7 @@ impl PlacementPlan {
         parents
             .try_reserve(touched_bound)
             .map_err(|_| CachePoolError::MetadataAllocation)?;
-        let mut group_states = Vec::new();
-        group_states
-            .try_reserve_exact(group_count)
-            .map_err(|_| CachePoolError::MetadataAllocation)?;
+        let mut group_states = metadata_vec(group_count)?;
         group_states.resize_with(group_count, || None);
         let mut new_parent_ids = Vec::new();
         new_parent_ids
@@ -770,16 +772,10 @@ impl CachePool {
 
         let parent_capacity =
             usize::try_from(parent_capacity).map_err(|_| CachePoolError::MetadataAllocation)?;
-        let mut packings = Vec::new();
-        packings
-            .try_reserve_exact(group_packings.len())
-            .map_err(|_| CachePoolError::MetadataAllocation)?;
+        let mut packings = metadata_vec(group_packings.len())?;
         packings.extend_from_slice(group_packings);
 
-        let mut parents = Vec::new();
-        parents
-            .try_reserve_exact(parent_capacity)
-            .map_err(|_| CachePoolError::MetadataAllocation)?;
+        let mut parents = metadata_vec(parent_capacity)?;
         parents.resize_with(parent_capacity, Parent::default);
 
         let mut free_parents = VecDeque::new();
@@ -788,10 +784,7 @@ impl CachePool {
             .map_err(|_| CachePoolError::MetadataAllocation)?;
         free_parents.extend(1..=parent_capacity as u32);
 
-        let mut partial_parents = Vec::new();
-        partial_parents
-            .try_reserve_exact(parent_capacity)
-            .map_err(|_| CachePoolError::MetadataAllocation)?;
+        let partial_parents = metadata_vec(parent_capacity)?;
 
         Ok(Self {
             id,
@@ -919,18 +912,11 @@ impl CachePool {
             .ok_or(CachePoolError::DemandOverflow)?;
         self.prepare_validation_capacity(total_blocks)?;
 
-        let mut groups = Vec::new();
-        groups
-            .try_reserve_exact(demands.len())
-            .map_err(|_| CachePoolError::MetadataAllocation)?;
+        let mut groups = metadata_vec(demands.len())?;
         for demand in demands {
-            let mut pages = Vec::new();
-            pages
-                .try_reserve_exact(demand.blocks)
-                .map_err(|_| CachePoolError::MetadataAllocation)?;
             groups.push(GroupTable {
                 group: demand.group,
-                pages,
+                pages: metadata_vec(demand.blocks)?,
                 snapshot: Weak::new(),
             });
         }
@@ -997,10 +983,7 @@ impl CachePool {
             PlacementPlan::new(self.group_packings.len(), total_blocks, self.parents.len())?;
         for (request, demands) in requests {
             for &demand in demands {
-                let mut pages = Vec::new();
-                pages
-                    .try_reserve_exact(demand.blocks)
-                    .map_err(|_| CachePoolError::MetadataAllocation)?;
+                let mut pages = metadata_vec(demand.blocks)?;
                 match self.plan_partition(&mut plan, request.writer, demand, &mut pages) {
                     Err(CachePoolError::InsufficientCapacity { .. }) => return Ok(false),
                     other => other?,
@@ -1033,10 +1016,7 @@ impl CachePool {
                 .ok_or(CachePoolError::DemandOverflow)
         })?;
         self.prepare_validation_capacity(request_blocks)?;
-        let mut growth = Vec::new();
-        growth
-            .try_reserve_exact(demands.len())
-            .map_err(|_| CachePoolError::MetadataAllocation)?;
+        let mut growth = metadata_vec(demands.len())?;
         for (demand, group) in demands.iter().zip(&mut request.groups) {
             let additional = demand
                 .blocks
@@ -1075,14 +1055,8 @@ impl CachePool {
         {
             return Err(CachePoolError::StaleHandle);
         }
-        let mut groups = Vec::new();
-        groups
-            .try_reserve_exact(demands.len())
-            .map_err(|_| CachePoolError::MetadataAllocation)?;
-        let mut shared_lengths = Vec::new();
-        shared_lengths
-            .try_reserve_exact(demands.len())
-            .map_err(|_| CachePoolError::MetadataAllocation)?;
+        let mut groups = metadata_vec(demands.len())?;
+        let mut shared_lengths = metadata_vec(demands.len())?;
         for (demand, source) in demands.iter().zip(&request.groups) {
             // Append-only growth preserves this prefix. Replacement and reset
             // invalidate the private hint before changing existing positions,
@@ -1100,10 +1074,7 @@ impl CachePool {
             let tail = if shared == demand.blocks {
                 previous
             } else {
-                let mut pages = Vec::new();
-                pages
-                    .try_reserve_exact(demand.blocks - shared)
-                    .map_err(|_| CachePoolError::MetadataAllocation)?;
+                let mut pages = metadata_vec(demand.blocks - shared)?;
                 pages.extend(
                     source.pages[shared..demand.blocks]
                         .iter()
@@ -1355,15 +1326,9 @@ impl CachePool {
         if replacements.len() != request.groups.len() {
             return Err(CachePoolError::StaleHandle);
         }
-        let mut reusable = Vec::new();
-        reusable
-            .try_reserve_exact(replacements.len())
-            .map_err(|_| CachePoolError::MetadataAllocation)?;
+        let mut reusable = metadata_vec(replacements.len())?;
         for (indices, group) in replacements.iter().zip(&request.groups) {
-            let mut reuse = Vec::new();
-            reuse
-                .try_reserve_exact(indices.len())
-                .map_err(|_| CachePoolError::MetadataAllocation)?;
+            let mut reuse = metadata_vec(indices.len())?;
             if indices.windows(2).any(|pair| pair[0] >= pair[1]) {
                 return Err(CachePoolError::DuplicateHandle);
             }
@@ -1374,10 +1339,7 @@ impl CachePool {
             }
             reusable.push(reuse);
         }
-        let mut demands = Vec::new();
-        demands
-            .try_reserve_exact(request.groups.len())
-            .map_err(|_| CachePoolError::MetadataAllocation)?;
+        let mut demands = metadata_vec(request.groups.len())?;
         for (reuse, group) in reusable.iter().zip(&request.groups) {
             demands.push(GroupDemand::new(
                 group.group,
@@ -1511,10 +1473,7 @@ impl CachePool {
         }
         claims.dedup_by_key(|claim| claim.handle);
 
-        let mut prepared_claims = Vec::new();
-        prepared_claims
-            .try_reserve_exact(claims.len())
-            .map_err(|_| CachePoolError::MetadataAllocation)?;
+        let mut prepared_claims = metadata_vec(claims.len())?;
         for claim in &claims {
             let slot = self.validate_writer_available(*claim)?;
             prepared_claims.push(PreparedWriterClaim {

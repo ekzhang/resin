@@ -1,3 +1,4 @@
+use std::cmp::Reverse;
 use std::num::NonZeroUsize;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -179,23 +180,16 @@ impl<T: Schedulable> Scheduler<T> {
     }
 
     pub fn requeue_survivors(&mut self, mut survivors: Vec<T>) {
-        if survivors.is_empty() {
-            return;
-        }
         for survivor in &mut survivors {
             survivor.set_running(true);
         }
-        self.merge_by_turn(survivors);
-        self.bump_epoch();
+        self.restore_rejected(survivors);
     }
 
     /// Return a memory-retracted request to the waiting tail.
     pub fn requeue_retracted(&mut self, mut item: T) {
         item.set_running(false);
-        let turn = self.take_fresh_turn();
-        item.set_turn_ordinal(turn);
-        self.ready.push(item);
-        self.bump_epoch();
+        self.enqueue(item);
     }
 
     pub fn position(&self, mut predicate: impl FnMut(&T) -> bool) -> Option<usize> {
@@ -224,43 +218,17 @@ impl<T: Schedulable> Scheduler<T> {
 
     fn selected_identities(&self) -> Vec<SelectedIdentity> {
         let limit = self.max_running_requests.get();
-        let running = self.running_identities();
+        let mut running = self.running_identities();
         let running_count = self.ready.iter().filter(|item| item.is_running()).count();
         if running
             .first()
             .is_some_and(|identity| self.ready[identity.index].phase() == Phase::Prefill)
         {
             let anchor = &self.ready[running[0].index];
-            let free = limit - running_count;
-            if free == 0 {
-                return running;
-            }
-            let waiting = self.ready.iter().filter(|item| {
-                !item.is_running()
-                    && item.batch_key() == anchor.batch_key()
-                    && item.phase() == anchor.phase()
+            self.append_waiting_cohort(&mut running, limit - running_count, |item| {
+                item.batch_key() == anchor.batch_key() && item.phase() == anchor.phase()
             });
-            let Some(max_priority) = waiting.clone().map(Schedulable::priority).max() else {
-                return running;
-            };
-            let mut selected = running;
-            selected.extend(
-                self.ready
-                    .iter()
-                    .enumerate()
-                    .filter(|(_, item)| {
-                        !item.is_running()
-                            && item.priority() == max_priority
-                            && item.batch_key() == anchor.batch_key()
-                            && item.phase() == anchor.phase()
-                    })
-                    .take(free)
-                    .map(|(index, item)| SelectedIdentity {
-                        index,
-                        turn: item.turn_ordinal(),
-                    }),
-            );
-            return selected;
+            return running;
         }
 
         if running_count < limit {
@@ -269,60 +237,55 @@ impl<T: Schedulable> Scheduler<T> {
                 .iter()
                 .find(|item| item.is_running())
                 .and_then(Schedulable::batch_key);
-            let waiting = self.ready.iter().filter(|item| {
-                !item.is_running()
-                    && item.phase() == Phase::Prefill
+            let mut waiting = Vec::new();
+            self.append_waiting_cohort(&mut waiting, limit - running_count, |item| {
+                item.phase() == Phase::Prefill
                     && (running_count == 0 || item.batch_key() == running_key)
             });
-            if let Some(max_priority) = waiting.clone().map(Schedulable::priority).max() {
-                let anchor = waiting
-                    .clone()
-                    .find(|item| item.priority() == max_priority)
-                    .expect("maximum waiting priority has an anchor");
-                return self
-                    .ready
-                    .iter()
-                    .enumerate()
-                    .filter(|(_, item)| {
-                        !item.is_running()
-                            && item.priority() == max_priority
-                            && item.batch_key() == anchor.batch_key()
-                            && item.phase() == Phase::Prefill
-                    })
-                    .take(limit - running_count)
-                    .map(|(index, item)| SelectedIdentity {
-                        index,
-                        turn: item.turn_ordinal(),
-                    })
-                    .collect();
+            if !waiting.is_empty() {
+                return waiting;
             }
         }
-        if !running.is_empty() {
-            return running;
+        if running.is_empty() {
+            self.append_waiting_cohort(&mut running, limit, |_| true);
         }
+        running
+    }
 
-        let waiting = self.ready.iter();
-        let Some(max_priority) = waiting.clone().map(Schedulable::priority).max() else {
-            return Vec::new();
-        };
-        let anchor = waiting
-            .clone()
-            .find(|item| item.priority() == max_priority)
-            .expect("maximum waiting priority has an anchor");
-        self.ready
+    fn append_waiting_cohort(
+        &self,
+        selected: &mut Vec<SelectedIdentity>,
+        limit: usize,
+        eligible: impl Fn(&T) -> bool,
+    ) {
+        if limit == 0 {
+            return;
+        }
+        let waiting = self
+            .ready
             .iter()
             .enumerate()
-            .filter(|(_, item)| {
-                item.priority() == max_priority
-                    && item.batch_key() == anchor.batch_key()
-                    && item.phase() == anchor.phase()
-            })
-            .take(limit)
-            .map(|(index, item)| SelectedIdentity {
-                index,
-                turn: item.turn_ordinal(),
-            })
-            .collect()
+            .filter(|(_, item)| !item.is_running() && eligible(item));
+        // min preserves the oldest request when priorities tie.
+        let Some((_, anchor)) = waiting
+            .clone()
+            .min_by_key(|(_, item)| Reverse(item.priority()))
+        else {
+            return;
+        };
+        selected.extend(
+            waiting
+                .filter(|(_, item)| {
+                    item.priority() == anchor.priority()
+                        && item.batch_key() == anchor.batch_key()
+                        && item.phase() == anchor.phase()
+                })
+                .take(limit)
+                .map(|(index, item)| SelectedIdentity {
+                    index,
+                    turn: item.turn_ordinal(),
+                }),
+        );
     }
 
     fn running_identities(&self) -> Vec<SelectedIdentity> {

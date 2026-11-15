@@ -366,22 +366,6 @@ pub trait Runner<P> {
         Ok(())
     }
 }
-struct RunnerReceipt<'a> {
-    logprobs: Option<LogprobView<'a>>,
-    prompt_logprobs: Option<LogprobView<'a>>,
-    state_checkpoints: &'a [u64],
-}
-
-fn read_runner_receipt<P>(runner: &impl Runner<P>) -> Result<RunnerReceipt<'_>> {
-    execution_call("receipt access", || {
-        Ok(RunnerReceipt {
-            logprobs: runner.logprobs(),
-            prompt_logprobs: runner.prompt_logprobs(),
-            state_checkpoints: runner.state_checkpoints(),
-        })
-    })
-}
-
 #[derive(Debug)]
 struct Request<P> {
     metrics: Option<RequestMetricsState>,
@@ -533,9 +517,9 @@ struct BatchRow<P> {
     terminal: bool,
 }
 
-struct PreparedProgress {
+struct PreparedProgress<'a> {
     resident_tokens: u32,
-    sampled_tokens: Vec<u32>,
+    sampled_tokens: &'a [u32],
 }
 
 struct Batch<P> {
@@ -1143,6 +1127,12 @@ impl<P: Clone> EngineCore<P> {
     /// complete logically while physical retirement waits for the next step.
     /// The caller separately checks that its device runtime supports feedback.
     pub fn retain_continuation(&mut self, plan: &ExecutionPlan<P>) -> bool {
+        let allowed = self.can_continue(plan);
+        self.continuation = allowed.then(|| plan.clone());
+        allowed
+    }
+
+    fn can_continue(&self, plan: &ExecutionPlan<P>) -> bool {
         let maximum = u64::from(self.runner_config.max_accepted_per_step);
         let two_step_writes = maximum
             + u64::from(
@@ -1153,7 +1143,7 @@ impl<P: Clone> EngineCore<P> {
         let Some(batch) = &self.in_flight else {
             return false;
         };
-        let allowed = self.scheduler.is_empty()
+        self.scheduler.is_empty()
             && plan.phase == Phase::Decode
             && batch.rows.len() == plan.sequence_ids.len()
             && batch.rows.iter().all(|row| {
@@ -1204,9 +1194,7 @@ impl<P: Clone> EngineCore<P> {
                                 }
                             })
                     })
-                });
-        self.continuation = allowed.then(|| plan.clone());
-        allowed
+                })
     }
 
     /// A conservative host plan reserves the longest possible previous output;
@@ -1581,14 +1569,17 @@ impl<P: Clone> EngineCore<P> {
     ) -> Result<Vec<E>> {
         // Validate the complete execution result before terminal output limits
         // can hide writes beyond the leased capacity or extra prefill tokens.
-        let RunnerReceipt {
-            logprobs,
-            prompt_logprobs,
-            state_checkpoints,
-        } = match read_runner_receipt(runner) {
-            Ok(receipt) => receipt,
-            Err(error) => return self.quarantine(batch, "runner receipt access failed", error),
-        };
+        let (logprobs, prompt_logprobs, state_checkpoints) =
+            match execution_call("receipt access", || {
+                Ok((
+                    runner.logprobs(),
+                    runner.prompt_logprobs(),
+                    runner.state_checkpoints(),
+                ))
+            }) {
+                Ok(receipt) => receipt,
+                Err(error) => return self.quarantine(batch, "runner receipt access failed", error),
+            };
         if let Err(error) = self
             .validate_runner_output(&batch.rows, output_token_ids)
             .and_then(|()| logprobs.map_or(Ok(()), |scores| scores.validate(output_token_ids)))
@@ -1600,54 +1591,51 @@ impl<P: Clone> EngineCore<P> {
             .first()
             .is_some_and(|row| row.scheduled.phase == Phase::Decode);
 
-        let prompt_counts = batch
-            .rows
-            .iter()
-            .map(|row| row.request.prompt_score_range(row.scheduled).len())
-            .collect::<Vec<_>>();
-        let mut prompt_top_counts = Vec::new();
-        let mut prompt_target_indptr = Vec::new();
-        let mut prompt_target_ids = Vec::new();
-        for row in &batch.rows {
-            for position in row.request.prompt_score_range(row.scheduled) {
-                if prompt_target_indptr.is_empty() {
-                    prompt_target_indptr.push(0);
-                }
-                prompt_top_counts.push(row.request.prompt_top_logprobs);
-                prompt_target_ids.extend_from_slice(row.request.prompt_targets(position));
-                prompt_target_indptr.push(prompt_target_ids.len() as u32);
-            }
-        }
-        if let Err(error) = match prompt_logprobs {
-            Some(scores) => scores.validate_prompt(
-                &prompt_counts,
-                &prompt_top_counts,
-                &prompt_target_indptr,
-                &prompt_target_ids,
-            ),
-            None if prompt_counts.iter().any(|&count| count > 0) => Err(Error::execution(
-                "runner did not return requested prompt logprobs",
-            )),
-            None => Ok(()),
-        } {
-            return self.quarantine(batch, "invalid prompt scores", error);
-        }
         // Prepare owned scores before cleanup; publish them with logical progress.
-        let prompt_updates = prompt_counts
-            .iter()
-            .enumerate()
-            .map(|(row, &count)| {
-                (0..count)
-                    .map(|column| prompt_logprobs.unwrap().token(row, column))
-                    .collect::<Vec<_>>()
-            })
-            .collect::<Vec<_>>();
+        let prompt_updates = if let Some(scores) = prompt_logprobs {
+            let requested = batch.rows.iter().map(|row| {
+                row.request
+                    .prompt_score_range(row.scheduled)
+                    .map(move |position| {
+                        (
+                            row.request.prompt_top_logprobs,
+                            row.request.prompt_targets(position),
+                        )
+                    })
+            });
+            if let Err(error) = scores.validate_prompt(requested) {
+                return self.quarantine(batch, "invalid prompt scores", error);
+            }
+            batch
+                .rows
+                .iter()
+                .enumerate()
+                .map(|(index, row)| {
+                    (0..row.request.prompt_score_range(row.scheduled).len())
+                        .map(|column| scores.token(index, column))
+                        .collect::<Vec<_>>()
+                })
+                .collect::<Vec<_>>()
+        } else {
+            if batch
+                .rows
+                .iter()
+                .any(|row| !row.request.prompt_score_range(row.scheduled).is_empty())
+            {
+                return self.quarantine(
+                    batch,
+                    "invalid prompt scores",
+                    Error::execution("runner did not return requested prompt logprobs"),
+                );
+            }
+            Vec::new()
+        };
 
         let mut retired = Vec::with_capacity(batch.rows.len());
         let mut retired_ids = Vec::new();
         let event_capacity = output_token_ids.token_count();
         let mut events = Vec::with_capacity(event_capacity);
-        let mut committed_token_ids = Vec::with_capacity(batch.rows.len());
+        let mut committed_token_ids: Vec<&[u32]> = Vec::with_capacity(batch.rows.len());
         for (row_index, (row, token_ids)) in
             batch.rows.iter().zip(output_token_ids.iter()).enumerate()
         {
@@ -1657,7 +1645,7 @@ impl<P: Clone> EngineCore<P> {
                 // stop token. Validate its execution above, then ignore it.
                 retired.push(true);
                 retired_ids.push(request.id);
-                committed_token_ids.push(Vec::new());
+                committed_token_ids.push(&[]);
                 continue;
             }
             if !row.scheduled.sample {
@@ -1667,19 +1655,18 @@ impl<P: Clone> EngineCore<P> {
                 if finished {
                     retired_ids.push(request.id);
                 }
-                committed_token_ids.push(token_ids.to_vec());
+                committed_token_ids.push(token_ids);
                 continue;
             }
             let remaining = request
                 .max_output_tokens
                 .saturating_sub(request.generated.len());
-            let mut committed = Vec::with_capacity(token_ids.len().min(remaining));
+            let mut committed = 0;
             let mut finished = false;
             for (token_index, &token_id) in token_ids.iter().take(remaining).enumerate() {
                 let finish_reason = if request.stop_token_ids.binary_search(&token_id).is_ok() {
                     Some(CompletionReason::Stop)
-                } else if request.generated.len() + committed.len() + 1 >= request.max_output_tokens
-                {
+                } else if request.generated.len() + committed + 1 >= request.max_output_tokens {
                     Some(CompletionReason::Length)
                 } else {
                     None
@@ -1689,7 +1676,7 @@ impl<P: Clone> EngineCore<P> {
                     make_event(TokenEvent {
                         request_id: request.id,
                         token_id,
-                        index: request.generated.len() + committed.len(),
+                        index: request.generated.len() + committed,
                         finished,
                         finish_reason,
                         logprobs: logprobs.and_then(|scores| scores.token(row_index, token_index)),
@@ -1701,7 +1688,7 @@ impl<P: Clone> EngineCore<P> {
                     }
                 };
                 events.push(event);
-                committed.push(token_id);
+                committed += 1;
                 if finished {
                     break;
                 }
@@ -1710,7 +1697,7 @@ impl<P: Clone> EngineCore<P> {
             if finished {
                 retired_ids.push(request.id);
             }
-            committed_token_ids.push(committed);
+            committed_token_ids.push(&token_ids[..committed]);
         }
 
         let prepared_progress =
@@ -1746,18 +1733,15 @@ impl<P: Clone> EngineCore<P> {
                         visible.resident_tokens,
                         row.terminal,
                     )
-                })
-                .collect::<Vec<_>>();
-            if let Err(error) = resources.accept_state_checkpoints(&progress, state_checkpoints) {
+                });
+            if let Err(error) = resources.accept_state_checkpoints(progress, state_checkpoints) {
                 return self.quarantine(
                     batch,
                     "invalid state checkpoint receipt",
                     Error::from(error),
                 );
             }
-            resources.finish_state_initialization(
-                &progress.iter().map(|item| item.0).collect::<Vec<_>>(),
-            );
+            resources.finish_state_initialization(batch.rows.iter().map(|row| row.request.id));
         } else if !state_checkpoints.is_empty() {
             return self.quarantine(
                 batch,
@@ -1766,51 +1750,41 @@ impl<P: Clone> EngineCore<P> {
             );
         }
 
-        // Validate every physical retirement and reserve all destination
-        // storage before asking the runner or any allocator to release state.
-        for (row, retire) in batch.rows.iter().zip(&retired) {
-            if !*retire || continuation.is_some() {
-                continue;
-            }
-            if let Err(error) = self.validate_request_cache(&row.request) {
-                return self.quarantine(batch, "native cache retirement failed", error);
-            }
-        }
         let mut survivors = Vec::new();
-        if continuation.is_none()
-            && survivors
+        if continuation.is_none() {
+            // Validate every physical retirement and reserve all destination
+            // storage before asking the runner or any allocator to release state.
+            for (row, retire) in batch.rows.iter().zip(&retired) {
+                if *retire && let Err(error) = self.validate_request_cache(&row.request) {
+                    return self.quarantine(batch, "native cache retirement failed", error);
+                }
+            }
+            if survivors
                 .try_reserve_exact(batch.rows.len().saturating_sub(retired_ids.len()))
                 .is_err()
-        {
-            let error = Error::memory("could not reserve surviving request storage");
-            return self.quarantine(batch, "native survivor storage failed", error);
-        }
-
-        if continuation.is_none()
-            && !retired_ids.is_empty()
-            && let Err(error) = execution_call("release", || runner.release(&retired_ids))
-        {
-            return self.quarantine(batch, "runner release failed", error);
-        }
-        if continuation.is_none() {
+            {
+                let error = Error::memory("could not reserve surviving request storage");
+                return self.quarantine(batch, "native survivor storage failed", error);
+            }
+            if !retired_ids.is_empty()
+                && let Err(error) = execution_call("release", || runner.release(&retired_ids))
+            {
+                return self.quarantine(batch, "runner release failed", error);
+            }
             // Runner cleanup proves physical execution is terminal. Only now
             // may its writer lease return and cache pages become reusable.
             self.release_kv_access(batch.resources.take());
             if let Err(error) = self.publish_batch_prefixes(&mut batch, &prepared_progress) {
                 return self.quarantine(batch, "native prefix publication failed", error);
             }
-        }
-
-        for (row, retire) in batch.rows.iter_mut().zip(&retired) {
-            if !*retire || continuation.is_some() {
-                continue;
-            }
-            if let Err(error) = self.retire_request_cache(&mut row.request) {
-                return self.quarantine(
-                    batch,
-                    "native cache retirement failed after preflight",
-                    error,
-                );
+            for (row, retire) in batch.rows.iter_mut().zip(&retired) {
+                if *retire && let Err(error) = self.retire_request_cache(&mut row.request) {
+                    return self.quarantine(
+                        batch,
+                        "native cache retirement failed after preflight",
+                        error,
+                    );
+                }
             }
         }
 
@@ -1860,7 +1834,9 @@ impl<P: Clone> EngineCore<P> {
                 .as_mut()
                 .expect("scored request owns score storage");
             let start = row.scheduled.token_start() as usize + 1;
-            scores[start..start + updates.len()].clone_from_slice(&updates);
+            for (score, update) in scores[start..start + updates.len()].iter_mut().zip(updates) {
+                *score = update;
+            }
         }
         if let Some(mut template) = continuation {
             for (slot, (row, retire)) in batch.rows.iter_mut().zip(retired).enumerate() {
@@ -1886,7 +1862,7 @@ impl<P: Clone> EngineCore<P> {
                 }
             }
             self.in_flight = Some(batch);
-            self.retain_continuation(&template);
+            self.continuation = self.can_continue(&template).then_some(template);
         } else {
             for (row, retire) in batch.rows.drain(..).zip(retired) {
                 let request = row.request;
@@ -1963,7 +1939,21 @@ impl<P: Clone> EngineCore<P> {
         }
         self.raise_if_poisoned()?;
         self.require_completed_step()?;
-        self.close_healthy(runner)
+        if let Err(error) = self.poll_storage(true) {
+            self.poison_message("storage could not retire");
+            return Err(error);
+        }
+        self.scheduler
+            .restore_rejected(std::mem::take(&mut self.storage_waiting));
+        self.retire_ready(runner)?;
+        if let Some(resources) = self.kv_resources.as_mut() {
+            resources.clear_prefix_cache().map_err(Error::from)?;
+        }
+        self.closed = true;
+        if let Some(metrics) = &mut self.metrics {
+            metrics.close();
+        }
+        Ok(())
     }
 }
 
@@ -1982,31 +1972,11 @@ impl<P: Clone> EngineCore<P> {
         let Some(resources) = &mut self.kv_resources else {
             return Ok(());
         };
-        let Some(alignment) = resources.prefix_alignment() else {
+        if resources.prefix_alignment().is_none() {
             return Ok(());
-        };
-        let has_recurrent_state = self
-            .runner_config
-            .cache_layout
-            .as_ref()
-            .is_some_and(|layout| layout.groups().iter().any(|group| group.is_recurrent()));
+        }
         for (row, progress) in batch.rows.iter_mut().zip(progress) {
             if row.terminal || progress.resident_tokens == 0 {
-                continue;
-            }
-            let checkpoints = if has_recurrent_state {
-                resources
-                    .ready_state_checkpoints(row.request.id)
-                    .into_iter()
-                    .filter(|(_, length)| *length <= progress.resident_tokens)
-                    .collect::<Vec<_>>()
-            } else {
-                if progress.resident_tokens % alignment != 0 {
-                    continue;
-                }
-                vec![(0, progress.resident_tokens)]
-            };
-            if checkpoints.is_empty() {
                 continue;
             }
             let request = &mut row.request;
@@ -2014,28 +1984,18 @@ impl<P: Clone> EngineCore<P> {
                 continue;
             };
             let identity = identity.key();
-            let endpoint = checkpoints.iter().map(|(_, length)| *length).max().unwrap() as usize;
-            if endpoint > identity.len() {
+            if progress.resident_tokens as usize > identity.len() {
                 return Err(Error::internal(
                     "resident KV progress exceeds the request token history",
                 ));
             }
-            for (reservation_id, length) in checkpoints {
-                let pages = request
-                    .cache
-                    .as_mut()
-                    .expect("prefix-enabled requests own managed pages");
-                let key = identity.prefix(length as usize);
-                if has_recurrent_state {
-                    resources
-                        .publish_state_prefix(pages, reservation_id, &key)
-                        .map_err(Error::from)?;
-                } else {
-                    resources
-                        .publish_prefix(pages, &key, length)
-                        .map_err(Error::from)?;
-                }
-            }
+            let pages = request
+                .cache
+                .as_mut()
+                .expect("prefix-enabled requests own managed pages");
+            resources
+                .publish_ready_prefixes(pages, &identity, progress.resident_tokens)
+                .map_err(Error::from)?;
         }
         Ok(())
     }
@@ -2065,15 +2025,11 @@ impl<P: Clone> EngineCore<P> {
         }
 
         let mut estimate = resources.admission_estimate();
-        let running = self
-            .scheduler
-            .iter()
-            .filter(|request| request.is_running())
-            .collect::<Vec<_>>();
-        for request in &running {
+        let mut running_count = 0;
+        for request in self.scheduler.iter().filter(|request| request.is_running()) {
             estimate.include(request.cache.as_ref(), self.estimated_context(request))?;
+            running_count += 1;
         }
-        let running_count = running.len();
         let selected_running = selected
             .iter()
             .take_while(|request| request.is_running())
@@ -2126,10 +2082,11 @@ impl<P: Clone> EngineCore<P> {
             .filter(|request| request.is_running())
             .count();
         let resources = self.kv_resources.as_ref().expect("managed cache pressure");
-        let Some(request_id) = self
+        let Some((index, _)) = self
             .scheduler
             .iter()
-            .filter(|request| {
+            .enumerate()
+            .filter(|(_, request)| {
                 request.cache.as_ref().is_some_and(|pages| {
                     resources.reclaimable(pages) && (!request.is_running() || running_count > 1)
                 })
@@ -2137,21 +2094,16 @@ impl<P: Clone> EngineCore<P> {
             // Waiting prefix hits can pin pages outside admission estimates.
             // Release those owners before replaying admitted work; otherwise a
             // retracted prefill can be readmitted forever while decode stalls.
-            .min_by_key(|request| {
+            .min_by_key(|(_, request)| {
                 (
                     request.is_running(),
                     request.generated.len(),
                     Reverse(request.prompt.len()),
                 )
             })
-            .map(|request| request.id)
         else {
             return Ok(false);
         };
-        let index = self
-            .scheduler
-            .position(|request| request.id == request_id)
-            .expect("selected retraction victim remains ready");
         let mut request = self.scheduler.remove(index);
 
         if request.is_running()
@@ -2231,24 +2183,6 @@ impl<P: Clone> EngineCore<P> {
         Err(error)
     }
 
-    fn close_healthy(&mut self, runner: &mut impl Runner<P>) -> Result<()> {
-        if let Err(error) = self.poll_storage(true) {
-            self.poison_message("storage could not retire");
-            return Err(error);
-        }
-        self.scheduler
-            .restore_rejected(std::mem::take(&mut self.storage_waiting));
-        self.retire_ready(runner)?;
-        if let Some(resources) = self.kv_resources.as_mut() {
-            resources.clear_prefix_cache().map_err(Error::from)?;
-        }
-        self.closed = true;
-        if let Some(metrics) = &mut self.metrics {
-            metrics.close();
-        }
-        Ok(())
-    }
-
     fn retire_ready(&mut self, runner: &mut impl Runner<P>) -> Result<()> {
         if self.scheduler.is_empty() {
             return Ok(());
@@ -2320,22 +2254,22 @@ impl<P: Clone> EngineCore<P> {
         Ok(())
     }
 
-    fn prepare_scheduled_progress(
+    fn prepare_scheduled_progress<'a>(
         rows: &mut [BatchRow<P>],
-        output_token_ids: &[Vec<u32>],
-    ) -> Result<Vec<PreparedProgress>> {
+        output_token_ids: &[&'a [u32]],
+    ) -> Result<Vec<PreparedProgress<'a>>> {
         if rows.len() != output_token_ids.len() {
             return Err(Error::internal(
                 "dense runner output does not cover every scheduled row",
             ));
         }
         let mut prepared = Vec::with_capacity(rows.len());
-        for (row, token_ids) in rows.iter_mut().zip(output_token_ids) {
+        for (row, &token_ids) in rows.iter_mut().zip(output_token_ids) {
             let request = &mut row.request;
             if row.terminal {
                 prepared.push(PreparedProgress {
                     resident_tokens: request.resident_tokens,
-                    sampled_tokens: Vec::new(),
+                    sampled_tokens: &[],
                 });
                 continue;
             }
@@ -2370,21 +2304,19 @@ impl<P: Clone> EngineCore<P> {
             }
             prepared.push(PreparedProgress {
                 resident_tokens,
-                sampled_tokens: if scheduled.sample {
-                    token_ids.clone()
-                } else {
-                    Default::default()
-                },
+                sampled_tokens: if scheduled.sample { token_ids } else { &[] },
             });
         }
         Ok(prepared)
     }
 
-    fn apply_scheduled_progress(rows: &mut [BatchRow<P>], prepared: Vec<PreparedProgress>) {
+    fn apply_scheduled_progress(rows: &mut [BatchRow<P>], prepared: Vec<PreparedProgress<'_>>) {
         assert_eq!(rows.len(), prepared.len());
         for (row, progress) in rows.iter_mut().zip(prepared) {
             row.request.resident_tokens = progress.resident_tokens;
-            row.request.generated.extend(progress.sampled_tokens);
+            row.request
+                .generated
+                .extend_from_slice(progress.sampled_tokens);
         }
     }
 
@@ -2500,25 +2432,16 @@ fn build_plan<P: Clone>(
             )?);
         }
         prompt_score_indptr.push(prompt_score_indices.len() as u32);
-        match scheduled.phase {
-            Phase::Prefill => {
-                let start = scheduled.token_start() as usize;
-                let end = token_end as usize;
-                let prompt_end = end.min(request.prompt.len());
-                if start < prompt_end {
-                    token_ids.extend_from_slice(&request.prompt[start..prompt_end]);
-                }
-                if end > request.prompt.len() {
-                    let generated_start = start.saturating_sub(request.prompt.len());
-                    let generated_end = end - request.prompt.len();
-                    token_ids.extend_from_slice(&request.generated[generated_start..generated_end]);
-                }
-            }
-            Phase::Decode => {
-                token_ids.push(*request.generated.last().ok_or_else(|| {
-                    Error::internal("scheduled decode request has no generated token")
-                })?);
-            }
+        let start = scheduled.token_start() as usize;
+        let end = token_end as usize;
+        let prompt_end = end.min(request.prompt.len());
+        if start < prompt_end {
+            token_ids.extend_from_slice(&request.prompt[start..prompt_end]);
+        }
+        if end > request.prompt.len() {
+            let generated_start = start.saturating_sub(request.prompt.len());
+            let generated_end = end - request.prompt.len();
+            token_ids.extend_from_slice(&request.generated[generated_start..generated_end]);
         }
         context_lengths.push(scheduled.token_start());
         prefill_lengths.push(request.prefill_length()?);
@@ -2703,7 +2626,7 @@ mod tests {
                 scheduled,
                 terminal: false,
             }];
-            assert!(EngineCore::<()>::prepare_scheduled_progress(&mut rows, &[vec![9]]).is_err());
+            assert!(EngineCore::<()>::prepare_scheduled_progress(&mut rows, &[&[9]]).is_err());
         }
     }
 
