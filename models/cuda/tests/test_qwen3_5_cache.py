@@ -159,7 +159,7 @@ def test_mixed_dtype_state_views_share_the_byte_arena() -> None:
     assert arena.target_hidden_states[1, 0, 0].item() == 5.0
 
 
-def test_graph_cache_uses_fixed_tables_and_null_capture_inputs() -> None:
+def test_graph_cache_gives_each_capture_row_private_writable_storage() -> None:
     values = _qwen38()
     text = values["text_config"]  # type: ignore[assignment]
     text.update(  # type: ignore[union-attr]
@@ -182,7 +182,9 @@ def test_graph_cache_uses_fixed_tables_and_null_capture_inputs() -> None:
     )
     config = Qwen35Config.from_hugging_face(values)
     geometry = CacheGeometry.from_config(config, include_mtp=True)
-    arena = CacheArena(torch.device("cpu"), geometry.layout(2), geometry)
+    arena = CacheArena(
+        torch.device("cpu"), geometry.layout(2), geometry, max_batch_size=3
+    )
 
     cache = arena.graph_cache(batch_size=3, sequence_capacity=257)
     assert [tuple(group.slab_ids.shape) for group in cache.groups] == [
@@ -196,4 +198,14 @@ def test_graph_cache_uses_fixed_tables_and_null_capture_inputs() -> None:
     assert isinstance(target_slabs, tuple) and isinstance(state_slabs, tuple)
     assert len(target_slabs) == 9
     assert len(state_slabs) == 3
-    assert set(inputs.values()) == {(0,) * 9, (0,) * 3}
+    state_slots = inputs["cache.1.slots"]
+    assert isinstance(state_slots, tuple)
+    addresses = set(zip(state_slabs, state_slots, strict=True))
+    assert len(addresses) == 3
+    assert all(parent > arena.layout.parent_capacity for parent, _ in addresses)
+    for row, (parent, slot) in enumerate(zip(state_slabs, state_slots, strict=True)):
+        arena.recurrent_states[parent, slot].fill_(row + 1)
+    for row, (parent, slot) in enumerate(zip(state_slabs, state_slots, strict=True)):
+        assert arena.recurrent_states[parent, slot].eq(row + 1).all()
+    arena.reset_null()
+    assert not arena.storage[arena.layout.parent_capacity + 1 :].any()

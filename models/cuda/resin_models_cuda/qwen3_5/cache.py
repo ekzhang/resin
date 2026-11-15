@@ -15,6 +15,8 @@ from resin.backend.cuda.slab import (
     DevicePageGroup,
     GraphPageTableArena,
     SlabDeviceCache,
+    graph_scratch_address,
+    graph_scratch_parent_count,
     stage_page_groups,
     state_view_factory,
 )
@@ -164,6 +166,14 @@ class CacheGeometry:
             + self.hidden_size * BF16_BYTES
         )
 
+    @property
+    def packings(self) -> tuple[int, ...]:
+        return (
+            self.target_blocks_per_slab,
+            self.state_blocks_per_slab,
+            *((self.mtp_blocks_per_slab,) if self.include_mtp else ()),
+        )
+
     def layout(self, slab_capacity: int) -> CacheLayout:
         groups = [
             CacheGroupLayout(PAGE_TOKENS, blocks_per_slab=self.target_blocks_per_slab),
@@ -301,17 +311,23 @@ class CacheArena(GraphPageTableArena):
         geometry: CacheGeometry,
         *,
         kv_dtype: Any = None,
+        max_batch_size: int = 1,
     ) -> None:
         self.device = device
         self.layout = layout
         self.geometry = geometry
+        self.max_batch_size = max_batch_size
         if kv_dtype is None:
             kv_dtype = torch.bfloat16
         if kv_dtype.itemsize != geometry.kv_element_bytes:
             raise ValueError("Qwen3.5 KV dtype does not match its cache geometry")
         self.kv_dtype = kv_dtype
         self.binding = CachePoolBinding(layout, resource="Qwen3.5 cache")
-        physical = layout.parent_capacity + 1
+        physical = (
+            layout.parent_capacity
+            + 1
+            + graph_scratch_parent_count(geometry.packings, max_batch_size)
+        )
         self.storage = torch.zeros(
             (physical, geometry.slab_bytes), dtype=torch.uint8, device=device
         )
@@ -377,6 +393,16 @@ class CacheArena(GraphPageTableArena):
 
     def reset_null(self) -> None:
         self.storage[0].zero_()
+        self.storage[self.layout.parent_capacity + 1 :].zero_()
+
+    def _graph_padding_address(self, index: int, row: int) -> tuple[int, int]:
+        return graph_scratch_address(
+            self.layout.parent_capacity,
+            self.geometry.packings,
+            self.max_batch_size,
+            index,
+            row,
+        )
 
     def tensorize(self, plan: PagedCachePlan, staging: Any) -> DeviceCache:
         return self._make_graph_cache(stage_page_groups(plan, staging))

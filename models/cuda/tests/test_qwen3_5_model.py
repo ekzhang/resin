@@ -229,6 +229,9 @@ def test_radixark_quantized_target_keeps_mtp_bfloat16() -> None:
 
 
 def _assert_native_text_model_matches_transformers_reference() -> None:
+    from unittest.mock import patch
+
+    from transformers.models.qwen3_5 import modeling_qwen3_5 as reference_module
     from transformers.models.qwen3_5.configuration_qwen3_5 import (
         Qwen3_5TextConfig,
     )
@@ -260,7 +263,16 @@ def _assert_native_text_model_matches_transformers_reference() -> None:
     )
     config = Qwen35Config.from_hugging_face(values)  # type: ignore[arg-type]
     native = Qwen35ForConditionalGeneration(config, include_mtp=False).language_model
-    reference = ReferenceModel(Qwen3_5TextConfig.from_dict(values))  # type: ignore[arg-type]
+    # This reference runs on CPU even when the host has optional CUDA kernels.
+    with patch.multiple(
+        reference_module,
+        FusedRMSNormGated=None,
+        causal_conv1d_fn=None,
+        causal_conv1d_update=None,
+        chunk_gated_delta_rule=None,
+        fused_recurrent_gated_delta_rule=None,
+    ):
+        reference = ReferenceModel(Qwen3_5TextConfig.from_dict(values))  # type: ignore[arg-type]
     reference.load_state_dict(native.state_dict())
     token_ids = torch.tensor([[1, 7, 12, 4]])
     positions = torch.arange(4)[None]

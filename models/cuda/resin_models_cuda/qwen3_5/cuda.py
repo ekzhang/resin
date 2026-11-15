@@ -39,6 +39,7 @@ from resin.backend.cuda.runner import (
     validate_hybrid_plan,
 )
 from resin.backend.cuda.scoring import format_output, prompt_scores, score_completion
+from resin.backend.cuda.slab import graph_scratch_parent_count
 from resin.backend.cuda.staging import TensorStager
 from resin.backend.cuda.state import execute_state
 from resin.backend.cuda.vision_cache import VisionFeatureCache
@@ -286,6 +287,8 @@ class Qwen3_5CudaRunner(CudaRunner):
             free_memory,
             gpu_memory_utilization,
             self.cache_geometry.slab_bytes,
+            reserved_parent_count=1
+            + graph_scratch_parent_count(self.cache_geometry.packings, max_batch_size),
             overhead_bytes=_CACHE_WORKSPACE_BYTES,
         )
         slab_capacity = capacity.parent_capacity
@@ -306,6 +309,7 @@ class Qwen3_5CudaRunner(CudaRunner):
             self.cache_layout,
             self.cache_geometry,
             kv_dtype=cache_dtype,
+            max_batch_size=max_batch_size,
         )
         self._configure_cache_binding(self._cache.binding)
         self._attention = PagedAttentionRuntime(
