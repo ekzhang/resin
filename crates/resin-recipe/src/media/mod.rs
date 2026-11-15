@@ -134,6 +134,38 @@ pub enum Source {
     Video(Video),
 }
 
+/// Append merge-block-major patches, each laid out as channel/time/height/width.
+fn append_patches(
+    output: &mut Vec<f32>,
+    [grid_h, grid_w]: [usize; 2],
+    patch: usize,
+    merge: usize,
+    temporal: usize,
+    pixel: impl Fn(usize, usize, usize) -> f32,
+) {
+    for block_y in 0..grid_h / merge {
+        for block_x in 0..grid_w / merge {
+            for merge_y in 0..merge {
+                for merge_x in 0..merge {
+                    for channel in 0..3 {
+                        for _ in 0..temporal {
+                            for y in 0..patch {
+                                for x in 0..patch {
+                                    output.push(pixel(
+                                        (block_y * merge + merge_y) * patch + y,
+                                        (block_x * merge + merge_x) * patch + x,
+                                        channel,
+                                    ));
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
 pub fn resize_filter(value: u32) -> Result<FilterType, Error> {
     match value {
         0 => Ok(FilterType::Nearest),

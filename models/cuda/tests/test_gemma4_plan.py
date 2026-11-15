@@ -335,6 +335,41 @@ def _reserved_plan(initial_positions, *, advance=0, reservation=8):
     ), layout
 
 
+@pytest.mark.parametrize("phase", [BatchPhase.PREFILL, BatchPhase.DECODE])
+def test_adapted_page_columns_preserve_window_offsets_and_native_ownership(phase):
+    native, layout = _reserved_plan([65, 9000], reservation=1)
+    native = BatchPlan(
+        sequence_ids=native.sequence_ids,
+        context_lengths=native.context_lengths,
+        token_ids=native.token_ids,
+        token_indptr=native.token_indptr,
+        cache_groups=native.cache_groups,
+        phase=phase,
+    )
+    batch = edge_plan.build_gemma4_batch_plan(native, layout)
+    for source, adapted in zip(
+        native.cache_groups, (batch.global_, batch.local), strict=True
+    ):
+        expected_first = tuple(
+            int(value) * PAGE_SIZE for value in source.block_table_start_indices
+        )
+        assert adapted.first_token_positions == expected_first
+        assert adapted.kv_lengths == tuple(
+            position + 1 - first for position, first in zip((65, 9000), expected_first)
+        )
+        np.testing.assert_array_equal(adapted.kv_indptr, source.block_indptr)
+        np.testing.assert_array_equal(adapted.page_indices, source.block_slab_ids)
+        assert not source.block_indptr.flags.writeable
+        assert not source.block_slab_ids.flags.writeable
+        assert not np.shares_memory(adapted.kv_indptr, source.block_indptr)
+        assert not np.shares_memory(adapted.page_indices, source.block_slab_ids)
+        original_end, original_page = source.block_indptr[-1], source.block_slab_ids[0]
+        adapted.kv_indptr[-1] = 0
+        adapted.page_indices[0] = 0
+        assert source.block_indptr[-1] == original_end
+        assert source.block_slab_ids[0] == original_page
+
+
 def test_reserved_envelopes_crop_unwritten_future_pages_and_keep_owner_tables():
     for initial in (58, 63, 64, 65, 511, 512, 513, 8191, 8192, 8193, 8703, 8704, 8705):
         for advance in (0, 1, 4):

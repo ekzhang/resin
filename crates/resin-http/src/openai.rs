@@ -153,15 +153,11 @@ pub async fn models(State(state): State<AppState>) -> Json<Value> {
 pub async fn chat_completions(
     State(state): State<AppState>,
     headers: HeaderMap,
-    Json(mut body): Json<ChatRequest>,
+    Json(body): Json<ChatRequest>,
 ) -> Response {
-    body.routed_dp_rank = match routed_rank(&state, &headers, body.routed_dp_rank) {
-        Ok(rank) => rank.map(|rank| json!(rank)),
-        Err(response) => return *response,
-    };
     let stream = body.stream;
     let include_usage = body.stream_options.include_usage;
-    let request = match chat_request(&state, body) {
+    let request = match chat_request(&state, &headers, body) {
         Ok(request) => request,
         Err(response) => return *response,
     };
@@ -178,7 +174,12 @@ pub async fn chat_completions(
     }
 }
 
-fn chat_request(state: &AppState, body: ChatRequest) -> RequestResult<ConversationRequest> {
+fn chat_request(
+    state: &AppState,
+    headers: &HeaderMap,
+    body: ChatRequest,
+) -> RequestResult<ConversationRequest> {
+    let routed_dp_rank = routed_rank(state, headers, body.routed_dp_rank)?;
     validate_model(state, &body.model)?;
     validate_sampling(body.temperature, body.top_p, body.top_k, body.seed)?;
     validate_logprobs(body.top_logprobs, state.max_top_logprobs)?;
@@ -209,10 +210,7 @@ fn chat_request(state: &AppState, body: ChatRequest) -> RequestResult<Conversati
         logprobs: body.logprobs.unwrap_or(false) || body.top_logprobs.unwrap_or(0) > 0,
         top_logprobs: body.top_logprobs.unwrap_or(0),
         prompt_logprobs: body.prompt_logprobs,
-        routed_dp_rank: body
-            .routed_dp_rank
-            .and_then(|rank| rank.as_u64())
-            .map(|rank| rank as usize),
+        routed_dp_rank,
         stop: body.stop.map_or_else(Vec::new, OneOrManyStrings::into_vec),
         reasoning_effort: body.reasoning_effort,
         cache_salt: body.cache_salt,
@@ -364,14 +362,10 @@ fn chat_chunk(
 pub async fn responses(
     State(state): State<AppState>,
     headers: HeaderMap,
-    Json(mut body): Json<ResponsesRequest>,
+    Json(body): Json<ResponsesRequest>,
 ) -> Response {
-    body.routed_dp_rank = match routed_rank(&state, &headers, body.routed_dp_rank) {
-        Ok(rank) => rank.map(|rank| json!(rank)),
-        Err(response) => return *response,
-    };
     let stream = body.stream;
-    let request = match responses_request(&state, body) {
+    let request = match responses_request(&state, &headers, body) {
         Ok(request) => request,
         Err(response) => return *response,
     };
@@ -393,12 +387,8 @@ pub async fn input_tokens(
     headers: HeaderMap,
     Json(mut body): Json<ResponsesRequest>,
 ) -> Response {
-    body.routed_dp_rank = match routed_rank(&state, &headers, body.routed_dp_rank) {
-        Ok(rank) => rank.map(|rank| json!(rank)),
-        Err(response) => return *response,
-    };
     body.max_output_tokens = None;
-    let request = match responses_request(&state, body) {
+    let request = match responses_request(&state, &headers, body) {
         Ok(request) => request,
         Err(response) => return *response,
     };
@@ -434,8 +424,10 @@ pub(crate) async fn token_count_response(
 
 fn responses_request(
     state: &AppState,
+    headers: &HeaderMap,
     mut body: ResponsesRequest,
 ) -> RequestResult<ConversationRequest> {
+    let routed_dp_rank = routed_rank(state, headers, body.routed_dp_rank)?;
     validate_model(state, &body.model)?;
     validate_sampling(body.temperature, body.top_p, body.top_k, body.seed)?;
     validate_logprobs(body.top_logprobs, state.max_top_logprobs)?;
@@ -483,10 +475,7 @@ fn responses_request(
         logprobs: body.logprobs.unwrap_or(false) || body.top_logprobs.unwrap_or(0) > 0,
         top_logprobs: body.top_logprobs.unwrap_or(0),
         prompt_logprobs: body.prompt_logprobs,
-        routed_dp_rank: body
-            .routed_dp_rank
-            .and_then(|rank| rank.as_u64())
-            .map(|rank| rank as usize),
+        routed_dp_rank,
         stop: body.stop.map_or_else(Vec::new, OneOrManyStrings::into_vec),
         reasoning_effort,
         cache_salt: body.cache_salt,

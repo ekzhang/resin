@@ -7,7 +7,7 @@ pub use parser::{GlmParser, GlmTokens};
 
 use crate::{
     Error, Prompt,
-    render::{function, list, messages, object_arguments, option, whitespace},
+    render::{function, list, messages, object_arguments, whitespace},
 };
 use serde_json::Value;
 
@@ -87,27 +87,6 @@ fn tool_json(tool: &Value) -> Value {
         object.remove("defer_loading");
     }
     tool
-}
-
-/// Only trusted template syntax becomes a control span, never caller text.
-fn tool_instructions(prompt: &mut Prompt) {
-    let mut tail = TOOL_SUFFIX;
-    while let Some((offset, marker)) = [
-        "<tool_call>",
-        "</tool_call>",
-        "<arg_key>",
-        "</arg_key>",
-        "<arg_value>",
-        "</arg_value>",
-    ]
-    .iter()
-    .filter_map(|marker| tail.find(marker).map(|offset| (offset, *marker)))
-    .min_by_key(|(offset, _)| *offset)
-    {
-        prompt.text(&tail[..offset]).special(marker);
-        tail = &tail[offset + marker.len()..];
-    }
-    prompt.text(tail);
 }
 
 fn render_call(prompt: &mut Prompt, call: &Value) -> Result<(), Error> {
@@ -232,16 +211,14 @@ impl crate::Recipe for Glm53FlashRecipe {
         }
     }
     fn render(&self, request: &Value) -> Result<Prompt, Error> {
-        let request = crate::recipe::request("GLM-5.3-Flash", &self.params, request)?;
-        let messages = messages(&request, "GLM-5.3-Flash")?;
-        let effort = match option(&request, "reasoning_effort").and_then(Value::as_str) {
+        let options = crate::recipe::options("GLM-5.3-Flash", &self.params, request)?;
+        let messages = messages(request, "GLM-5.3-Flash")?;
+        let effort = match options.reasoning_effort.as_deref() {
             Some("low") => "Low",
             Some("high") => "High",
             _ => "Max",
         };
-        let clear_thinking = option(&request, "clear_thinking")
-            .and_then(Value::as_bool)
-            .unwrap_or(false);
+        let clear_thinking = options.clear_thinking.unwrap_or(false);
         let tools = list(&request["tools"]);
         let last_user = messages
             .iter()
@@ -262,7 +239,17 @@ impl crate::Recipe for Glm53FlashRecipe {
                         .text("\n");
                 }
             }
-            tool_instructions(&mut prompt);
+            prompt.template(
+                TOOL_SUFFIX,
+                &[
+                    "<tool_call>",
+                    "</tool_call>",
+                    "<arg_key>",
+                    "</arg_key>",
+                    "<arg_value>",
+                    "</arg_value>",
+                ],
+            );
         }
         let mut index = 0;
         while index < messages.len() {
@@ -321,10 +308,7 @@ impl crate::Recipe for Glm53FlashRecipe {
             }
             index += 1;
         }
-        if option(&request, "add_generation_prompt")
-            .and_then(Value::as_bool)
-            .unwrap_or(true)
-        {
+        if options.add_generation_prompt.unwrap_or(true) {
             prompt.special("<|assistant|>").special("<think>");
         }
         Ok(prompt)

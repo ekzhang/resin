@@ -57,14 +57,10 @@ const fn default_top_p() -> f64 {
 pub async fn messages(
     State(state): State<AppState>,
     headers: HeaderMap,
-    Json(mut body): Json<MessagesRequest>,
+    Json(body): Json<MessagesRequest>,
 ) -> Response {
-    body.routed_dp_rank = match routed_rank(&state, &headers, body.routed_dp_rank) {
-        Ok(rank) => rank.map(|rank| json!(rank)),
-        Err(response) => return *response,
-    };
     let stream = body.stream;
-    let request = match conversation_request(&state, body) {
+    let request = match conversation_request(&state, &headers, body) {
         Ok(request) => request,
         Err(response) => return *response,
     };
@@ -86,14 +82,10 @@ pub async fn count_tokens(
     headers: HeaderMap,
     Json(mut body): Json<MessagesRequest>,
 ) -> Response {
-    body.routed_dp_rank = match routed_rank(&state, &headers, body.routed_dp_rank) {
-        Ok(rank) => rank.map(|rank| json!(rank)),
-        Err(response) => return *response,
-    };
     // The count endpoint has no generation budget. Reuse the Messages prompt
     // normalization without requiring the generation-only max_tokens field.
     body.max_tokens = Some(1);
-    let request = match conversation_request(&state, body) {
+    let request = match conversation_request(&state, &headers, body) {
         Ok(request) => request,
         Err(response) => return *response,
     };
@@ -102,8 +94,10 @@ pub async fn count_tokens(
 
 fn conversation_request(
     state: &AppState,
+    headers: &HeaderMap,
     mut body: MessagesRequest,
 ) -> RequestResult<ConversationRequest> {
+    let routed_dp_rank = routed_rank(state, headers, body.routed_dp_rank)?;
     if body.model != state.model.as_ref() {
         return Err(Box::new(
             (
@@ -170,10 +164,7 @@ fn conversation_request(
         logprobs: false,
         top_logprobs: 0,
         prompt_logprobs: false,
-        routed_dp_rank: body
-            .routed_dp_rank
-            .and_then(|rank| rank.as_u64())
-            .map(|rank| rank as usize),
+        routed_dp_rank,
         stop: body.stop_sequences,
         reasoning_effort: None,
         cache_salt: body.cache_salt,

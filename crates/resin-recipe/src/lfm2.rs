@@ -184,8 +184,7 @@ impl Lfm2Recipe {
 }
 impl crate::Recipe for Lfm2Recipe {
     fn render(&self, request: &Value) -> Result<crate::Prompt, crate::Error> {
-        let request = crate::recipe::request("lfm2", &self.params, request)?;
-        let request = &request;
+        let options = crate::recipe::options("lfm2", &self.params, request)?;
         let messages = messages(request, "LFM2")?;
         let mut prompt = Prompt::new();
         prompt.special(BOS);
@@ -222,8 +221,7 @@ impl crate::Recipe for Lfm2Recipe {
         let last_user = messages
             .iter()
             .rposition(|message| message["role"] == "user");
-        let preserve =
-            request["extra"]["preserve_thinking"] == true || request["preserve_thinking"] == true;
+        let preserve = options.preserve_thinking.unwrap_or(false);
         for (index, message) in messages.iter().enumerate() {
             let role = message["role"]
                 .as_str()
@@ -274,7 +272,7 @@ impl crate::Recipe for Lfm2Recipe {
             prompt.special(END);
             prompt.text("\n");
         }
-        if crate::render::option(request, "add_generation_prompt") != Some(&Value::Bool(false)) {
+        if options.add_generation_prompt.unwrap_or(true) {
             prompt.special(START);
             prompt.text("assistant\n");
         }

@@ -3,7 +3,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use super::{RgbImage, Tensor, resize_filter};
+use super::{RgbImage, Tensor, append_patches, resize_filter};
 use crate::Error;
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -165,34 +165,21 @@ impl Config {
             pixels
                 .try_reserve(count)
                 .map_err(|_| Error::new("Qwen pixel tensor is too large"))?;
-            // Patch rows are merge-block-major, then local merge y/x. Within
-            // each row: channel, repeated temporal plane, patch y/x.
-            for block_y in 0..grid_h / merge {
-                for block_x in 0..grid_w / merge {
-                    for merge_y in 0..merge {
-                        for merge_x in 0..merge {
-                            for channel in 0..3 {
-                                for _ in 0..temporal {
-                                    for y in 0..patch {
-                                        for x in 0..patch {
-                                            let row = (block_y * merge + merge_y) * patch + y;
-                                            let col = (block_x * merge + merge_x) * patch + x;
-                                            let value =
-                                                image.data[(row * width + col) * 3 + channel];
-                                            pixels.push(if self.do_normalize {
-                                                (value - self.image_mean[channel])
-                                                    / self.image_std[channel]
-                                            } else {
-                                                value
-                                            });
-                                        }
-                                    }
-                                }
-                            }
-                        }
+            append_patches(
+                &mut pixels,
+                [grid_h, grid_w],
+                patch,
+                merge,
+                temporal,
+                |y, x, c| {
+                    let value = image.data[(y * width + x) * 3 + c];
+                    if self.do_normalize {
+                        (value - self.image_mean[c]) / self.image_std[c]
+                    } else {
+                        value
                     }
-                }
-            }
+                },
+            );
             grids.extend([1, grid_h as i64, grid_w as i64]);
             token_counts.push((grid_h / merge) * (grid_w / merge));
         }

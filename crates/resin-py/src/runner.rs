@@ -22,8 +22,11 @@ fn positive_u32(name: &str, value: Option<u32>) -> PyResult<Option<NonZeroU32>> 
 pub(crate) struct RunnerConfig {
     pub(super) max_batch_tokens: Option<NonZeroU32>,
     pub(super) prefill_chunk_size: Option<NonZeroU32>,
+    #[pyo3(get)]
     pub(super) continuation_prefill: bool,
+    #[pyo3(get)]
     pub(super) max_accepted_per_step: u32,
+    #[pyo3(get)]
     pub(super) cache_layout: Option<Py<CacheLayout>>,
 }
 
@@ -103,23 +106,6 @@ impl RunnerConfig {
         self.prefill_chunk_size.map(NonZeroU32::get)
     }
 
-    #[getter]
-    fn continuation_prefill(&self) -> bool {
-        self.continuation_prefill
-    }
-
-    #[getter]
-    fn max_accepted_per_step(&self) -> u32 {
-        self.max_accepted_per_step
-    }
-
-    #[getter]
-    fn cache_layout(&self, py: Python<'_>) -> Option<Py<CacheLayout>> {
-        self.cache_layout
-            .as_ref()
-            .map(|layout| layout.clone_ref(py))
-    }
-
     fn __repr__(&self) -> String {
         format!(
             "RunnerConfig(max_batch_tokens={:?}, prefill_chunk_size={:?}, continuation_prefill={}, max_accepted_per_step={}, cache={})",
@@ -133,7 +119,7 @@ impl RunnerConfig {
 }
 
 /// Concrete Engine-owned resource identities passed to `bind_resources`.
-#[pyclass(frozen, module = "resin._resin", skip_from_py_object)]
+#[pyclass(frozen, get_all, module = "resin._resin", skip_from_py_object)]
 pub(crate) struct ResourceBinding {
     cache_pool_id: Option<u64>,
     cache_layout: Option<Py<CacheLayout>>,
@@ -141,18 +127,6 @@ pub(crate) struct ResourceBinding {
 
 #[pymethods]
 impl ResourceBinding {
-    #[getter]
-    fn cache_pool_id(&self) -> Option<u64> {
-        self.cache_pool_id
-    }
-
-    #[getter]
-    fn cache_layout(&self, py: Python<'_>) -> Option<Py<CacheLayout>> {
-        self.cache_layout
-            .as_ref()
-            .map(|layout| layout.clone_ref(py))
-    }
-
     fn __repr__(&self) -> String {
         format!("ResourceBinding(cache_pool_id={:?})", self.cache_pool_id)
     }

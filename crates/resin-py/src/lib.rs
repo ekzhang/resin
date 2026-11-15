@@ -63,6 +63,7 @@ fn default_sampling_seed(engine_id: u64, request_id: u64) -> i64 {
 struct SchedulerConfig {
     max_batch_tokens: Option<NonZeroU32>,
     prefill_chunk_size: NonZeroU32,
+    #[pyo3(get)]
     schedule_conservativeness: f64,
 }
 
@@ -120,11 +121,6 @@ impl SchedulerConfig {
         self.prefill_chunk_size.get()
     }
 
-    #[getter]
-    fn schedule_conservativeness(&self) -> f64 {
-        self.schedule_conservativeness
-    }
-
     fn __repr__(&self) -> String {
         format!(
             "SchedulerConfig(max_batch_tokens={}, prefill_chunk_size={}, schedule_conservativeness={:?})",
@@ -177,15 +173,24 @@ impl BatchPhase {
 #[pyclass(frozen, module = "resin._resin", skip_from_py_object)]
 #[derive(Clone, Debug)]
 struct SamplingParams {
+    #[pyo3(get)]
     max_output_tokens: Option<u32>,
     stop_token_ids: Arc<[u32]>,
+    #[pyo3(get)]
     temperature: f64,
+    #[pyo3(get)]
     top_p: f64,
+    #[pyo3(get)]
     top_k: Option<u32>,
+    #[pyo3(get)]
     seed: Option<i64>,
+    #[pyo3(get)]
     logprobs: bool,
+    #[pyo3(get)]
     top_logprobs: u32,
+    #[pyo3(get)]
     prompt_logprobs: bool,
+    #[pyo3(get)]
     prompt_top_logprobs: u32,
     extra: Option<Arc<Py<PyAny>>>,
 }
@@ -262,51 +267,8 @@ impl SamplingParams {
     }
 
     #[getter]
-    fn max_output_tokens(&self) -> Option<u32> {
-        self.max_output_tokens
-    }
-
-    #[getter]
     fn stop_token_ids(&self, py: Python<'_>) -> PyResult<Py<PyTuple>> {
         Ok(PyTuple::new(py, self.stop_token_ids.iter().copied())?.unbind())
-    }
-
-    #[getter]
-    fn temperature(&self) -> f64 {
-        self.temperature
-    }
-
-    #[getter]
-    fn top_p(&self) -> f64 {
-        self.top_p
-    }
-
-    #[getter]
-    fn top_k(&self) -> Option<u32> {
-        self.top_k
-    }
-
-    #[getter]
-    fn seed(&self) -> Option<i64> {
-        self.seed
-    }
-
-    #[getter]
-    fn logprobs(&self) -> bool {
-        self.logprobs
-    }
-    #[getter]
-    fn prompt_logprobs(&self) -> bool {
-        self.prompt_logprobs
-    }
-    #[getter]
-    fn prompt_top_logprobs(&self) -> u32 {
-        self.prompt_top_logprobs
-    }
-
-    #[getter]
-    fn top_logprobs(&self) -> u32 {
-        self.top_logprobs
     }
 
     #[getter]
@@ -363,8 +325,14 @@ struct BatchPlan {
     prefill_lengths: Vec<u32>,
     token_ids: Vec<u32>,
     token_indptr: Vec<u32>,
+    /// Whether this is a prefill or decode batch. Mixed-chunk is not supported.
+    #[pyo3(get)]
     phase: BatchPhase,
+    /// Monotonic identifier for tracing and correlating runner steps.
+    #[pyo3(get)]
     batch_id: u64,
+    /// Optional key that prevents incompatible requests from sharing a batch.
+    #[pyo3(get)]
     batch_key: Option<u64>,
     cache_groups: Vec<CacheGroupPlan>,
     sampling_mask: Vec<bool>,
@@ -834,36 +802,12 @@ impl BatchPlan {
         arrays::readonly_view(this.clone().into_any(), positions)
     }
 
-    /// Whether this is a prefill or decode batch. Mixed-chunk is not supported.
-    #[getter]
-    fn phase(&self) -> BatchPhase {
-        self.phase
-    }
-
-    /// Monotonic identifier for tracing and correlating runner steps.
-    #[getter]
-    fn batch_id(&self) -> u64 {
-        self.batch_id
-    }
-
-    /// Optional key that prevents incompatible requests from sharing a batch.
-    #[getter]
-    fn batch_key(&self) -> Option<u64> {
-        self.batch_key
-    }
-
     /// Ordered physical placement plans corresponding to CacheLayout groups.
     /// There is one plan per layout group, not one plan per sequence; each plan
     /// contains one block-table row for every sequence in this batch.
     #[getter]
     fn cache_groups(&self, py: Python<'_>) -> PyResult<Py<PyTuple>> {
-        let groups = self
-            .cache_groups
-            .iter()
-            .cloned()
-            .map(|group| Py::new(py, group))
-            .collect::<PyResult<Vec<_>>>()?;
-        Ok(PyTuple::new(py, groups)?.unbind())
+        Ok(PyTuple::new(py, self.cache_groups.iter().cloned())?.unbind())
     }
 
     /// Which sequences should generate a sampled token. Used for chunked
@@ -913,13 +857,7 @@ impl BatchPlan {
     /// Effective sampling parameters, one per sequence.
     #[getter]
     fn sampling_params(&self, py: Python<'_>) -> PyResult<Py<PyTuple>> {
-        let params = self
-            .sampling_params
-            .iter()
-            .cloned()
-            .map(|params| Py::new(py, params))
-            .collect::<PyResult<Vec<_>>>()?;
-        Ok(PyTuple::new(py, params)?.unbind())
+        Ok(PyTuple::new(py, self.sampling_params.iter().cloned())?.unbind())
     }
 
     /// Opaque runner inputs, one per sequence. The scheduler never inspects them.
@@ -975,9 +913,13 @@ impl BatchPlan {
 #[pyclass(frozen, module = "resin._resin", skip_from_py_object)]
 #[derive(Clone, Debug)]
 struct TokenEvent {
+    #[pyo3(get)]
     request_id: u64,
+    #[pyo3(get)]
     token_id: u32,
+    #[pyo3(get)]
     index: usize,
+    #[pyo3(get)]
     finished: bool,
     finish_reason: Option<CompletionReason>,
     logprobs: Option<core::TokenLogprobs>,
@@ -989,26 +931,6 @@ impl TokenEvent {
     fn logprobs(&self) -> Option<TokenLogprobs> {
         self.logprobs.clone().map(|inner| TokenLogprobs { inner })
     }
-    #[getter]
-    fn request_id(&self) -> u64 {
-        self.request_id
-    }
-
-    #[getter]
-    fn token_id(&self) -> u32 {
-        self.token_id
-    }
-
-    #[getter]
-    fn index(&self) -> usize {
-        self.index
-    }
-
-    #[getter]
-    fn finished(&self) -> bool {
-        self.finished
-    }
-
     #[getter]
     fn finish_reason(&self) -> Option<&'static str> {
         self.finish_reason.map(CompletionReason::as_str)
@@ -2130,18 +2052,20 @@ mod tests {
     use super::*;
 
     fn wire_plan(group_index: u32) -> BatchPlan {
-        let group = CacheGroupPlan::from_parts(
-            group_index,
-            vec![0, 1],
-            vec![7],
-            vec![0],
-            vec![0],
-            vec![7, 7],
-            vec![0, 0],
-            vec![0, 1],
-            1,
-        )
-        .unwrap();
+        let group = CacheGroupPlan::from_inner(
+            resin_core::resources::kv::KvGroupPlan::new(
+                group_index,
+                vec![0, 1],
+                vec![7],
+                vec![0],
+                vec![0],
+                vec![7, 7],
+                vec![0, 0],
+                vec![0, 1],
+                NonZeroU32::new(1).unwrap(),
+            )
+            .unwrap(),
+        );
         BatchPlan {
             prompt_score_indices: Vec::new(),
             prompt_score_token_ids: Vec::new(),

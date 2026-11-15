@@ -13,11 +13,12 @@ import os
 import stat
 import tempfile
 import threading
-from collections.abc import Callable
+from collections.abc import Callable, Generator
+from contextlib import contextmanager
 from dataclasses import asdict, dataclass
 from functools import wraps
 from pathlib import Path
-from typing import Any, TypeVar
+from typing import Any, BinaryIO, TypeVar
 
 from blake3 import blake3
 
@@ -107,7 +108,7 @@ class ArtifactCache:
 
         self._check_identity(identity)
         try:
-            artifact_path, relative_path = self._artifact_path(artifact)
+            artifact_path, _ = self._artifact_path(artifact)
             record_path = artifact_path.with_name(
                 f"{artifact_path.name}{self._record_suffix}"
             )
@@ -120,16 +121,7 @@ class ArtifactCache:
         except (OSError, ValueError, json.JSONDecodeError):
             return False
 
-        return raw_record == asdict(
-            ArtifactRecord(
-                schema=_SCHEMA_VERSION,
-                abi=self._abi,
-                identity=identity,
-                artifact=relative_path.as_posix(),
-                size=size,
-                blake3=digest,
-            )
-        )
+        return raw_record == asdict(self._record(artifact_path, identity, size, digest))
 
     def publish(
         self, artifact: str | os.PathLike[str], *, identity: str
@@ -137,21 +129,10 @@ class ArtifactCache:
         """Hash an artifact and atomically publish its validation record."""
 
         self._check_identity(identity)
-        artifact_path, relative_path = self._artifact_path(artifact)
-        size, digest = _fingerprint(artifact_path)
-        record = ArtifactRecord(
-            schema=_SCHEMA_VERSION,
-            abi=self._abi,
-            identity=identity,
-            artifact=relative_path.as_posix(),
-            size=size,
-            blake3=digest,
+        artifact_path, _ = self._artifact_path(artifact)
+        return self._publish_record(
+            artifact_path, identity, _fingerprint(artifact_path)
         )
-        record_path = artifact_path.with_name(
-            f"{artifact_path.name}{self._record_suffix}"
-        )
-        _atomic_write_json(record_path, asdict(record))
-        return record
 
     def publish_from(
         self,
@@ -174,24 +155,34 @@ class ArtifactCache:
         """
 
         self._check_identity(identity)
-        artifact_path, relative_path = self._artifact_path(artifact)
+        artifact_path, _ = self._artifact_path(artifact)
         source_path = Path(source).expanduser().resolve(strict=False)
-        if source_path == artifact_path:
-            return self.publish(artifact_path, identity=identity)
+        fingerprint = (
+            _fingerprint(artifact_path)
+            if source_path == artifact_path
+            else _atomic_copy_artifact(source_path, artifact_path)
+        )
+        return self._publish_record(artifact_path, identity, fingerprint)
 
-        size, digest = _atomic_copy_artifact(source_path, artifact_path)
-        record = ArtifactRecord(
+    def _record(
+        self, artifact: Path, identity: str, size: int, digest: str
+    ) -> ArtifactRecord:
+        return ArtifactRecord(
             schema=_SCHEMA_VERSION,
             abi=self._abi,
             identity=identity,
-            artifact=relative_path.as_posix(),
+            artifact=artifact.relative_to(self._root).as_posix(),
             size=size,
             blake3=digest,
         )
-        record_path = artifact_path.with_name(
-            f"{artifact_path.name}{self._record_suffix}"
+
+    def _publish_record(
+        self, artifact: Path, identity: str, fingerprint: tuple[int, str]
+    ) -> ArtifactRecord:
+        record = self._record(artifact, identity, *fingerprint)
+        _atomic_write_json(
+            artifact.with_name(f"{artifact.name}{self._record_suffix}"), asdict(record)
         )
-        _atomic_write_json(record_path, asdict(record))
         return record
 
     def load_or_build(
@@ -336,35 +327,27 @@ def _atomic_copy_artifact(source: Path, destination: Path) -> tuple[int, str]:
     # durable artifact or readiness record.
     with source.open("rb") as source_file:
         source_mode = stat.S_IMODE(os.fstat(source_file.fileno()).st_mode)
-        destination.parent.mkdir(parents=True, exist_ok=True)
-        descriptor, temporary_name = tempfile.mkstemp(
-            dir=destination.parent,
-            prefix=f".{destination.name}.",
-            suffix=".tmp",
-        )
-        temporary_path = Path(temporary_name)
         digest = blake3()
         size = 0
-        try:
-            with os.fdopen(descriptor, "wb") as temporary:
-                os.fchmod(temporary.fileno(), source_mode)
-                for chunk in iter(lambda: source_file.read(1024 * 1024), b""):
-                    temporary.write(chunk)
-                    size += len(chunk)
-                    digest.update(chunk)
-                temporary.flush()
-                _fsync_if_supported(temporary.fileno())
-            os.replace(temporary_path, destination)
-            _fsync_directory(destination.parent)
-        except BaseException:
-            temporary_path.unlink(missing_ok=True)
-            raise
+        with _atomic_file(destination) as temporary:
+            os.fchmod(temporary.fileno(), source_mode)
+            for chunk in iter(lambda: source_file.read(1024 * 1024), b""):
+                temporary.write(chunk)
+                size += len(chunk)
+                digest.update(chunk)
 
     return size, digest.hexdigest()
 
 
 def _atomic_write_json(path: Path, value: dict[str, object]) -> None:
     payload = json.dumps(value, sort_keys=True, separators=(",", ":")).encode()
+    with _atomic_file(path) as temporary:
+        temporary.write(payload)
+
+
+@contextmanager
+def _atomic_file(path: Path) -> Generator[BinaryIO, None, None]:
+    """Flush a complete temporary file before atomically publishing its name."""
     path.parent.mkdir(parents=True, exist_ok=True)
     descriptor, temporary_name = tempfile.mkstemp(
         dir=path.parent,
@@ -374,7 +357,7 @@ def _atomic_write_json(path: Path, value: dict[str, object]) -> None:
     temporary_path = Path(temporary_name)
     try:
         with os.fdopen(descriptor, "wb") as temporary:
-            temporary.write(payload)
+            yield temporary
             temporary.flush()
             _fsync_if_supported(temporary.fileno())
         os.replace(temporary_path, path)

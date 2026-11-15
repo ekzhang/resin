@@ -43,60 +43,28 @@ class Gemma4BatchPlan:
 def _paged_plan(
     group: CacheGroupView,
     token_indptr: npt.NDArray[np.int32],
-    positions: npt.NDArray[np.int64],
-    *,
-    decode_lookahead: int,
+    post_lengths: npt.NDArray[np.int64] | None = None,
 ) -> PagedAttentionPlan:
-    packed_blocks = group.packed_block_ids.astype(np.int64, copy=False)
-    packed_appends = group.packed_append_ids.astype(np.int64, copy=False)
-    page_rows: list[npt.NDArray[np.int64]] = []
-    last_page_lengths = []
-    first_positions = []
-    kv_lengths = []
-    for row in range(len(token_indptr) - 1):
-        start, end = map(int, token_indptr[row : row + 2])
-        post_length = int(positions[end - 1]) + 1
-        leased_length = post_length + decode_lookahead
-        first_block = int(group.block_table_start_indices[row])
-        pages = packed_blocks[group.block_slice(row)]
-        first_position = first_block * PAGE_SIZE
-        kv_length = leased_length - first_position
-        page_rows.append(pages)
-        last_page_lengths.append((leased_length - 1) % PAGE_SIZE + 1)
-        first_positions.append(first_position)
-        kv_lengths.append(kv_length)
-
-    kv_indptr = np.zeros(len(page_rows) + 1, dtype=np.int32)
-    kv_indptr[1:] = np.cumsum([len(row) for row in page_rows], dtype=np.int32)
-    return PagedAttentionPlan(
-        qo_indptr=token_indptr,
-        kv_indptr=kv_indptr,
-        # Physical parent zero is reserved for inactive CUDA-graph rows, so
-        # positive Engine page IDs map directly into the device slabs.
-        page_indices=(np.concatenate(page_rows)).astype(np.int32, copy=False),
-        last_page_lengths=np.asarray(last_page_lengths, dtype=np.int32),
-        append_slots=(packed_appends * PAGE_SIZE + group.append_block_offsets).astype(
-            np.int64, copy=False
-        ),
-        first_token_positions=tuple(first_positions),
-        kv_lengths=tuple(kv_lengths),
-    )
-
-
-def _reservation_envelope(group: CacheGroupView, token_indptr):
-    packed = group.packed_block_ids.astype(np.int32)
-    first = tuple(int(value) * PAGE_SIZE for value in group.block_table_start_indices)
-    counts = np.diff(group.block_indptr).astype(np.int64)
+    """Use the native CSR directly, with readable lengths or the full lease."""
+    first = group.block_table_start_indices.astype(np.int64) * PAGE_SIZE
+    if post_lengths is None:
+        lengths = np.diff(group.block_indptr).astype(np.int64) * PAGE_SIZE
+        last_page_lengths = np.full(len(first), PAGE_SIZE, dtype=np.int32)
+    else:
+        lengths = post_lengths - first
+        last_page_lengths = ((post_lengths - 1) % PAGE_SIZE + 1).astype(np.int32)
     return PagedAttentionPlan(
         qo_indptr=token_indptr,
         kv_indptr=group.block_indptr.astype(np.int32),
-        page_indices=packed,
-        last_page_lengths=np.full(len(counts), PAGE_SIZE, dtype=np.int32),
+        # Physical parent zero is reserved for inactive CUDA-graph rows, so
+        # positive Engine page IDs map directly into the device slabs.
+        page_indices=group.packed_block_ids.astype(np.int32),
+        last_page_lengths=last_page_lengths,
         append_slots=(
             group.packed_append_ids * PAGE_SIZE + group.append_block_offsets
         ).astype(np.int64),
-        first_token_positions=first,
-        kv_lengths=tuple(int(value) * PAGE_SIZE for value in counts),
+        first_token_positions=tuple(map(int, first)),
+        kv_lengths=tuple(map(int, lengths)),
     )
 
 
@@ -129,50 +97,37 @@ def build_gemma4_batch_plan(
         raise ValueError("decode rows must contain one token")
 
     history, local = cache.groups
-    if batch.phase == BatchPhase.DECODE:
-        local_envelope = _reservation_envelope(local, token_indptr)
-        global_envelope = _reservation_envelope(history, token_indptr)
+    decode = batch.phase == BatchPhase.DECODE
+    post_lengths = (
+        positions + decode_lookahead + 1
+        if decode
+        else batch.context_lengths.astype(np.int64) + query_lengths
+    )
 
-        def readable(source):
-            return _reshape_paged_plan(
-                source,
-                token_indptr,
-                positions,
-                positions + decode_lookahead + 1,
-                truncate=True,
-                include_append=True,
-            )
+    def attention(group):
+        plan = _paged_plan(group, token_indptr, None if decode else post_lengths)
+        if not decode:
+            return plan, None
+        return _reshape_paged_plan(
+            plan,
+            token_indptr,
+            positions,
+            post_lengths,
+            include_append=True,
+        ), plan
 
-        return Gemma4BatchPlan(
-            phase=batch.phase,
-            token_ids=token_ids,
-            positions=positions,
-            token_indptr=token_indptr,
-            local=readable(local_envelope),
-            global_=readable(global_envelope),
-            last_token_indices=(token_indptr[1:] - 1).astype(np.int64),
-            local_envelope=local_envelope,
-            global_envelope=global_envelope,
-        )
-
+    local_plan, local_envelope = attention(local)
+    global_plan, global_envelope = attention(history)
     return Gemma4BatchPlan(
         phase=batch.phase,
         token_ids=token_ids,
         positions=positions,
         token_indptr=token_indptr,
-        local=_paged_plan(
-            local,
-            token_indptr,
-            positions,
-            decode_lookahead=decode_lookahead,
-        ),
-        global_=_paged_plan(
-            history,
-            token_indptr,
-            positions,
-            decode_lookahead=decode_lookahead,
-        ),
+        local=local_plan,
+        global_=global_plan,
         last_token_indices=(token_indptr[1:] - 1).astype(np.int64),
+        local_envelope=local_envelope,
+        global_envelope=global_envelope,
     )
 
 
@@ -182,7 +137,6 @@ def _reshape_paged_plan(
     positions: npt.NDArray[np.int64],
     post_lengths: npt.NDArray[np.int64],
     *,
-    truncate: bool,
     include_append: bool,
 ) -> PagedAttentionPlan:
     page_rows = []
@@ -201,8 +155,7 @@ def _reshape_paged_plan(
         )
         if required_pages > len(pages):
             raise ValueError("Gemma 4 paged attention row exceeds its lease")
-        if truncate:
-            pages = pages[:required_pages]
+        pages = pages[:required_pages]
         start, end = map(int, token_indptr[row : row + 2])
         row_positions = positions[start:end]
         if include_append:
@@ -245,11 +198,8 @@ def expand_gemma4_decode_batch(
         raise ValueError("decode batches must contain one anchor per row")
     width = drafts.shape[1] + 1
     token_ids = np.concatenate((batch.token_ids[:, None], drafts), axis=1).reshape(-1)
-    positions = np.concatenate(
-        [
-            np.arange(int(position), int(position) + width, dtype=np.int64)
-            for position in batch.positions
-        ]
+    positions = (batch.positions[:, None] + np.arange(width, dtype=np.int64)).reshape(
+        -1
     )
     token_indptr = np.arange(0, (rows + 1) * width, width, dtype=np.int32)
     post_lengths = batch.positions.astype(np.int64, copy=False) + width
@@ -263,7 +213,6 @@ def expand_gemma4_decode_batch(
             token_indptr,
             positions,
             post_lengths,
-            truncate=True,
             include_append=True,
         ),
         global_=_reshape_paged_plan(
@@ -271,7 +220,6 @@ def expand_gemma4_decode_batch(
             token_indptr,
             positions,
             post_lengths,
-            truncate=True,
             include_append=True,
         ),
         last_token_indices=(token_indptr[1:] - 1).astype(np.int64),
@@ -324,17 +272,13 @@ def gemma4_assistant_context(
     ):
         raise ValueError("assistant local window must be a positive integer")
     contexts = batch.positions.astype(np.int64, copy=False)
-    context = Gemma4BatchPlan(
-        phase=BatchPhase.DECODE,
-        token_ids=batch.token_ids,
-        positions=batch.positions,
-        token_indptr=batch.token_indptr,
+    context = replace(
+        batch,
         local=_reshape_paged_plan(
             batch.local,
             batch.token_indptr,
             batch.positions,
             contexts,
-            truncate=True,
             include_append=False,
         ),
         global_=_reshape_paged_plan(
@@ -342,10 +286,10 @@ def gemma4_assistant_context(
             batch.token_indptr,
             batch.positions,
             contexts,
-            truncate=True,
             include_append=False,
         ),
-        last_token_indices=batch.last_token_indices,
+        local_envelope=None,
+        global_envelope=None,
     )
 
     if local_window_tokens is None:

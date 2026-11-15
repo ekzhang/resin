@@ -4,7 +4,7 @@ mod schema;
 
 use serde_json::Value;
 
-use crate::render::{function, list, messages, option};
+use crate::render::{function, list, messages};
 use crate::{AttributedText, Decoder, Error, FinishReason, Prompt, ResponseParser};
 
 fn content(value: Option<&Value>) -> String {
@@ -247,12 +247,12 @@ impl GptOssRecipe {
 }
 impl crate::Recipe for GptOssRecipe {
     fn render(&self, request: &Value) -> Result<crate::Prompt, crate::Error> {
-        let request = crate::recipe::request("gpt_oss", &self.params, request)?;
-        let request = &request;
+        let options = crate::recipe::options("gpt_oss", &self.params, request)?;
         let messages = messages(request, "GPT-OSS")?;
         let tools = list(&request["tools"]);
-        let effort = option(request, "reasoning_effort")
-            .and_then(Value::as_str)
+        let effort = options
+            .reasoning_effort
+            .as_deref()
             .unwrap_or("medium")
             .to_ascii_lowercase();
         if !["low", "medium", "high"].contains(&effort.as_str()) {
@@ -261,18 +261,14 @@ impl crate::Recipe for GptOssRecipe {
             ));
         }
         let mut prompt = Prompt::new();
-        if option(request, "use_system_prompt")
-            .and_then(Value::as_bool)
-            .unwrap_or(true)
-        {
-            let identity = option(request, "model_identity")
-                .and_then(Value::as_str)
+        if options.use_system_prompt.unwrap_or(true) {
+            let identity = options
+                .model_identity
+                .as_deref()
                 .unwrap_or("You are ChatGPT, a large language model trained by OpenAI.");
-            let cutoff = option(request, "knowledge_cutoff")
-                .and_then(Value::as_str)
-                .unwrap_or("2024-06");
+            let cutoff = options.knowledge_cutoff.as_deref().unwrap_or("2024-06");
             let mut system = format!("{identity}\nKnowledge cutoff: {cutoff}");
-            if let Some(date) = option(request, "conversation_start_date").and_then(Value::as_str) {
+            if let Some(date) = options.conversation_start_date.as_deref() {
                 system.push_str(&format!("\nCurrent date: {date}"));
             }
             system.push_str(&format!("\n\nReasoning: {effort}\n\n# Valid channels: analysis, commentary, final. Channel must be included for every message."));
@@ -299,12 +295,8 @@ impl crate::Recipe for GptOssRecipe {
             }
             message(&mut prompt, "developer", None, None, &sections.join("\n\n"));
         }
-        let auto_drop_analysis = option(request, "auto_drop_analysis")
-            .and_then(Value::as_bool)
-            .unwrap_or(false);
-        let add_generation_prompt = option(request, "add_generation_prompt")
-            .and_then(Value::as_bool)
-            .unwrap_or(true);
+        let auto_drop_analysis = options.auto_drop_analysis.unwrap_or(false);
+        let add_generation_prompt = options.add_generation_prompt.unwrap_or(true);
         for (index, item) in messages.iter().enumerate() {
             if first_system == Some(index) {
                 continue;

@@ -4,7 +4,7 @@ mod values;
 
 use serde_json::Value;
 
-use crate::render::{function, list as array, messages, option, text as string, truthy};
+use crate::render::{function, list as array, messages, text as string, truthy};
 use crate::{AttributedText, Decoder, Error, FinishReason, Prompt};
 
 fn strip_thinking(text: &str) -> String {
@@ -257,13 +257,10 @@ impl crate::Recipe for Gemma4Recipe {
         }
     }
     fn render(&self, request: &Value) -> Result<crate::Prompt, crate::Error> {
-        let request = crate::recipe::request("gemma4", &self.params, request)?;
-        let request = &request;
+        let options = crate::recipe::options("gemma4", &self.params, request)?;
         let messages = messages(request, "Gemma 4")?;
         let tools = array(&request["tools"]);
-        let enable_thinking = option(request, "enable_thinking")
-            .and_then(Value::as_bool)
-            .unwrap_or(false);
+        let enable_thinking = options.enable_thinking.unwrap_or(false);
         let mut prompt = Prompt::new();
         prompt.special("<bos>");
         let system = matches!(string(&messages[0]["role"]), "system" | "developer");
@@ -419,17 +416,11 @@ impl crate::Recipe for Gemma4Recipe {
                 prompt.special("<turn|>").text("\n");
             }
         }
-        if option(request, "add_generation_prompt")
-            .and_then(Value::as_bool)
-            .unwrap_or(true)
+        if options.add_generation_prompt.unwrap_or(true)
             && !matches!(previous_kind, Some("tool_response" | "tool_call"))
         {
             prompt.special("<|turn>").text("model\n");
-            if !enable_thinking
-                && option(request, "empty_thought_prefix")
-                    .and_then(Value::as_bool)
-                    .unwrap_or(true)
-            {
+            if !enable_thinking && options.empty_thought_prefix.unwrap_or(true) {
                 prompt
                     .special("<|channel>")
                     .text("thought\n")

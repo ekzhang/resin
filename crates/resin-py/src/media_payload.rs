@@ -33,16 +33,8 @@ pub(crate) fn array<T: numpy::Element>(
     Ok(array.unbind())
 }
 
-pub(crate) fn f32_tensor(value: &Bound<'_, PyAny>) -> PyResult<Tensor<f32>> {
-    let array = value.extract::<PyReadonlyArrayDyn<'_, f32>>()?;
-    Tensor::new(
-        array.shape().to_vec(),
-        array.as_array().iter().copied().collect(),
-    )
-    .map_err(error)
-}
-pub(crate) fn i64_tensor(value: &Bound<'_, PyAny>) -> PyResult<Tensor<i64>> {
-    let array = value.extract::<PyReadonlyArrayDyn<'_, i64>>()?;
+fn tensor<T: numpy::Element + Copy>(value: &Bound<'_, PyAny>) -> PyResult<Tensor<T>> {
+    let array = value.extract::<PyReadonlyArrayDyn<'_, T>>()?;
     Tensor::new(
         array.shape().to_vec(),
         array.as_array().iter().copied().collect(),
@@ -106,11 +98,28 @@ fn hash_tensor<T: bytemuck::Pod>(hash: &mut Sha256, name: &str, tensor: &Tensor<
     }
     Digest::update(hash, bytemuck::cast_slice(&tensor.data));
 }
-fn f32_hash(hash: &mut Sha256, name: &str, tensor: &Tensor<f32>) {
-    hash_tensor(hash, name, tensor);
-}
-fn i64_hash(hash: &mut Sha256, name: &str, tensor: &Tensor<i64>) {
-    hash_tensor(hash, name, tensor);
+
+// Every payload exposes the same text/cache identity; model-specific methods
+// remain alongside each constructor below.
+macro_rules! media_methods {
+    (impl $class:ident { $($methods:tt)* }) => {
+        #[pymethods]
+        impl $class {
+            #[getter]
+            fn token_ids(&self, py: Python<'_>) -> PyResult<Py<PyTuple>> {
+                tuple(py, self.identity.tokens.iter().copied())
+            }
+            #[getter]
+            fn digest(&self) -> &str {
+                &self.identity.digest
+            }
+            #[getter]
+            fn cache_key(&self, py: Python<'_>) -> PyResult<Py<PyTuple>> {
+                tuple(py, self.identity.keys.iter().copied())
+            }
+            $($methods)*
+        }
+    };
 }
 
 #[pyclass(frozen, module = "resin._resin")]
@@ -122,42 +131,31 @@ pub(crate) struct InklingMedia {
     #[pyo3(get, name = "pixel_values")]
     pixels: Option<Py<PyArrayDyn<f32>>>,
 }
-#[pymethods]
-impl InklingMedia {
-    #[new]
-    #[pyo3(signature=(*, token_ids, image_token_id, pixel_values=None))]
-    fn new(
-        py: Python<'_>,
-        token_ids: Vec<u32>,
-        image_token_id: u32,
-        pixel_values: Option<&Bound<'_, PyAny>>,
-    ) -> PyResult<Self> {
-        Self::build(
-            py,
-            token_ids,
-            image_token_id,
-            pixel_values.map(f32_tensor).transpose()?,
-        )
-    }
-    #[getter]
-    fn token_ids(&self, py: Python<'_>) -> PyResult<Py<PyTuple>> {
-        tuple(py, self.identity.tokens.iter().copied())
-    }
-    #[getter]
-    fn image_positions(&self, py: Python<'_>) -> PyResult<Py<PyTuple>> {
-        tuple(py, self.positions.iter().copied())
-    }
-    #[getter]
-    fn token_spans(&self, py: Python<'_>) -> PyResult<Py<PyTuple>> {
-        spans(py, [])
-    }
-    #[getter]
-    fn digest(&self) -> &str {
-        &self.identity.digest
-    }
-    #[getter]
-    fn cache_key(&self, py: Python<'_>) -> PyResult<Py<PyTuple>> {
-        tuple(py, self.identity.keys.iter().copied())
+media_methods! {
+    impl InklingMedia {
+        #[new]
+        #[pyo3(signature=(*, token_ids, image_token_id, pixel_values=None))]
+        fn new(
+            py: Python<'_>,
+            token_ids: Vec<u32>,
+            image_token_id: u32,
+            pixel_values: Option<&Bound<'_, PyAny>>,
+        ) -> PyResult<Self> {
+            Self::build(
+                py,
+                token_ids,
+                image_token_id,
+                pixel_values.map(tensor).transpose()?,
+            )
+        }
+        #[getter]
+        fn image_positions(&self, py: Python<'_>) -> PyResult<Py<PyTuple>> {
+            tuple(py, self.positions.iter().copied())
+        }
+        #[getter]
+        fn token_spans(&self, py: Python<'_>) -> PyResult<Py<PyTuple>> {
+            spans(py, [])
+        }
     }
 }
 impl InklingMedia {
@@ -180,7 +178,7 @@ impl InklingMedia {
                     "Inkling image placeholder count does not match pixel patches",
                 ));
             }
-            f32_hash(&mut hash, "pixels", &pixels);
+            hash_tensor(&mut hash, "pixels", &pixels);
             Some(array(py, pixels)?)
         } else {
             if !positions.is_empty() {
@@ -214,49 +212,38 @@ pub(crate) struct Qwen35Media {
     #[pyo3(get, name = "rope_delta")]
     delta: i64,
 }
-#[pymethods]
-impl Qwen35Media {
-    #[new]
-    #[pyo3(signature=(*, token_ids, image_positions, pixel_values, image_grid_thw, spatial_merge_size, image_token_id))]
-    #[allow(clippy::too_many_arguments)]
-    fn new(
-        py: Python<'_>,
-        token_ids: Vec<u32>,
-        image_positions: Vec<usize>,
-        pixel_values: &Bound<'_, PyAny>,
-        image_grid_thw: &Bound<'_, PyAny>,
-        spatial_merge_size: usize,
-        image_token_id: u32,
-    ) -> PyResult<Self> {
-        Self::build(
-            py,
-            token_ids,
-            image_positions,
-            f32_tensor(pixel_values)?,
-            i64_tensor(image_grid_thw)?,
-            spatial_merge_size,
-            image_token_id,
-        )
-    }
-    #[getter]
-    fn token_ids(&self, py: Python<'_>) -> PyResult<Py<PyTuple>> {
-        tuple(py, self.identity.tokens.iter().copied())
-    }
-    #[getter]
-    fn image_positions(&self, py: Python<'_>) -> PyResult<Py<PyTuple>> {
-        tuple(py, self.positions.iter().copied())
-    }
-    #[getter]
-    fn token_spans(&self, py: Python<'_>) -> PyResult<Py<PyTuple>> {
-        spans(py, [])
-    }
-    #[getter]
-    fn digest(&self) -> &str {
-        &self.identity.digest
-    }
-    #[getter]
-    fn cache_key(&self, py: Python<'_>) -> PyResult<Py<PyTuple>> {
-        tuple(py, self.identity.keys.iter().copied())
+media_methods! {
+    impl Qwen35Media {
+        #[new]
+        #[pyo3(signature=(*, token_ids, image_positions, pixel_values, image_grid_thw, spatial_merge_size, image_token_id))]
+        #[allow(clippy::too_many_arguments)]
+        fn new(
+            py: Python<'_>,
+            token_ids: Vec<u32>,
+            image_positions: Vec<usize>,
+            pixel_values: &Bound<'_, PyAny>,
+            image_grid_thw: &Bound<'_, PyAny>,
+            spatial_merge_size: usize,
+            image_token_id: u32,
+        ) -> PyResult<Self> {
+            Self::build(
+                py,
+                token_ids,
+                image_positions,
+                tensor(pixel_values)?,
+                tensor(image_grid_thw)?,
+                spatial_merge_size,
+                image_token_id,
+            )
+        }
+        #[getter]
+        fn image_positions(&self, py: Python<'_>) -> PyResult<Py<PyTuple>> {
+            tuple(py, self.positions.iter().copied())
+        }
+        #[getter]
+        fn token_spans(&self, py: Python<'_>) -> PyResult<Py<PyTuple>> {
+            spans(py, [])
+        }
     }
 }
 
@@ -273,49 +260,38 @@ pub(crate) struct Glm53FlashMedia {
     #[pyo3(get, name = "image_grid_thw")]
     grids: Py<PyArrayDyn<i64>>,
 }
-#[pymethods]
-impl Glm53FlashMedia {
-    #[new]
-    #[pyo3(signature=(*, token_ids, image_positions, pixel_values, image_grid_thw, spatial_merge_size, image_token_id))]
-    #[allow(clippy::too_many_arguments)]
-    fn new(
-        py: Python<'_>,
-        token_ids: Vec<u32>,
-        image_positions: Vec<usize>,
-        pixel_values: &Bound<'_, PyAny>,
-        image_grid_thw: &Bound<'_, PyAny>,
-        spatial_merge_size: usize,
-        image_token_id: u32,
-    ) -> PyResult<Self> {
-        Self::build(
-            py,
-            token_ids,
-            image_positions,
-            f32_tensor(pixel_values)?,
-            i64_tensor(image_grid_thw)?,
-            spatial_merge_size,
-            image_token_id,
-        )
-    }
-    #[getter]
-    fn token_ids(&self, py: Python<'_>) -> PyResult<Py<PyTuple>> {
-        tuple(py, self.identity.tokens.iter().copied())
-    }
-    #[getter]
-    fn image_positions(&self, py: Python<'_>) -> PyResult<Py<PyTuple>> {
-        tuple(py, self.positions.iter().copied())
-    }
-    #[getter]
-    fn token_spans(&self, py: Python<'_>) -> PyResult<Py<PyTuple>> {
-        spans(py, [])
-    }
-    #[getter]
-    fn digest(&self) -> &str {
-        &self.identity.digest
-    }
-    #[getter]
-    fn cache_key(&self, py: Python<'_>) -> PyResult<Py<PyTuple>> {
-        tuple(py, self.identity.keys.iter().copied())
+media_methods! {
+    impl Glm53FlashMedia {
+        #[new]
+        #[pyo3(signature=(*, token_ids, image_positions, pixel_values, image_grid_thw, spatial_merge_size, image_token_id))]
+        #[allow(clippy::too_many_arguments)]
+        fn new(
+            py: Python<'_>,
+            token_ids: Vec<u32>,
+            image_positions: Vec<usize>,
+            pixel_values: &Bound<'_, PyAny>,
+            image_grid_thw: &Bound<'_, PyAny>,
+            spatial_merge_size: usize,
+            image_token_id: u32,
+        ) -> PyResult<Self> {
+            Self::build(
+                py,
+                token_ids,
+                image_positions,
+                tensor(pixel_values)?,
+                tensor(image_grid_thw)?,
+                spatial_merge_size,
+                image_token_id,
+            )
+        }
+        #[getter]
+        fn image_positions(&self, py: Python<'_>) -> PyResult<Py<PyTuple>> {
+            tuple(py, self.positions.iter().copied())
+        }
+        #[getter]
+        fn token_spans(&self, py: Python<'_>) -> PyResult<Py<PyTuple>> {
+            spans(py, [])
+        }
     }
 }
 
@@ -335,105 +311,94 @@ pub(crate) struct Gemma4Media {
     #[pyo3(get, name = "video_position_ids")]
     video_positions: Option<Py<PyArrayDyn<i64>>>,
 }
-#[pymethods]
-impl Gemma4Media {
-    #[new]
-    #[pyo3(signature=(*, token_ids, mm_token_type_ids, pixel_values=None, image_position_ids=None, pixel_values_videos=None, video_position_ids=None))]
-    #[allow(clippy::too_many_arguments)]
-    fn new(
-        py: Python<'_>,
-        token_ids: Vec<u32>,
-        mm_token_type_ids: Vec<u8>,
-        pixel_values: Option<&Bound<'_, PyAny>>,
-        image_position_ids: Option<&Bound<'_, PyAny>>,
-        pixel_values_videos: Option<&Bound<'_, PyAny>>,
-        video_position_ids: Option<&Bound<'_, PyAny>>,
-    ) -> PyResult<Self> {
-        Self::build(
-            py,
-            token_ids,
-            mm_token_type_ids,
-            pixel_values.map(f32_tensor).transpose()?,
-            image_position_ids.map(i64_tensor).transpose()?,
-            pixel_values_videos.map(f32_tensor).transpose()?,
-            video_position_ids.map(i64_tensor).transpose()?,
-        )
-    }
-    #[getter]
-    fn token_ids(&self, py: Python<'_>) -> PyResult<Py<PyTuple>> {
-        tuple(py, self.identity.tokens.iter().copied())
-    }
-    #[getter]
-    fn mm_token_type_ids(&self, py: Python<'_>) -> PyResult<Py<PyTuple>> {
-        tuple(py, self.types.iter().copied())
-    }
-    #[getter]
-    fn image_positions(&self, py: Python<'_>) -> PyResult<Py<PyTuple>> {
-        tuple(py, self.positions_of(1))
-    }
-    #[getter]
-    fn video_positions(&self, py: Python<'_>) -> PyResult<Py<PyTuple>> {
-        tuple(py, self.positions_of(2))
-    }
-    #[getter]
-    fn block_ids(&self, py: Python<'_>) -> PyResult<Py<PyTuple>> {
-        let mut block = -1i64;
-        let mut previous = false;
-        tuple(
-            py,
-            self.types.iter().map(|&kind| {
-                let vision = kind != 0;
-                if vision && !previous {
-                    block += 1;
-                }
-                previous = vision;
-                if vision { block } else { -1 }
-            }),
-        )
-    }
-    #[getter]
-    fn token_spans(&self, py: Python<'_>) -> PyResult<Py<PyTuple>> {
-        spans(
-            py,
-            contiguous_ranges(
-                &self
-                    .types
-                    .iter()
-                    .enumerate()
-                    .filter_map(|(i, &t)| (t != 0).then_some(i))
-                    .collect::<Vec<_>>(),
-            ),
-        )
-    }
-    #[getter]
-    fn digest(&self) -> &str {
-        &self.identity.digest
-    }
-    #[getter]
-    fn cache_key(&self, py: Python<'_>) -> PyResult<Py<PyTuple>> {
-        tuple(py, self.identity.keys.iter().copied())
-    }
-    #[pyo3(signature=(*,image_token_id,video_token_id))]
-    fn validate_placeholder_tokens(
-        &self,
-        image_token_id: u32,
-        video_token_id: u32,
-    ) -> PyResult<()> {
-        for (&token, &kind) in self.identity.tokens.iter().zip(&self.types) {
-            if kind != 0
-                && token
-                    != if kind == 1 {
-                        image_token_id
-                    } else {
-                        video_token_id
-                    }
-            {
-                return Err(error(
-                    "media token type does not match its placeholder token",
-                ));
-            }
+media_methods! {
+    impl Gemma4Media {
+        #[new]
+        #[pyo3(signature=(*, token_ids, mm_token_type_ids, pixel_values=None, image_position_ids=None, pixel_values_videos=None, video_position_ids=None))]
+        #[allow(clippy::too_many_arguments)]
+        fn new(
+            py: Python<'_>,
+            token_ids: Vec<u32>,
+            mm_token_type_ids: Vec<u8>,
+            pixel_values: Option<&Bound<'_, PyAny>>,
+            image_position_ids: Option<&Bound<'_, PyAny>>,
+            pixel_values_videos: Option<&Bound<'_, PyAny>>,
+            video_position_ids: Option<&Bound<'_, PyAny>>,
+        ) -> PyResult<Self> {
+            Self::build(
+                py,
+                token_ids,
+                mm_token_type_ids,
+                pixel_values.map(tensor).transpose()?,
+                image_position_ids.map(tensor).transpose()?,
+                pixel_values_videos.map(tensor).transpose()?,
+                video_position_ids.map(tensor).transpose()?,
+            )
         }
-        Ok(())
+        #[getter]
+        fn mm_token_type_ids(&self, py: Python<'_>) -> PyResult<Py<PyTuple>> {
+            tuple(py, self.types.iter().copied())
+        }
+        #[getter]
+        fn image_positions(&self, py: Python<'_>) -> PyResult<Py<PyTuple>> {
+            tuple(py, self.positions_of(1))
+        }
+        #[getter]
+        fn video_positions(&self, py: Python<'_>) -> PyResult<Py<PyTuple>> {
+            tuple(py, self.positions_of(2))
+        }
+        #[getter]
+        fn block_ids(&self, py: Python<'_>) -> PyResult<Py<PyTuple>> {
+            let mut block = -1i64;
+            let mut previous = false;
+            tuple(
+                py,
+                self.types.iter().map(|&kind| {
+                    let vision = kind != 0;
+                    if vision && !previous {
+                        block += 1;
+                    }
+                    previous = vision;
+                    if vision { block } else { -1 }
+                }),
+            )
+        }
+        #[getter]
+        fn token_spans(&self, py: Python<'_>) -> PyResult<Py<PyTuple>> {
+            spans(
+                py,
+                contiguous_ranges(
+                    &self
+                        .types
+                        .iter()
+                        .enumerate()
+                        .filter_map(|(i, &t)| (t != 0).then_some(i))
+                        .collect::<Vec<_>>(),
+                ),
+            )
+        }
+        #[pyo3(signature=(*,image_token_id,video_token_id))]
+        fn validate_placeholder_tokens(
+            &self,
+            image_token_id: u32,
+            video_token_id: u32,
+        ) -> PyResult<()> {
+            for (&token, &kind) in self.identity.tokens.iter().zip(&self.types) {
+                if kind != 0
+                    && token
+                        != if kind == 1 {
+                            image_token_id
+                        } else {
+                            video_token_id
+                        }
+                {
+                    return Err(error(
+                        "media token type does not match its placeholder token",
+                    ));
+                }
+            }
+            Ok(())
+        }
     }
 }
 impl Gemma4Media {
@@ -482,8 +447,8 @@ impl Gemma4Media {
                 if t.shape.len() != rank {
                     return Err(error(format!("{name} must have rank {rank}")));
                 }
-                f32_hash(&mut hash, name, t);
-                f32_hash(&mut vision_hash, name, t);
+                hash_tensor(&mut hash, name, t);
+                hash_tensor(&mut vision_hash, name, t);
             }
         }
         for (name, tensor, rank) in [
@@ -494,8 +459,8 @@ impl Gemma4Media {
                 if t.shape.len() != rank {
                     return Err(error(format!("{name} must have rank {rank}")));
                 }
-                i64_hash(&mut hash, name, t);
-                i64_hash(&mut vision_hash, name, t);
+                hash_tensor(&mut hash, name, t);
+                hash_tensor(&mut vision_hash, name, t);
             }
         }
         let visual = types
@@ -543,7 +508,7 @@ impl DeepSeekV41Image {
         n_vit_w: usize,
         types: Vec<u32>,
     ) -> PyResult<Self> {
-        Self::build(py, start, f32_tensor(patches)?, n_vit_h, n_vit_w, types)
+        Self::build(py, start, tensor(patches)?, n_vit_h, n_vit_w, types)
     }
     #[getter]
     fn types(&self, py: Python<'_>) -> PyResult<Py<PyTuple>> {
@@ -590,37 +555,26 @@ pub(crate) struct DeepSeekV41Media {
     #[pyo3(get, name = "image_token_id")]
     marker: u32,
 }
-#[pymethods]
-impl DeepSeekV41Media {
-    #[new]
-    #[pyo3(signature=(*, token_ids, images, image_token_id=129264))]
-    fn new(
-        py: Python<'_>,
-        token_ids: Vec<u32>,
-        images: Vec<Py<DeepSeekV41Image>>,
-        image_token_id: u32,
-    ) -> PyResult<Self> {
-        Self::build(py, token_ids, images, image_token_id)
-    }
-    #[getter]
-    fn token_ids(&self, py: Python<'_>) -> PyResult<Py<PyTuple>> {
-        tuple(py, self.identity.tokens.iter().copied())
-    }
-    #[getter]
-    fn images(&self, py: Python<'_>) -> PyResult<Py<PyTuple>> {
-        tuple(py, self.images.iter().map(|p| p.clone_ref(py)))
-    }
-    #[getter]
-    fn token_spans(&self, py: Python<'_>) -> PyResult<Py<PyTuple>> {
-        spans(py, [])
-    }
-    #[getter]
-    fn digest(&self) -> &str {
-        &self.identity.digest
-    }
-    #[getter]
-    fn cache_key(&self, py: Python<'_>) -> PyResult<Py<PyTuple>> {
-        tuple(py, self.identity.keys.iter().copied())
+media_methods! {
+    impl DeepSeekV41Media {
+        #[new]
+        #[pyo3(signature=(*, token_ids, images, image_token_id=129264))]
+        fn new(
+            py: Python<'_>,
+            token_ids: Vec<u32>,
+            images: Vec<Py<DeepSeekV41Image>>,
+            image_token_id: u32,
+        ) -> PyResult<Self> {
+            Self::build(py, token_ids, images, image_token_id)
+        }
+        #[getter]
+        fn images(&self, py: Python<'_>) -> PyResult<Py<PyTuple>> {
+            tuple(py, self.images.iter().map(|p| p.clone_ref(py)))
+        }
+        #[getter]
+        fn token_spans(&self, py: Python<'_>) -> PyResult<Py<PyTuple>> {
+            spans(py, [])
+        }
     }
 }
 impl DeepSeekV41Media {
@@ -759,8 +713,8 @@ impl Qwen35Media {
             qwen::mrope_positions(tokens.len(), &ranges, &grids, merge).map_err(error)?;
         let mut hash = Sha256::new();
         Digest::update(&mut hash, b"resin.qwen.media.v2");
-        f32_hash(&mut hash, "pixels", &pixels);
-        i64_hash(&mut hash, "grids", &grids);
+        hash_tensor(&mut hash, "pixels", &pixels);
+        hash_tensor(&mut hash, "grids", &grids);
         Ok(Self {
             identity: Identity::new(tokens, &positions, hash)?,
             positions,
@@ -796,8 +750,8 @@ impl Glm53FlashMedia {
         }
         let mut hash = Sha256::new();
         Digest::update(&mut hash, b"resin.glm53flash.media.v1");
-        f32_hash(&mut hash, "pixels", &pixels);
-        i64_hash(&mut hash, "grids", &grids);
+        hash_tensor(&mut hash, "pixels", &pixels);
+        hash_tensor(&mut hash, "grids", &grids);
         Ok(Self {
             identity: Identity::new(tokens, &positions, hash)?,
             positions,
@@ -981,12 +935,7 @@ fn take_buffer<T: numpy::Element + Copy>(
     let value = buffers
         .next()
         .ok_or_else(|| error("media transfer is missing a tensor buffer"))?;
-    let array = value.bind(py).extract::<PyReadonlyArrayDyn<'_, T>>()?;
-    Tensor::new(
-        array.shape().to_vec(),
-        array.as_array().iter().copied().collect(),
-    )
-    .map_err(error)
+    tensor(value.bind(py))
 }
 
 #[pyfunction]

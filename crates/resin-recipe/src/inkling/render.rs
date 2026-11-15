@@ -1,6 +1,6 @@
 //! Inkling's pinned template; user text never becomes a control token.
 use super::{InklingParser, InklingRecipe, InklingTokens};
-use crate::render::{function, object_arguments, option, value_or};
+use crate::render::{function, object_arguments, value_or};
 use crate::{Error, Prompt};
 use serde_json::{Value, json};
 
@@ -16,11 +16,10 @@ fn block(prompt: &mut Prompt, role: &str, kind: &str, text: &str) {
         .text(text)
         .special("<|end_message|>");
 }
-fn effort(request: &Value) -> Result<String, Error> {
-    let value = option(request, "reasoning_effort");
+fn effort(value: Option<&crate::ReasoningEffort>) -> Result<String, Error> {
     let num = match value {
         None => 0.9,
-        Some(Value::String(value)) => match value.trim() {
+        Some(crate::ReasoningEffort::Name(value)) => match value.trim() {
             "none" => 0.0,
             "minimal" => 0.1,
             "low" => 0.2,
@@ -29,7 +28,7 @@ fn effort(request: &Value) -> Result<String, Error> {
             "max" | "xhigh" => 0.99,
             _ => return Err(Error::new("unknown Inkling reasoning_effort")),
         },
-        Some(value) => value
+        Some(crate::ReasoningEffort::Number(value)) => value
             .as_f64()
             .ok_or_else(|| Error::new("reasoning_effort must be a number or effort name"))?,
     };
@@ -53,8 +52,7 @@ fn emit_effort(prompt: &mut Prompt, effort: &str) {
 
 impl crate::Recipe for InklingRecipe {
     fn render(&self, request: &Value) -> Result<crate::Prompt, crate::Error> {
-        let request = crate::recipe::request("inkling", &self.params, request)?;
-        let request = &request;
+        let options = crate::recipe::options("inkling", &self.params, request)?;
         let messages = request["messages"]
             .as_array()
             .ok_or_else(|| Error::new("messages must be an array"))?;
@@ -82,7 +80,7 @@ impl crate::Recipe for InklingRecipe {
                 .text(compact(&Value::Array(specs)))
                 .special("<|end_message|>");
         }
-        let effort = effort(request)?;
+        let effort = effort(options.reasoning_effort.as_ref())?;
         let mut effort_emitted = false;
         for message in messages {
             let role = message["role"].as_str().unwrap_or("");
@@ -191,10 +189,7 @@ impl crate::Recipe for InklingRecipe {
         if !effort_emitted {
             emit_effort(&mut prompt, &effort);
         }
-        if option(request, "add_generation_prompt")
-            .and_then(Value::as_bool)
-            .unwrap_or(true)
-        {
+        if options.add_generation_prompt.unwrap_or(true) {
             prompt.special("<|message_model|>");
         }
         Ok(prompt)

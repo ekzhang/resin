@@ -89,8 +89,19 @@ pub(crate) struct CacheGroupLayout {
     inner: KvGroupLayout,
 }
 
+#[pymethods]
 impl CacheGroupLayout {
-    pub(crate) fn from_parts(
+    #[new]
+    #[pyo3(signature = (
+        block_tokens,
+        *,
+        blocks_per_slab = 1,
+        retention = CacheRetention::History,
+        window_tokens = None,
+        family = CacheGroupFamily::History,
+        read_window_tokens = None
+    ))]
+    fn new(
         block_tokens: u32,
         blocks_per_slab: u32,
         retention: CacheRetention,
@@ -130,45 +141,6 @@ impl CacheGroupLayout {
             None => inner,
         };
         Ok(Self { inner })
-    }
-
-    fn from_inner(inner: KvGroupLayout) -> Self {
-        Self { inner }
-    }
-
-    fn repr_string(&self) -> String {
-        group_repr(self.inner)
-    }
-}
-
-#[pymethods]
-impl CacheGroupLayout {
-    #[new]
-    #[pyo3(signature = (
-        block_tokens,
-        *,
-        blocks_per_slab = 1,
-        retention = CacheRetention::History,
-        window_tokens = None,
-        family = CacheGroupFamily::History,
-        read_window_tokens = None
-    ))]
-    fn new(
-        block_tokens: u32,
-        blocks_per_slab: u32,
-        retention: CacheRetention,
-        window_tokens: Option<u32>,
-        family: CacheGroupFamily,
-        read_window_tokens: Option<u32>,
-    ) -> PyResult<Self> {
-        Self::from_parts(
-            block_tokens,
-            blocks_per_slab,
-            retention,
-            window_tokens,
-            family,
-            read_window_tokens,
-        )
     }
 
     /// Number of token positions represented by one logical block.
@@ -221,7 +193,7 @@ impl CacheGroupLayout {
     }
 
     fn __repr__(&self) -> String {
-        self.repr_string()
+        group_repr(self.inner)
     }
 }
 
@@ -238,19 +210,6 @@ pub(crate) struct CacheLayout {
 }
 
 impl CacheLayout {
-    pub(crate) fn from_groups(
-        parent_capacity: u32,
-        groups: Vec<CacheGroupLayout>,
-    ) -> PyResult<Self> {
-        Ok(Self {
-            inner: KvLayout::new(
-                parent_capacity,
-                groups.into_iter().map(|group| group.inner).collect(),
-            )
-            .map_err(layout_error)?,
-        })
-    }
-
     pub(crate) const fn inner_native(&self) -> &KvLayout {
         &self.inner
     }
@@ -290,13 +249,15 @@ impl CacheLayout {
         replay_suffix_tokens: u32,
         decode_write_extra_tokens: u32,
     ) -> PyResult<Self> {
-        let groups = groups.into_iter().map(|group| *group.borrow(py)).collect();
-        let mut layout = Self::from_groups(parent_capacity, groups)?;
-        layout.inner = layout
-            .inner
+        Ok(Self {
+            inner: KvLayout::new(
+                parent_capacity,
+                groups.iter().map(|group| group.borrow(py).inner).collect(),
+            )
+            .map_err(layout_error)?
             .with_replay_suffix_tokens(replay_suffix_tokens)
-            .with_decode_write_extra_tokens(decode_write_extra_tokens);
-        Ok(layout)
+            .with_decode_write_extra_tokens(decode_write_extra_tokens),
+        })
     }
 
     /// Minimum final prompt suffix rebuilt after every prefix-cache hit.
@@ -326,15 +287,14 @@ impl CacheLayout {
     /// Ordered immutable cache-group descriptors.
     #[getter]
     fn groups(&self, py: Python<'_>) -> PyResult<Py<PyTuple>> {
-        let groups = self
-            .inner
-            .groups()
-            .iter()
-            .copied()
-            .map(CacheGroupLayout::from_inner)
-            .map(|group| Py::new(py, group))
-            .collect::<PyResult<Vec<_>>>()?;
-        Ok(PyTuple::new(py, groups)?.unbind())
+        Ok(PyTuple::new(
+            py,
+            self.inner
+                .groups()
+                .iter()
+                .map(|&inner| CacheGroupLayout { inner }),
+        )?
+        .unbind())
     }
 
     fn group_kernel_page_capacity(&self, group_index: u32) -> PyResult<u32> {
@@ -476,38 +436,6 @@ impl CacheGroupPlan {
         }
     }
 
-    #[allow(clippy::too_many_arguments)]
-    pub(crate) fn from_parts(
-        group_index: u32,
-        block_indptr: Vec<u32>,
-        block_slab_ids: Vec<u32>,
-        block_slotnums: Vec<u32>,
-        block_table_start_indices: Vec<u32>,
-        append_slab_ids: Vec<u32>,
-        append_slotnums: Vec<u32>,
-        append_block_offsets: Vec<u32>,
-        blocks_per_slab: u32,
-    ) -> PyResult<Self> {
-        let blocks_per_slab = NonZeroU32::new(blocks_per_slab)
-            .ok_or_else(|| PyValueError::new_err("blocks_per_slab must be positive"))?;
-        Ok(Self {
-            inner: Arc::new(
-                KvGroupPlan::new(
-                    group_index,
-                    block_indptr,
-                    block_slab_ids,
-                    block_slotnums,
-                    block_table_start_indices,
-                    append_slab_ids,
-                    append_slotnums,
-                    append_block_offsets,
-                    blocks_per_slab,
-                )
-                .map_err(plan_error)?,
-            ),
-        })
-    }
-
     pub(crate) fn validate_local(&self) -> PyResult<()> {
         self.inner.validate().map_err(plan_error)
     }
@@ -558,21 +486,20 @@ impl CacheGroupPlan {
         blocks_per_slab: u32,
         state: Option<Py<CacheStatePlan>>,
     ) -> PyResult<Self> {
-        let mut plan = Self::from_parts(
+        let plan = KvGroupPlan {
             group_index,
-            crate::arrays::owned_vec(block_indptr),
-            crate::arrays::owned_vec(block_slab_ids),
-            crate::arrays::owned_vec(block_slotnums),
-            crate::arrays::owned_vec(block_table_start_indices),
-            crate::arrays::owned_vec(append_slab_ids),
-            crate::arrays::owned_vec(append_slotnums),
-            crate::arrays::owned_vec(append_block_offsets),
             blocks_per_slab,
-        )?;
-        Arc::make_mut(&mut plan.inner).state =
-            state.as_ref().map(|state| state.borrow(py).inner.clone());
-        plan.validate_local()?;
-        Ok(plan)
+            block_indptr: crate::arrays::owned_vec(block_indptr),
+            block_slab_ids: crate::arrays::owned_vec(block_slab_ids),
+            block_slotnums: crate::arrays::owned_vec(block_slotnums),
+            block_table_start_indices: crate::arrays::owned_vec(block_table_start_indices),
+            append_slab_ids: crate::arrays::owned_vec(append_slab_ids),
+            append_slotnums: crate::arrays::owned_vec(append_slotnums),
+            append_block_offsets: crate::arrays::owned_vec(append_block_offsets),
+            state: state.as_ref().map(|state| state.borrow(py).inner.clone()),
+        };
+        plan.validate().map_err(plan_error)?;
+        Ok(Self::from_inner(plan))
     }
 
     /// Zero-based index of this plan's matching CacheGroupLayout. BatchPlan
@@ -590,19 +517,11 @@ impl CacheGroupPlan {
     }
 
     #[getter]
-    fn state(&self, py: Python<'_>) -> PyResult<Option<Py<CacheStatePlan>>> {
+    fn state(&self) -> Option<CacheStatePlan> {
         self.inner
             .state
-            .as_ref()
-            .map(|state| {
-                Py::new(
-                    py,
-                    CacheStatePlan {
-                        inner: state.clone(),
-                    },
-                )
-            })
-            .transpose()
+            .clone()
+            .map(|inner| CacheStatePlan { inner })
     }
 
     /// CSR row pointer into the block-address arrays. Its length is one more

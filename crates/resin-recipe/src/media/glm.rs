@@ -2,7 +2,7 @@
 //! ratio inside a ceil-aligned, black-padded canvas. Input pixels are RGB [0,1].
 use serde::{Deserialize, Serialize};
 
-use super::{RgbImage, Tensor, qwen::Prepared};
+use super::{RgbImage, Tensor, append_patches, qwen::Prepared};
 use crate::Error;
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -132,34 +132,25 @@ impl Config {
                 self.patch_size,
                 self.merge_size,
             );
-            for by in 0..gh / m {
-                for bx in 0..gw / m {
-                    for my in 0..m {
-                        for mx in 0..m {
-                            for c in 0..3 {
-                                for _ in 0..self.temporal_patch_size {
-                                    for py in 0..p {
-                                        for px in 0..p {
-                                            let (y, x) =
-                                                ((by * m + my) * p + py, (bx * m + mx) * p + px);
-                                            let v = if y < ch && x < cw {
-                                                resized[(y * cw + x) * 3 + c]
-                                            } else {
-                                                0.0
-                                            };
-                                            pixels.push(if self.do_normalize {
-                                                (v - self.image_mean[c]) / self.image_std[c]
-                                            } else {
-                                                v
-                                            });
-                                        }
-                                    }
-                                }
-                            }
-                        }
+            append_patches(
+                &mut pixels,
+                [gh, gw],
+                p,
+                m,
+                self.temporal_patch_size,
+                |y, x, c| {
+                    let value = if y < ch && x < cw {
+                        resized[(y * cw + x) * 3 + c]
+                    } else {
+                        0.0
+                    };
+                    if self.do_normalize {
+                        (value - self.image_mean[c]) / self.image_std[c]
+                    } else {
+                        value
                     }
-                }
-            }
+                },
+            );
             grids.extend([1, gh as i64, gw as i64]);
             counts.push(gh / m * (gw / m));
         }

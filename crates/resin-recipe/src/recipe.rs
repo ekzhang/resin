@@ -80,7 +80,7 @@ pub enum ReasoningEffort {
     Number(serde_json::Number),
 }
 
-pub(crate) fn request<T>(name: &str, params: &T, request: &Value) -> Result<Value, Error>
+pub(crate) fn options<T>(name: &str, params: &T, request: &Value) -> Result<T, Error>
 where
     T: Serialize + DeserializeOwned,
 {
@@ -116,9 +116,6 @@ where
         options.insert(key.clone(), value.clone());
     }
     options.retain(|_, value| !value.is_null());
-    serde_json::from_value::<T>(Value::Object(options.clone()))
-        .map_err(|error| Error::new(format!("invalid {name} options: {error}")))?;
-    Ok(
-        serde_json::json!({"messages": request["messages"], "tools": request["tools"], "extra": options}),
-    )
+    serde_json::from_value(Value::Object(options))
+        .map_err(|error| Error::new(format!("invalid {name} options: {error}")))
 }

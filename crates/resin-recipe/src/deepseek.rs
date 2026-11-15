@@ -164,18 +164,10 @@ fn merge_messages(messages: Vec<Value>) -> Result<Vec<Value>, Error> {
 }
 
 fn render_tools(prompt: &mut Prompt, tools: &[Value]) -> Result<(), Error> {
-    // Only the template's delimiters are control tokens; schemas remain text.
-    let mut template = include_str!("deepseek/tools.txt");
-    while let Some((at, marker)) = [DSML, THINKING_START, THINKING_END]
-        .into_iter()
-        .filter_map(|marker| template.find(marker).map(|at| (at, marker)))
-        .min_by_key(|(at, _)| *at)
-    {
-        prompt.text(&template[..at]);
-        prompt.special(marker);
-        template = &template[at + marker.len()..];
-    }
-    prompt.text(template);
+    prompt.template(
+        include_str!("deepseek/tools.txt"),
+        &[DSML, THINKING_START, THINKING_END],
+    );
     for tool in tools {
         let tool = qualified_function(tool)?;
         if !tool.is_object() {
@@ -313,8 +305,12 @@ impl DeepSeekV41Recipe {
         Ok(Self { params })
     }
     fn request(&self, raw: &Value) -> Result<Value, crate::Error> {
-        let mut request = crate::recipe::request("deepseek_v41", &self.params, raw)?;
+        let params = crate::recipe::options("deepseek_v41", &self.params, raw)?;
+        let mut request = serde_json::json!({
+            "messages": raw["messages"], "tools": raw["tools"], "extra": params,
+        });
         let options = request["extra"].as_object_mut().unwrap();
+        options.retain(|_, value| !value.is_null());
         if option(raw, "enable_thinking").is_some() && option(raw, "thinking_mode").is_none() {
             options.remove("thinking_mode");
         }

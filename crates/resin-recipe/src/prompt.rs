@@ -38,6 +38,19 @@ impl Prompt {
         self
     }
 
+    /// Recognize control markers in trusted template constants, never caller text.
+    pub(crate) fn template(&mut self, mut text: &'static str, markers: &[&str]) -> &mut Self {
+        while let Some((offset, marker)) = markers
+            .iter()
+            .filter_map(|marker| text.find(marker).map(|offset| (offset, *marker)))
+            .min_by_key(|(offset, _)| *offset)
+        {
+            self.text(&text[..offset]).special(marker);
+            text = &text[offset + marker.len()..];
+        }
+        self.text(text)
+    }
+
     pub fn append(&mut self, prompt: Self) -> &mut Self {
         for span in prompt.spans {
             match span {

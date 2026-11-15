@@ -5,7 +5,7 @@ pub use parser::{QwenParser, QwenTokens};
 
 use crate::{
     Error, Prompt,
-    render::{function, list, messages, option, whitespace},
+    render::{function, list, messages, whitespace},
 };
 use serde_json::Value;
 
@@ -79,21 +79,6 @@ fn end(prompt: &mut Prompt) {
     prompt.special("<|im_end|>").text("\n");
 }
 
-fn tool_instructions(prompt: &mut Prompt) {
-    // The pinned template tokenizes its fixed examples as real tool markers.
-    // Recognize these only in this trusted constant, never in caller text.
-    let mut tail = TOOL_INSTRUCTIONS;
-    while let Some((offset, marker)) = ["<tool_call>", "</tool_call>"]
-        .iter()
-        .filter_map(|marker| tail.find(marker).map(|offset| (offset, *marker)))
-        .min_by_key(|(offset, _)| *offset)
-    {
-        prompt.text(&tail[..offset]).special(marker);
-        tail = &tail[offset + marker.len()..];
-    }
-    prompt.text(tail);
-}
-
 /// Shared construction parameters for the Qwen-family formats.
 #[derive(Clone, Debug, Default, serde::Deserialize, serde::Serialize)]
 #[serde(default, deny_unknown_fields)]
@@ -133,22 +118,14 @@ impl<const FORMAT: u8> QwenRecipe<FORMAT> {
 }
 impl<const FORMAT: u8> crate::Recipe for QwenRecipe<FORMAT> {
     fn render(&self, request: &Value) -> Result<Prompt, Error> {
-        let request = crate::recipe::request("Qwen", &self.params, request)?;
-        let request = &request;
+        let options = crate::recipe::options("Qwen", &self.params, request)?;
         let messages = messages(request, "Qwen")?;
         let variant35 = FORMAT != QWEN38;
-        let thinking = option(request, "enable_thinking")
-            .and_then(Value::as_bool)
-            .unwrap_or(true);
+        let thinking = options.enable_thinking.unwrap_or(true);
         // Ornith's template renders every past reasoning block unconditionally.
-        let preserve = FORMAT == ORNITH
-            || option(request, "preserve_thinking")
-                .and_then(Value::as_bool)
-                .unwrap_or(!variant35);
+        let preserve = FORMAT == ORNITH || options.preserve_thinking.unwrap_or(!variant35);
         let python_literals = FORMAT == QWEN35;
-        let effort = option(request, "reasoning_effort")
-            .and_then(Value::as_str)
-            .unwrap_or("xhigh");
+        let effort = options.reasoning_effort.as_deref().unwrap_or("xhigh");
         let instructions = if variant35 || !thinking {
             ""
         } else {
@@ -192,7 +169,7 @@ impl<const FORMAT: u8> crate::Recipe for QwenRecipe<FORMAT> {
                     prompt.text("\n").text(crate::json::spaced(tool));
                 }
                 prompt.text("\n</tools>");
-                tool_instructions(&mut prompt);
+                prompt.template(TOOL_INSTRUCTIONS, &["<tool_call>", "</tool_call>"]);
                 if !system.rendered_text().is_empty() {
                     prompt.text("\n\n");
                 }
@@ -217,9 +194,7 @@ impl<const FORMAT: u8> crate::Recipe for QwenRecipe<FORMAT> {
         let last_query =
             last_query.ok_or_else(|| Error::new("no user query found in Qwen messages"))?;
         let mut vision = Vision {
-            labels: option(request, "add_vision_id")
-                .and_then(Value::as_bool)
-                .unwrap_or(false),
+            labels: options.add_vision_id.unwrap_or(false),
             ..Default::default()
         };
         for (index, item) in messages.iter().enumerate() {
@@ -333,10 +308,7 @@ impl<const FORMAT: u8> crate::Recipe for QwenRecipe<FORMAT> {
                 _ => return Err(Error::new("unexpected Qwen message role")),
             }
         }
-        if option(request, "add_generation_prompt")
-            .and_then(Value::as_bool)
-            .unwrap_or(true)
-        {
+        if options.add_generation_prompt.unwrap_or(true) {
             start(&mut prompt, "assistant");
             prompt.special("<think>").text("\n");
             if !thinking {

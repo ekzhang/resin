@@ -146,25 +146,19 @@ impl Config {
             pad(&source, width, height)?
         };
         let mut data = Vec::with_capacity(resized.data.len());
-        for patch_y in 0..n_vit_h {
-            for patch_x in 0..n_vit_w {
-                for channel in 0..3 {
-                    for y in 0..self.patch_size {
-                        for x in 0..self.patch_size {
-                            let index = ((patch_y * self.patch_size + y) * width
-                                + patch_x * self.patch_size
-                                + x)
-                                * 3
-                                + channel;
-                            let rgb8 = (resized.data[index] * 255.0)
-                                .round_ties_even()
-                                .clamp(0.0, 255.0);
-                            data.push(bf16::from_f32((rgb8 / 255.0 - 0.5) / 0.5).to_f32());
-                        }
-                    }
-                }
-            }
-        }
+        super::append_patches(
+            &mut data,
+            [n_vit_h, n_vit_w],
+            self.patch_size,
+            1,
+            1,
+            |y, x, c| {
+                let rgb8 = (resized.data[(y * width + x) * 3 + c] * 255.0)
+                    .round_ties_even()
+                    .clamp(0.0, 255.0);
+                bf16::from_f32((rgb8 / 255.0 - 0.5) / 0.5).to_f32()
+            },
+        );
         Ok(Image {
             patches: Tensor::new(vec![n_vit_h * n_vit_w, 3, 14, 14], data)?,
             n_vit_h,
