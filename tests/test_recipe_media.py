@@ -16,9 +16,9 @@ from resin.recipe import get_native_recipe
 
 MODELS = (
     (
-        "inkling",
-        "thinkingmachines/Inkling-Small-NVFP4",
-        "b6a99534467840620d411e4cd4ad5819b2610d9c",
+        "inkling2",
+        "thinkingmachines/Inkling-2-Small",
+        "2ad1157016e1aac77b6ff1b770e7c05229403134",
     ),
     (
         "qwen3_5",
@@ -135,14 +135,14 @@ def test_native_recipe_preserves_real_image_geometry_and_tools(model_processor):
         }
     ]
     assert_reference_tensors(
-        processor, recipe, messages, tools=tools, resized_pixels=model != "inkling"
+        processor, recipe, messages, tools=tools, resized_pixels=model != "inkling2"
     )
 
 
 def test_native_recipe_matches_unresized_reference_pixels(model_processor):
     model, processor, _recipe = model_processor
     config = processor.image_processor.to_dict()
-    if model == "inkling":
+    if model == "inkling2":
         factor = config["size"]["height"]
     else:
         config["do_resize"] = False

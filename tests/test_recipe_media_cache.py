@@ -17,7 +17,7 @@ import resin
 from resin.recipe import (
     Gemma4Media,
     Image,
-    InklingMedia,
+    Inkling2Media,
     Message,
     RenderedPrompt,
     Role,
@@ -77,7 +77,7 @@ def tokenizer():
 CASES = [
     ("deepseek_v41", {"vision_config": {"min_pixels": 0}}, (14, 28)),
     ("gemma4", {"media_config": GEMMA_CONFIG}, (4, 8)),
-    ("inkling", {"media_config": {"size": {"height": 2, "width": 2}}}, (4, 8)),
+    ("inkling2", {"media_config": {"size": {"height": 2, "width": 2}}}, (4, 8)),
     (
         "qwen3_5",
         {"media_config": {"patch_size": 2, "merge_size": 2, "do_resize": False}},
@@ -111,9 +111,9 @@ def messages(*images, lead="Describe: "):
     return [Message(Role.USER, [Text(lead), *images])]
 
 
-def inkling_pixels(prompt: RenderedPrompt):
+def inkling2_pixels(prompt: RenderedPrompt):
     media = prompt.media
-    assert isinstance(media, InklingMedia)
+    assert isinstance(media, Inkling2Media)
     pixels = media.pixel_values
     assert pixels is not None
     return pixels
@@ -225,7 +225,7 @@ def test_image_transport_roundtrip_preserves_immutable_digest(name, config, shap
 def test_recipe_image_cache_is_bounded_and_recipe_configuration_is_local():
     backend = tokenizer()
     config = {"size": {"height": 2, "width": 2}}
-    recipe = get_native_recipe("inkling", backend, media_config=config)
+    recipe = get_native_recipe("inkling2", backend, media_config=config)
     images = [encoded_image(color=(value, 30, 90)) for value in range(10)]
     for image in images[:8]:
         recipe.render(messages(image))
@@ -240,22 +240,22 @@ def test_recipe_image_cache_is_bounded_and_recipe_configuration_is_local():
     assert info["retained_bytes"] <= 128 * 1024**2
 
     other = get_native_recipe(
-        "inkling", backend, media_config={**config, "do_normalize": False}
+        "inkling2", backend, media_config={**config, "do_normalize": False}
     )
-    normalized = inkling_pixels(recipe.render(messages(images[0])))
-    unnormalized = inkling_pixels(other.render(messages(images[0])))
+    normalized = inkling2_pixels(recipe.render(messages(images[0])))
+    unnormalized = inkling2_pixels(other.render(messages(images[0])))
     assert not np.array_equal(normalized, unnormalized)
     assert other._media_preparation_cache_info()["misses"] == 1
 
 
 def test_mutable_arrays_and_python_tokenizers_bypass_image_cache():
     config = {"size": {"height": 2, "width": 2}}
-    native = get_native_recipe("inkling", tokenizer(), media_config=config)
+    native = get_native_recipe("inkling2", tokenizer(), media_config=config)
     pixels = np.full((4, 8, 3), 0.25, dtype=np.float32)
     request = messages(Image.from_rgb(pixels))
-    first = inkling_pixels(native.render(request)).copy()
+    first = inkling2_pixels(native.render(request)).copy()
     pixels.fill(0.75)
-    second = inkling_pixels(native.render(request))
+    second = inkling2_pixels(native.render(request))
     assert not np.array_equal(first, second)
     assert native._media_preparation_cache_info() == {
         "entries": 0,
@@ -265,12 +265,12 @@ def test_mutable_arrays_and_python_tokenizers_bypass_image_cache():
     }
     encoded = bytearray(encoded_image().source[0])
     request = messages(Image(source=(encoded, "image/png")))
-    first = inkling_pixels(native.render(request)).copy()
+    first = inkling2_pixels(native.render(request)).copy()
     encoded[:] = encoded_image(color=(10, 30, 220)).source[0]
-    second = inkling_pixels(native.render(request))
+    second = inkling2_pixels(native.render(request))
     assert not np.array_equal(first, second)
     assert native._media_preparation_cache_info()["entries"] == 0
-    custom = get_native_recipe("inkling", Tokenizer(), media_config=config)
+    custom = get_native_recipe("inkling2", Tokenizer(), media_config=config)
     custom.render(messages(encoded_image()))
     custom.render(messages(encoded_image()))
     assert custom._media_preparation_cache_info()["entries"] == 0
@@ -292,13 +292,13 @@ def test_image_cache_retains_neither_python_sources_nor_bound_buffers():
         pass
 
     native = get_native_recipe(
-        "inkling", tokenizer(), media_config={"size": {"height": 2, "width": 2}}
+        "inkling2", tokenizer(), media_config={"size": {"height": 2, "width": 2}}
     )
     source = DataUrl(encoded_image(data_url=True).source)
     source_ref = weakref.ref(source)
     request = messages(Image(source=source))
     prompt = native.render(request)
-    pixels_ref = weakref.ref(inkling_pixels(prompt))
+    pixels_ref = weakref.ref(inkling2_pixels(prompt))
     del source, request, prompt
     gc.collect()
     assert native._media_preparation_cache_info()["entries"] == 1
@@ -308,7 +308,7 @@ def test_image_cache_retains_neither_python_sources_nor_bound_buffers():
 
 def test_image_cache_does_not_hide_invalid_mime_or_changed_payload():
     native = get_native_recipe(
-        "inkling", tokenizer(), media_config={"size": {"height": 2, "width": 2}}
+        "inkling2", tokenizer(), media_config={"size": {"height": 2, "width": 2}}
     )
     image = encoded_image()
     native.render(messages(image))

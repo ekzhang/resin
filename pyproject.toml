@@ -68,6 +68,10 @@ include = [
 [tool.ruff]
 target-version = "py311"
 
+[tool.ruff.format]
+# Preserve upstream formatting in the adapted CuTe implementation.
+exclude = ["models/cuda/resin_models_cuda/inkling2/cute_grouped_nvfp4.py"]
+
 [tool.ruff.lint]
 select = ["E4", "E7", "E9", "F", "I", "TID252"]
 
@@ -167,3 +171,11 @@ invalid-mutable-override = "ignore"
 
 [tool.ty.environment]
 extra-paths = [".type-libs/sources"]
+
+[tool.ty.src]
+# CuTe's staged device expressions do not follow Python's static type rules.
+exclude = [
+  "models/cuda/resin_models_cuda/inkling2/cute_grouped_nvfp4.py",
+  "models/cuda/resin_models_cuda/inkling2/fa4_bias_kernel.py",
+  "models/cuda/resin_models_cuda/inkling2/fa4_bias_utils.py",
+]

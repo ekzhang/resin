@@ -186,7 +186,6 @@ def test_capabilities_declare_axes_and_reject_unsupported_combinations():
 @pytest.mark.parametrize(
     "module,runner",
     [
-        ("resin_models_cuda.inkling.cuda", "InklingCudaRunner"),
         ("resin_models_torch.lfm2.reference", "Lfm2TorchRunner"),
     ],
 )
@@ -196,6 +195,20 @@ def test_unsharded_model_implementations_reject_attention_tp(module, runner):
         implementation.parallelism_capabilities.validate(
             Parallelism(world_size=2, attn_tp=2), model=runner
         )
+
+
+def test_inkling2_supports_combined_attention_tp_dp_and_expert_parallelism():
+    from resin_models_cuda.inkling2.cuda import Inkling2CudaRunner
+
+    capabilities = Inkling2CudaRunner.parallelism_capabilities
+    capabilities.validate(
+        Parallelism(world_size=4, attn_tp=2, attn_dp=2, ep=4), model="Inkling 2"
+    )
+    for topology in (
+        Parallelism(world_size=2, attn_tp=2, ep=1),
+        Parallelism(world_size=4, attn_tp=2, ep=2),
+    ):
+        capabilities.validate(topology, model="Inkling 2")
 
 
 @pytest.mark.parametrize(

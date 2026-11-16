@@ -342,33 +342,44 @@ MODEL_SPECS.update(
             recipe="ornith",
             text_only=True,
         ),
-        "inkling": ModelSpec(
-            name="inkling",
-            family="inkling",
+        "inkling2": ModelSpec(
+            name="inkling2",
+            family="inkling2",
             checkpoint=Checkpoint(
-                repo_id="thinkingmachines/Inkling-Small-NVFP4",
-                revision="b6a99534467840620d411e4cd4ad5819b2610d9c",
+                repo_id="thinkingmachines/Inkling-2-Small",
+                revision="2ad1157016e1aac77b6ff1b770e7c05229403134",
                 directory="target",
                 required_files=(
                     "config.json",
                     "tokenizer.json",
                     "tokenizer_config.json",
+                    "mtp.safetensors",
+                ),
+                patterns=(
+                    "*.json",
+                    "*.jinja",
+                    "*.model",
+                    "tokenizer*",
+                    "model*.safetensors",
+                    "mtp.safetensors",
+                    "merges.txt",
+                    "vocab.json",
                 ),
             ),
-            assistant=Checkpoint(
-                repo_id="RadixArk/Inkling-Small-DSpark",
-                revision="736501c3901cfc6bbb53ba382781eb0e5d9ad66a",
-                directory="draft",
-                required_files=("config.json",),
-                patterns=("config.json", "model.safetensors"),
-            ),
-            model_mount="/models/resin-inkling",
-            model_volume="resin-inkling-models-v1",
-            kernel_mount="/kernel-cache/resin-inkling",
-            kernel_volume="resin-inkling-kernels-v2",
+            model_mount="/models/resin-inkling2",
+            model_volume="resin-inkling2-models-v1",
+            kernel_mount="/kernel-cache/resin-inkling2",
+            kernel_volume="resin-inkling2-kernels-v1",
             gpu="B300",
-            label="inkling-small",
-            draft_tokens=5,
+            world_size=2,
+            attn_tp=2,
+            ep=2,
+            label="inkling2-small",
+            expert_backend="cute-dsl",
+            context_length=1_048_576,
+            max_batch_size=256,
+            draft_tokens=7,
+            image_warmup=True,
         ),
     }
 )
@@ -534,7 +545,7 @@ def image_environment(model: str | ModelSpec) -> dict[str, str]:
             "TILELANG_CACHE_DIR": f"{root}/tilelang",
             "FLASHINFER_WORKSPACE_BASE": "/tmp/resin-flashinfer-build",
         }
-    arch = "10.3a" if spec.family == "inkling" else "10.0a"
+    arch = "10.3a" if spec.family == "inkling2" else "10.0a"
     env.update(
         {
             "TORCH_CUDA_ARCH_LIST": arch,
@@ -545,7 +556,7 @@ def image_environment(model: str | ModelSpec) -> dict[str, str]:
             "FLASH_ATTENTION_ARCH": "sm_" + arch.replace(".", ""),
         }
     )
-    if spec.family == "inkling":
+    if spec.family == "inkling2":
         env.update(CUTE_DSL_ARCH="sm_103a")
     else:
         env.update(
@@ -635,14 +646,13 @@ def create_runner(
     )
     page_tokens = {"gpt_oss": 128, "gemma4": 64}.get(spec.family, 1)
     width = (context_length + page_tokens - 1) // page_tokens
-    if spec.family == "inkling":
-        width += draft_tokens
     if decode_batch_sizes is None:
         from resin.backend.cuda.graphs import default_decode_graph_shapes
 
         shapes = default_decode_graph_shapes(
             width,
-            speculative=bool(draft_tokens) and spec.family != "glm5_3_flash",
+            speculative=bool(draft_tokens)
+            and spec.family not in {"glm5_3_flash", "inkling2"},
             max_batch_size=max_batch_size,
         )
     else:
@@ -734,22 +744,22 @@ def create_runner(
             kv_cache_dtype="fp8",
             **common,
         )
-    if spec.family == "inkling":
-        from resin_models_cuda.inkling.cuda import InklingCudaRunner
+    if spec.family == "inkling2":
+        from resin_models_cuda.inkling2.cuda import Inkling2CudaRunner
 
-        if draft_tokens != 5:
-            raise ValueError("Inkling requires its fixed five-token DSpark draft")
-        if groups is not None and groups.topology.world_size != 1:
-            raise ValueError("Inkling currently supports a single GPU")
-        if assistant is None:
-            raise ValueError("Inkling requires a draft checkpoint")
-        return InklingCudaRunner(
+        if expert_backend not in (None, "triton", "cute-dsl"):
+            raise ValueError("Inkling 2 expert backend must be triton or cute-dsl")
+        return Inkling2CudaRunner(
             checkpoint,
-            assistant,
             max_seq_len=context_length,
             max_batch_size=max_batch_size,
+            parallel_groups=groups,
+            speculative_draft_tokens=draft_tokens,
             prefill_chunk_size=prefill_chunk_size,
             gpu_memory_utilization=memory,
+            expert_backend=expert_backend or spec.expert_backend,
+            fast_allreduce=fast_allreduce,
+            fused_attention_prologue=True,
             **common,
         )
     raise ValueError(f"unsupported runner family: {spec.family}")

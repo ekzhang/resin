@@ -123,29 +123,33 @@ macro_rules! media_methods {
 }
 
 #[pyclass(frozen, module = "resin._resin")]
-pub(crate) struct InklingMedia {
+pub(crate) struct Inkling2Media {
     identity: Identity,
     #[pyo3(get, name = "image_token_id")]
     marker: u32,
     positions: Vec<usize>,
     #[pyo3(get, name = "pixel_values")]
     pixels: Option<Py<PyArrayDyn<f32>>>,
+    #[pyo3(get, name = "image_grid_thw")]
+    grids: Option<Py<PyArrayDyn<i64>>>,
 }
 media_methods! {
-    impl InklingMedia {
+    impl Inkling2Media {
         #[new]
-        #[pyo3(signature=(*, token_ids, image_token_id, pixel_values=None))]
+        #[pyo3(signature=(*, token_ids, image_token_id, pixel_values=None, image_grid_thw=None))]
         fn new(
             py: Python<'_>,
             token_ids: Vec<u32>,
             image_token_id: u32,
             pixel_values: Option<&Bound<'_, PyAny>>,
+            image_grid_thw: Option<&Bound<'_, PyAny>>,
         ) -> PyResult<Self> {
             Self::build(
                 py,
                 token_ids,
                 image_token_id,
                 pixel_values.map(tensor).transpose()?,
+                image_grid_thw.map(tensor).transpose()?,
             )
         }
         #[getter]
@@ -158,12 +162,13 @@ media_methods! {
         }
     }
 }
-impl InklingMedia {
+impl Inkling2Media {
     pub(crate) fn build(
         py: Python<'_>,
         tokens: Vec<u32>,
         marker: u32,
         pixels: Option<Tensor<f32>>,
+        grids: Option<Tensor<i64>>,
     ) -> PyResult<Self> {
         let positions = tokens
             .iter()
@@ -171,26 +176,53 @@ impl InklingMedia {
             .filter_map(|(i, &t)| (t == marker).then_some(i))
             .collect::<Vec<_>>();
         let mut hash = Sha256::new();
-        Digest::update(&mut hash, b"resin.inkling.media.v2");
-        let pixels = if let Some(pixels) = pixels {
-            if pixels.shape.len() != 5 || pixels.shape[0] != positions.len() {
+        Digest::update(&mut hash, b"resin.inkling2.media.v1");
+        let (pixels, grids) = if let Some(pixels) = pixels {
+            if pixels.shape.len() != 4
+                || pixels.shape[0] != positions.len()
+                || pixels.shape[1] == 0
+                || pixels.shape[2] == 0
+                || pixels.shape[3] != 3
+            {
                 return Err(error(
-                    "Inkling image placeholder count does not match pixel patches",
+                    "Inkling2 image placeholder count does not match pixel patches",
                 ));
             }
-            hash_tensor(&mut hash, "pixels", &pixels);
-            Some(array(py, pixels)?)
-        } else {
-            if !positions.is_empty() {
-                return Err(error("Inkling image placeholders require pixel_values"));
+            let grids =
+                grids.ok_or_else(|| error("Inkling2 pixel_values require image_grid_thw"))?;
+            if grids.shape.len() != 2
+                || grids.shape[1] != 3
+                || grids
+                    .data
+                    .as_chunks::<3>()
+                    .0
+                    .iter()
+                    .any(|g| g[0] != 1 || g[1] <= 0 || g[2] <= 0)
+                || grids
+                    .data
+                    .as_chunks::<3>()
+                    .0
+                    .iter()
+                    .try_fold(0i64, |total, g| total.checked_add(g[1].checked_mul(g[2])?))
+                    != Some(positions.len() as i64)
+            {
+                return Err(error("Inkling2 image grids do not match pixel patches"));
             }
-            None
+            hash_tensor(&mut hash, "pixels", &pixels);
+            hash_tensor(&mut hash, "grids", &grids);
+            (Some(array(py, pixels)?), Some(array(py, grids)?))
+        } else {
+            if !positions.is_empty() || grids.is_some() {
+                return Err(error("Inkling2 image placeholders require pixel_values"));
+            }
+            (None, None)
         };
         Ok(Self {
             identity: Identity::new(tokens, &positions, hash)?,
             marker,
             positions,
             pixels,
+            grids,
         })
     }
 }
@@ -761,7 +793,7 @@ struct MediaTransfer {
 #[derive(Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 enum MediaDescriptor {
-    Inkling {
+    Inkling2 {
         marker: u32,
         pixels: bool,
     },
@@ -821,13 +853,18 @@ pub(crate) fn _media_to_buffers(
     media: &Bound<'_, PyAny>,
 ) -> PyResult<(Py<PyBytes>, Py<PyTuple>)> {
     let mut buffers = Vec::new();
-    let descriptor = if let Ok(value) = media.cast::<InklingMedia>() {
+    let descriptor = if let Ok(value) = media.cast::<Inkling2Media>() {
         let value = value.borrow();
         push_values(media, &mut buffers, &value.identity.tokens);
         if let Some(pixels) = &value.pixels {
             push_buffer(py, &mut buffers, pixels);
+            push_buffer(
+                py,
+                &mut buffers,
+                value.grids.as_ref().expect("validated image grids"),
+            );
         }
-        MediaDescriptor::Inkling {
+        MediaDescriptor::Inkling2 {
             marker: value.marker,
             pixels: value.pixels.is_some(),
         }
@@ -929,9 +966,13 @@ pub(crate) fn _media_from_buffers(
     }
     let tokens = tokens.data;
     let media = match descriptor.media {
-        MediaDescriptor::Inkling { marker, pixels } => {
+        MediaDescriptor::Inkling2 { marker, pixels } => {
             let pixels = pixels.then(|| take_buffer(py, &mut buffers)).transpose()?;
-            Py::new(py, InklingMedia::build(py, tokens, marker, pixels)?)?.into_any()
+            let grids = pixels
+                .as_ref()
+                .map(|_| take_buffer(py, &mut buffers))
+                .transpose()?;
+            Py::new(py, Inkling2Media::build(py, tokens, marker, pixels, grids)?)?.into_any()
         }
         MediaDescriptor::Qwen {
             positions,

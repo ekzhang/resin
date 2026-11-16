@@ -155,6 +155,9 @@ class FlashInferAllReduce:
     back to the process group's ordinary collective. This lets decode use the
     custom kernel without reserving a context-sized communication workspace
     for prefill.
+
+    Outputs own their storage, but calls share a communication workspace.
+    Order calls on one stream; concurrent streams need separate instances.
     """
 
     def __init__(

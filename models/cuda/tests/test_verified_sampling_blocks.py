@@ -9,10 +9,11 @@ import torch
 
 from resin import BatchPhase, BatchPlan, SamplingParams
 from resin.backend.cuda.sampling import FusedSampler
+from resin.backend.cuda.staging import TensorStager
 from resin.backend.speculative import SpeculativeStats
 from resin_models_cuda.deepseek_v41.cuda import DeepSeekV41CudaRunner
-from resin_models_cuda.inkling import cuda as inkling_runtime
-from resin_models_cuda.inkling.cuda import InklingCudaRunner
+from resin_models_cuda.inkling2 import cuda as inkling_runtime
+from resin_models_cuda.inkling2.cuda import Inkling2CudaRunner
 
 
 class _BlockSampler:
@@ -26,7 +27,7 @@ class _BlockSampler:
     def empty(self, rows, device):
         return object.__new__(FusedSampler).empty(rows, device)
 
-    def __call__(self, logits, plan):
+    def __call__(self, logits, plan, **kwargs):
         self._record(logits)
         assert plan.num_sequences == logits.shape[0]
         return self.targets.clone()
@@ -72,7 +73,43 @@ def _fixture(runner_type, *, scored=False):
     return runner, plan, logits, drafts, targets
 
 
-@pytest.mark.parametrize("runner_type", [DeepSeekV41CudaRunner, InklingCudaRunner])
+def _inkling_fixture(monkeypatch, runner, logits, drafts, counts, stored):
+    monkeypatch.setattr(
+        inkling_runtime,
+        "TensorStager",
+        lambda _device: SimpleNamespace(
+            device=lambda _name, values, dtype: torch.tensor(values, dtype=dtype)
+        ),
+    )
+    runner.parallel_groups = None
+    runner.cache_geometry = SimpleNamespace(state_width=4)
+    runner._graph_inputs = {}
+    runner._initial_state = lambda *a: torch.zeros(2, 1, 3, 4)
+    runner._draft = SimpleNamespace(
+        propose=lambda *a, **kw: drafts,
+        inject_target=lambda *a: torch.arange(12).view(2, 3, 2).float(),
+    )
+    runner._model = lambda *a, **kw: (logits, object(), torch.zeros(2, 1, 3, 4), None)
+    cache = SimpleNamespace(
+        draft_features_at=lambda positions: torch.zeros(2, 1, 2),
+        store_draft_features=lambda *a: None,
+        store_state=lambda positions, state: stored.append(positions.flatten().clone()),
+    )
+    runner._cache = SimpleNamespace(
+        tensorize=lambda *a: cache,
+        graph_cache=lambda *a: cache,
+        graph_device_inputs=lambda *a: {},
+        reset_null=lambda: None,
+    )
+
+    def rollback(initial, _inputs, accepted):
+        counts.append(accepted.tolist())
+        return initial
+
+    monkeypatch.setattr(inkling_runtime, "select_convolution_state", rollback)
+
+
+@pytest.mark.parametrize("runner_type", [DeepSeekV41CudaRunner, Inkling2CudaRunner])
 @pytest.mark.parametrize("scored", [False, True])
 @pytest.mark.parametrize("all_rejected", [False, True])
 def test_eager_verification_routes_scores_and_rolls_back_accepted_state(
@@ -97,38 +134,45 @@ def test_eager_verification_routes_scores_and_rolls_back_accepted_state(
         )
     else:
         runtime = inkling_runtime
-        runner._draft = SimpleNamespace(
-            propose=lambda *a: (drafts, None), inject_target=lambda *a: None
-        )
-        runner._model = SimpleNamespace(
-            target=lambda *a, **kw: (logits, object(), object(), None)
-        )
-        runner._initial_state = lambda *a: object()
-        runner._store_state = lambda _cache, ends, _state: stored.append(ends)
-        monkeypatch.setattr(
-            runtime,
-            "select_convolution_state",
-            lambda _initial, _inputs, processed, **kw: counts.append(
-                processed.tolist()
-            ),
-        )
+        _inkling_fixture(monkeypatch, runner, logits, drafts, counts, stored)
 
     prepared, result = object(), object()
 
     def score(raw, decision, native):
-        assert scored and raw is logits and native is plan
-        return prepared
+        assert raw is logits and native is plan
+        return prepared if scored else None
 
     def complete(decision, **kwargs):
-        assert kwargs["scores"] is prepared and kwargs["plan"] is plan
-        return SimpleNamespace(result=lambda: result)
+        assert (
+            kwargs["scores"] is (prepared if scored else None)
+            and kwargs["plan"] is plan
+        )
+        output = (
+            result
+            if scored
+            else SimpleNamespace(
+                token_ids=torch.cat(
+                    [
+                        tokens[:count]
+                        for tokens, count in zip(
+                            decision.tokens, decision.counts.tolist(), strict=True
+                        )
+                    ]
+                )
+            )
+        )
+        return SimpleNamespace(result=lambda: output)
 
     monkeypatch.setattr(runtime, "score_completion", score)
     monkeypatch.setattr(
         runtime, "DeviceCompletion", SimpleNamespace(from_acceptance=complete)
     )
-    output = runner._speculative_decode(
-        plan, object(), torch.tensor(plan.token_ids, dtype=torch.int64), positions
+    output = (
+        runner._speculative_decode(
+            plan, object(), torch.tensor(plan.token_ids, dtype=torch.int64), positions
+        )
+        if runner_type is DeepSeekV41CudaRunner
+        else runner._eager(plan, object())
     )
     expected = [1, 1] if all_rejected else [2, 3]
     assert counts == [expected]
@@ -209,51 +253,38 @@ def test_deepseek_graph_verification_samples_and_broadcasts_one_block():
 
 
 @pytest.mark.parametrize("all_rejected", [False, True])
-def test_inkling_graph_keeps_target_logits_and_one_device_acceptance(
+def test_inkling2_graph_keeps_target_logits_and_one_device_acceptance(
     monkeypatch, all_rejected
 ):
-    runner, plan, logits, drafts, targets = _fixture(InklingCudaRunner)
+    runner, plan, logits, drafts, targets = _fixture(Inkling2CudaRunner)
     if all_rejected:
         targets[:, 0].fill_(9)
     runner._graph_device_caches = {}
-    runner._cache = SimpleNamespace(
-        graph_cache=lambda *_args: object(),
-        graph_device_inputs=lambda _cache: {},
-        reset_null=lambda: None,
+    state_positions, state_counts = [], []
+    _inkling_fixture(monkeypatch, runner, logits, drafts, state_counts, state_positions)
+    shape = (2, 128, 2)
+    step = runner._new_decode_graph_step(shape)
+    step.inputs["token_ids"].copy_(
+        torch.tensor(plan.token_ids, dtype=torch.int64).view(2, 1)
     )
-    runner._new_phase_timing = lambda *_args: None
-    runner._graph_state_inputs = torch.empty(2)
-    runner._draft = SimpleNamespace(
-        propose=lambda *_args: (drafts, None),
-        inject_target=lambda *_args: None,
-    )
-    runner._model = SimpleNamespace(
-        target=lambda *_args, **_kwargs: (logits, object(), object(), None)
-    )
-    runner._initial_state = lambda *_args: object()
-    state_positions = []
-    runner._store_state = lambda _cache, positions, _state: state_positions.append(
-        positions.clone()
-    )
-    state_counts = []
-    monkeypatch.setattr(
-        inkling_runtime,
-        "select_convolution_state",
-        lambda _initial, _inputs, counts, **_kwargs: state_counts.append(
-            counts.clone()
-        ),
-    )
-    step = runner._new_decode_graph_step((2, 128))
-    step.inputs["token_ids"].copy_(torch.tensor(plan.token_ids, dtype=torch.int64))
     positions = torch.tensor(plan.positions, dtype=torch.int64)
     step.inputs["positions"].copy_(positions)
     step.launch()
 
-    acceptance = runner._graph_acceptance[(2, 128)]
+    acceptance = runner._graph_acceptance[shape]
     expected = [1, 1] if all_rejected else [2, 3]
     assert acceptance.counts.tolist() == expected
-    assert state_counts[0].tolist() == expected
+    assert state_counts[0] == expected
     torch.testing.assert_close(state_positions[0], positions + acceptance.counts - 1)
-    assert runner._graph_logits[(2, 128)] is logits
+    assert runner._graph_logits[shape] is logits
     assert runner._sampler.calls == [(2, 3, 10)]
-    torch.testing.assert_close(step.output, torch.cat((drafts, targets), dim=1))
+    torch.testing.assert_close(step.output, acceptance.tokens)
+
+    # Overlapped continuations stage device-owned feedback, whose shapes must
+    # agree with the captured buffers without host reshaping.
+    feedback = acceptance.feedback().inputs()
+    TensorStager("cpu").copy_into(
+        {name: step.inputs[name] for name in feedback}, feedback
+    )
+    torch.testing.assert_close(step.inputs["token_ids"], feedback["token_ids"])
+    torch.testing.assert_close(step.inputs["positions"], positions + acceptance.counts)

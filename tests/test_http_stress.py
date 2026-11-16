@@ -216,6 +216,24 @@ def test_client_against_real_resin_http_listener(stream):
         assert errors == []
 
 
+def test_invalid_top_logprobs_case_is_rejected_before_generation():
+    from test_http_lifecycle import Recipe, Runner, running_server
+
+    case = next(
+        case for case in robustness_cases("test", 1) if case.name == "bad-top-logprobs"
+    )
+
+    async def run(base):
+        async with httpx.AsyncClient(base_url=base + "/v1/") as client:
+            return await run_case(client, case, 5)
+
+    runner = Runner()
+    with running_server(runner, Recipe()) as (_, _, _, errors, base, _):
+        result = asyncio.run(run(base))
+        assert result["ok"] and result["status"] in (400, 422), result
+        assert not runner.counts and not errors
+
+
 def test_each_routed_rank_gets_both_protocols_scoring_modes_and_prompt_lengths():
     cases = [chat_case("model", i, 4, 16) for i in range(192)]
     for rank in range(4):

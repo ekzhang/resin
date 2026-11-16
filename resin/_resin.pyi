@@ -777,7 +777,7 @@ class Image:
     def source(self, /) -> Any: ...
 
 @final
-class InklingMedia:
+class Inkling2Media:
     def __new__(
         cls,
         /,
@@ -785,7 +785,8 @@ class InklingMedia:
         token_ids: Sequence[int],
         image_token_id: int,
         pixel_values: Any | None = None,
-    ) -> InklingMedia: ...
+        image_grid_thw: Any | None = None,
+    ) -> Inkling2Media: ...
     @property
     def cache_key(self, /) -> tuple[int, ...]: ...
     @property
@@ -796,6 +797,8 @@ class InklingMedia:
     def image_token_id(self, /) -> int: ...
     @property
     def pixel_values(self, /) -> npt.NDArray[np.float32] | None: ...
+    @property
+    def image_grid_thw(self, /) -> npt.NDArray[np.int64] | None: ...
     @property
     def token_ids(self, /) -> tuple[int, ...]: ...
     @property

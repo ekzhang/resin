@@ -124,6 +124,7 @@ def perfetto_trace(
 
     directory = Path(directory)
     directory.mkdir(parents=True, exist_ok=True)
+    occurrences = Counter()
     if synchronize is None:
         synchronize = torch.cuda.synchronize
     activities = [torch.profiler.ProfilerActivity.CPU]
@@ -131,7 +132,11 @@ def perfetto_trace(
         activities.append(torch.profiler.ProfilerActivity.CUDA)
 
     def trace(case, run_pass):
-        name = f"{case.phase}-ctx{case.context_length}-b{case.batch_size}-rank{rank:03}"
+        name = f"{case.phase}-ctx{case.context_length}-b{case.batch_size}"
+        occurrences[name] += 1
+        if occurrences[name] > 1:
+            name += f"-repeat{occurrences[name]:03}"
+        name += f"-rank{rank:03}"
         target = directory / f"{name}.json.gz"
         passes = decode_passes if case.phase == "decode" else 2
         unit = "decode completions" if case.phase == "decode" else "prefill cohorts"
@@ -410,6 +415,7 @@ def run_sweep(
     on_result: Callable[[dict], None] | None = None,
     trace_step: Callable[[BenchCase, Callable[[], dict]], None] | None = None,
     trace_decode_passes: int | None = None,
+    retain_outputs: bool = False,
 ) -> list[dict]:
     """Measure prefill cohorts or a steady decode window on an existing Engine.
 
@@ -432,6 +438,8 @@ def run_sweep(
     calls than reserved fail before executing extra work. All distributed
     drivers must use the same passes. Trace output headroom preserves the normal
     continuation guard; cache-page boundaries can still interrupt overlap.
+    retain_outputs saves local-replica output IDs after cleanup, including warmup
+    and any untimed trace continuation; measured context endpoints delimit timing.
     """
 
     sampling = dict[str, Any]({"temperature": 0.0, **(sampling or {})})
@@ -880,6 +888,10 @@ def run_sweep(
                     if not lease.done:
                         engine.cancel(lease)
                 local.clear_prefix_cache()
+        if retain_outputs:
+            records[-1]["local_output_token_ids"] = [
+                lease.take_result() for lease in leases
+            ]
         if on_result is not None:
             on_result(records[-1])
     return records

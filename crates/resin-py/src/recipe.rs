@@ -505,7 +505,11 @@ impl NativeRecipe {
         let sources = if cached.is_some() {
             Vec::new()
         } else {
-            media_preprocess::sources(py, sources)?
+            media_preprocess::sources(
+                py,
+                sources,
+                matches!(self.media_config, Some(MediaConfig::Inkling2(_))),
+            )?
         };
         let (token_ids, preparation, placements) = py.detach(|| -> PyResult<_> {
             let preparation = if let Some(prepared) = cached {
@@ -741,7 +745,7 @@ pub(crate) fn get_native_recipe(
                 params,
             )?))
         }
-        "inkling" => Box::new(resin_recipe::inkling::InklingRecipe::new(recipe_params(
+        "inkling2" => Box::new(resin_recipe::inkling2::Inkling2Recipe::new(recipe_params(
             image_processor_params(tokenizer, params)?,
         )?)),
         "lfm2" => Box::new(resin_recipe::lfm2::Lfm2Recipe::new(recipe_params(params)?)),

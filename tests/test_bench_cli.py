@@ -10,6 +10,142 @@ import pytest
 from scripts import bench
 
 
+def test_repeats_defer_all_profiles_and_keep_identical_headroom():
+    from resin.bench import BenchCase
+
+    cases = [
+        BenchCase(phase="decode", context_length=32768, batch_size=batch)
+        for batch in (1, 8, 32)
+    ]
+    seen, profiles = [], []
+
+    def trace(case, step):
+        profiles.append((len(seen), case.batch_size))
+
+    def sweep(engine, selected, **kwargs):
+        seen.append((selected, kwargs))
+        for case in selected:
+            kwargs["trace_step"](case, lambda: None)
+
+    bench._repeat_sweeps(
+        sweep,
+        object(),
+        cases,
+        options=dict(repeats=3, trace_after_sweep=True, trace_batch_sizes=[1, 32]),
+        metadata={"source": "frozen"},
+        trace_step=trace,
+        warmup_steps=8,
+        measure_steps=128,
+        on_result=object(),
+    )
+    assert profiles == [(4, 1), (4, 32)]
+    assert [entry[1]["metadata"]["repeat"] for entry in seen[:3]] == [1, 2, 3]
+    assert all(entry[1]["warmup_steps"] == 8 for entry in seen)
+    assert all(entry[1]["measure_steps"] == 128 for entry in seen)
+    assert all(entry[1]["trace_step"] is not None for entry in seen)
+    assert seen[-1][1]["on_result"] is None
+    assert seen[-1][1]["metadata"]["benchmark_role"] == "untimed_trace_cohort"
+
+
+def test_capacity_only_probe_never_enters_capture_or_retained_cases(capsys):
+    from resin import CacheGroupLayout, CacheLayout
+    from resin.backend.capacity import plan_cache_capacity
+    from resin.bench import BenchCase
+
+    plan = plan_cache_capacity(100_000, 100_000, 0.9, 100)
+    raw = SimpleNamespace(
+        cache_capacity_plan=plan,
+        cache_layout=CacheLayout(
+            parent_capacity=plan.parent_capacity, groups=[CacheGroupLayout(128)]
+        ),
+        runner_config=SimpleNamespace(max_accepted_per_step=8),
+        enqueue=lambda: None,
+    )
+    cases = [BenchCase(phase="decode", context_length=32768, batch_size=1)]
+    options: dict = dict(
+        warmup_steps=8,
+        measure_steps=128,
+        draft_tokens=7,
+        trace_dir="traces",
+        capacity_probe_batch_sizes=[64],
+    )
+    retained, skipped = bench._cache_preflight(raw, cases, options)
+    assert retained == cases and not skipped
+    probe = options["cache_capacity_probes"][0]
+    assert probe["batch_size"] == 64
+    assert probe["peak_context"] == 33905
+    assert probe["fits"] is False and probe["measured"] is False
+    assert '"probes"' in capsys.readouterr().out
+
+
+@pytest.mark.parametrize("value", [0, -1])
+def test_repeat_count_must_be_positive(value):
+    args = bench.argument_parser().parse_args(
+        ["--model", "inkling2", "--repeats", str(value)]
+    )
+    with pytest.raises(ValueError, match="repeats"):
+        bench._configuration(args)
+
+
+def test_resident_sweep_api_accepts_and_forwards_cli_repeat_options(monkeypatch):
+    args = bench.argument_parser().parse_args(
+        [
+            "--model",
+            "inkling2",
+            "--repeats",
+            "3",
+            "--trace-after-sweep",
+            "--trace-batch-sizes",
+            "1,8",
+            "--capacity-probe-batch-sizes",
+            "64",
+        ]
+    )
+    _, cases, topology, options = bench._configuration(args)
+    checked = []
+
+    def validate(model, cases, topology, forwarded):
+        checked.append(forwarded)
+        raise RuntimeError("CPU-only API boundary")
+
+    monkeypatch.setattr(bench, "_validate_configuration", validate)
+    with pytest.raises(RuntimeError, match="CPU-only API boundary"):
+        bench.run_benchmark(
+            "inkling2", "/unused", cases, parallelism=topology, **options
+        )
+    assert checked[0]["repeats"] == 3
+    assert checked[0]["trace_after_sweep"] is True
+    assert checked[0]["trace_batch_sizes"] == [1, 8]
+    assert checked[0]["capacity_probe_batch_sizes"] == [64]
+
+
+def test_fast_allreduce_reaches_runner_and_rejects_unsupported_models(monkeypatch):
+    from resin.bench import BenchCase
+
+    args = bench.argument_parser().parse_args(
+        ["--model", "inkling2", "--fast-allreduce"]
+    )
+    spec, cases, topology, options = bench._configuration(args)
+    monkeypatch.setattr(bench, "create_runner", lambda *args, **kwargs: kwargs)
+    runner_options = bench._runner(
+        spec.name,
+        "/checkpoint",
+        device="cuda:0",
+        groups=None,
+        cases=[BenchCase(**cases[0])],
+        options=options,
+        context_capacity=8192,
+    )
+    assert options["fast_allreduce"] is True
+    assert runner_options["fast_allreduce"] is True
+    assert topology.world_size == 2
+    args = bench.argument_parser().parse_args(
+        ["--model", "glm-5.3-flash", "--fast-allreduce"]
+    )
+    with pytest.raises(ValueError, match="does not support fast all-reduce"):
+        bench._configuration(args)
+
+
 @pytest.mark.parametrize("name", bench.MODEL_SPECS)
 def test_model_defaults_build_valid_natural_sweeps(name):
     args = bench.argument_parser().parse_args(["--model", name])
@@ -29,6 +165,61 @@ def test_model_defaults_build_valid_natural_sweeps(name):
         for case in cases
         if case["phase"] == "decode"
     ] == [(8192, batch) for batch in (1, 2, 4, 8, 16, 32, 64)]
+
+
+def test_paired_topologies_keep_allocation_and_independent_metadata(monkeypatch):
+    import subprocess
+
+    from deploy import modal_bench
+
+    monkeypatch.setattr(subprocess, "check_output", lambda *a, **kw: "GPU0\nGPU1\n")
+    seen = []
+
+    def run(model, cases, topology, options, **kwargs):
+        seen.append((topology, options["metadata"]["benchmark_sequence"]))
+        return [{"topology": topology}]
+
+    monkeypatch.setattr(modal_bench, "_run_sweep", run)
+    topology = dict(world_size=2, attn_tp=2, attn_dp=1, ep=2, cp=1)
+    variants = [{"name": "EP2"}, {"name": "ETP2", "topology": {"ep": 1}}]
+    modal_bench.sweep_sequence.local("inkling2", [], topology, {}, variants)
+    assert [item[0]["ep"] for item in seen] == [2, 1]
+    assert all(item[0]["attn_tp"] == 2 for item in seen)
+    assert [item[1]["name"] for item in seen] == ["EP2", "ETP2"]
+    assert all(item[1]["gpu_uuid"] == "GPU0\nGPU1" for item in seen)
+    assert topology["ep"] == 2
+    with pytest.raises(ValueError, match="retain the GPU count"):
+        modal_bench.sweep_sequence.local(
+            "inkling2",
+            [],
+            topology,
+            {},
+            [{"name": "wrong", "topology": {"world_size": 4}}],
+        )
+    assert len(seen) == 2
+
+
+def test_saved_custom_prompt_and_output_retention_are_forwarded():
+    args = bench.argument_parser().parse_args(
+        [
+            "--model",
+            "inkling2",
+            "--prompt-source",
+            "saved",
+            "--prompt-corpus",
+            "literal.zip",
+            "--retain-outputs",
+            "--context-lengths",
+            "27",
+            "--batch-sizes",
+            "1",
+        ]
+    )
+    _, cases, _, options = bench._configuration(args)
+    assert options["prompt_source"] == "saved"
+    assert options["retain_outputs"] is True
+    assert str(options["prompt_corpus"]) == "literal.zip"
+    assert all(case["context_length"] == 27 for case in cases)
 
 
 def test_phase_specific_sweeps_override_shared_values():
@@ -320,7 +511,7 @@ def test_modal_download_is_cpu_only_and_uses_shared_registry(monkeypatch, capsys
 @pytest.mark.parametrize(
     "arguments,fragment",
     [
-        (["--model", "inkling", "--balanced-experts"], "balanced expert routing"),
+        (["--model", "inkling2", "--balanced-experts"], "balanced expert routing"),
         (["--model", "qwen3_5", "--gpu", "B300"], "GPU-specific kernel"),
     ],
 )

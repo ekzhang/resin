@@ -14,14 +14,15 @@ from resin import (
     SamplingParams,
 )
 from resin.backend.plan_transport import PlanTransport, RequestRegistration
-from resin.recipe import InklingMedia
+from resin.recipe import Inkling2Media
 
 
 def media(value=0.5):
-    return InklingMedia(
+    return Inkling2Media(
         token_ids=[7, 200054, 9],
         image_token_id=200054,
-        pixel_values=np.full((1, 2, 2, 2, 3), value, dtype=np.float32),
+        pixel_values=np.full((1, 2, 2, 3), value, dtype=np.float32),
+        image_grid_thw=np.array([[1, 1, 1]], dtype=np.int64),
     )
 
 
@@ -233,7 +234,7 @@ def test_restore_owns_step_arrays_and_registration_buffers():
     assert restored.sequence_ids.tolist() == [9]
     assert restored.token_ids.tolist() == [7, 200054, 9]
     received = restored.media[0]
-    assert isinstance(received, InklingMedia)
+    assert isinstance(received, Inkling2Media)
     assert received.token_ids == (7, 200054, 9)
     np.testing.assert_array_equal(received.pixel_values, 0.5)
 
@@ -269,8 +270,8 @@ def test_release_allows_new_request_with_same_id_without_invalidating_old_plan()
     assert len(second_packet.registrations) == 1
     second = receiver.restore(second_packet)
     assert first.media[0] is not second.media[0]
-    assert isinstance(first.media[0], InklingMedia)
-    assert isinstance(second.media[0], InklingMedia)
+    assert isinstance(first.media[0], Inkling2Media)
+    assert isinstance(second.media[0], Inkling2Media)
     np.testing.assert_array_equal(first.media[0].pixel_values, 0.25)
     np.testing.assert_array_equal(second.media[0].pixel_values, 0.75)
     assert second.sampling_params[0].temperature == 0

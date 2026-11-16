@@ -37,7 +37,7 @@ layouts it can actually support.
 
 `GptOssCudaRunner` owns GPT-OSS paging, FA4, router, sampling, and
 tensor-parallel execution directly in the GPT-OSS model folder. Gemma 4,
-Qwen3.5, Inkling, and DeepSeek V4.1 likewise derive directly from `CudaRunner`;
+Qwen3.5, Inkling 2, and DeepSeek V4.1 likewise derive directly from `CudaRunner`;
 there is no intermediate runner named for paging or MoE unless a second model
 actually shares its complete execution contract.
 

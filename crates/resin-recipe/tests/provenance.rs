@@ -1,7 +1,7 @@
 use resin_recipe::deepseek::DeepSeekV41Recipe;
 use resin_recipe::gemma::Gemma4Recipe;
 use resin_recipe::gpt_oss::GptOssRecipe;
-use resin_recipe::inkling::InklingRecipe;
+use resin_recipe::inkling2::Inkling2Recipe;
 use resin_recipe::lfm2::Lfm2Recipe;
 use resin_recipe::qwen::Qwen38Recipe;
 use resin_recipe::{
@@ -166,7 +166,7 @@ fn all_model_grammars_preserve_unicode_and_source_indices_across_batching() {
             &["<|im_end|>", "<|im_start|>", "assistant", "<|im_sep|>"][..],
         ),
         (
-            recipe::<InklingRecipe>(),
+            recipe::<Inkling2Recipe>(),
             &["<|content_thinking|>"],
             &[],
             &["<|content_text|>"],
@@ -279,7 +279,7 @@ fn transformed_tools_have_no_fabricated_provenance_and_serde_keeps_flat_events()
     let tokenizer = tokenizer(false, &[]);
     for (model, open, body, close) in [
         (
-            recipe::<InklingRecipe>(),
+            recipe::<Inkling2Recipe>(),
             "<|content_invoke_tool_json|>",
             r#"{"name":"f","args":{"a":1}}"#,
             "<|content_text|>",

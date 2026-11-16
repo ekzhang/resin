@@ -126,6 +126,30 @@ def test_next_device_submission_precedes_previous_cpu_harvest():
     runner.shutdown()
 
 
+@pytest.mark.parametrize("output_count", [16, 32])
+def test_eight_token_verification_requires_output_headroom(output_count):
+    runner = AsyncRunner()
+    runner.runner_config = RunnerConfig(
+        cache_layout=runner.runner_config.cache_layout,
+        max_accepted_per_step=8,
+    )
+    engine = Engine(runner, enable_overlap=True)
+    request = engine.submit(
+        [1] * 129, sampling_params=SamplingParams(max_output_tokens=output_count)
+    )
+    try:
+        while engine.has_work():
+            engine.step()
+        assert request.take_result() == list(range(2, output_count + 2))
+        if output_count == 16:
+            assert engine.overlap_stats == (0, 0)
+        else:
+            assert engine.overlap_stats[1] > 0
+    finally:
+        engine.close()
+        runner.shutdown()
+
+
 @pytest.mark.parametrize("overlap", [True, False])
 def test_overlap_switch_preserves_single_step_for_synchronous_runners(overlap):
     class Synchronous:

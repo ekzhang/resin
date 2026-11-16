@@ -94,10 +94,11 @@ def test_media_transfer_rejects_unknown_types_versions_and_malformed_buffers():
     custom: Any = SimpleNamespace(token_ids=(1,))
     with pytest.raises(TypeError, match="custom media.*local"):
         resin._resin._media_to_buffers(custom)
-    media = resin.recipe.InklingMedia(
+    media = resin.recipe.Inkling2Media(
         token_ids=(2, 8),
         image_token_id=8,
-        pixel_values=np.ones((1, 1, 2, 2, 3), dtype=np.float32),
+        pixel_values=np.ones((1, 2, 2, 3), dtype=np.float32),
+        image_grid_thw=np.array([[1, 1, 1]], dtype=np.int64),
     )
     metadata, buffers = resin._resin._media_to_buffers(media)
     descriptor = json.loads(metadata)
@@ -120,15 +121,16 @@ def test_media_transfer_rejects_unknown_types_versions_and_malformed_buffers():
         resin._resin._media_from_buffers(metadata, (buffers[0][None], *buffers[1:]))
     with pytest.raises(ValueError, match="placeholder count"):
         resin._resin._media_from_buffers(
-            metadata, (buffers[0], np.ones((2, 1, 2, 2, 3), dtype=np.float32))
+            metadata, (buffers[0], np.ones((2, 2, 2, 3), dtype=np.float32), buffers[2])
         )
 
 
 def test_media_transfer_snapshots_receiver_and_keeps_sender_buffers_alive():
-    media = resin.recipe.InklingMedia(
+    media = resin.recipe.Inkling2Media(
         token_ids=(2, 8),
         image_token_id=8,
-        pixel_values=np.ones((1, 1, 2, 2, 3), dtype=np.float32),
+        pixel_values=np.ones((1, 2, 2, 3), dtype=np.float32),
+        image_grid_thw=np.array([[1, 1, 1]], dtype=np.int64),
     )
     metadata, buffers = resin._resin._media_to_buffers(media)
     assert buffers[1] is media.pixel_values
@@ -157,7 +159,7 @@ def test_image_sources_share_one_owned_rgb_boundary() -> None:
     raw = encoded.getvalue()
     rgb = pixels.astype(np.float32) / np.float32(255)
     recipe = get_native_recipe(
-        "inkling", Tokenizer(), media_config={"size": {"height": 2, "width": 2}}
+        "inkling2", Tokenizer(), media_config={"size": {"height": 2, "width": 2}}
     )
     sources = (
         resin.recipe.Image.from_rgb(rgb),
@@ -179,7 +181,7 @@ def test_image_sources_share_one_owned_rgb_boundary() -> None:
     assert np.array_equal(payloads[0].pixel_values, before)
 
 
-@pytest.mark.parametrize("recipe_name", ["inkling", "qwen3_5"])
+@pytest.mark.parametrize("recipe_name", ["inkling2", "qwen3_5"])
 def test_image_only_recipes_reject_video(recipe_name) -> None:
     recipe = get_native_recipe(recipe_name, Tokenizer())
     with pytest.raises(ValueError, match="image|video"):
@@ -241,7 +243,7 @@ def test_gemma_interleaved_geometry_and_atomic_spans() -> None:
     assert restored.video_positions == media.video_positions
 
 
-def test_qwen_and_inkling_native_patch_counts_and_layout() -> None:
+def test_qwen_and_inkling2_native_patch_counts_and_layout() -> None:
     pixels = np.full((4, 8, 3), 0.5, dtype=np.float32)
     qwen = get_native_recipe(
         "qwen3_5",
@@ -265,16 +267,16 @@ def test_qwen_and_inkling_native_patch_counts_and_layout() -> None:
         media, "pixel_values", "image_grid_thw", "position_ids"
     )
     assert restored.rope_delta == media.rope_delta
-    inkling = get_native_recipe(
-        "inkling",
+    inkling2 = get_native_recipe(
+        "inkling2",
         Tokenizer(),
         media_config={"size": {"height": 2, "width": 2}, "do_normalize": False},
     )
-    media = render_media(inkling, [resin.recipe.Image.from_rgb(pixels)])
-    assert len(media.image_positions) == 10
-    assert media.pixel_values.shape == (10, 2, 2, 2, 3)
-    assert np.all(media.pixel_values[[4, 9]] == -1)
-    assert np.all(media.pixel_values[[0, 1, 2, 3, 5, 6, 7, 8]] == 0.5)
+    media = render_media(inkling2, [resin.recipe.Image.from_rgb(pixels)])
+    assert len(media.image_positions) == 8
+    assert media.pixel_values.shape == (8, 2, 2, 3)
+    assert media.image_grid_thw.tolist() == [[1, 2, 4]]
+    assert np.all(media.pixel_values == 0.5)
     assert media.token_spans == ()
 
 
@@ -349,7 +351,7 @@ def test_native_media_does_not_import_python_image_or_tensor_libraries() -> None
             ('qwen3_5', {{'media_config': {{'patch_size': 2, 'merge_size': 2, 'do_resize': False}}}}, (4, 4)),
             ('qwen3_8', {{'media_config': {{'patch_size': 2, 'merge_size': 2, 'do_resize': False}}}}, (4, 4)),
             ('glm5_3_flash', {{'media_config': {{'patch_size': 2, 'merge_size': 2, 'do_resize': False}}}}, (4, 4)),
-            ('inkling', {{'media_config': {{'size': {{'height': 2, 'width': 2}}}}}}, (2, 2)),
+            ('inkling2', {{'media_config': {{'size': {{'height': 2, 'width': 2}}}}}}, (2, 2)),
             ('deepseek_v41', {{'vision_config': {{'min_pixels': 0}}}}, (14, 14)),
         ]
         for name, config, size in cases:
@@ -361,7 +363,7 @@ def test_native_media_does_not_import_python_image_or_tensor_libraries() -> None
             assert prompt.media is not None
             assert isinstance(prompt.media.token_ids, tuple)
             assert resin._resin._media_from_buffers(*resin._resin._media_to_buffers(prompt.media)).cache_key == prompt.media.cache_key
-            if name == 'inkling':
+            if name == 'inkling2':
                 encoded = resin.recipe.Image.from_bytes({encoded.getvalue()!r}, media_type='image/png')
                 assert recipe.render([resin.recipe.Message(resin.recipe.Role.USER, [encoded])]).media is not None
             if name == 'gemma4':

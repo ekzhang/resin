@@ -15,6 +15,14 @@ pin the corpus, tokenizer, chat template and exact token IDs. Missing artifacts
 fail before GPU dispatch. Use `--prompt-source synthetic` for random-token
 controls, and keep those results separate from ShareGPT measurements.
 
+Use `--prompt-source saved --prompt-corpus PATH` for custom chat artifacts with
+their own source metadata. Saved prompts run at their exact token lengths; they
+are neither repeated nor padded to the requested context. Record template options
+such as reasoning effort when comparing coding prompts with conversation workloads.
+`--retain-outputs` saves each local replica's output token IDs after timing,
+including warmup and trace continuations. The measured context endpoints identify
+the timed portion.
+
 Sampling defaults to greedy. Set `--temperature`, `--top-p`, `--top-k` and `--seed`
 explicitly for sampled runs, for example `--temperature 1.0 --top-p 0.95
 --top-k 64 --seed 41`. Resin applies top-p before top-k. Draft acceptance uses
@@ -72,7 +80,12 @@ Use `--decode-batch-sizes 1,2,4,8` for a smaller initial sweep, then extend thro
 16/32/64 to find the throughput plateau and its interactivity cost. Cache
 preflight rejects an oversized cohort instead of silently measuring fewer users.
 `--skip-capacity-exceeded` records and skips cases that cannot fit, while keeping
-the requested engine capacity. Prefill cohorts are capped at 131,072 input tokens
+the requested engine capacity. Use `--capacity-probe-batch-sizes 64` to report an
+additional cohort's requirements against the loaded pool without allocating its
+graph buffers or measuring it. A failed probe describes that configured pool,
+not the GPU's absolute capacity. Records include the requested decode batch
+catalog and configured batch capacity separately from the live cohort.
+Prefill cohorts are capped at 131,072 input tokens
 by default: `context_length * batch_size` per attention replica. Adjust this with
 `--max-prefill-tokens`; zero disables the cap. Budget exclusions are recorded
 separately from KV-capacity failures.
@@ -106,6 +119,13 @@ overridden with `--warmup-steps` and `--measure-steps`. Prefill separately uses
 one complete warmup cohort and three complete measured cohorts, controlled by
 `--prefill-warmup-steps` and `--prefill-measure-steps`. These prefill options count
 whole cohorts, independently of how many Engine chunks each cohort needs.
+
+`--repeats 3` repeats the complete sweep on the same resident Engine. To keep
+profiler activation out of every primary measurement, combine `--trace-dir`
+with `--trace-after-sweep`. The harness reserves identical trace headroom for
+all repeats, then profiles fresh cohorts after the last primary window. Select
+those cohorts with `--trace-batch-sizes 1,8,32`; their diagnostic warmup and
+measurement records are excluded from the primary JSONL.
 
 ## Timing and synthetic workloads
 
@@ -167,6 +187,33 @@ shared-prefix measurements must use separate chart files. The default is zero
 shared tokens. DeepSeek requires attention TP1; the DeepGEMM expert path
 requires ADP=EP=world size, CP1, and at least two GPUs.
 
+## External SGLang baseline
+
+`scripts/bench_sglang.py` runs an isolated, pinned SGLang installation against the
+same prompt artifact. Install the script as an importable module and register
+`resin_benchmark = bench_sglang:install_plugin` in SGLang's
+`sglang.srt.plugins` entry-point group. The plugin observes already committed
+decode results; it adds no device synchronization or model changes.
+
+```bash
+SGLANG_PLUGINS=resin_benchmark python scripts/bench_sglang.py \
+  --server-args server-args.json --plan plan.json --prompts prompts.zip --preflight
+```
+
+Remove `--preflight` to run. The plan specifies full-cohort warmup and measurement
+windows, output headroom, repeats, and capacity probes. Rates count actual
+committed tokens over continuous completion intervals, including intervening
+host work. Per-user rate and its reciprocal TPOT are amortized over speculative
+bursts, not streamed token latency. Profiling runs only after all primary windows.
+For a warmed decode trace, set `profile_after_window: true` on a `trace_cases`
+entry. Each rank arms the profiler after that diagnostic cohort completes its
+`warmup_steps + measure_steps` intervals. The next three forwards are captured;
+per-rank start records retain forward counters and committed context lengths
+at arming. Overlap may already have queued the following forward. Without this option,
+the upstream stage profiler captures the first three decode passes after prefill.
+The [32K comparison](../artifacts/inkling2-qualification/cleanup-32k/README.md)
+retains example configurations, dependency versions, capacity limits, and results.
+
 ## Prefill and decode traces
 
 `--trace-dir DIR` captures extra passes after each measured case. Prefill
@@ -188,7 +235,8 @@ remain in their worker loop and are not independently profiled. The records
 should not be interpreted as every GPU's trace for those layouts.
 
 Each case produces raw `<phase>-ctx<length>-b<batch>-rank<rank>.json.gz` files
-and a merged `<phase>-ctx<length>-b<batch>-all-ranks.json.gz`. The Modal backend
+and a merged `<phase>-ctx<length>-b<batch>-all-ranks.json.gz`. Repeated cases add
+`-repeat002`, `-repeat003`, and so on before the rank suffix. The Modal backend
 downloads them to the local directory. Local sweeps create a fresh run subdirectory
 beneath `--trace-dir`, preventing stale ranks from an earlier sweep from being
 merged into new traces. Pass that subdirectory to the merger when remerging.

@@ -48,7 +48,7 @@ with graph capture disabled.
 
 Attention planning, attention kernels, cache writes,
 recurrent updates, media processing, and sampling retain their existing paths.
-DeepSeek passes token IDs into its hash-routed experts. Qwen3.5 and Inkling keep
+DeepSeek passes token IDs into its hash-routed experts. Qwen3.5 and Inkling 2 keep
 their recurrent/convolution state outside these graphs.
 
 Prefill capture is bounded to these tensor regions. It uses the shared

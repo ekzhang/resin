@@ -524,7 +524,7 @@ def test_native_parser_flushes_partial_utf8_in_http_actor(stream):
     tokenizer = Tokenizer(_FastTokenizer(backend))
     assert tokenizer.is_native
 
-    native_recipe = get_native_recipe("inkling", tokenizer)
+    native_recipe = get_native_recipe("inkling2", tokenizer)
 
     class ByteRunner:
         def __init__(self):

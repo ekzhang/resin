@@ -25,18 +25,19 @@ from resin import (
 )
 from resin.backend.distributed import DistributedEngine, DistributedWorker
 from resin.backend.topology import ParallelGroups
-from resin.recipe import InklingMedia
+from resin.recipe import Inkling2Media
 
 TOKENS = (10, 11, 77, 12, 13, 14)
-PIXEL_SHAPE = (1, 2, 256, 256, 3)
+PIXEL_SHAPE = (1, 384, 384, 3)
 PIXEL_BYTES = int(np.prod(PIXEL_SHAPE)) * 4
 
 
-def _media() -> InklingMedia:
-    return InklingMedia(
+def _media() -> Inkling2Media:
+    return Inkling2Media(
         token_ids=TOKENS,
         image_token_id=77,
         pixel_values=np.full(PIXEL_SHAPE, 0.25, dtype=np.float32),
+        image_grid_thw=np.array([[1, 1, 1]], dtype=np.int64),
     )
 
 
@@ -64,7 +65,7 @@ class _MediaRunner:
             plan.sequence_ids, plan.media, plan.sampling_params, strict=True
         ):
             sequence_id = int(raw_id)
-            assert isinstance(media, InklingMedia)
+            assert isinstance(media, Inkling2Media)
             if sequence_id in self.active:
                 assert self.active[sequence_id] is media
             else:

@@ -194,12 +194,12 @@ def test_local_checkpoint_override_needs_no_volume_marker(monkeypatch, tmp_path)
 
 @pytest.mark.parametrize(
     "draft,groups",
-    [(0, None), (5, SimpleNamespace(topology=SimpleNamespace(world_size=2)))],
+    [(1, None), (5, None), (8, None)],
 )
-def test_inkling_rejects_unsupported_runtime_options(draft, groups):
-    with pytest.raises(ValueError, match="fixed five-token|single GPU"):
+def test_inkling2_rejects_unsupported_runtime_options(draft, groups):
+    with pytest.raises(ValueError, match="target-only or seven-token"):
         create_runner(
-            "inkling",
+            "inkling2",
             device="cuda:0",
             groups=groups,
             context_length=1024,
@@ -209,12 +209,31 @@ def test_inkling_rejects_unsupported_runtime_options(draft, groups):
         )
 
 
+def test_inkling2_factory_enables_qualified_attention_prologue(monkeypatch):
+    from resin_models_cuda.inkling2 import cuda
+
+    monkeypatch.setattr(cuda, "Inkling2CudaRunner", lambda *args, **kwargs: kwargs)
+    options = create_runner(
+        "inkling2",
+        device="cuda:0",
+        context_length=1024,
+        max_batch_size=1,
+        prefill_chunk_size=4096,
+        draft_tokens=7,
+        expert_backend="cute-dsl",
+        fast_allreduce=True,
+    )
+    assert options["fused_attention_prologue"] is True
+    assert options["expert_backend"] == "cute-dsl"
+    assert options["fast_allreduce"] is True
+
+
 @pytest.mark.parametrize(
     "model,gpu",
     [
         ("gemma4", "B200"),
         ("qwen3_5", "B300"),
-        ("inkling", "H200"),
+        ("inkling2", "H200"),
         ("deepseek-v41", "H100"),
     ],
 )

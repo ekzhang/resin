@@ -16,12 +16,12 @@ from resin.recipe import (
     DeepSeekV41Media,
     Gemma4Media,
     Glm53FlashMedia,
-    InklingMedia,
+    Inkling2Media,
     Qwen35Media,
 )
 
 
-@pytest.fixture(params=["deepseek", "glm", "qwen", "gemma", "inkling"])
+@pytest.fixture(params=["deepseek", "glm", "qwen", "gemma", "inkling2"])
 def case(request):
     return _case(request.param)
 
@@ -30,7 +30,7 @@ def _case(name):
     from resin_models_cuda.deepseek_v41.cuda import DeepSeekV41CudaRunner
     from resin_models_cuda.gemma4.cuda import Gemma4CudaRunner
     from resin_models_cuda.glm5_3_flash.cuda import Glm53FlashCudaRunner
-    from resin_models_cuda.inkling.cuda import InklingCudaRunner
+    from resin_models_cuda.inkling2.cuda import Inkling2CudaRunner
     from resin_models_cuda.qwen3_5.cuda import Qwen3_5CudaRunner
 
     cls = {
@@ -38,7 +38,7 @@ def _case(name):
         "glm": Glm53FlashCudaRunner,
         "qwen": Qwen3_5CudaRunner,
         "gemma": Gemma4CudaRunner,
-        "inkling": InklingCudaRunner,
+        "inkling2": Inkling2CudaRunner,
     }[name]
     # These are deliberately partial runners with mock model/encoder state.
     runner: Any = object.__new__(cls)
@@ -46,7 +46,7 @@ def _case(name):
     runner.config = SimpleNamespace(hidden_size=3, image_token_id=8, video_token_id=9)
     runner._media_features = {}
     runner._target_hidden = {}
-    if name in ("deepseek", "glm", "qwen"):
+    if name in ("deepseek", "glm", "qwen", "inkling2"):
         runner._continuation = CudaContinuation()
     if name == "qwen":
         runner._drafts, runner._draft_hidden = {}, {}
@@ -82,6 +82,8 @@ def _case(name):
         get_video_features=lambda pixels, positions: encode(pixels, 2, "video"),
     )
 
+    runner._vision = runner._model.vision
+
     def media(value=0.25, *, followup=False, geometry=False, shift=0):
         prefix = (7,) * (1 + shift)
         suffix = (6, 5) if followup else (6,)
@@ -109,12 +111,15 @@ def _case(name):
                 spatial_merge_size=2,
                 image_token_id=8,
             )
-        if name == "inkling":
-            return InklingMedia(
+        if name == "inkling2":
+            return Inkling2Media(
                 token_ids=prefix + (8, 8) + suffix,
                 image_token_id=8,
+                image_grid_thw=np.array(
+                    [[1, 2, 1] if geometry else [1, 1, 2]], dtype=np.int64
+                ),
                 pixel_values=np.full(
-                    (2, 1, 4, 2, 3) if geometry else (2, 1, 2, 4, 3),
+                    (2, 4, 2, 3) if geometry else (2, 2, 4, 3),
                     value,
                     dtype=np.float32,
                 ),
@@ -129,7 +134,7 @@ def _case(name):
         )
 
     def features(sequence_id, payload, *, start=0):
-        if name in ("qwen", "inkling"):
+        if name in ("qwen", "inkling2"):
             return (runner._features_for(sequence_id, payload),)
         if name == "gemma":
             result = runner._features_for(sequence_id, payload)

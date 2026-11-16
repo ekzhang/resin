@@ -1,4 +1,4 @@
-"""Saved, chat-templated ShareGPT workloads shared by inference benchmarks.
+"""Saved, chat-templated workloads shared by inference benchmarks.
 
 Loading an artifact uses only the standard library. Preparation imports a
 tokenizer lazily and runs entirely on CPU. Long prompts are explicitly packed
@@ -89,7 +89,8 @@ class PromptArtifact:
         }
         self.metadata.update(
             artifact_sha256=self.digest,
-            prompt_source_id="chat-templated-sharegpt:" + self.digest,
+            prompt_source_id=f"chat-templated-{self._manifest.get('source', 'sharegpt')}:"
+            + self.digest,
             available_contexts={
                 key: entry["count"] for key, entry in self._manifest["contexts"].items()
             },

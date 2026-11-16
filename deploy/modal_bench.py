@@ -61,6 +61,16 @@ app = modal.App(
 qualification_image = (
     image.uv_pip_install("pytest>=8,<9")
     .add_local_dir(ROOT / "tests", "/opt/resin/tests", copy=True)
+    .add_local_file(
+        ROOT / "scripts/check_server.py",
+        "/opt/resin/tests/scripts/check_server.py",
+        copy=True,
+    )
+    .add_local_file(
+        ROOT / "scripts/stress_http.py",
+        "/opt/resin/tests/scripts/stress_http.py",
+        copy=True,
+    )
     .add_local_dir(
         ROOT / "models/cuda/tests", "/opt/resin/models/cuda/tests", copy=True
     )
@@ -179,6 +189,7 @@ def sweep_sequence(
     Each leg launches a fresh benchmark worker, load, and graph catalog. The
     common harness remains fixed; variant overlays may change accelerator model
     modules only, and every leg must explicitly supply the same module names.
+    Topology overrides may change parallelism while retaining the GPU count.
     """
     import subprocess
 
@@ -189,6 +200,11 @@ def sweep_sequence(
         raise ValueError("benchmark sequence variant names must be unique")
     variant_modules = set(variants[0].get("module_source_overlays", {}))
     for variant in variants:
+        if (
+            variant.get("topology", {}).get("world_size", topology["world_size"])
+            != topology["world_size"]
+        ):
+            raise ValueError("benchmark sequence variants must retain the GPU count")
         overlays = variant.get("module_source_overlays", {})
         if set(overlays) != variant_modules:
             raise ValueError(
@@ -222,7 +238,7 @@ def sweep_sequence(
         records = _run_sweep(
             model,
             cases,
-            topology,
+            {**topology, **variant.get("topology", {})},
             variant_options,
             module_source_overlays={
                 **(module_source_overlays or {}),
@@ -247,6 +263,7 @@ def qualify(
     *,
     environment: dict[str, str] | None = None,
     module_source_overlays: dict[str, str] | None = None,
+    world_size: int = 1,
 ) -> dict:
     """Run ordinary numerical/graph regression tests against a pinned GPU model."""
     return _run_qualification(
@@ -254,6 +271,7 @@ def qualify(
         test_paths,
         environment=environment,
         module_source_overlays=module_source_overlays,
+        world_size=world_size,
     )
 
 
@@ -263,6 +281,7 @@ def _run_qualification(
     *,
     environment: dict[str, str] | None = None,
     module_source_overlays: dict[str, str] | None = None,
+    world_size: int = 1,
 ) -> dict:
     import hashlib
     import importlib.util
@@ -270,6 +289,9 @@ def _run_qualification(
     import time
 
     from deploy.models import prepare_runtime, require_checkpoint
+
+    if type(world_size) is not int or world_size < 1:
+        raise ValueError("qualification world_size must be a positive integer")
 
     spec = get_model(model)
     os.environ.update(image_environment(spec))
@@ -294,6 +316,16 @@ def _run_qualification(
     process = subprocess.Popen(
         [
             "python",
+            *(
+                [
+                    "-m",
+                    "torch.distributed.run",
+                    "--standalone",
+                    f"--nproc-per-node={world_size}",
+                ]
+                if world_size > 1
+                else []
+            ),
             "-m",
             "pytest",
             "-o",
@@ -321,8 +353,10 @@ def _run_qualification(
     finally:
         if kernel_volume is not None:
             kernel_volume.commit()
+        TRACE_VOLUME.commit()
     return {
         "model": model,
+        "world_size": world_size,
         "checkpoint_revision": spec.revision,
         "test_paths": test_paths,
         "returncode": process.returncode,
@@ -346,8 +380,9 @@ def qualify_sequence(
     *,
     environment: dict[str, str] | None = None,
     stop_on_failure: bool = True,
+    world_size: int = 1,
 ) -> list[dict]:
-    """Run source variants through fresh pytest processes on one GPU."""
+    """Run source variants through fresh pytest processes on one allocation."""
     import importlib.metadata
     import importlib.util
     import subprocess
@@ -397,6 +432,7 @@ def qualify_sequence(
                         **variant.get("environment", {}),
                     },
                     module_source_overlays=variant.get("module_source_overlays"),
+                    world_size=world_size,
                 )
             finally:
                 for key in os.environ.keys() - previous_environment.keys():

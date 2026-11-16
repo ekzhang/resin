@@ -46,7 +46,7 @@ PROPERTY_TYPES = {
                     "mm_token_type_ids",
                 ),
             ),
-            ("InklingMedia", ("image_positions",)),
+            ("Inkling2Media", ("image_positions",)),
             ("Qwen35Media", ("image_positions",)),
             ("Glm53FlashMedia", ("image_positions",)),
         )
@@ -57,7 +57,7 @@ PROPERTY_TYPES = {
         for owner in (
             "DeepSeekV41Media",
             "Gemma4Media",
-            "InklingMedia",
+            "Inkling2Media",
             "Qwen35Media",
             "Glm53FlashMedia",
         )
@@ -65,7 +65,8 @@ PROPERTY_TYPES = {
     **{
         (owner, name): f"npt.NDArray[np.{dtype}]" + (" | None" if optional else "")
         for owner, name, dtype, optional in (
-            ("InklingMedia", "pixel_values", "float32", True),
+            ("Inkling2Media", "pixel_values", "float32", True),
+            ("Inkling2Media", "image_grid_thw", "int64", True),
             ("Qwen35Media", "pixel_values", "float32", False),
             ("Glm53FlashMedia", "pixel_values", "float32", False),
             ("Glm53FlashMedia", "image_grid_thw", "int64", False),

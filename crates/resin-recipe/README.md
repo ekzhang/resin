@@ -2,7 +2,7 @@
 
 Stock model conversation formats, independent of Python, HTTP and GPU execution.
 Concrete recipes implement the `Recipe` trait for GPT-OSS, DeepSeek V4.1,
-Inkling, Qwen3.5/3.8, Gemma4, GLM-5.3-Flash or LFM2.5. Each family owns serde construction
+Inkling2, Qwen3.5/3.8, Gemma4, GLM-5.3-Flash or LFM2.5. Each family owns serde construction
 parameters, such as `GptOssRecipeParams`, and its matching renderer, parser,
 message policy and stop markers.
 
@@ -37,7 +37,7 @@ when preparing the vision encoder inputs.
 buffered text, including truncated UTF-8; finalization is idempotent. A shared
 `TokenizerDecoder` retains the tokenizer's rolling decode context. Control IDs,
 not printable text, drive model grammar. Tool behavior follows the format:
-Inkling/Harmony/Qwen/Gemma/LFM commit validated calls at their closing marker;
+Inkling2/Harmony/Qwen/Gemma/LFM commit validated calls at their closing marker;
 DeepSeek streams DSML calls and argument deltas as they arrive. Finalization does
 not invent complete arguments for an unfinished call.
 

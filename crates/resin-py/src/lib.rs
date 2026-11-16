@@ -1964,7 +1964,7 @@ mod _resin {
     #[pymodule_export]
     use crate::media_payload::{
         _media_from_buffers, _media_to_buffers, DeepSeekV41Image, DeepSeekV41Media, Gemma4Media,
-        Glm53FlashMedia, InklingMedia, Qwen35Media,
+        Glm53FlashMedia, Inkling2Media, Qwen35Media,
     };
 
     #[pymodule_export]

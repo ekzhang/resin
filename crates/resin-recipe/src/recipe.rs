@@ -68,7 +68,7 @@ pub enum MediaConfig {
     DeepSeek(media::deepseek::Config, Option<u32>),
     Gemma(media::gemma::Config),
     Glm(media::glm::Config),
-    Inkling(media::inkling::Config),
+    Inkling2(media::inkling2::Config),
     Qwen(media::qwen::Config),
 }
 

@@ -13,7 +13,7 @@ from test_http_lifecycle import post, running_server
 from test_recipe import _byte_tokenizer
 
 import resin
-from resin.recipe import InklingMedia, NativeRecipe, get_native_recipe
+from resin.recipe import Inkling2Media, NativeRecipe, get_native_recipe
 
 
 def tokenizer():
@@ -130,7 +130,7 @@ def test_native_event_constructor_validates_span_storage(spans, error):
 
 
 def test_parser_does_not_retain_media_or_the_rendered_prompt():
-    native = get_native_recipe("inkling", tokenizer())
+    native = get_native_recipe("inkling2", tokenizer())
     pixels = np.zeros((40, 40, 3), dtype=np.float32)
     source = weakref.ref(pixels)
     messages = [
@@ -139,7 +139,7 @@ def test_parser_does_not_retain_media_or_the_rendered_prompt():
         )
     ]
     prompt = native.render(messages)
-    assert isinstance(prompt.media, InklingMedia)
+    assert isinstance(prompt.media, Inkling2Media)
     assert prompt.media.pixel_values is not None
     reference = weakref.ref(prompt.media.pixel_values)
     parser = native.create_parser(prompt)
@@ -151,15 +151,17 @@ def test_parser_does_not_retain_media_or_the_rendered_prompt():
 
 
 def test_native_media_accounts_for_each_source():
-    native = get_native_recipe("inkling", tokenizer())
+    native = get_native_recipe("inkling2", tokenizer())
     valid = resin.recipe.Image(source=np.zeros((40, 40, 3), dtype=np.float32))
     prompt = native.render(
         [resin.recipe.Message(resin.recipe.Role.USER, [valid, valid])]
     )
-    assert isinstance(prompt.media, InklingMedia)
+    assert isinstance(prompt.media, Inkling2Media)
     assert prompt.media.pixel_values is not None
-    assert prompt.media.pixel_values.shape[0] == 4
-    assert len(prompt.media.image_positions) == 4
+    assert prompt.media.pixel_values.shape[0] == 2
+    assert len(prompt.media.image_positions) == 2
+    assert prompt.media.image_grid_thw is not None
+    assert prompt.media.image_grid_thw.tolist() == [[1, 1, 1], [1, 1, 1]]
     with pytest.raises(ValueError, match="dtype float32"):
         native.render(
             [
@@ -332,7 +334,7 @@ def test_rendered_prompt_token_view_is_owned_readonly_and_outlives_prompt():
     [
         ("gpt_oss", ["<|return|>", "<|call|>"]),
         ("deepseek_v41", ["<｜end▁of▁sentence｜>"]),
-        ("inkling", ["<|content_model_end_sampling|>"]),
+        ("inkling2", ["<|content_model_end_sampling|>"]),
         ("qwen3_5", ["<|im_end|>", "<|endoftext|>"]),
         ("qwen3_8", ["<|im_end|>", "<|endoftext|>"]),
         ("gemma4", ["<turn|>", "<eos>"]),

@@ -1,1 +1,0 @@
-"""Inkling checkpoint configuration."""

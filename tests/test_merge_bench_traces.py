@@ -193,6 +193,8 @@ def test_cli_groups_cases_ignores_merged_outputs_and_retains_inputs(tmp_path, ca
     for case, rank in (
         ("decode-ctx16-b4", 1),
         ("decode-ctx16-b4", 0),
+        ("decode-ctx16-b4-repeat002", 1),
+        ("decode-ctx16-b4-repeat002", 0),
         ("decode-ctx32-b2", 0),
         ("prefill-ctx16-b4", 0),
         ("prefill-ctx16-b4", 1),
@@ -201,7 +203,12 @@ def test_cli_groups_cases_ignores_merged_outputs_and_retains_inputs(tmp_path, ca
     write(tmp_path / "decode-ctx16-b4-all-ranks.json.gz", {"old": "replace"})
     (tmp_path / "other.json").write_text("unrelated")
     main([str(tmp_path)])
-    assert len(capsys.readouterr().out.splitlines()) == 3
+    assert len(capsys.readouterr().out.splitlines()) == 4
+    repeated = read(tmp_path / "decode-ctx16-b4-repeat002-all-ranks.json.gz")
+    assert [source["rank"] for source in repeated["resinTraceMerge"]["sources"]] == [
+        0,
+        1,
+    ]
     assert (
         len(
             read(tmp_path / "decode-ctx16-b4-all-ranks.json.gz")["resinTraceMerge"][

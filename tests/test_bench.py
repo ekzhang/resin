@@ -22,6 +22,7 @@ from resin.bench import (
     BenchCase,
     BenchmarkRunner,
     distributed_reducer,
+    perfetto_trace,
     run_sweep,
 )
 
@@ -61,6 +62,49 @@ class Runner:
             self.processed_counts.append(acceptance.processed_counts)
             return forward_output(acceptance.token_rows)
         return forward_output([0] * plan.num_sequences)
+
+
+@pytest.mark.parametrize("retain", [False, True])
+def test_output_retention_runs_after_timing_and_includes_trace_continuation(retain):
+    runner = BenchmarkRunner(Runner())
+    engine = Engine(runner, context_length=64)
+
+    def trace(case, step):
+        step()
+
+    records = run_sweep(
+        engine,
+        [BenchCase(phase="decode", context_length=3, batch_size=1)],
+        runner=runner,
+        prompt_batches={3: [[1, 2, 3]]},
+        warmup_steps=2,
+        measure_steps=4,
+        trace_step=trace,
+        retain_outputs=retain,
+    )
+    record = records[0]
+    assert record["committed_tokens"] == 4
+    assert record["measure_steps"] == 4
+    assert engine.active_request_count == 0
+    if retain:
+        # Initial prefill token, two warmups, four measured and one traced step.
+        assert record["local_output_token_ids"] == [[0] * 8]
+    else:
+        assert "local_output_token_ids" not in record
+
+
+def test_repeated_case_traces_are_kept_separate(tmp_path):
+    trace = perfetto_trace(
+        tmp_path, cuda=False, synchronize=lambda: None, decode_passes=1
+    )
+    case = BenchCase(phase="decode", context_length=27, batch_size=1)
+    for _ in range(3):
+        trace(case, lambda: torch.ones(2).sum())
+    assert sorted(path.name for path in tmp_path.iterdir()) == [
+        "decode-ctx27-b1-rank000.json.gz",
+        "decode-ctx27-b1-repeat002-rank000.json.gz",
+        "decode-ctx27-b1-repeat003-rank000.json.gz",
+    ]
 
 
 def test_distributed_benchmark_forwards_preparation_without_rebuilding_it():

@@ -457,7 +457,7 @@ def piece_recipe(name, pieces, *, terminal=True):
 def test_stop_cutting_one_token_keeps_other_whole_token_scores(
     api, pieces, expected, whole, terminal
 ):
-    recipe, ids, piece_ids = piece_recipe("inkling", pieces, terminal=terminal)
+    recipe, ids, piece_ids = piece_recipe("inkling2", pieces, terminal=terminal)
     result = scored_exchange(
         recipe,
         ids,
@@ -505,7 +505,7 @@ def test_prompt_scores_allow_zero_output_tokens(api, stream):
             "<|content_xml|>",
         ]
     )
-    recipe = get_native_recipe("inkling", backend)
+    recipe = get_native_recipe("inkling2", backend)
     request_input = {"messages": [{"role": "user", "content": "score this"}]}
     prompt_ids = recipe.render(
         [

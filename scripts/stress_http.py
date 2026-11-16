@@ -358,13 +358,18 @@ def robustness_cases(model: str, dp_size: int) -> list[Case]:
     mutations = [
         ("bad-temperature", {"temperature": -1}),
         ("bad-top-p", {"top_p": 0}),
-        ("bad-top-logprobs", {"top_logprobs": 21}),
+        ("bad-top-logprobs", {"top_logprobs": -1}),
         ("bad-max-tokens", {"max_tokens": 0}),
         ("bad-rank", {"routed_dp_rank": dp_size}),
         ("negative-rank", {"routed_dp_rank": -1}),
     ]
     cases = [
-        Case(name=name, body={**base, **change}, expected_status=(400,))
+        Case(
+            name=name,
+            body={**base, **change},
+            # A negative unsigned count may fail JSON deserialization first.
+            expected_status=(400, 422) if name == "bad-top-logprobs" else (400,),
+        )
         for name, change in mutations
     ]
     cases.extend(

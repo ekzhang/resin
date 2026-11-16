@@ -145,8 +145,10 @@ def _serve_rank(rank: int, port: int, model: str) -> None:
         max_batch_size=spec.max_batch_size,
         prefill_chunk_size=spec.prefill_chunk_size,
         draft_tokens=spec.draft_tokens,
-        fast_allreduce=spec.family == "gpt_oss",
+        fast_allreduce=spec.family in {"gpt_oss", "inkling2"},
     )
+    if capacity := getattr(runner, "cache_capacity_plan", None):
+        print(f"[serve] {spec.name} rank {rank} cache: {capacity}", flush=True)
     runner.capture_cuda_graphs()
     worker = DistributedWorker(runner, groups) if groups is not None else None
     if worker is not None and groups is not None and not groups.is_driver:

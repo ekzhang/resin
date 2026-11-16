@@ -62,8 +62,8 @@ def _token_ids(tokenizer: HuggingFaceTokenizer) -> dict[str, int]:
     return result
 
 
-def _inkling_parser(tokenizer, *, content: bool = False) -> FinalizingResponseParser:
-    recipe = get_native_recipe("inkling", tokenizer)
+def _inkling2_parser(tokenizer, *, content: bool = False) -> FinalizingResponseParser:
+    recipe = get_native_recipe("inkling2", tokenizer)
     parser = recipe.create_parser(recipe.render([]))
     if content:
         assert parser.feed(recipe.tokenizer.encode("<|content_text|>")) == []
@@ -134,7 +134,7 @@ def test_native_decode_is_equivalent_for_every_chunk_boundary() -> None:
     ids = backend.encode(text, add_special_tokens=False).ids
 
     def parse(chunks: Sequence[Sequence[int]]) -> list[ParserEvent]:
-        parser = _inkling_parser(tokenizer)
+        parser = _inkling2_parser(tokenizer)
         events: list[ParserEvent] = []
         for chunk in chunks:
             events.extend(parser.feed(chunk))
@@ -158,7 +158,7 @@ def test_native_decoder_buffers_partial_utf8_between_feeds() -> None:
     ids = backend.encode("🦀", add_special_tokens=False).ids
     assert len(ids) == 4
     markers = _token_ids(backend)
-    parser = _inkling_parser(Tokenizer(_FastTokenizer(backend)))
+    parser = _inkling2_parser(Tokenizer(_FastTokenizer(backend)))
 
     assert parser.feed([markers["<|content_text|>"]]) == []
     for token_id in ids[:-1]:
@@ -175,7 +175,7 @@ def test_native_decoder_buffers_partial_utf8_between_feeds() -> None:
 
 def test_native_decoder_flushes_incomplete_utf8_at_finish() -> None:
     backend = _byte_tokenizer()
-    parser = _inkling_parser(Tokenizer(_FastTokenizer(backend)), content=True)
+    parser = _inkling2_parser(Tokenizer(_FastTokenizer(backend)), content=True)
     incomplete = backend.encode("🦀", add_special_tokens=False).ids[:2]
 
     assert parser.feed(incomplete) == []
@@ -190,7 +190,7 @@ def test_native_decoder_flushes_incomplete_utf8_at_finish() -> None:
 def test_native_tokenizer_is_a_snapshot_and_parsers_have_independent_state() -> None:
     backend = _byte_tokenizer()
     tokenizer = Tokenizer(_FastTokenizer(backend))
-    recipe = get_native_recipe("inkling", tokenizer)
+    recipe = get_native_recipe("inkling2", tokenizer)
     prompt = recipe.render([])
     backend.decoder = None
     parsers = [recipe.create_parser(prompt) for _ in range(2)]
@@ -224,7 +224,7 @@ def test_native_parser_rejects_an_unsupported_decoder_chain() -> None:
     backend = _byte_tokenizer()
     backend.decoder = WordPiece()
     with pytest.raises(ValueError, match="decoder"):
-        _inkling_parser(Tokenizer(backend))
+        _inkling2_parser(Tokenizer(backend))
 
 
 def test_custom_tokenizer_with_no_native_backend_uses_decode() -> None:
@@ -240,7 +240,7 @@ def test_custom_tokenizer_with_no_native_backend_uses_decode() -> None:
 
     tokenizer = Tokenizer(CustomTokenizer())
     assert not tokenizer.is_native
-    parser = _inkling_parser(tokenizer, content=True)
+    parser = _inkling2_parser(tokenizer, content=True)
 
     assert parser.feed([ord("x")]) == [resin.recipe.TextDelta("x")]
     assert calls == [[ord("x")]]
@@ -277,7 +277,7 @@ class _CallbackTokenizer:
 
 def test_callback_tokenizer_keeps_ordinary_encoding_and_serving_stops_separate():
     tokenizer = _CallbackTokenizer()
-    model_recipe = get_native_recipe("inkling", tokenizer)
+    model_recipe = get_native_recipe("inkling2", tokenizer)
     marker = "<|content_model_end_sampling|>"
     messages = [
         resin.recipe.Message(resin.recipe.Role.USER, [resin.recipe.Text(marker)])
@@ -294,7 +294,7 @@ def test_callback_tokenizer_rejects_unknown_or_boolean_control_ids(
 ):
     tokenizer = _CallbackTokenizer()
     monkeypatch.setattr(tokenizer, "convert_tokens_to_ids", lambda _: invalid_id)
-    model_recipe = get_native_recipe("inkling", tokenizer)
+    model_recipe = get_native_recipe("inkling2", tokenizer)
     with pytest.raises(ValueError, match="control token"):
         model_recipe.stop_token_ids
 
@@ -311,7 +311,7 @@ def test_callback_decoder_is_captured_once_instead_of_refetched():
             return super().decode
 
     tokenizer = TokenizerWithProperty()
-    model_recipe = get_native_recipe("inkling", tokenizer)
+    model_recipe = get_native_recipe("inkling2", tokenizer)
     parser = model_recipe.create_parser(
         model_recipe.render(
             [resin.recipe.Message(resin.recipe.Role.USER, [resin.recipe.Text("hi")])]
@@ -347,11 +347,11 @@ def test_deepseek_constructor_effort_matches_per_request_effort():
     )
 
 
-def test_inkling_tool_float_preserves_original_value() -> None:
+def test_inkling2_tool_float_preserves_original_value() -> None:
     import json
 
     backend = _byte_tokenizer()
-    parser = _inkling_parser(Tokenizer(backend))
+    parser = _inkling2_parser(Tokenizer(backend))
     # TML 0.2.0 rounds this to 0.9999899864196776; the generated JSON and
     # native parser must retain the exact Python value.
     ids = backend.encode(
@@ -367,7 +367,7 @@ def test_callback_recipe_stop_ids_are_static_after_first_resolution():
     tokenizer.markers = dict(tokenizer.markers)
     marker = "<|content_model_end_sampling|>"
     expected = tokenizer.markers[marker]
-    recipe = get_native_recipe("inkling", tokenizer)
+    recipe = get_native_recipe("inkling2", tokenizer)
     assert recipe.stop_token_ids == [expected]
     tokenizer.markers[marker] = expected + 1
     assert recipe.stop_token_ids == [expected]

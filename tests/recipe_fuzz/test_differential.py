@@ -70,7 +70,7 @@ PARTS = st.one_of(st.builds(Part, st.sampled_from(("text", "reasoning")), TEXT),
 CUTS = st.lists(st.integers(0, 512), max_size=12)
 
 
-class InklingAdapter:
+class Inkling2Adapter:
     """Encode the same grammar independently for HF and TML tokenizers."""
 
     def __init__(self):
@@ -84,7 +84,7 @@ class InklingAdapter:
             f"<|{name}|>": backend.token_to_id(f"<|{name}|>") for name in MARKERS
         }
         assert all(token_id is not None for token_id in self.ids.values())
-        self.recipe = get_native_recipe("inkling", backend)
+        self.recipe = get_native_recipe("inkling2", backend)
         assert self.recipe.tokenizer.is_native
         self.reference = tokenizers.O200kBaseChatTokenizer()
         _, self.reference_parser = v0.Renderer(self.reference).render_for_completion(
@@ -143,7 +143,7 @@ class InklingAdapter:
         from transformers.utils.chat_template_utils import _compile_jinja_template
 
         template = _compile_jinja_template(
-            Path(__file__).with_name("templates").joinpath("inkling.jinja").read_text()
+            Path(__file__).with_name("templates").joinpath("inkling2.jinja").read_text()
         )
         return template.render(**request)
 
@@ -230,7 +230,7 @@ class InklingAdapter:
 # Each additional format supplies encoding, its real oracle, and parser setup;
 # the case generator, semantic normalization, and chunk driver stay shared.
 ADAPTERS = {
-    "inkling": InklingAdapter,
+    "inkling2": Inkling2Adapter,
     "gpt_oss": GptOssAdapter,
     "deepseek_v41": DeepSeekV41Adapter,
     "qwen3_5": QwenAdapter,

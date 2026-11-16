@@ -26,7 +26,7 @@ from resin.server import HttpServer
         ("glm-5.3-flash", 3, None),
         ("gemma4", 0, None),
         ("qwen3_5", 0, None),
-        ("inkling", 0, None),
+        ("inkling2", 0, None),
         ("gpt-oss-20b", 0, "warmup"),
         ("deepseek-v41", 0, "serve"),
     ],
@@ -66,7 +66,7 @@ def test_rank_warms_then_serves_and_closes_on_failure(monkeypatch, name, rank, f
     def make_runner(model, **options):
         assert model is spec
         assert options["draft_tokens"] == spec.draft_tokens
-        assert options["fast_allreduce"] == (spec.family == "gpt_oss")
+        assert options["fast_allreduce"] == (spec.family in {"gpt_oss", "inkling2"})
         assert options["context_length"] == spec.context_length + (
             spec.family == "gpt_oss"
         )

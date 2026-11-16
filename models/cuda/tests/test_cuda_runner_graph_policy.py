@@ -2,8 +2,9 @@ from __future__ import annotations
 
 from contextlib import nullcontext
 from types import SimpleNamespace
-from typing import NoReturn
+from typing import Any, NoReturn
 
+import numpy as np
 import pytest
 import torch
 
@@ -18,12 +19,57 @@ from resin.backend.cuda.runner import CudaRunner
 from resin_models_cuda.deepseek_v41.cuda import DeepSeekV41CudaRunner
 from resin_models_cuda.gemma4.cuda import Gemma4CudaRunner
 from resin_models_cuda.gpt_oss.cuda import GptOssCudaRunner
-from resin_models_cuda.inkling.cuda import InklingCudaRunner
+from resin_models_cuda.inkling2.cache import CacheArena, CacheGeometry
+from resin_models_cuda.inkling2.cuda import Inkling2CudaRunner
 from resin_models_cuda.qwen3_5.cuda import Qwen3_5CudaRunner
 
 
 def _fail(message: str) -> NoReturn:
     raise AssertionError(message)
+
+
+@pytest.mark.parametrize("enqueue", [False, True])
+@pytest.mark.parametrize("larger_graph", [False, True])
+def test_inkling_distributed_graph_selection_covers_the_complete_native_lease(
+    enqueue, larger_graph
+):
+    runner: Any = object.__new__(Inkling2CudaRunner)
+    runner.speculative_draft_tokens = 7
+    runner._sampling_graph_algorithm = lambda _plan: 1
+    geometry = CacheGeometry(2, 3, 1, 2, 2, 8, 32, 3, 128, 128, prefill_chunk_size=128)
+    runner._cache = CacheArena("cpu", geometry.layout(8), geometry)
+    # Position 119 and this step's eight writes fit in one page. The native
+    # continuation lease reserves a second page which a 120-token graph lacks.
+    plan = SimpleNamespace(num_sequences=1, positions=np.array([119]))
+    cache_plan = SimpleNamespace(
+        rows=1,
+        groups=tuple(
+            SimpleNamespace(block_indptr=np.array([0, count]))
+            for count in (2, 2, 2, 2, 1)
+        ),
+    )
+    shapes = ((1, 120, 1), (1, 256, 1)) if larger_graph else ((1, 120, 1),)
+    runner._select_cuda_graph = lambda _mode, *, match: next(
+        (shape for shape in shapes if match(shape)), None
+    )
+    votes, launched = [], []
+
+    def vote(_mode, _context, **options):
+        votes.append(options)
+        return options["required_shape"] if options["eligible"] else None
+
+    runner._select_distributed_cuda_graph = vote
+    runner._graph_forward = lambda *_args, **options: launched.append(options)
+    used, _ = runner._distributed_graph(
+        plan, object(), SimpleNamespace(cache_plan=cache_plan), enqueue=enqueue
+    )
+    assert used is larger_graph
+    assert votes[0]["eligible"] is larger_graph
+    if larger_graph:
+        assert votes[0]["required_shape"] == (1, 256, 1)
+        assert launched[0]["shape"] == (1, 256, 1)
+    else:
+        assert launched == []
 
 
 @pytest.mark.parametrize(
@@ -34,7 +80,7 @@ def _fail(message: str) -> NoReturn:
             ("unused",),
             {"max_seq_len": 32, "tensor_parallel": SimpleNamespace(rank=0, size=1)},
         ),
-        (InklingCudaRunner, ("unused", "unused"), {"max_seq_len": 32}),
+        (Inkling2CudaRunner, ("unused",), {"max_seq_len": 32}),
         (Qwen3_5CudaRunner, (), {}),
         (GptOssCudaRunner, (), {"kernel_attention": lambda: None}),
         (Gemma4CudaRunner, (), {}),
@@ -68,7 +114,7 @@ def test_model_runner_passes_graph_policies_to_shared_runtime(
     "runner_type",
     [
         DeepSeekV41CudaRunner,
-        InklingCudaRunner,
+        Inkling2CudaRunner,
         Qwen3_5CudaRunner,
         GptOssCudaRunner,
         Gemma4CudaRunner,

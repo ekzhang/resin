@@ -17,7 +17,7 @@ use sha2::{Digest, Sha256};
 
 use crate::{
     media_payload::{
-        DeepSeekV41Image, DeepSeekV41Media, Gemma4Media, Glm53FlashMedia, InklingMedia,
+        DeepSeekV41Image, DeepSeekV41Media, Gemma4Media, Glm53FlashMedia, Inkling2Media,
         Qwen35Media, error,
     },
     recipe_media::MediaTokens,
@@ -28,7 +28,7 @@ use crate::{
 enum Payload {
     DeepSeek(media::deepseek::Prepared, u32),
     Gemma(media::gemma::Prepared, u32, u32),
-    Inkling(media::inkling::Prepared, u32),
+    Inkling2(media::inkling2::Prepared, u32),
     Qwen(media::qwen::Prepared, usize, u32),
     Glm(media::qwen::Prepared, usize, u32),
 }
@@ -247,13 +247,13 @@ pub(crate) fn process(
                 Payload::DeepSeek(prepared, id),
             )
         }
-        MediaConfig::Inkling(config) => {
+        MediaConfig::Inkling2(config) => {
             let id = encoder.special_id("<|unused_200054|>")?;
             let prepared = config.process(&images)?;
             (
                 prepared.token_counts.clone(),
                 "<|unused_200054|>",
-                Payload::Inkling(prepared, id),
+                Payload::Inkling2(prepared, id),
             )
         }
         MediaConfig::Qwen(config) => {
@@ -322,8 +322,10 @@ impl Prepared {
                         })
                         .sum::<usize>()
             }
-            Payload::Inkling(data, _) => {
-                tensor_bytes(&data.pixel_values) + vector_bytes(&data.token_counts)
+            Payload::Inkling2(data, _) => {
+                tensor_bytes(&data.pixel_values)
+                    + tensor_bytes(&data.image_grid_thw)
+                    + vector_bytes(&data.token_counts)
             }
             Payload::Qwen(data, _, _) | Payload::Glm(data, _, _) => {
                 tensor_bytes(&data.pixel_values)
@@ -365,9 +367,15 @@ impl Prepared {
                 )?
                 .into_any()
             }
-            Payload::Inkling(data, marker) => Py::new(
+            Payload::Inkling2(data, marker) => Py::new(
                 py,
-                InklingMedia::build(py, tokens, marker, Some(data.pixel_values))?,
+                Inkling2Media::build(
+                    py,
+                    tokens,
+                    marker,
+                    Some(data.pixel_values),
+                    Some(data.image_grid_thw),
+                )?,
             )?
             .into_any(),
             Payload::Qwen(data, merge, marker) => {
@@ -438,16 +446,24 @@ impl Prepared {
     }
 }
 
-pub(crate) fn image_source(py: Python<'_>, source: &Bound<'_, PyAny>) -> PyResult<RgbImage> {
+pub(crate) fn image_source(
+    py: Python<'_>,
+    source: &Bound<'_, PyAny>,
+    checkerboard: bool,
+) -> PyResult<RgbImage> {
     if let Ok(value) = source.extract::<String>() {
-        return py.detach(|| RgbImage::data_url(&value)).map_err(error);
+        return py
+            .detach(|| RgbImage::data_url_with_background(&value, checkerboard))
+            .map_err(error);
     }
     if let Ok(pair) = source.cast::<PyTuple>()
         && pair.len() == 2
     {
         let data: Vec<u8> = pair.get_item(0)?.extract()?;
         let mime: String = pair.get_item(1)?.extract()?;
-        return py.detach(|| RgbImage::decode(&data, &mime)).map_err(error);
+        return py
+            .detach(|| RgbImage::decode_with_background(&data, &mime, checkerboard))
+            .map_err(error);
     }
     let array = source
         .extract::<PyReadonlyArrayDyn<'_, f32>>()
@@ -505,7 +521,7 @@ fn video_source(py: Python<'_>, source: &Bound<'_, PyAny>) -> PyResult<Video> {
                 .map_err(error)?,
             );
         } else {
-            images.push(image_source(py, &frame)?);
+            images.push(image_source(py, &frame, false)?);
         }
     }
     let frame_indices = indices.unwrap_or_else(|| (0..images.len()).collect());
@@ -518,11 +534,15 @@ fn video_source(py: Python<'_>, source: &Bound<'_, PyAny>) -> PyResult<Video> {
         frame_indices,
     })
 }
-pub(crate) fn sources(py: Python<'_>, sources: MediaSources) -> PyResult<Vec<Source>> {
+pub(crate) fn sources(
+    py: Python<'_>,
+    sources: MediaSources,
+    checkerboard: bool,
+) -> PyResult<Vec<Source>> {
     sources
         .into_iter()
         .map(|(kind, source)| match kind {
-            "image" => image_source(py, source.bind(py)).map(Source::Image),
+            "image" => image_source(py, source.bind(py), checkerboard).map(Source::Image),
             "video" => video_source(py, source.bind(py)).map(Source::Video),
             _ => Err(error("this recipe does not support audio input")),
         })
@@ -543,9 +563,10 @@ mod tests {
                 String::new(),
                 String::new(),
             )],
-            payload: Payload::Inkling(
-                media::inkling::Prepared {
+            payload: Payload::Inkling2(
+                media::inkling2::Prepared {
                     pixel_values: media::Tensor::new(vec![1], data).unwrap(),
+                    image_grid_thw: media::Tensor::new(vec![1, 3], vec![1, 1, 1]).unwrap(),
                     token_counts: vec![1],
                 },
                 1,

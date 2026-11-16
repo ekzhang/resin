@@ -60,7 +60,8 @@ Model weights are not distributed with Resin. Users who download Liquid AI or
 OpenAI or DeepSeek checkpoints are responsible for the checkpoints' separate license terms.
 
 The native conversation formats in crates/resin-recipe follow the checkpoint
-chat templates for thinkingmachines/Inkling-Small-NVFP4, Qwen/Qwen3.5,
+chat templates for thinkingmachines/Inkling-2-Small (revision
+2ad1157016e1aac77b6ff1b770e7c05229403134), Qwen/Qwen3.5,
 RadixArk/Qwen3.8-27B-NVFP4, nvidia/Gemma-4-31B-IT-NVFP4, and
 LiquidAI/LFM2.5-230M. Source revisions and retained reference licenses are
 recorded in tests/recipe_fuzz/references/README.md and templates/README.md.
@@ -83,10 +84,23 @@ follows its inference/vision.py, under the same copyright and MIT License.
 The MIT notice is retained at crates/resin-recipe/licenses/deepseek-MIT.txt.
 
 The image/video geometry, normalization, patch layouts and rotary positions in
-crates/resin-recipe/src/media/{gemma,inkling,qwen}.rs follow Hugging Face
+crates/resin-recipe/src/media/{gemma,inkling2,qwen}.rs follow Hugging Face
 Transformers' model processors (Copyright The HuggingFace Team), Apache License 2.0.
 https://github.com/huggingface/transformers
 The Rust implementations use the image crate's resize filters.
+The Inkling2 image patch layout, normalization and transparency compositing follow
+image_processing_inkling2.py at Transformers revision
+3a134bc37f7c22c801b618e289b0255425f22647.
+
+Inkling 2 model, DSpark, vision and quantization operators in
+models/cuda/resin_models_cuda/inkling2 follow SGLang's integration:
+https://github.com/sgl-project/sglang/tree/e62ac6279646c686d3b328f58d9b5c2c2d5927dc
+Adapted model code is Apache-2.0; cute_grouped_nvfp4.py is NVIDIA/FlashInfer
+BSD-3-Clause, described below with its full notice retained in the source file.
+Copied kernels retain their source attribution. The model-local FP32 attention
+launcher adapts FlashAttention 4.0.0b26's BSD-3-Clause launch preparation; its
+license is retained in inkling2/LICENSE.flash-attention. FlashAttention's
+Blackwell kernel implementation is supplied by the pinned dependency.
 
 The shared-expert scale layout in resin/backend/cuda/mega_moe.py and the
 validation reference code in tests/test_mega_moe.py and
@@ -206,3 +220,25 @@ and Qwen3-VL vision modules, including their geometry and encoder blocks:
 
 MLX-VLM is licensed under the MIT License. Its notice is retained in the model
 directory's LICENSE and in the dependency distribution.
+
+The compact routed NVFP4 CuTe-DSL GEMM in
+models/cuda/resin_models_cuda/inkling2/cute_grouped_nvfp4.py is vendored from
+sgl-project/sglang revision e62ac6279646c686d3b328f58d9b5c2c2d5927dc,
+python/sglang/kernels/ops/inkling2/cute_grouped_nvfp4.py. It derives from
+FlashInfer 0.7.1 grouped_gemm_masked_blackwell.py, copyright 2025 NVIDIA
+Corporation & Affiliates, under BSD-3-Clause. The full notice and license
+are retained in the source file.
+
+The stable router in models/cuda/resin_models_cuda/inkling2/triton.py
+adapts SGLang revision e62ac6279646c686d3b328f58d9b5c2c2d5927dc,
+python/sglang/kernels/ops/inkling2/route.py and ops/moe/gate_topk.py,
+under the Apache License, Version 2.0. The production adaptation consumes
+precomputed logits and preserves stable selection and log-sigmoid normalization.
+
+The optional NVFP4 routed quantization and SwiGLU bridge in
+models/cuda/resin_models_cuda/inkling2/expert_native.{py,cu} adapt
+sgl-project/sglang revision e62ac6279646c686d3b328f58d9b5c2c2d5927dc,
+python/sglang/kernels/ops/inkling2/nvfp4.py and
+python/sglang/kernels/jit/csrc/inkling2/routed_quant.cuh, under Apache-2.0.
+The adaptation retains device arithmetic and uses Resin's existing FlashInfer
+compilation toolchain with int64 route indices and indirect route weights.

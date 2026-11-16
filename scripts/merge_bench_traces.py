@@ -12,7 +12,8 @@ from collections.abc import Iterable
 from pathlib import Path
 
 TRACE_NAME = re.compile(
-    r"(?P<case>(?:prefill|decode)-ctx\d+-b\d+)-rank(?P<rank>\d+)\.json(?:\.gz)?$"
+    r"(?P<case>(?:prefill|decode)-ctx\d+-b\d+(?:-repeat\d+)?)"
+    r"-rank(?P<rank>\d+)\.json(?:\.gz)?$"
 )
 
 

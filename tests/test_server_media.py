@@ -11,7 +11,7 @@ from resin.recipe import get_native_recipe
 def test_image_preparation_owns_input_pixels():
     image = np.ones((2, 3, 3), dtype=np.float32)
     recipe = get_native_recipe(
-        "inkling", Tokenizer(), media_config={"do_normalize": False}
+        "inkling2", Tokenizer(), media_config={"do_normalize": False}
     )
     media = render_media(recipe, [resin.recipe.Image.from_rgb(image)])
     prepared = media.pixel_values.copy()
@@ -23,6 +23,6 @@ def test_image_preparation_owns_input_pixels():
 
 def test_image_preparation_rejects_implicit_dtype_conversion() -> None:
     image = np.zeros((2, 3, 3), dtype=np.uint8)
-    recipe = get_native_recipe("inkling", Tokenizer())
+    recipe = get_native_recipe("inkling2", Tokenizer())
     with pytest.raises((TypeError, ValueError), match="float32|dtype"):
         render_media(recipe, [resin.recipe.Image(source=image)])

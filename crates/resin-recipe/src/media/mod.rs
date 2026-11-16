@@ -8,7 +8,7 @@ use crate::Error;
 pub mod deepseek;
 pub mod gemma;
 pub mod glm;
-pub mod inkling;
+pub mod inkling2;
 pub mod qwen;
 
 #[derive(Clone, Debug)]
@@ -57,6 +57,14 @@ impl RgbImage {
     }
 
     pub fn decode(data: &[u8], media_type: &str) -> Result<Self, Error> {
+        Self::decode_with_background(data, media_type, false)
+    }
+
+    pub fn decode_with_background(
+        data: &[u8],
+        media_type: &str,
+        checkerboard: bool,
+    ) -> Result<Self, Error> {
         if data.is_empty() {
             return Err(Error::new("image bytes must not be empty"));
         }
@@ -74,8 +82,23 @@ impl RgbImage {
             }
         };
         let decoded = image::load_from_memory_with_format(data, format)
-            .map_err(|error| Error::new(format!("invalid image: {error}")))?
-            .to_rgb32f();
+            .map_err(|error| Error::new(format!("invalid image: {error}")))?;
+        if checkerboard && decoded.color().has_alpha() {
+            let rgba = decoded.to_rgba8();
+            let mut pixels = Vec::with_capacity(rgba.width() as usize * rgba.height() as usize * 3);
+            for (x, y, pixel) in rgba.enumerate_pixels() {
+                let background = if (x / 8 + y / 8) % 2 == 0 { 204 } else { 153 };
+                let alpha = u32::from(pixel[3]);
+                for channel in 0..3 {
+                    let value =
+                        (u32::from(pixel[channel]) * alpha + background * (255 - alpha) + 127)
+                            / 255;
+                    pixels.push(value as f32 / 255.0);
+                }
+            }
+            return Self::new(rgba.width() as usize, rgba.height() as usize, pixels);
+        }
+        let decoded = decoded.to_rgb32f();
         Self::new(
             decoded.width() as usize,
             decoded.height() as usize,
@@ -84,6 +107,10 @@ impl RgbImage {
     }
 
     pub fn data_url(source: &str) -> Result<Self, Error> {
+        Self::data_url_with_background(source, false)
+    }
+
+    pub fn data_url_with_background(source: &str, checkerboard: bool) -> Result<Self, Error> {
         let (header, encoded) = source.split_once(",").ok_or_else(|| {
             Error::new("image URLs must be base64 data URLs; remote fetching is disabled")
         })?;
@@ -96,7 +123,7 @@ impl RgbImage {
         let data = base64::engine::general_purpose::STANDARD
             .decode(encoded)
             .map_err(|_| Error::new("image data URL contains invalid base64"))?;
-        Self::decode(&data, media_type)
+        Self::decode_with_background(&data, media_type, checkerboard)
     }
 
     pub fn resize(&self, width: usize, height: usize, filter: FilterType) -> Result<Self, Error> {
