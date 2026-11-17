@@ -51,7 +51,7 @@ def test_state_alignment_is_independent_of_prefill_chunk_size():
 @torch.inference_mode()
 def test_checkpoints_inside_accepted_verification_preserve_exact_state(device):
     if device == "cuda" and not torch.cuda.is_available():
-        pytest.skip(reason="requires CUDA")
+        pytest.skip("requires CUDA")  # ty: ignore[too-many-positional-arguments]
     torch.manual_seed(39)
     initial = torch.randn(2, 2, 3, 16, device=device).bfloat16()
     inputs = torch.randn(2, 8, 2, 16, device=device).bfloat16()
