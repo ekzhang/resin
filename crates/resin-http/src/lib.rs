@@ -39,7 +39,7 @@ pub type TokenCounter =
     Arc<dyn Fn(ConversationRequest, oneshot::Sender<Result<usize, String>>) + Send + Sync>;
 
 /// Static configuration for HTTP route handlers.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub struct RouteConfig {
     /// Enable OpenAI API endpoints (/v1/responses, /v1/chat/completions).
     pub enable_openai: bool,
@@ -58,6 +58,12 @@ pub struct RouteConfig {
 
     /// The hosting engine's shared limit on token-score alternatives.
     pub max_top_logprobs: u32,
+
+    /// Input types accepted by the configured recipe.
+    pub input_modalities: Vec<String>,
+
+    /// Maximum context length configured on the hosting engine.
+    pub context_length: u32,
 }
 
 impl Default for RouteConfig {
@@ -69,6 +75,8 @@ impl Default for RouteConfig {
             enable_priority_scheduling: false,
             routed_dp_size: 1,
             max_top_logprobs: DEFAULT_MAX_TOP_LOGPROBS,
+            input_modalities: vec!["text".into()],
+            context_length: 32768,
         }
     }
 }
@@ -82,6 +90,8 @@ struct AppState {
     routed_dp_size: usize,
     enable_priority_scheduling: bool,
     max_top_logprobs: u32,
+    input_modalities: Arc<[String]>,
+    context_length: u32,
 }
 
 impl AppState {
@@ -128,6 +138,8 @@ pub fn router(
         routed_dp_size: routes.routed_dp_size,
         enable_priority_scheduling: routes.enable_priority_scheduling,
         max_top_logprobs: routes.max_top_logprobs,
+        input_modalities: routes.input_modalities.into(),
+        context_length: routes.context_length,
     };
     let mut router = Router::new().route("/health", get(openai::health));
     if let Some(metrics) = metrics {

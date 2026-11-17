@@ -120,6 +120,57 @@ def post(base, body):
     return urllib.request.urlopen(request, timeout=5)
 
 
+@pytest.mark.parametrize(
+    "kind,modalities",
+    [
+        ("custom", None),
+        ("custom", ["text", "audio"]),
+        ("inkling2", ["text", "image"]),
+        ("qwen3_5", ["text"]),
+        ("gemma4", ["text", "image", "video"]),
+    ],
+)
+def test_models_reports_recipe_modalities_and_engine_context(kind, modalities):
+    if kind == "custom":
+        recipe = Recipe()
+        if modalities is not None:
+            recipe.input_modalities = modalities
+    else:
+        recipe = get_native_recipe(
+            kind,
+            _FastTokenizer(_byte_tokenizer()),
+            stop_token_ids=[],
+            **({"text_only": True} if kind == "qwen3_5" else {}),
+        )
+        assert recipe.input_modalities == modalities
+    with running_server(Runner(), recipe, engine_options={"context_length": 12345}) as (
+        _,
+        engine,
+        _,
+        errors,
+        base,
+        _,
+    ):
+        with urllib.request.urlopen(f"{base}/v1/models", timeout=5) as response:
+            assert json.load(response) == {
+                "object": "list",
+                "data": [
+                    {
+                        "id": "test",
+                        "object": "model",
+                        "created": 0,
+                        "owned_by": "resin",
+                        "architecture": {
+                            "input_modalities": modalities or ["text"],
+                            "output_modalities": ["text"],
+                        },
+                        "context_length": engine.context_length,
+                    }
+                ],
+            }
+        assert not errors
+
+
 def test_programmatic_shutdown_stops_idle_server_and_closes_engine():
     with running_server(Runner()) as (server, engine, thread, errors, _base, port):
         server.shutdown()

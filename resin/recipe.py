@@ -52,6 +52,9 @@ class Recipe(Protocol):
 
     We recommend using one of the recipes in the `resin-recipe` crate, which
     includes optimized incremental parsers in Rust.
+
+    Custom recipes can expose an ``input_modalities`` sequence for model discovery;
+    the HTTP server defaults to ``["text"]`` when it is omitted.
     """
 
     @property

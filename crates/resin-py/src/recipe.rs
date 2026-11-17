@@ -574,6 +574,15 @@ impl NativeRecipe {
     fn tokenizer(&self) -> RecipeTokenizer {
         self.tokenizer.clone()
     }
+
+    #[getter]
+    fn input_modalities(&self) -> Vec<&'static str> {
+        match &self.media_config {
+            None => vec!["text"],
+            Some(MediaConfig::Gemma(_)) => vec!["text", "image", "video"],
+            Some(_) => vec!["text", "image"],
+        }
+    }
     #[pyo3(signature=(messages: "Sequence[Message]", *, tools: "Sequence[Tool]" = Vec::new(), options=None))]
     pub(crate) fn render(
         &self,

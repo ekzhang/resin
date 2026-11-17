@@ -141,7 +141,18 @@ impl NativeHttpServer {
                 "enable_demo=True requires enable_openai=True",
             ));
         }
-        let max_top_logprobs = Python::attach(|py| engine.bind(py).borrow().max_top_logprobs());
+        let (max_top_logprobs, context_length, input_modalities) = Python::attach(|py| {
+            let engine = engine.bind(py).borrow();
+            let modalities = crate::recipe::optional_attr(recipe.bind(py), "input_modalities")?
+                .map(|value| value.extract::<Vec<String>>())
+                .transpose()?
+                .unwrap_or_else(|| vec!["text".into()]);
+            Ok::<_, PyErr>((
+                engine.max_top_logprobs(),
+                engine.context_length(),
+                modalities,
+            ))
+        })?;
         Ok(Self {
             engine,
             distributed,
@@ -161,6 +172,8 @@ impl NativeHttpServer {
                 enable_priority_scheduling,
                 routed_dp_size,
                 max_top_logprobs,
+                input_modalities,
+                context_length,
             },
             running: AtomicBool::new(false),
             shutdown: Mutex::new(None),
@@ -187,7 +200,7 @@ impl NativeHttpServer {
         let distributed = self.distributed.as_ref().map(|value| value.clone_ref(py));
         let recipe = self.recipe.clone_ref(py);
         let model = self.model.clone();
-        let routes = self.routes;
+        let routes = self.routes.clone();
         let stream_interval = self.stream_interval;
         let request_queue_capacity = self.request_queue_capacity;
         let admission = self.admission;

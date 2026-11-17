@@ -145,7 +145,12 @@ pub async fn models(State(state): State<AppState>) -> Json<Value> {
             "id": state.model.as_ref(),
             "object": "model",
             "created": 0,
-            "owned_by": "resin"
+            "owned_by": "resin",
+            "architecture": {
+                "input_modalities": state.input_modalities.as_ref(),
+                "output_modalities": ["text"]
+            },
+            "context_length": state.context_length
         }]
     }))
 }
