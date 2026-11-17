@@ -89,6 +89,53 @@ def capture(call):
     return graph, result
 
 
+def test_store_kv_unseen_chunks_reuse_compilation(monkeypatch):
+    from resin_models_cuda.inkling2.triton import _store_kv
+
+    device = torch.cuda.current_device()
+    saved = _store_kv.device_caches[device]
+    monkeypatch.setitem(_store_kv.device_caches, device, ({}, *saved[1:]))
+    variants = None
+    for tokens, start in ((128, 0), (1, 127), (129, 128), (4096, 257), (3073, 8193)):
+        positions = (
+            torch.arange(start, start + tokens, device="cuda")[None]
+            .expand(2, -1)
+            .clone()
+        )
+        cache = cache_fixture(positions[:, -1] + 1, 2)
+        keys, values = (
+            torch.randn(2, tokens, 2, 256, device="cuda").bfloat16()[..., ::2]
+            for _ in range(2)
+        )
+        for row in (None, 1):
+            active = cache if row is None else cache.row(row)
+            if row is not None:
+                # Row metadata and an odd packed-token offset lose alignment.
+                keys, values, positions = (
+                    keys[1:, 1:],
+                    values[1:, 1:],
+                    positions[:1, 1:],
+                )
+                keys.neg_()
+                values.neg_()
+            pages = active.groups[0].slab_ids.gather(1, positions // 128).long()
+            expected = [cache.keys.clone(), cache.values.clone()]
+            for output, source in zip(expected, (keys, values), strict=True):
+                output[pages, positions % 128] = source
+            active.store_kv(
+                keys, values, positions, group_index=0, layer=0, layer_count=1
+            )
+            for actual, wanted in zip(
+                (cache.keys, cache.values), expected, strict=True
+            ):
+                torch.testing.assert_close(actual, wanted, rtol=0, atol=0)
+            compiled = set(_store_kv.device_caches[device][0])
+            if variants is None:
+                variants = compiled
+            else:
+                assert compiled == variants
+
+
 @pytest.mark.parametrize("window", [None, 1023])
 def test_paged_attention_and_sink_match_dense(window):
     from resin_models_cuda.inkling2.attention import paged_attention

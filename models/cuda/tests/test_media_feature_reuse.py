@@ -200,6 +200,35 @@ def test_changed_pixels_cannot_replace_a_live_request(case):
         case.features(1, case.media(0.75))
 
 
+def test_inkling2_only_encodes_chunks_with_image_positions():
+    case = _case("inkling2")
+    payload = case.media()
+    case.runner._model.embed_tokens = case.runner._model.embed
+    case.runner._model.embed_norm = lambda hidden: hidden
+
+    def chunk(sequence_id, start, stop):
+        plan = BatchPlan(
+            sequence_ids=[sequence_id],
+            context_lengths=[start],
+            token_ids=payload.token_ids[start:stop],
+            token_indptr=[0, stop - start],
+            phase=BatchPhase.PREFILL,
+            media=[payload],
+        )
+        return case.runner._media_embeddings(
+            plan, 0, torch.tensor([payload.token_ids[start:stop]])
+        )
+
+    assert chunk(1, 0, 1) is None
+    assert chunk(2, 3, 4) is None  # Restored prefix already includes the image.
+    assert case.state.calls == 0 and not case.runner._media_features
+    embeddings = chunk(1, 1, 3)
+    torch.testing.assert_close(embeddings, torch.full((1, 2, 3), 0.25))
+    assert case.state.calls == 1
+    assert chunk(1, 3, 4) is None
+    assert case.state.calls == 1
+
+
 def test_gemma_rebuilds_current_request_positions():
     case = _case("gemma")
     original = case.media()

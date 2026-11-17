@@ -611,13 +611,15 @@ class Inkling2CudaRunner(CudaRunner):
         media = plan.media[row]
         if media is None:
             return None
-        features = self._features_for(int(plan.sequence_ids[row]), media)
-        embeddings = self._model.embed_norm(self._model.embed_tokens(ids))
         start = int(plan.context_lengths[row])
         positions = np.asarray(media.image_positions)
         selected = np.flatnonzero(
             (positions >= start) & (positions < start + ids.shape[1])
         )
+        if not selected.size:
+            return None
+        features = self._features_for(int(plan.sequence_ids[row]), media)
+        embeddings = self._model.embed_norm(self._model.embed_tokens(ids))
         destination = torch.as_tensor(positions[selected] - start, device=self.device)
         source = torch.as_tensor(selected, device=self.device)
         embeddings[0].index_copy_(0, destination, features[source])

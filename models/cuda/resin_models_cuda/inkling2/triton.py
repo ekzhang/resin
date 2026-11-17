@@ -35,8 +35,11 @@ def _kv_location(
     return page, offset
 
 
+# Flatten request-dependent strides: Triton specializes tuple elements recursively.
+# Inner strides describe fixed tensor layouts and retain vectorized loads/stores.
 @triton.jit(
-    do_not_specialize=["T", "layer", "KS", "VS", "DKS", "DVS", "PS", "GS", "WIDTH"]
+    do_not_specialize=("T layer WIDTH KB VB PB GSB GOB").split(),
+    do_not_specialize_on_alignment=["Positions", "Slabs", "Slots", "First"],
 )
 def _store_kv(
     K,
@@ -49,12 +52,29 @@ def _store_kv(
     DestV,
     T,
     layer,
-    KS,
-    VS,
-    DKS,
-    DVS,
-    PS,
-    GS,
+    KB,
+    KT,
+    KH,
+    KD,
+    VB,
+    VT,
+    VH,
+    VD,
+    CKP,
+    CKT,
+    CKH,
+    CKD,
+    CVP,
+    CVT,
+    CVH,
+    CVD,
+    PB,
+    PT,
+    GSB,
+    GSC,
+    GOB,
+    GOC,
+    GFB,
     WIDTH,
     HEADS: tl.constexpr,
     DIM: tl.constexpr,
@@ -73,8 +93,8 @@ def _store_kv(
         First,
         batch,
         token,
-        PS,
-        GS,
+        (PB, PT),
+        (GSB, GSC, GOB, GOC, GFB),
         WIDTH,
         layer,
         PAGE,
@@ -85,19 +105,15 @@ def _store_kv(
     col = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
     head, dim = col // DIM, col % DIM
     mask = col < HEADS * DIM
-    key = tl.load(
-        K + batch * KS[0] + token * KS[1] + head * KS[2] + dim * KS[3], mask, 0
-    )
-    value = tl.load(
-        V + batch * VS[0] + token * VS[1] + head * VS[2] + dim * VS[3], mask, 0
-    )
+    key = tl.load(K + batch * KB + token * KT + head * KH + dim * KD, mask, 0)
+    value = tl.load(V + batch * VB + token * VT + head * VH + dim * VD, mask, 0)
     tl.store(
-        DestK + page * DKS[0] + offset * DKS[1] + head * DKS[2] + dim * DKS[3],
+        DestK + page * CKP + offset * CKT + head * CKH + dim * CKD,
         key,
         mask,
     )
     tl.store(
-        DestV + page * DVS[0] + offset * DVS[1] + head * DVS[2] + dim * DVS[3],
+        DestV + page * CVP + offset * CVT + head * CVH + dim * CVD,
         value,
         mask,
     )
@@ -122,16 +138,14 @@ def store_kv(cache, keys, values, positions, group_index, layer, layer_count):
         cache.values,
         tokens,
         layer,
-        keys.stride(),
-        values.stride(),
-        cache.keys.stride(),
-        cache.values.stride(),
-        positions.stride(),
-        (
-            *group.slab_ids.stride(),
-            *group.slotnums.stride(),
-            group.first_blocks.stride(0),
-        ),
+        *keys.stride(),
+        *values.stride(),
+        *cache.keys.stride(),
+        *cache.values.stride(),
+        *positions.stride(),
+        *group.slab_ids.stride(),
+        *group.slotnums.stride(),
+        group.first_blocks.stride(0),
         group.slab_ids.shape[1],
         heads,
         dim,

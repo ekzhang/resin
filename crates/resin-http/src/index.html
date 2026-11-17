@@ -170,7 +170,7 @@ const reasoningEffort=document.querySelector('#reasoning-effort'),temperature=do
 const topP=document.querySelector('#top-p'),maxOutputTokens=document.querySelector('#max-output-tokens');
 const attach=document.querySelector('#attach'),imageInput=document.querySelector('#image-input'),attachments=document.querySelector('#attachments');
 const supportedImageTypes=new Set(['image/avif','image/bmp','image/gif','image/jpeg','image/png','image/tiff','image/webp']);
-const maxImages=4,maxImageBytes=8*1024*1024;let history=[],pendingImages=[];
+const maxImages=4,maxImageBytes=8*1024*1024,maxImageDimension=4096;let history=[],pendingImages=[];
 const replicaCount=Math.max(1,Number(document.querySelector('meta[name="resin-dp-size"]').content)||1);
 const conversationRank=crypto.getRandomValues(new Uint32Array(1))[0]%replicaCount;
 fetch('/v1/models').then(r=>r.json()).then(x=>modelEl.textContent=x.data?.[0]?.id||'');
@@ -182,6 +182,18 @@ function turn(role,text=''){const follow=atChatBottom(),e=document.createElement
 function userTurn(text,images){const e=turn('user');e.textContent='';if(images.length){const media=document.createElement('div');media.className='user-media';for(const image of images){const preview=document.createElement('img');preview.src=image.url;preview.alt=image.name;media.append(preview)}e.append(media)}const content=document.createElement('div');content.className='user-text';content.textContent=text;e.append(content);return e}
 function renderAttachments(){attachments.replaceChildren();attachments.hidden=!pendingImages.length;pendingImages.forEach((image,index)=>{const item=document.createElement('div'),preview=document.createElement('img'),remove=document.createElement('button');item.className='attachment';preview.src=image.url;preview.alt=image.name;remove.type='button';remove.textContent='×';remove.title=`Remove ${image.name}`;remove.setAttribute('aria-label',remove.title);remove.addEventListener('click',()=>{pendingImages.splice(index,1);renderAttachments()});item.append(preview,remove);attachments.append(item)})}
 function readDataUrl(file){return new Promise((resolve,reject)=>{const reader=new FileReader();reader.onload=()=>resolve(reader.result);reader.onerror=()=>reject(reader.error||new Error(`Could not read ${file.name}`));reader.readAsDataURL(file)})}
+async function resizeImage(file){
+  const image=await createImageBitmap(file);
+  try {
+    const scale=maxImageDimension/Math.max(image.width,image.height);if(scale>=1)return file;
+    const canvas=document.createElement('canvas');canvas.width=Math.max(1,Math.round(image.width*scale));canvas.height=Math.max(1,Math.round(image.height*scale));
+    const context=canvas.getContext('2d');if(!context)throw new Error('Image resizing is unavailable');
+    context.imageSmoothingQuality='high';context.drawImage(image,0,0,canvas.width,canvas.height);
+    const type=['image/jpeg','image/webp'].includes(file.type)?file.type:'image/png';
+    const blob=await new Promise(resolve=>canvas.toBlob(resolve,type,0.9));if(!blob)throw new Error('Could not resize image');
+    return new File([blob],file.name,{type:blob.type});
+  } finally {image.close()}
+}
 function escapeHtml(s){return s.replaceAll('&','&amp;').replaceAll('<','&lt;').replaceAll('>','&gt;').replaceAll('"','&quot;').replaceAll("'",'&#39;')}
 function inlineMarkdown(source){
   const held=[]; let value=escapeHtml(source);
@@ -230,7 +242,22 @@ new ResizeObserver(updateScrollFades).observe(document.body);
 updateScrollFades();
 settingsToggle.addEventListener('click',()=>{settings.hidden=!settings.hidden;settingsToggle.setAttribute('aria-expanded',String(!settings.hidden))});
 attach.addEventListener('click',()=>imageInput.click());
-imageInput.addEventListener('change',async()=>{const files=[...imageInput.files];imageInput.value='';let error='';for(const file of files){if(pendingImages.length>=maxImages){error=`Attach at most ${maxImages} images`;break}if(!supportedImageTypes.has(file.type)){error=`Unsupported image type: ${file.type||file.name}`;continue}if(file.size>maxImageBytes){error=`${file.name} is larger than 8 MiB`;continue}if(pendingImages.reduce((total,image)=>total+image.size,0)+file.size>maxImageBytes){error='Attached images total more than 8 MiB';break}try{pendingImages.push({name:file.name,size:file.size,url:await readDataUrl(file)})}catch(err){error=err.message}}renderAttachments();stats.textContent=error});
+imageInput.addEventListener('change',async()=>{
+  const files=[...imageInput.files];imageInput.value='';if(send.disabled||!files.length)return;
+  send.disabled=true;attach.disabled=true;stats.textContent='Preparing images…';let error='';
+  try {
+    for(const file of files){
+      if(pendingImages.length>=maxImages){error=`Attach at most ${maxImages} images`;break}
+      if(!supportedImageTypes.has(file.type)){error=`Unsupported image type: ${file.type||file.name}`;continue}
+      try {
+        const image=await resizeImage(file);
+        if(image.size>maxImageBytes){error=`${file.name} is larger than 8 MiB`;continue}
+        if(pendingImages.reduce((total,item)=>total+item.size,0)+image.size>maxImageBytes){error='Attached images total more than 8 MiB';break}
+        pendingImages.push({name:file.name,size:image.size,url:await readDataUrl(image)});
+      } catch(err) {error=`Could not prepare ${file.name}: ${err.message}`}
+    }
+  } finally {renderAttachments();stats.textContent=error;send.disabled=false;attach.disabled=false}
+});
 form.addEventListener('submit',async e=>{
   e.preventDefault();if(send.disabled)return;const text=prompt.value.trim(),images=pendingImages;if(!text&&!images.length)return;
   pendingImages=[];renderAttachments();prompt.value='';resizePrompt();send.disabled=true;attach.disabled=true;stats.textContent='';userTurn(text,images);
