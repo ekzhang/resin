@@ -130,8 +130,16 @@ per slab, and construct the final layout.
 
 With `prefix_cache=True`, the Engine resumes requests from the longest usable
 cached prefix. A flat SHA-256 index maps request namespaces and text or media
-identities to immutable checkpoints. Checkpoint alignment is the least common
-multiple of all cache groups' block sizes.
+identities to immutable checkpoints. Recurrent state is tracked at
+`state_tracking_interval=256` tokens, aligned with the model's cache blocks and
+independent of the prefill chunk size.
+
+For recurrent or sliding-window caches, an active request keeps its latest
+usable checkpoint. Generation endpoints and detected shared prompt boundaries
+are retained for reuse. Additional periodic checkpoints are optional:
+`prefix_cache_checkpoint_interval=N` retains them every `N` tokens, subject to
+alignment; the default `0` disables them. Models with only full-context KV retain
+ordinary prefix reuse through shared history pages.
 
 The Engine evicts least-recently-used checkpoints under memory pressure, and
 shared pages remain allocated until their last owner releases them. See the

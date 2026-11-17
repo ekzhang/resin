@@ -12,7 +12,7 @@ use super::paged::{
     CachePool, CachePoolError, CachedPages, GroupDemand, GroupId, PageAccessClaim, PageHandle,
     RequestPages, RetireRequestFailure, SequenceId, WriterAccessLease,
 };
-use super::prefix::PrefixCache;
+use super::prefix::{PrefixCache, PrefixHash};
 pub use super::prefix::{PrefixIdentity, PrefixKey};
 
 /// A point-in-time inventory of the shared physical cache pool.
@@ -103,6 +103,8 @@ pub struct PagedKvResources {
     state_groups: Vec<bool>,
     state_demands: Vec<GroupDemand>,
     last_snapshot_id: u64,
+    checkpoint_interval: u32,
+    latest_prefixes: HashMap<u64, (PrefixHash, u32)>,
 }
 
 struct ContextPlan {
@@ -184,7 +186,63 @@ impl PagedKvResources {
             state_groups,
             state_demands,
             last_snapshot_id: 0,
+            checkpoint_interval: 0,
+            latest_prefixes: HashMap::new(),
         })
+    }
+
+    pub(crate) fn set_prefix_cache_policy(
+        &mut self,
+        state_tracking_interval: u32,
+        checkpoint_interval: u32,
+    ) -> Result<(), CachePoolError> {
+        if self.prefix_cache.is_some() {
+            let mut alignment = prefix_alignment(&self.layout)?;
+            if !self.state_demands.is_empty() {
+                alignment = lcm(alignment, state_tracking_interval)?;
+            }
+            self.checkpoint_interval = if checkpoint_interval == 0 {
+                0
+            } else {
+                lcm(alignment, checkpoint_interval)?
+            };
+            self.prefix_cache = Some(PrefixCache::new(alignment));
+        }
+        Ok(())
+    }
+
+    pub(crate) const fn checkpoint_interval(&self) -> u32 {
+        self.checkpoint_interval
+    }
+
+    pub(crate) fn observe_prompt(&mut self, request: u64, key: &PrefixKey<'_>) -> u32 {
+        let maximum = key
+            .len()
+            .saturating_sub(self.layout.replay_suffix_tokens().max(1) as usize);
+        self.prefix_cache
+            .as_mut()
+            .map_or(0, |cache| cache.observe(request, &key.prefix(maximum)))
+    }
+
+    pub(crate) fn retain_request_prefix(
+        &mut self,
+        request: u64,
+        key: &PrefixKey<'_>,
+    ) -> Result<(), CachePoolError> {
+        if let Some(&(hash, length)) = self.latest_prefixes.get(&request)
+            && let Some(mut cache) = self.prefix_cache.take()
+        {
+            let result = if cache.retain(hash)
+                && let Some(pages) = cache.peek(hash)
+            {
+                self.store_prefix(pages, &key.prefix(length as usize), false)
+            } else {
+                Ok(())
+            };
+            self.prefix_cache = Some(cache);
+            result?;
+        }
+        Ok(())
     }
 
     pub const fn pool(&self) -> &CachePool {
@@ -620,6 +678,13 @@ impl PagedKvResources {
         // The matched immutable snapshot also holds STATE before its private
         // restore. Optional backup failure must not reject a successful hit.
         let _ = self.store_prefix(snapshot, &key.prefix(length as usize), true);
+        self.latest_prefixes.insert(
+            state.sequence().get(),
+            (
+                key.prefix(length as usize).hash(cache.alignment() as usize),
+                length,
+            ),
+        );
         Ok(length)
     }
 
@@ -645,23 +710,50 @@ impl PagedKvResources {
         }
         let demands = self.demands(resident_tokens);
         let pages = self.pool.share_request_prefix(state, &demands)?;
-        self.cache_prefix(pages, &key.prefix(length))?;
+        self.cache_prefix(state.sequence().get(), pages, &key.prefix(length))?;
         Ok(true)
     }
 
     fn cache_prefix(
         &mut self,
+        request: u64,
         pages: CachedPages,
         key: &PrefixKey<'_>,
     ) -> Result<(), CachePoolError> {
-        self.store_prefix(&pages, key, false)?;
-        let replaced = self
+        let cache = self
             .prefix_cache
-            .as_mut()
-            .ok_or(CachePoolError::StaleHandle)?
-            .insert(key, pages);
+            .as_ref()
+            .ok_or(CachePoolError::StaleHandle)?;
+        let hash = key.hash(cache.alignment() as usize);
+        let full_history = self.state_demands.is_empty()
+            && self
+                .layout
+                .groups()
+                .iter()
+                .all(|group| group.retention() == KvRetention::FullContext);
+        let retain = full_history
+            || cache.is_shared(key)
+            || (self.checkpoint_interval != 0
+                && key.len().is_multiple_of(self.checkpoint_interval as usize));
+        if retain {
+            self.store_prefix(&pages, key, false)?;
+        }
+        let cache = self.prefix_cache.as_mut().unwrap();
+        let replaced = cache.insert_with_retention(key, pages, retain);
         if let Some(replaced) = replaced {
             self.pool.retire_cached_prefix(replaced)?;
+        }
+        if let Some((previous, _)) = self
+            .latest_prefixes
+            .insert(request, (hash, key.len() as u32))
+            && previous != hash
+            && !self
+                .latest_prefixes
+                .values()
+                .any(|&(head, _)| head == previous)
+            && let Some(previous) = cache.remove_transient(previous)
+        {
+            self.pool.retire_cached_prefix(previous)?;
         }
         Ok(())
     }
@@ -684,6 +776,7 @@ impl PagedKvResources {
 
     pub fn clear_prefix_cache(&mut self) -> Result<(), CachePoolError> {
         while self.evict_one_prefix()? {}
+        self.latest_prefixes.clear();
         Ok(())
     }
 
@@ -740,6 +833,12 @@ impl PagedKvResources {
                 error,
                 request: state,
             });
+        }
+        if let Some(cache) = &mut self.prefix_cache {
+            if let Some((hash, _)) = self.latest_prefixes.remove(&state.sequence().get()) {
+                cache.retain(hash);
+            }
+            cache.finish_request(state.sequence().get());
         }
         self.pool.retire_request(state)
     }
@@ -807,12 +906,16 @@ impl PagedKvResources {
                     if !ids.contains(&snapshot.id) {
                         continue;
                     }
-                    if snapshot.ready || (!terminal && snapshot.prefix_length != physical) {
+                    if snapshot.ready || (!terminal && snapshot.prefix_length > physical) {
                         return Err(Self::invalid(
                             "state checkpoint does not match the accepted cache prefix",
                         ));
                     }
-                    accepted.push((request_id, index, !terminal && physical == visible));
+                    accepted.push((
+                        request_id,
+                        index,
+                        !terminal && snapshot.prefix_length <= visible,
+                    ));
                 }
             }
         }
@@ -873,17 +976,19 @@ impl PagedKvResources {
         if key.len() != snapshot.prefix_length as usize {
             return Err(CachePoolError::StaleHandle);
         }
-        if snapshot.history_write_end > snapshot.prefix_length
-            && self
-                .layout
-                .groups()
-                .iter()
-                .any(|group| group.retention().window_tokens().is_some())
-        {
-            // The copied STATE is immutable, but the accompanying WINDOW ring
-            // remained writable for the whole continuation lease. Without a
-            // separately pinned historical ring, an older prefix is optional
-            // cache data we must discard rather than mislabel newer KV.
+        if self.layout.groups().iter().any(|group| {
+            let Some(window) = group.read_window_tokens() else {
+                return false;
+            };
+            let first_read = snapshot
+                .prefix_length
+                .saturating_sub(window.get().saturating_sub(1))
+                / group.block_tokens();
+            let last_write = snapshot.history_write_end.saturating_sub(1) / group.block_tokens();
+            last_write.saturating_sub(first_read) >= group.window_resident_blocks().unwrap().get()
+        }) {
+            // A wide speculative/continuation lease may overwrite old ring
+            // pages. Publish only if the checkpoint's entire read window survives.
             snapshot.ready = false;
             return Ok(());
         }
@@ -911,7 +1016,7 @@ impl PagedKvResources {
             .pool
             .combine_state_snapshots(history, copied, &self.state_groups)?;
         snapshot.ready = false;
-        self.cache_prefix(pages, key)
+        self.cache_prefix(state.sequence().get(), pages, key)
     }
 
     fn demands(&self, context: u32) -> Vec<GroupDemand> {
@@ -1263,17 +1368,18 @@ impl Drop for PagedKvResources {
 }
 
 fn prefix_alignment(layout: &KvLayout) -> Result<u32, CachePoolError> {
-    fn gcd(mut left: u32, mut right: u32) -> u32 {
-        while right != 0 {
-            (left, right) = (right, left % right);
-        }
-        left
-    }
     layout.groups().iter().try_fold(1u32, |alignment, group| {
-        alignment
-            .checked_mul(group.block_tokens().get() / gcd(alignment, group.block_tokens().get()))
-            .ok_or(CachePoolError::DemandOverflow)
+        lcm(alignment, group.block_tokens().get())
     })
+}
+
+fn lcm(left: u32, right: u32) -> Result<u32, CachePoolError> {
+    let (mut a, mut b) = (left, right);
+    while b != 0 {
+        (a, b) = (b, a % b);
+    }
+    left.checked_mul(right / a)
+        .ok_or(CachePoolError::DemandOverflow)
 }
 
 /// One request owner selected for a cache batch.
@@ -1379,6 +1485,7 @@ mod tests {
             let history = KvGroupLayout::new(128, 1, KvRetention::FullContext).unwrap();
             let layout = KvLayout::new(capacity, vec![history, window]).unwrap();
             let mut r = PagedKvResources::with_prefix_cache(layout).unwrap();
+            r.set_prefix_cache_policy(256, 128).unwrap();
             let store = HeldStorage::default();
             r.storage = Some((
                 Box::new(store.clone()),
@@ -1465,6 +1572,7 @@ mod tests {
         .unwrap();
         let mut resources = PagedKvResources::with_prefix_cache(layout).unwrap();
         let id = RequestId::new(NonZeroU64::new(1).unwrap());
+        resources.set_prefix_cache_policy(256, 2).unwrap();
         let mut request = resources.attach(id, 0).unwrap();
         resources.ensure_context(&mut request, 0, 2).unwrap();
         resources
@@ -2596,8 +2704,8 @@ mod tests {
     }
 
     #[test]
-    fn delayed_window_state_checkpoint_cannot_publish_a_reused_ring() {
-        for delayed in [false, true] {
+    fn delayed_window_state_checkpoint_requires_its_read_window() {
+        for (delayed, overwritten) in [(false, false), (true, false), (true, true)] {
             let layout = KvLayout::new(
                 6,
                 vec![
@@ -2625,8 +2733,7 @@ mod tests {
             let id = RequestId::new(NonZeroU64::new(1).unwrap());
             let mut request = resources.attach(id, 0).unwrap();
             let (phase, start, count, lookahead) = if delayed {
-                // Checkpoint4 is reached inside a lease permitted to write
-                // through6. Its logical block3 reuses ring block0 afterward.
+                // The lease reuses block0, but checkpoint4 only reads block1.
                 resources.ensure_context(&mut request, 3, 7).unwrap();
                 (Phase::Decode, 3, 1, 3)
             } else {
@@ -2663,12 +2770,22 @@ mod tests {
                 .unwrap();
             resources.finish_state_initialization([id.get()]);
             resources.release(access.lease);
+            if overwritten {
+                // An excessively delayed publication must still reject a
+                // snapshot once the required block1 has also been overwritten.
+                resources
+                    .state_resources
+                    .get_mut(&id.get())
+                    .unwrap()
+                    .snapshots[0]
+                    .history_write_end = 9;
+            }
             resources
                 .publish_state_prefix(&mut request, receipt, &key(&[1, 2, 3, 4]))
                 .unwrap();
             assert_eq!(
                 resources.prefix_metrics().unwrap().entries,
-                u64::from(!delayed)
+                u64::from(!overwritten)
             );
             assert!(request.groups()[1].pages()[0].is_writable());
             resources.retire(request).unwrap();

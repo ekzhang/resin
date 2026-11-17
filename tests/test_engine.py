@@ -49,6 +49,18 @@ class TestEngine:
         with pytest.raises(ValueError, match="context_length must be positive"):
             Engine(RecordingRunner(), context_length=0)
 
+    def test_prefix_cache_intervals_are_engine_settings(self) -> None:
+        with Engine(
+            RecordingRunner(),
+            state_tracking_interval=128,
+            prefix_cache_checkpoint_interval=4096,
+        ) as engine:
+            assert engine.prefix_cache_stats is None
+        with pytest.raises(ValueError, match="state_tracking_interval"):
+            Engine(RecordingRunner(), state_tracking_interval=0)
+        with pytest.raises(OverflowError):
+            Engine(RecordingRunner(), prefix_cache_checkpoint_interval=-1)
+
     @pytest.mark.parametrize("params", [None, SamplingParams(max_output_tokens=None)])
     def test_missing_generation_limit_uses_remaining_model_context(
         self, params

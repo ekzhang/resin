@@ -11,6 +11,7 @@ from resin_models_cuda.inkling2.cache import CacheArena, CacheGeometry
 from resin_models_cuda.inkling2.cuda import Inkling2CudaRunner
 from resin_models_cuda.inkling2.dspark import DSparkMarkovHead
 from resin_models_cuda.inkling2.kernels import (
+    copy_state_checkpoints,
     select_convolution_state,
     short_convolution,
 )
@@ -38,6 +39,71 @@ def test_snapshot_preserves_state_and_draft_features_without_aliasing():
     arena.draft_features[2, 1].fill_(11)
     assert arena.states[2, 1].eq(3).all()
     assert features.eq(0).all()
+
+
+def test_state_alignment_is_independent_of_prefill_chunk_size():
+    geometry = CacheGeometry(2, 3, 1, 2, 2, 8, 32, 3, 128, 128)
+    assert geometry.prefill_chunk_size == 4096
+    assert geometry.layout(64).groups[geometry.state_group].block_tokens == 128
+
+
+@pytest.mark.parametrize("device", ["cpu", "cuda"])
+@torch.inference_mode()
+def test_checkpoints_inside_accepted_verification_preserve_exact_state(device):
+    if device == "cuda" and not torch.cuda.is_available():
+        pytest.skip("requires CUDA")
+    torch.manual_seed(39)
+    initial = torch.randn(2, 2, 3, 16, device=device).bfloat16()
+    inputs = torch.randn(2, 8, 2, 16, device=device).bfloat16()
+    features = torch.randn(2, 8, 13, device=device).bfloat16()
+    width = initial[0].numel() + features.shape[-1]
+    arena = torch.full((8, 2 * width + 17), -99, device=device).bfloat16()
+    storage = arena.as_strided((8, 2, width), (arena.stride(0), width, 1))
+    addresses = torch.tensor([[0, 0, item + 1, 1] for item in range(6)], device=device)
+    candidates = torch.tensor(
+        [[0, 256], [1, 512], [0, 260], [0, 261], [0, 253], [1, 517]],
+        device=device,
+    )
+    positions = torch.tensor([253, 509], device=device)
+    ends = torch.tensor([260, 511], device=device)
+
+    def operation():
+        return copy_state_checkpoints(
+            storage, addresses, candidates, ends, initial, inputs, features, positions
+        )
+
+    def check(flags):
+        history = torch.cat((initial.transpose(1, 2), inputs), dim=1)
+        expected = torch.full_like(arena, -99)
+        expected_slots = expected.as_strided(storage.shape, storage.stride())
+        ready = []
+        for (_, _, slab, slot), (row, prefix) in zip(
+            addresses.tolist(), candidates.tolist(), strict=True
+        ):
+            count = prefix - int(positions[row])
+            valid = 0 < count <= 8 and prefix <= int(ends[row])
+            ready.append(valid)
+            if valid:
+                state = history[row, count : count + 3].transpose(0, 1).flatten()
+                expected_slots[slab, slot] = torch.cat(
+                    (state, features[row, count - 1])
+                )
+        assert flags.tolist() == ready
+        torch.testing.assert_close(arena, expected, rtol=0, atol=0)
+
+    check(operation())
+    if device == "cuda":
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            flags = operation()
+        for stop in (512, 517):
+            arena.fill_(-99)
+            ends[1] = stop
+            initial.add_(1)
+            inputs.sub_(2)
+            features.add_(3)
+            graph.replay()
+            check(flags)
 
 
 def test_convolution_rollback_uses_raw_inputs_at_each_accepted_boundary():
@@ -97,6 +163,12 @@ def test_initial_state_owns_storage_and_zeros_only_new_sequences():
     expected[positions == 0] = 0
     torch.testing.assert_close(initial, expected, rtol=0, atol=0)
     torch.testing.assert_close(live, original, rtol=0, atol=0)
+    scratch = torch.empty_like(live)
+    captured = runner._initial_state(
+        SimpleNamespace(state_at=state_at), positions, out=scratch
+    )
+    assert captured.data_ptr() == scratch.data_ptr()
+    torch.testing.assert_close(captured, expected, rtol=0, atol=0)
 
     live.fill_(-7)  # A later target forward overwrites the physical live slots.
     torch.testing.assert_close(initial, expected, rtol=0, atol=0)

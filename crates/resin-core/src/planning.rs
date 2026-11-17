@@ -7,6 +7,7 @@ pub struct PlanningConfig {
     pub max_batch_tokens: Option<NonZeroU32>,
     pub prefill_chunk_size: NonZeroU32,
     pub checkpoint_alignment: Option<NonZeroU32>,
+    pub checkpoint_interval: u32,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -17,6 +18,8 @@ pub struct RequestProgress {
     pub sample_at_prefill_end: bool,
     /// Half-open token ranges which must be processed in one prefill row.
     pub atomic_prefill_spans: Vec<(u32, u32)>,
+    /// A detected common prompt boundary whose exact state should be retained.
+    pub shared_prefix: u32,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
@@ -83,6 +86,26 @@ pub fn schedule_ready_prefix(
             }
         }
         if request.phase == Phase::Prefill {
+            let periodic = if config.checkpoint_interval == 0 {
+                None
+            } else {
+                request
+                    .logical_context
+                    .checked_div(config.checkpoint_interval)
+                    .and_then(|block| block.checked_add(1))
+                    .and_then(|block| block.checked_mul(config.checkpoint_interval))
+            };
+            for checkpoint in periodic.into_iter().chain([request.shared_prefix]) {
+                if request.logical_context < checkpoint
+                    && checkpoint < end
+                    && !request
+                        .atomic_prefill_spans
+                        .iter()
+                        .any(|&(start, end)| start < checkpoint && checkpoint < end)
+                {
+                    end = checkpoint;
+                }
+            }
             for &(span_start, span_end) in &request.atomic_prefill_spans {
                 if span_start < end && end < span_end {
                     if span_end <= hard_end {
@@ -129,6 +152,7 @@ mod tests {
             logical_context,
             sample_at_prefill_end: true,
             atomic_prefill_spans: Vec::new(),
+            shared_prefix: 0,
         }
     }
 
@@ -140,6 +164,7 @@ mod tests {
                 max_batch_tokens: NonZeroU32::new(3),
                 prefill_chunk_size: NonZeroU32::new(2).unwrap(),
                 checkpoint_alignment: None,
+                checkpoint_interval: 0,
             },
         )
         .unwrap();
@@ -158,6 +183,7 @@ mod tests {
                 max_batch_tokens: NonZeroU32::new(4),
                 prefill_chunk_size: NonZeroU32::new(8).unwrap(),
                 checkpoint_alignment: None,
+                checkpoint_interval: 0,
             },
         )
         .unwrap();
@@ -174,6 +200,7 @@ mod tests {
                 max_batch_tokens: None,
                 prefill_chunk_size: NonZeroU32::new(50).unwrap(),
                 checkpoint_alignment: None,
+                checkpoint_interval: 0,
             },
         )
         .unwrap();
@@ -188,6 +215,7 @@ mod tests {
                 max_batch_tokens: None,
                 prefill_chunk_size: NonZeroU32::new(32).unwrap(),
                 checkpoint_alignment: NonZeroU32::new(4),
+                checkpoint_interval: 0,
             },
         )
         .unwrap();
@@ -200,6 +228,7 @@ mod tests {
                 max_batch_tokens: None,
                 prefill_chunk_size: NonZeroU32::new(32).unwrap(),
                 checkpoint_alignment: NonZeroU32::new(4),
+                checkpoint_interval: 0,
             },
         )
         .unwrap();
@@ -212,6 +241,7 @@ mod tests {
                 max_batch_tokens: None,
                 prefill_chunk_size: NonZeroU32::new(32).unwrap(),
                 checkpoint_alignment: NonZeroU32::new(4),
+                checkpoint_interval: 0,
             },
         )
         .unwrap();
@@ -229,6 +259,7 @@ mod tests {
                 max_batch_tokens: NonZeroU32::new(4096),
                 prefill_chunk_size: NonZeroU32::new(4096).unwrap(),
                 checkpoint_alignment: NonZeroU32::new(64),
+                checkpoint_interval: 0,
             },
         )
         .unwrap();
@@ -247,11 +278,13 @@ mod tests {
                 logical_context: 0,
                 sample_at_prefill_end: false,
                 atomic_prefill_spans: Vec::new(),
+                shared_prefix: 0,
             }],
             PlanningConfig {
                 max_batch_tokens: None,
                 prefill_chunk_size: NonZeroU32::new(8).unwrap(),
                 checkpoint_alignment: None,
+                checkpoint_interval: 0,
             },
         )
         .unwrap();
@@ -267,6 +300,7 @@ mod tests {
             logical_context: 4,
             sample_at_prefill_end: false,
             atomic_prefill_spans: Vec::new(),
+            shared_prefix: 0,
         };
         assert_eq!(
             schedule_ready_prefix(
@@ -275,6 +309,7 @@ mod tests {
                     max_batch_tokens: None,
                     prefill_chunk_size: NonZeroU32::new(4).unwrap(),
                     checkpoint_alignment: None,
+                    checkpoint_interval: 0,
                 },
             ),
             Err(PlanningError::MixedPhases)

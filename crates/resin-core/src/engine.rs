@@ -374,6 +374,7 @@ struct Request<P> {
     running: bool,
     prompt: Vec<u32>,
     cache_identity: Option<PrefixIdentity>,
+    shared_prefix: u32,
     atomic_prefill_spans: Vec<(u32, u32)>,
     resident_tokens: u32,
     generated: Vec<u32>,
@@ -574,7 +575,9 @@ impl<P: Clone> EngineCore<P> {
             .as_ref()
             .map(|layout| {
                 if prefix_cache {
-                    PagedKvResources::with_prefix_cache(layout.clone())
+                    let mut resources = PagedKvResources::with_prefix_cache(layout.clone())?;
+                    resources.set_prefix_cache_policy(256, 0)?;
+                    Ok(resources)
                 } else {
                     PagedKvResources::new(layout.clone())
                 }
@@ -792,6 +795,27 @@ impl<P: Clone> EngineCore<P> {
         }
         Ok(())
     }
+
+    /// Configure checkpoint opportunities and optional periodic retention.
+    /// Must be set before submitting requests; runner block geometry is unchanged.
+    pub fn set_prefix_cache_policy(
+        &mut self,
+        state_tracking_interval: u32,
+        checkpoint_interval: u32,
+    ) -> Result<()> {
+        if state_tracking_interval == 0 {
+            return Err(Error::invalid("state_tracking_interval must be positive"));
+        }
+        if self.next_request_id != 1 {
+            return Err(Error::invalid(
+                "prefix cache policy must be set before submitting requests",
+            ));
+        }
+        if let Some(resources) = &mut self.kv_resources {
+            resources.set_prefix_cache_policy(state_tracking_interval, checkpoint_interval)?;
+        }
+        Ok(())
+    }
     fn planning_config(&self) -> PlanningConfig {
         let min_limit = |a: Option<NonZeroU32>, b: Option<NonZeroU32>| match (a, b) {
             (Some(a), Some(b)) => Some(a.min(b)),
@@ -813,6 +837,10 @@ impl<P: Clone> EngineCore<P> {
                     limit.min(self.scheduler_config.prefill_chunk_size)
                 }),
             checkpoint_alignment: self.prefix_alignment().and_then(NonZeroU32::new),
+            checkpoint_interval: self
+                .kv_resources
+                .as_ref()
+                .map_or(0, PagedKvResources::checkpoint_interval),
         }
     }
 
@@ -968,6 +996,12 @@ impl<P: Clone> EngineCore<P> {
                     .as_mut()
                     .is_some_and(|r| r.start_storage(request_id, &identity.key()))
             });
+        let shared_prefix = match (&mut self.kv_resources, &cache_identity) {
+            (Some(resources), Some(identity)) => {
+                resources.observe_prompt(request_id, &identity.key())
+            }
+            _ => 0,
+        };
         lease_state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -993,6 +1027,7 @@ impl<P: Clone> EngineCore<P> {
             running: false,
             prompt: token_ids,
             cache_identity,
+            shared_prefix,
             atomic_prefill_spans,
             resident_tokens,
             generated: Vec::new(),
@@ -1165,7 +1200,28 @@ impl<P: Clone> EngineCore<P> {
                                     // Live recurrent state has no token-page
                                     // boundary. Its one private slot is pinned
                                     // for the entire continuation chain.
-                                    plan.cache_groups[index].state.is_some()
+                                    plan.cache_groups[index]
+                                        .state
+                                        .as_ref()
+                                        .is_some_and(|state| {
+                                            self.prefix_alignment().is_none_or(|alignment| {
+                                                let alignment = u64::from(alignment);
+                                                let first =
+                                                    (u64::from(start) / alignment + 1) * alignment;
+                                                let end = u64::from(start) + two_step_writes;
+                                                // A continuation cannot allocate snapshot slots.
+                                                // Drain before crossing an unreserved boundary.
+                                                (first..=end).step_by(alignment as usize).all(
+                                                    |prefix| {
+                                                        state.checkpoint_slots.iter().any(|slot| {
+                                                            slot.row as usize == row
+                                                                && u64::from(slot.prefix_length)
+                                                                    == prefix
+                                                        })
+                                                    },
+                                                )
+                                            })
+                                        })
                                 } else {
                                     // The page table is the frozen lease envelope,
                                     // not a promise that new pages may be allocated.
@@ -1940,6 +1996,11 @@ impl<P: Clone> EngineCore<P> {
         self.scheduler
             .restore_rejected(std::mem::take(&mut self.storage_waiting));
         self.retire_ready(runner)?;
+        // Retirement may publish the request's final rolling checkpoint.
+        if let Err(error) = self.poll_storage(true) {
+            self.poison_message("final checkpoint storage could not retire");
+            return Err(error);
+        }
         if let Some(resources) = self.kv_resources.as_mut() {
             resources.clear_prefix_cache().map_err(Error::from)?;
         }
@@ -1970,7 +2031,7 @@ impl<P: Clone> EngineCore<P> {
             return Ok(());
         }
         for (row, progress) in batch.rows.iter_mut().zip(progress) {
-            if row.terminal || progress.resident_tokens == 0 {
+            if progress.resident_tokens == 0 {
                 continue;
             }
             let request = &mut row.request;
@@ -2235,6 +2296,10 @@ impl<P: Clone> EngineCore<P> {
     }
 
     fn retire_request_cache(&mut self, request: &mut Request<P>) -> Result<()> {
+        if let (Some(resources), Some(identity)) = (&mut self.kv_resources, &request.cache_identity)
+        {
+            resources.retain_request_prefix(request.id, &identity.key())?;
+        }
         if let Some(pages) = request.cache.take()
             && let Err(failure) = self
                 .kv_resources
@@ -2483,6 +2548,7 @@ fn schedule_requests<P>(
                 logical_context: request.logical_context()?,
                 sample_at_prefill_end: request.sample_at_prefill_end(),
                 atomic_prefill_spans: request.atomic_prefill_spans.clone(),
+                shared_prefix: request.shared_prefix,
             })
         })
         .collect::<Result<Vec<_>>>()?;
@@ -2513,6 +2579,7 @@ mod tests {
             running: false,
             prompt: prompt.to_vec(),
             cache_identity: None,
+            shared_prefix: 0,
             atomic_prefill_spans: Vec::new(),
             resident_tokens: if generated.is_empty() {
                 0
@@ -2560,6 +2627,7 @@ mod tests {
             max_batch_tokens: config.max_batch_tokens,
             prefill_chunk_size: config.prefill_chunk_size,
             checkpoint_alignment: None,
+            checkpoint_interval: 0,
         }
     }
     #[test]

@@ -7,7 +7,7 @@ from weakref import ref
 
 import pytest
 import torch
-from test_flat_cache import RecordingCachedRunner
+from test_flat_cache import RecordingCachedRunner, _window_layout
 
 from resin import CacheGroupLayout, CacheLayout, Engine, SamplingParams
 from resin.cache_storage import MemoryCacheStorage
@@ -22,9 +22,13 @@ def make_engine(
     running=32,
     exports=None,
     capacity=32,
+    checkpoint_interval=0,
+    window=False,
 ):
     runner = RecordingCachedRunner(
-        CacheLayout(parent_capacity=capacity, groups=[CacheGroupLayout(2)])
+        _window_layout(capacity)
+        if window
+        else CacheLayout(parent_capacity=capacity, groups=[CacheGroupLayout(2)])
     )
     arena = torch.full((capacity + 1,), fill, dtype=torch.uint8)
 
@@ -36,7 +40,11 @@ def make_engine(
         )
 
     setattr(runner, "cache_storage_buffers", buffers)
-    options: dict[str, Any] = dict(prefix_cache=True, max_running_requests=running)
+    options: dict[str, Any] = dict(
+        prefix_cache=True,
+        max_running_requests=running,
+        prefix_cache_checkpoint_interval=checkpoint_interval,
+    )
     if limit is not None:
         options["prefix_cache_max_inflight"] = limit
     if policy is not None:
@@ -139,7 +147,7 @@ def test_memory_bytes_capacity_and_scatter_gather():
         engine, _, arena = make_engine(provider, 73 if not cached else 0)
         with engine:
             request = engine.submit(
-                [1, 2, 3], sampling_params=SamplingParams(max_output_tokens=2)
+                [1, 2, 3], sampling_params=SamplingParams(max_output_tokens=1)
             )
             while engine.has_work():
                 engine.step()
@@ -330,13 +338,35 @@ def test_storage_write_policy(policy):
     store.close()
 
 
+@pytest.mark.parametrize("interval", [0, 4])
+def test_storage_exports_retained_checkpoints_only(interval):
+    store, exports = MemoryCacheStorage(max_bytes=4096), []
+    engine, _, _ = make_engine(
+        store, checkpoint_interval=interval, exports=exports, window=True
+    )
+    with engine:
+        engine.submit(
+            list(range(13)), sampling_params=SamplingParams(max_output_tokens=8)
+        )
+        while engine.has_work():
+            engine.step()
+            sleep(0.001)
+    assert sorted(set(exports)) == ([20] if interval == 0 else [4, 8, 12, 16, 20])
+    store.close()
+
+
 @pytest.mark.parametrize("delay", ["lookup", "load", "store"])
 def test_async_progress_cancellation_and_retirement(delay):
     store, gate, pending = MemoryCacheStorage(max_bytes=4096), Event(), []
     params = SamplingParams(max_output_tokens=32)
-    warm, _, _ = make_engine(store, 73)
+    warm, warm_runner, _ = make_engine(store, 73)
     warm.submit([1, 2], sampling_params=params)
-    warm.step()
+    for _ in range(1000):
+        warm.step()
+        if warm_runner.plans:
+            break
+        sleep(0.001)
+    assert warm_runner.plans
     warm.close()
     engine, runner, arena = make_engine(store)
     running = engine.submit([9, 9], sampling_params=params)
@@ -357,9 +387,12 @@ def test_async_progress_cancellation_and_retirement(delay):
 
         setattr(store, delay, submit)
         waiting = engine.submit([1, 2, 3], sampling_params=params)
-        while not pending:
+        for _ in range(1000):
+            if pending:
+                break
             engine.step()
             sleep(0.001)
+        assert pending
         start = len(runner.plans)
         for _ in range(3):
             engine.step()

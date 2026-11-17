@@ -17,7 +17,7 @@ kind of model state:
 | `STATE`   | `HISTORY`   | One private live recurrent state per request, with optional immutable checkpoints. |
 
 For History groups, `block_tokens` is the number of token positions covered by a
-block. For State groups, it specifies checkpoint alignment. `blocks_per_slab`
+block. For State groups, it specifies the minimum checkpoint alignment. `blocks_per_slab`
 declares how many blocks of that group fit in one physical slab.
 
 An allocated slab belongs to one group. When its blocks are released, the slab
@@ -97,8 +97,28 @@ and compute only the remaining suffix.
 
 The Engine finds the longest usable checkpoint through a flat SHA-256 index of
 prefix identities. Reuse requires matching text or media identity and the same
-cache namespace. Checkpoint endpoints align to the least common multiple of all
-groups' `block_tokens`, so every group resumes at the same token position.
+cache namespace. Checkpoint endpoints align to all groups' `block_tokens`, so
+every group resumes at the same token position.
+
+For models with recurrent state or sliding-window attention, state tracking and
+checkpoint retention are separate settings:
+
+- `state_tracking_interval=256` sets the recurrent-state tracking interval in
+  tokens, independently of the prefill chunk size. The effective interval is the
+  least common multiple of this value and the cache groups' block sizes.
+- `prefix_cache_checkpoint_interval=0` disables periodic retention. Set it to
+  `N` to retain additional checkpoints at multiples of `N` tokens, aligned with
+  the effective checkpoint interval.
+
+For these models, an active request keeps its latest usable checkpoint, replacing
+older tracking snapshots as it advances. Generation completion preserves that
+checkpoint, which may precede the final token because of alignment. The Engine
+also preserves checkpoints at detected shared prompt boundaries. If a newly
+detected boundary has no cached state, the incoming request computes it before
+it can be reused. Checkpointing never splits an atomic media span.
+
+Models with only full-context KV retain ordinary prefix reuse: earlier aligned
+prefixes remain available through shared history pages, subject to LRU eviction.
 
 On a hit, the request shares the checkpoint's immutable history pages and copies
 any recurrent state into its own private live slot.

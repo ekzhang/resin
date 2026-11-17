@@ -101,7 +101,7 @@ class _StateExecution:
             copy_state(self.arena.state_blocks[group.group_index], addresses)
 
     def finish(
-        self, result: DeviceCompletion | ForwardOutput
+        self, result: DeviceCompletion | ForwardOutput, *, copy_checkpoint=None
     ) -> DeviceCompletion | ForwardOutput:
         from resin.backend.cuda.state_triton import copy_state
 
@@ -147,7 +147,7 @@ class _StateExecution:
                 torch.int64,
             )
             flags.append(
-                copy_state(
+                (copy_checkpoint or copy_state)(
                     self.arena.state_blocks[group.group_index],
                     addresses,
                     candidates=candidates,
@@ -174,9 +174,9 @@ def execute_state(function):
     """Apply plan-owned state transfers once around a runner submission.
 
     Nested fallback calls share the outer execution. The native continuation
-    clears restore instructions; snapshot copies run only when the accepted
-    cache prefix exactly matches a reserved checkpoint, before live state is
-    reused by another submission.
+    clears restore instructions. By default snapshots copy exact accepted
+    endpoints; runners with per-token state may also materialize interior
+    accepted prefixes before another submission overwrites their inputs.
     """
 
     @wraps(function)
@@ -198,7 +198,10 @@ def execute_state(function):
             with self._cuda_failure, torch.cuda.device(self.device):
                 try:
                     execution.restore()
-                    return execution.finish(function(self, plan, *args, **kwargs))
+                    return execution.finish(
+                        function(self, plan, *args, **kwargs),
+                        copy_checkpoint=getattr(self, "_copy_state_checkpoints", None),
+                    )
                 except GraphInputError as error:
                     if any(group.state.restore_copies for group in execution.groups):
                         # Model validation may reject after our restore launch.

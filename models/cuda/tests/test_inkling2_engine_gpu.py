@@ -121,10 +121,13 @@ def test_real_checkpoint_prefix_reuse_idle_dp_and_overlap(real_runtime):
         def drain(leases, count=output_count):
             while engine.has_work():
                 engine.step(allow_overlap=True)
+            results = []
             for lease in leases:
                 tokens = lease.take_result()
                 assert len(tokens) == count
                 assert all(0 <= token < runner.vocab_size for token in tokens)
+                results.append(tokens)
+            return results
 
         # Unequal local batches exercise graph padding and idle prefill regions.
         for pair in ((127, 129), (1023, 1025)):
@@ -133,6 +136,23 @@ def test_real_checkpoint_prefix_reuse_idle_dp_and_overlap(real_runtime):
         cached, fresh = submit(1025), submit(1025, salt="fresh")
         drain([cached, fresh])
         assert cached.cached_tokens >= 1024 and fresh.cached_tokens == 0
+
+        # This checkpoint is crossed during speculative decode, not prefill.
+        source = submit(253, salt="decode-checkpoint")
+        (generated,) = drain([source])
+        prompt = (seed * ((253 + len(seed) - 1) // len(seed)))[:253]
+        resumed = engine.submit(
+            [*prompt, *generated],
+            sampling_params=SamplingParams(
+                max_output_tokens=output_count,
+                temperature=0.0,
+                stop_token_ids=[],
+                seed=17,
+            ),
+            cache_salt="decode-checkpoint",
+        )
+        drain([resumed])
+        assert resumed.cached_tokens == 256
 
         # Other DP drivers remain idle while rank zero crosses a page boundary.
         drain([submit(127, salt="idle")] if groups.rank == 0 else [])

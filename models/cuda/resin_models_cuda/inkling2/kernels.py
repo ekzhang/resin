@@ -201,6 +201,29 @@ def select_convolution_state(
     return history.gather(1, gather).transpose(1, 2).contiguous()
 
 
+def copy_state_checkpoints(
+    storage, addresses, candidates, ends, initial, inputs, features, positions
+):
+    """Copy exact accepted prefixes from verification history, including DSpark."""
+    if storage.is_cuda:
+        from resin_models_cuda.inkling2.triton import copy_state_checkpoints as kernel
+
+        return kernel(
+            storage, addresses, candidates, ends, initial, inputs, features, positions
+        )
+    flags = torch.zeros(len(addresses), dtype=torch.bool, device=storage.device)
+    history = torch.cat((initial.transpose(1, 2), inputs), dim=1)
+    for item, ((row, prefix), (_, _, slab, slot)) in enumerate(
+        zip(candidates.tolist(), addresses.tolist(), strict=True)
+    ):
+        count = prefix - int(positions[row])
+        if 0 < count <= inputs.shape[1] and prefix <= int(ends[row]):
+            state = history[row, count : count + 3].transpose(0, 1).flatten()
+            storage[slab, slot].copy_(torch.cat((state, features[row, count - 1])))
+            flags[item] = True
+    return flags
+
+
 __all__ = [
     "rms_norm",
     "route_experts",
@@ -211,4 +234,5 @@ __all__ = [
     "convolution_residual",
     "gate_sink",
     "select_convolution_state",
+    "copy_state_checkpoints",
 ]

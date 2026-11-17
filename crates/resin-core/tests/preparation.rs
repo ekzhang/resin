@@ -132,6 +132,7 @@ fn drain(engine: &mut EngineCore<Payload>, model: &mut Model) {
 fn late_clone_failure_preserves_a_prior_prefix_and_releases_the_whole_lease() {
     let mut engine = engine(true);
     let mut model = Model::default();
+    engine.set_prefix_cache_policy(256, 2).unwrap();
     let healthy = Arc::new(AtomicBool::new(false));
     let warm = submit(
         &mut engine,

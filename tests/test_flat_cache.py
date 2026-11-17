@@ -62,6 +62,21 @@ class RecordingCachedRunner:
         self.released.extend(request_ids)
 
 
+def _window_layout(capacity=32, *, replay=0):
+    return CacheLayout(
+        parent_capacity=capacity,
+        replay_suffix_tokens=replay,
+        groups=[
+            CacheGroupLayout(
+                2,
+                retention=CacheRetention.WINDOW,
+                window_tokens=19,
+                read_window_tokens=4,
+            )
+        ],
+    )
+
+
 def _block_addresses(group: CacheGroupPlan) -> list[tuple[int, int]]:
     return list(zip(group.block_slab_ids, group.block_slotnums, strict=True))
 
@@ -265,6 +280,84 @@ class TestFlatCacheEngine:
         assert engine.prefix_cache_stats == (0, 1, 1, 2)
         assert engine.cache_occupied_block_count == 0
 
+    def test_tracking_replaces_old_snapshots_and_retains_generation_endpoint(self):
+        runner = RecordingCachedRunner(_window_layout())
+        with Engine(runner, prefix_cache=True) as engine:
+            first = engine.submit(
+                list(range(13)), sampling_params=SamplingParams(max_output_tokens=10)
+            )
+            while engine.has_work():
+                engine.step()
+                assert engine.prefix_cache_stats[0] <= 1
+            assert first.take_result() == list(range(13, 23))
+            assert engine.prefix_cache_stats[0] == 1
+
+            second = engine.submit(
+                list(range(24)), sampling_params=SamplingParams(max_output_tokens=1)
+            )
+            assert second.cached_tokens == 22
+            while engine.has_work():
+                engine.step()
+            assert second.take_result() == [24]
+
+    def test_shared_prompt_boundary_is_materialized_for_later_branches(self):
+        runner = RecordingCachedRunner(_window_layout())
+        shared = list(range(10))
+        with Engine(runner, prefix_cache=True) as engine:
+            for branch, expected_hit in [(100, 0), (200, 0), (300, 10)]:
+                start = len(runner.plans)
+                request = engine.submit(
+                    shared + [branch, branch + 1, branch + 2],
+                    sampling_params=SamplingParams(max_output_tokens=1),
+                )
+                assert request.cached_tokens == expected_hit
+                while engine.has_work():
+                    engine.step()
+                assert request.take_result() == [branch + 3]
+                if branch == 200:
+                    assert runner.plans[start].token_ids.tolist() == shared
+
+    @pytest.mark.parametrize(("replay", "cached"), [(1, 12), (4, 10)])
+    def test_repeated_prompt_retains_boundary_before_required_replay(
+        self, replay, cached
+    ):
+        runner = RecordingCachedRunner(_window_layout(replay=replay))
+        with Engine(runner, prefix_cache=True) as engine:
+            for expected_hit in [0, 0, cached]:
+                request = engine.submit(
+                    list(range(14)),
+                    sampling_params=SamplingParams(max_output_tokens=1),
+                )
+                assert request.cached_tokens == expected_hit
+                while engine.has_work():
+                    engine.step()
+                assert request.take_result() == [14]
+
+    @pytest.mark.parametrize(
+        ("interval", "entries", "cached"), [(0, 1, 0), (4, 3, 8), (3, 2, 6)]
+    )
+    def test_periodic_retention_is_opt_in_and_block_aligned(
+        self, interval, entries, cached
+    ):
+        runner = RecordingCachedRunner(_window_layout())
+        with Engine(
+            runner, prefix_cache=True, prefix_cache_checkpoint_interval=interval
+        ) as engine:
+            engine.submit(
+                list(range(13)), sampling_params=SamplingParams(max_output_tokens=1)
+            )
+            while engine.has_work():
+                engine.step()
+            assert engine.prefix_cache_stats[0] == entries
+            request = engine.submit(
+                list(range(8)) + [99],
+                sampling_params=SamplingParams(max_output_tokens=1),
+            )
+            assert request.cached_tokens == cached
+            while engine.has_work():
+                engine.step()
+            assert request.take_result() == [100]
+
     def test_media_digest_identity_controls_prefix_reuse(self) -> None:
         class Media:
             token_ids = [1, 2, 3, 4]
@@ -283,9 +376,10 @@ class TestFlatCacheEngine:
             engine.step()
 
         same_media = Media([1, 101, 102, 4])
-        engine.submit(
+        repeated = engine.submit(
             media=same_media, sampling_params=SamplingParams(max_output_tokens=1)
         )
+        assert repeated.cached_tokens == 2
         while engine.has_work():
             engine.step()
         assert runner.plans[-1].context_lengths.tolist() == [2]

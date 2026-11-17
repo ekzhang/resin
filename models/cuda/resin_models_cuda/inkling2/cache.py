@@ -178,7 +178,7 @@ class CacheGeometry:
             )
         groups.append(
             CacheGroupLayout(
-                self.prefill_chunk_size,
+                PAGE_TOKENS,
                 blocks_per_slab=self.state_blocks_per_slab,
                 family=CacheGroupFamily.STATE,
             )
@@ -223,7 +223,7 @@ class DeviceCache(SlabDeviceCache):
         slabs, slots, _ = self.locations(
             self.geometry.state_group,
             positions,
-            block_tokens=self.geometry.prefill_chunk_size,
+            block_tokens=PAGE_TOKENS,
         )
         return slabs.long(), slots.long()
 

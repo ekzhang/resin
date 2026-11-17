@@ -300,6 +300,31 @@ class Inkling2CudaRunner(CudaRunner):
             self._graph_acceptance,
             self._graph_inputs,
         ) = {}, {}, {}, {}
+        # Graphs replay serially. Share verification history across all buckets
+        # instead of pinning a separate multi-megabyte state per row per graph.
+        self._checkpoint_buffers = (
+            tuple(
+                torch.empty(shape, dtype=torch.bfloat16, device=self.device)
+                for shape in (
+                    (
+                        max_batch_size,
+                        geometry.target_layers,
+                        geometry.state_length,
+                        geometry.state_width,
+                    ),
+                    (
+                        max_batch_size,
+                        speculative_draft_tokens + 1,
+                        geometry.target_layers,
+                        geometry.state_width,
+                    ),
+                )
+            )
+            if self._draft is not None
+            else None
+        )
+        self._graph_checkpoint_inputs = {}
+        self._checkpoint_inputs = None
         self._continuation = CudaContinuation()
         shapes = resolve_decode_graph_shapes(
             cuda_graph_decode_shapes,
@@ -335,12 +360,13 @@ class Inkling2CudaRunner(CudaRunner):
     def speculative_stats(self):
         return self._speculation.snapshot(include_draft_tokens=True)
 
-    def _initial_state(self, cache, positions):
+    def _initial_state(self, cache, positions, *, out=None):
         state = cache.state_at((positions - 1).clamp_min(0)[:, None])[:, 0]
         return torch.where(
             (positions == 0)[:, None, None, None],
             torch.zeros((), dtype=state.dtype, device=state.device),
             state,
+            out=out,
         )
 
     def _decode(
@@ -354,9 +380,13 @@ class Inkling2CudaRunner(CudaRunner):
         valid_rows=None,
         phase_timing=None,
     ):
+        self._checkpoint_inputs = None
         if phase_timing is not None:
             phase_timing.mark(0)
-        initial = self._initial_state(cache, positions)
+        buffers = self._checkpoint_buffers
+        initial = self._initial_state(
+            cache, positions, out=None if buffers is None else buffers[0][: len(ids)]
+        )
         width = self.speculative_draft_tokens + 1
         if self._draft is None:
             drafts = ids[:, None][:, :0]
@@ -376,20 +406,7 @@ class Inkling2CudaRunner(CudaRunner):
         if phase_timing is not None:
             phase_timing.mark(1)
         verify_positions = positions[:, None] + torch.arange(width, device=self.device)
-        conv_inputs = (
-            torch.empty(
-                (
-                    ids.shape[0],
-                    width,
-                    self.config.num_hidden_layers,
-                    self.cache_geometry.state_width,
-                ),
-                dtype=torch.bfloat16,
-                device=self.device,
-            )
-            if self._draft is not None
-            else None
-        )
+        conv_inputs = None if buffers is None else buffers[1][: len(ids)]
         with (
             self._parallel_graph_capacity(
                 ids.shape[0] * width, valid_rows=valid_rows * width
@@ -416,6 +433,7 @@ class Inkling2CudaRunner(CudaRunner):
             assert conv_inputs is not None
             final_state = select_convolution_state(initial, conv_inputs, accepted)
             features = self._draft.inject_target(taps, verify_positions, cache)
+            self._checkpoint_inputs = initial, conv_inputs, features, positions
             selected = features[
                 torch.arange(ids.shape[0], device=self.device), accepted - 1
             ]
@@ -426,6 +444,17 @@ class Inkling2CudaRunner(CudaRunner):
         if phase_timing is not None:
             phase_timing.mark(3)
         return acceptance, logits
+
+    def _copy_state_checkpoints(self, storage, addresses, *, candidates, ends):
+        if self._checkpoint_inputs is None:
+            from resin.backend.cuda.state_triton import copy_state
+
+            return copy_state(storage, addresses, candidates=candidates, ends=ends)
+        from resin_models_cuda.inkling2.kernels import copy_state_checkpoints
+
+        return copy_state_checkpoints(
+            storage, addresses, candidates, ends, *self._checkpoint_inputs
+        )
 
     def _new_decode_graph_step(self, shape):
         size, width, algorithm = shape
@@ -470,6 +499,7 @@ class Inkling2CudaRunner(CudaRunner):
                 acceptance,
                 logits,
             )
+            self._graph_checkpoint_inputs[shape] = self._checkpoint_inputs
             output.copy_(acceptance.tokens)
 
         inputs = {
@@ -519,6 +549,7 @@ class Inkling2CudaRunner(CudaRunner):
         )
 
     def _prefill(self, plan, cache_plan, *, context=None):
+        self._checkpoint_inputs = None
         if plan is not None:
             staging = TensorStager(self.device)
             cache = self._cache.tensorize(cache_plan, staging)
@@ -708,6 +739,7 @@ class Inkling2CudaRunner(CudaRunner):
         if enqueue:
             return self._enqueue_graph_output(plan, shape, inputs, feedback)
         self._run_cuda_graph("decode", shape, inputs)
+        self._checkpoint_inputs = self._graph_checkpoint_inputs[shape]
         acceptance = self._graph_acceptance[shape]
         completion = DeviceCompletion.from_acceptance(
             acceptance,
@@ -731,6 +763,7 @@ class Inkling2CudaRunner(CudaRunner):
         if feedback is not None:
             inputs.update(feedback.inputs())
         self._run_cuda_graph("decode", shape, inputs)
+        self._checkpoint_inputs = self._graph_checkpoint_inputs[shape]
         acceptance = self._graph_acceptance[shape]
         next_inputs = acceptance.feedback()
         completion = DeviceCompletion.from_acceptance(

@@ -504,6 +504,8 @@ class Engine:
         max_top_logprobs: int = 32,
         scheduler_config: SchedulerConfig | None = None,
         prefix_cache: bool = False,
+        state_tracking_interval: int = 256,
+        prefix_cache_checkpoint_interval: int = 0,
         prefix_cache_storage: "CacheStorage | None" = None,
         prefix_cache_max_inflight: int | None = None,
         prefix_cache_storage_policy: 'Literal["write_through", "write_through_selective"]' = "write_through_selective",

@@ -13,6 +13,7 @@ struct Model {
     released: Vec<u64>,
     release_fails: bool,
     report_checkpoints: bool,
+    interior_checkpoints: bool,
     checkpoints: Vec<u64>,
 }
 impl Runner<&'static str> for Model {
@@ -39,7 +40,10 @@ impl Runner<&'static str> for Model {
                             } else {
                                 0
                             };
-                        if valid == slot.prefix_length
+                        if (valid == slot.prefix_length
+                            || (self.interior_checkpoints
+                                && plan.context_lengths[row] < slot.prefix_length
+                                && slot.prefix_length <= valid))
                             && !self.checkpoints.contains(&slot.reservation_id)
                         {
                             self.checkpoints.push(slot.reservation_id);
@@ -214,6 +218,7 @@ fn check_stopped_speculative_prefix(stop_token: bool) {
                 true,
             )
             .unwrap();
+            engine.set_prefix_cache_policy(2, 0).unwrap();
             let mut model = Model {
                 report_checkpoints: true,
                 ..Default::default()
@@ -296,6 +301,162 @@ fn output_limit_inside_speculative_block_does_not_publish_intermediate_state() {
     check_stopped_speculative_prefix(false);
 }
 
+fn state_tracking_engine() -> EngineCore<&'static str> {
+    EngineCore::new(
+        RunnerConfig {
+            cache_layout: Some(
+                KvLayout::new(
+                    128,
+                    vec![
+                        KvGroupLayout::new(128, 1, KvRetention::FullContext).unwrap(),
+                        KvGroupLayout::new_with_family(
+                            128,
+                            1,
+                            KvRetention::FullContext,
+                            KvGroupFamily::State,
+                        )
+                        .unwrap(),
+                        KvGroupLayout::new(
+                            128,
+                            1,
+                            KvRetention::SlidingWindow {
+                                tokens: NonZeroU32::new(1279).unwrap(),
+                            },
+                        )
+                        .unwrap()
+                        .with_read_window_tokens(256)
+                        .unwrap(),
+                    ],
+                )
+                .unwrap(),
+            ),
+            continuation_prefill: true,
+            max_accepted_per_step: 8,
+            ..Default::default()
+        },
+        4,
+        4096,
+        SchedulerConfig {
+            prefill_chunk_size: NonZeroU32::new(1024).unwrap(),
+            ..Default::default()
+        },
+        true,
+    )
+    .unwrap()
+}
+
+#[test]
+fn default_state_tracking_caches_only_visible_256_token_prefixes() {
+    for (stop, limit, expected) in [
+        (None, 9, 256),
+        (Some(255), 40, 0),
+        (Some(256), 40, 256),
+        (None, 3, 0),
+        (None, 4, 256),
+    ] {
+        let mut engine = state_tracking_engine();
+        let mut model = Model {
+            report_checkpoints: true,
+            interior_checkpoints: true,
+            ..Default::default()
+        };
+        let prompt: Vec<_> = (0..253).collect();
+        let mut submission = input(prompt.clone(), limit);
+        submission.stop_token_ids = stop.into_iter().collect();
+        let request = engine.submit(submission).unwrap();
+        engine.step(&mut model).unwrap();
+        assert_eq!(engine.prefix_cache_stats().unwrap().0, 0);
+        // Verification materializes prefix256 inside its accepted253..261 span.
+        model.outputs.push_back(Ok(vec![(254..262).collect()]));
+        engine.step(&mut model).unwrap();
+        assert_eq!(model.checkpoints.len(), 1);
+        let mut continuation = prompt;
+        continuation.extend(request.take_result().unwrap());
+        continuation.push(999);
+        let resumed = engine.submit(input(continuation, 1)).unwrap();
+        assert_eq!(
+            resumed.cached_tokens(),
+            expected,
+            "stop={stop:?}, limit={limit}"
+        );
+        engine.close(&mut model).unwrap();
+        assert_eq!(engine.cache_free_parent_count(), Some(128));
+    }
+}
+
+#[test]
+fn terminal_overlap_keeps_its_authenticated_interior_state_checkpoint() {
+    let mut engine = state_tracking_engine();
+    let mut model = Model {
+        report_checkpoints: true,
+        interior_checkpoints: true,
+        ..Default::default()
+    };
+    let prompt: Vec<_> = (0..253).collect();
+    let mut submission = input(prompt.clone(), 40);
+    submission.stop_token_ids = vec![256];
+    let request = engine.submit(submission).unwrap();
+    engine.step(&mut model).unwrap();
+    let plan = engine
+        .prepare_overlap_step(&mut model, None)
+        .unwrap()
+        .unwrap();
+    assert!(engine.retain_continuation(&plan));
+    let successor = engine.continuation_plan().unwrap().unwrap();
+    model.outputs.push_back(Ok(vec![(254..262).collect()]));
+    let output = model.forward(plan).unwrap();
+    assert_eq!(model.checkpoints.len(), 1);
+    engine
+        .complete_continuing_step_with(&mut model, Ok(output.view()), Ok)
+        .unwrap();
+    assert!(request.done());
+    assert_eq!(engine.prefix_cache_stats().unwrap().0, 0);
+    // The already-launched successor must drain before checkpoint ownership moves.
+    let output = model.forward(successor).unwrap();
+    assert!(model.checkpoints.is_empty());
+    engine
+        .complete_step_with(&mut model, Ok(output.view()), Ok)
+        .unwrap();
+    let mut continuation = prompt;
+    continuation.extend(request.take_result().unwrap());
+    let resumed = engine.submit(input(continuation, 1)).unwrap();
+    assert_eq!(resumed.cached_tokens(), 256);
+    engine.close(&mut model).unwrap();
+    assert_eq!(engine.cache_free_parent_count(), Some(128));
+}
+
+#[test]
+fn shared_state_boundary_is_recomputed_once_then_retained() {
+    let mut engine = state_tracking_engine();
+    let mut model = Model {
+        report_checkpoints: true,
+        ..Default::default()
+    };
+    let original: Vec<_> = (0..900).collect();
+    let seed = engine.submit(input(original.clone(), 1)).unwrap();
+    while engine.has_work() {
+        engine.step(&mut model).unwrap();
+    }
+    seed.take_result().unwrap();
+    assert_eq!(engine.prefix_cache_stats().unwrap().0, 1);
+    for (tail, expected) in [(1000, 0), (2000, 512)] {
+        let mut prompt = original[..512].to_vec();
+        prompt.extend(vec![tail; 388]);
+        let request = engine.submit(input(prompt, 1)).unwrap();
+        assert_eq!(request.cached_tokens(), expected);
+        let before = model.plans.len();
+        while engine.has_work() {
+            engine.step(&mut model).unwrap();
+        }
+        if expected == 0 {
+            assert_eq!(model.plans[before].token_ids.len(), 512);
+        }
+        request.take_result().unwrap();
+    }
+    engine.clear_prefix_cache().unwrap();
+    assert_eq!(engine.cache_free_parent_count(), Some(128));
+}
+
 #[test]
 fn growing_prefix_identity_keeps_media_namespace_and_accepted_decode_suffix() {
     let mut engine = EngineCore::new(
@@ -317,6 +478,7 @@ fn growing_prefix_identity_keeps_media_namespace_and_accepted_decode_suffix() {
         true,
     )
     .unwrap();
+    engine.set_prefix_cache_policy(256, 2).unwrap();
     let mut model = Model::default();
     let mut seed = input(vec![10, 11, 12], 6);
     seed.cache_key = Some(vec![100, 101, 102]);
@@ -1008,8 +1170,9 @@ fn drained_continuation_prefix_includes_previously_accepted_output() {
     tokens[32] = 999; // Change a token accepted during the overlapping step.
     let mut wrong_tokens = input(tokens, 1);
     wrong_tokens.cache_salt = Some("session".into());
-    // The earlier prompt checkpoint is reusable, but the 36-token suffix is not.
-    assert_eq!(engine.submit(wrong_tokens).unwrap().cached_tokens(), 28);
+    // The old rolling prompt checkpoint was discarded. The newly detected
+    // shared boundary will be recomputed by this request.
+    assert_eq!(engine.submit(wrong_tokens).unwrap().cached_tokens(), 0);
     engine.close(&mut model).unwrap();
     assert_eq!(request.take_result().unwrap(), [2, 3, 4, 5, 6, 7]);
 }
@@ -2341,6 +2504,7 @@ fn failed_prefill_growth_releases_unadmitted_pages_before_retrying_running_work(
         true,
     )
     .unwrap();
+    engine.set_prefix_cache_policy(256, 1).unwrap();
     let mut model = Model::default();
     let warm = engine.submit(input(vec![10, 11], 1)).unwrap();
     for _ in 0..2 {

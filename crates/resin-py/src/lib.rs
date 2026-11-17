@@ -1369,7 +1369,7 @@ impl Engine {
 #[pymethods]
 impl Engine {
     #[new]
-    #[pyo3(signature = (runner: "Runner", *, max_running_requests = 32, context_length = 32768, max_top_logprobs = DEFAULT_MAX_TOP_LOGPROBS, scheduler_config = None, prefix_cache = false, prefix_cache_storage: "CacheStorage | None" = None, prefix_cache_max_inflight = None, prefix_cache_storage_policy: r#"Literal["write_through", "write_through_selective"]"# = "write_through_selective", enable_overlap = true, enable_metrics = true))]
+    #[pyo3(signature = (runner: "Runner", *, max_running_requests = 32, context_length = 32768, max_top_logprobs = DEFAULT_MAX_TOP_LOGPROBS, scheduler_config = None, prefix_cache = false, state_tracking_interval = 256, prefix_cache_checkpoint_interval = 0, prefix_cache_storage: "CacheStorage | None" = None, prefix_cache_max_inflight = None, prefix_cache_storage_policy: r#"Literal["write_through", "write_through_selective"]"# = "write_through_selective", enable_overlap = true, enable_metrics = true))]
     #[allow(
         clippy::too_many_arguments,
         reason = "Python constructor exposes keyword configuration"
@@ -1382,6 +1382,8 @@ impl Engine {
         max_top_logprobs: u32,
         scheduler_config: Option<Py<SchedulerConfig>>,
         prefix_cache: bool,
+        state_tracking_interval: u32,
+        prefix_cache_checkpoint_interval: u32,
         prefix_cache_storage: Option<Py<PyAny>>,
         prefix_cache_max_inflight: Option<usize>,
         prefix_cache_storage_policy: &str,
@@ -1430,6 +1432,8 @@ impl Engine {
             prefix_cache,
         )
         .map_err(core_error)?;
+        core.set_prefix_cache_policy(state_tracking_interval, prefix_cache_checkpoint_interval)
+            .map_err(core_error)?;
         core.set_max_top_logprobs(max_top_logprobs);
         if enable_metrics {
             core.enable_metrics().map_err(core_error)?;

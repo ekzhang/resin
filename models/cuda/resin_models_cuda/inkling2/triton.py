@@ -685,3 +685,83 @@ def select_convolution_state(initial, inputs, accepted):
         512,
     )
     return out
+
+
+@triton.jit(do_not_specialize=["T"])
+def _checkpoint_state(
+    Storage,
+    Addresses,
+    Candidates,
+    Ends,
+    Initial,
+    Inputs,
+    Features,
+    Positions,
+    Flags,
+    T,
+    L: tl.constexpr,
+    D: tl.constexpr,
+    H: tl.constexpr,
+    SLAB: tl.constexpr,
+    SLOT: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    item, tile = tl.program_id(0), tl.program_id(1)
+    row = tl.load(Candidates + item * 2)
+    prefix = tl.load(Candidates + item * 2 + 1)
+    count = prefix - tl.load(Positions + row)
+    ready = (count > 0) & (count <= T) & (prefix <= tl.load(Ends + row))
+    if tile == 0:
+        tl.store(Flags + item, ready)
+    col = tile * BLOCK + tl.arange(0, BLOCK)
+    state_mask = ready & (col < L * 3 * D)
+    layer, position, channel = col // (3 * D), (col // D) % 3, col % D
+    source = count + position - 3
+    previous = tl.load(
+        Initial + row * L * 3 * D + layer * 3 * D + (source + 3) * D + channel,
+        state_mask & (source < 0),
+        0,
+    )
+    current = tl.load(
+        Inputs + ((row * T + source) * L + layer) * D + channel,
+        state_mask & (source >= 0),
+        0,
+    )
+    feature = tl.load(
+        Features + (row * T + count - 1) * H + col - L * 3 * D,
+        ready & (col >= L * 3 * D) & (col < L * 3 * D + H),
+        0,
+    )
+    slab = tl.load(Addresses + item * 4 + 2)
+    slot = tl.load(Addresses + item * 4 + 3)
+    tl.store(
+        Storage + slab * SLAB + slot * SLOT + col,
+        tl.where(col < L * 3 * D, tl.where(source < 0, previous, current), feature),
+        ready & (slab != 0) & (col < L * 3 * D + H),
+    )
+
+
+def copy_state_checkpoints(
+    storage, addresses, candidates, ends, initial, inputs, features, positions
+):
+    _, layers, _, width = initial.shape
+    flags = torch.empty(len(addresses), dtype=torch.bool, device=storage.device)
+    cast(Any, _checkpoint_state)[(len(addresses), triton.cdiv(storage.shape[2], 512))](
+        storage,
+        addresses,
+        candidates,
+        ends,
+        initial,
+        inputs,
+        features,
+        positions,
+        flags,
+        inputs.shape[1],
+        layers,
+        width,
+        features.shape[2],
+        storage.stride(0),
+        storage.stride(1),
+        512,
+    )
+    return flags
