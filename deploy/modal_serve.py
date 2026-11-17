@@ -244,12 +244,8 @@ def _monitor_process_context(process_context: Any, label: str) -> None:
     timeout=24 * 60 * 60,
     startup_timeout=60 * 60,
     scaledown_window=15 * 60,
-    max_containers=1,
 )
-@modal.concurrent(
-    max_inputs=MODEL.max_batch_size * MODEL.attn_dp,
-    target_inputs=MODEL.max_batch_size * MODEL.attn_dp,
-)
+@modal.concurrent(max_inputs=256, target_inputs=64)
 @modal.web_server(
     8000, startup_timeout=60 * 60, label=MODEL.label, requires_proxy_auth=False
 )
