@@ -288,9 +288,13 @@ class TestFlatCacheEngine:
             )
             while engine.has_work():
                 engine.step()
-                assert engine.prefix_cache_stats[0] <= 1
+                stats = engine.prefix_cache_stats
+                assert stats is not None
+                assert stats[0] <= 1
             assert first.take_result() == list(range(13, 23))
-            assert engine.prefix_cache_stats[0] == 1
+            stats = engine.prefix_cache_stats
+            assert stats is not None
+            assert stats[0] == 1
 
             second = engine.submit(
                 list(range(24)), sampling_params=SamplingParams(max_output_tokens=1)
@@ -348,7 +352,9 @@ class TestFlatCacheEngine:
             )
             while engine.has_work():
                 engine.step()
-            assert engine.prefix_cache_stats[0] == entries
+            stats = engine.prefix_cache_stats
+            assert stats is not None
+            assert stats[0] == entries
             request = engine.submit(
                 list(range(8)) + [99],
                 sampling_params=SamplingParams(max_output_tokens=1),
