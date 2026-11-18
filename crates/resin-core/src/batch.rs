@@ -42,16 +42,18 @@ pub struct SequenceStep {
 /// Numeric execution plan shared by native runners and replica transport.
 #[derive(Clone, Debug, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
 pub struct BatchPlan {
-    pub cohort: Arc<BatchCohort>,
     pub batch_id: u64,
+    pub batch_key: Option<u64>,
+    pub phase: Phase,
+    pub sequence_ids: Vec<u64>,
     pub context_lengths: Vec<u32>,
+    /// Final prefill-history endpoints, including generated inputs on retraction.
+    /// Only meaningful for prefill; constant across that history's chunks.
+    pub prefill_lengths: Vec<u32>,
     pub token_ids: Vec<u32>,
+    pub token_indptr: Vec<u32>,
+    pub sampling_mask: Vec<bool>,
     pub cache_groups: Arc<[KvGroupPlan]>,
-}
-
-/// Numerical columns that are fixed for the life of a decode cohort.
-#[derive(Clone, Debug, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
-pub struct BatchCohort {
     /// Flattened predecessor rows and their next prompt tokens, partitioned by sequence.
     pub prompt_score_indices: Vec<u32>,
     pub prompt_score_token_ids: Vec<u32>,
@@ -59,22 +61,6 @@ pub struct BatchCohort {
     pub prompt_score_top_counts: Vec<u32>,
     pub prompt_target_indptr: Vec<u32>,
     pub prompt_target_token_ids: Vec<u32>,
-    pub batch_key: Option<u64>,
-    pub phase: Phase,
-    pub sequence_ids: Vec<u64>,
-    /// Final prefill-history endpoints, including generated inputs on retraction.
-    /// Only meaningful for prefill; constant across that history's chunks.
-    pub prefill_lengths: Vec<u32>,
-    pub token_indptr: Vec<u32>,
-    pub sampling_mask: Vec<bool>,
-}
-
-impl std::ops::Deref for BatchPlan {
-    type Target = BatchCohort;
-
-    fn deref(&self) -> &BatchCohort {
-        &self.cohort
-    }
 }
 
 const PLAN_WIRE_MAGIC: &[u8; 8] = b"RSNPLAN\0";
@@ -115,15 +101,12 @@ impl BatchPlan {
         let Self {
             token_ids,
             context_lengths,
-            ..
-        } = self;
-        let BatchCohort {
             sequence_ids,
             token_indptr,
             prefill_lengths,
             sampling_mask,
             ..
-        } = &*self.cohort;
+        } = self;
         if token_ids.is_empty() {
             return Err(Error::invalid("a batch must contain at least one token"));
         }

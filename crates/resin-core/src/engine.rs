@@ -14,8 +14,8 @@ use crate::resources::paged_kv::{
     PrefixStoragePolicy, RequestResourceRef,
 };
 use crate::{
-    BatchCohort, BatchPlan, Phase, PlanningConfig, PlanningError, RequestId, RequestProgress,
-    Schedulable, Scheduler, Selection, SequenceStep, TokenRange, schedule_ready_prefix,
+    BatchPlan, Phase, PlanningConfig, PlanningError, RequestId, RequestProgress, Schedulable,
+    Scheduler, Selection, SequenceStep, TokenRange, schedule_ready_prefix,
 };
 use std::cmp::Reverse;
 use std::num::{NonZeroU32, NonZeroU64, NonZeroUsize};
@@ -2528,24 +2528,22 @@ fn build_plan<P: Clone>(
     let cache_groups = kv_groups.map_or_else(Arc::default, |groups| std::mem::take(groups).into());
     Ok(ExecutionPlan {
         batch: BatchPlan {
-            cohort: Arc::new(BatchCohort {
-                prompt_score_indices,
-                prompt_score_token_ids,
-                prompt_score_indptr,
-                prompt_score_top_counts,
-                prompt_target_indptr,
-                prompt_target_token_ids,
-                sequence_ids,
-                prefill_lengths,
-                token_indptr,
-                phase,
-                batch_key,
-                sampling_mask,
-            }),
-            context_lengths,
-            token_ids,
             batch_id,
+            batch_key,
+            phase,
+            sequence_ids,
+            context_lengths,
+            prefill_lengths,
+            token_ids,
+            token_indptr,
+            sampling_mask,
             cache_groups,
+            prompt_score_indices,
+            prompt_score_token_ids,
+            prompt_score_indptr,
+            prompt_score_top_counts,
+            prompt_target_indptr,
+            prompt_target_token_ids,
         },
         payloads,
     })

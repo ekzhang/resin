@@ -1199,7 +1199,8 @@ fn cross_page_continuation_reserves_pages_and_updates_physical_append_addresses(
     let next = engine.continuation_plan().unwrap().unwrap();
     assert_eq!(next.context_lengths, [35, 36]);
     assert!(engine.continuation_plan().unwrap().is_none());
-    assert!(std::sync::Arc::ptr_eq(&plan.cohort, &next.cohort));
+    assert_eq!(plan.sequence_ids, next.sequence_ids);
+    assert_eq!(plan.token_indptr, next.token_indptr);
     for (old, new) in plan.cache_groups.iter().zip(next.cache_groups.iter()) {
         assert!(std::sync::Arc::ptr_eq(&old.blocks, &new.blocks));
         assert_eq!(old.block_indptr, new.block_indptr);

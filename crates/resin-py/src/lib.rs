@@ -41,7 +41,7 @@ use parallelism::Parallelism;
 use resin_core::engine::{self as core, CompletionReason};
 use resin_core::logprobs::DEFAULT_MAX_TOP_LOGPROBS;
 use resin_core::resources::paged_kv::PrefixStoragePolicy;
-use resin_core::{BatchCohort, BatchPlan as NativeBatchPlan, Phase};
+use resin_core::{BatchPlan as NativeBatchPlan, Phase};
 use runner::{
     ResourceBinding, RunnerConfig, bind_runner_resources, optional_runner_callable,
     resolve_runner_config, resolve_runner_contract, runner_error_is_post_accept,
@@ -395,25 +395,25 @@ crate::arrays::array_methods! {
     impl BatchPlan {
         arrays {
             /// Stable request identifier for each sequence.
-            sequence_ids: u64 => batch.cohort.sequence_ids;
+            sequence_ids: u64 => batch.sequence_ids;
             /// Number of tokens already processed for each sequence.
             context_lengths: u32 => batch.context_lengths;
             /// Final history endpoint for each prefill, including retracted generated inputs.
             /// Only meaningful during prefill; constant across that history's chunks.
-            prefill_lengths: u32 => batch.cohort.prefill_lengths;
+            prefill_lengths: u32 => batch.prefill_lengths;
             /// Flattened scheduled token IDs, grouped by sequence.
             token_ids: u32 => batch.token_ids;
             /// Offsets into `token_ids` for each sequence.
-            token_indptr: u32 => batch.cohort.token_indptr;
+            token_indptr: u32 => batch.token_indptr;
             /// Which sequences should generate a sampled token. Used for chunked
             /// prefill, when some sequences only advance the cache.
-            sampling_mask: bool => batch.cohort.sampling_mask;
-            prompt_score_indices: u32 => batch.cohort.prompt_score_indices;
-            prompt_score_token_ids: u32 => batch.cohort.prompt_score_token_ids;
-            prompt_score_indptr: u32 => batch.cohort.prompt_score_indptr;
-            prompt_score_top_counts: u32 => batch.cohort.prompt_score_top_counts;
-            prompt_target_indptr: u32 => batch.cohort.prompt_target_indptr;
-            prompt_target_token_ids: u32 => batch.cohort.prompt_target_token_ids;
+            sampling_mask: bool => batch.sampling_mask;
+            prompt_score_indices: u32 => batch.prompt_score_indices;
+            prompt_score_token_ids: u32 => batch.prompt_score_token_ids;
+            prompt_score_indptr: u32 => batch.prompt_score_indptr;
+            prompt_score_top_counts: u32 => batch.prompt_score_top_counts;
+            prompt_target_indptr: u32 => batch.prompt_target_indptr;
+            prompt_target_token_ids: u32 => batch.prompt_target_token_ids;
         }
 
         #[pyo3(signature = () -> "npt.NDArray[np.uint8]")]
@@ -540,40 +540,38 @@ crate::arrays::array_methods! {
             let predecessor_count = prompt_score_indices.len();
             Self::checked(Self {
                 batch: NativeBatchPlan {
-                    cohort: Arc::new(BatchCohort {
-                        prompt_score_indices,
-                        prompt_score_top_counts: prompt_score_top_counts
-                            .map(arrays::owned_vec)
-                            .unwrap_or_else(|| vec![0; predecessor_count]),
-                        prompt_target_indptr: prompt_target_indptr.map(arrays::owned_vec).unwrap_or_else(
-                            || {
-                                if predecessor_count == 0 {
-                                    Vec::new()
-                                } else {
-                                    vec![0; predecessor_count + 1]
-                                }
-                            },
-                        ),
-                        prompt_target_token_ids: prompt_target_token_ids
-                            .map(arrays::owned_vec)
-                            .unwrap_or_default(),
-                        prompt_score_token_ids: prompt_score_token_ids
-                            .map(arrays::owned_vec)
-                            .unwrap_or_default(),
-                        prompt_score_indptr: prompt_score_indptr
-                            .map(arrays::owned_vec)
-                            .unwrap_or_else(|| vec![0; sequence_count + 1]),
-                        sequence_ids,
-                        prefill_lengths,
-                        token_indptr,
-                        phase: phase.core(),
-                        batch_key,
-                        sampling_mask,
-                    }),
-                    context_lengths,
-                    token_ids,
                     batch_id,
+                    batch_key,
+                    phase: phase.core(),
+                    sequence_ids,
+                    context_lengths,
+                    prefill_lengths,
+                    token_ids,
+                    token_indptr,
+                    sampling_mask,
                     cache_groups,
+                    prompt_score_indices,
+                    prompt_score_top_counts: prompt_score_top_counts
+                        .map(arrays::owned_vec)
+                        .unwrap_or_else(|| vec![0; predecessor_count]),
+                    prompt_target_indptr: prompt_target_indptr.map(arrays::owned_vec).unwrap_or_else(
+                        || {
+                            if predecessor_count == 0 {
+                                Vec::new()
+                            } else {
+                                vec![0; predecessor_count + 1]
+                            }
+                        },
+                    ),
+                    prompt_target_token_ids: prompt_target_token_ids
+                        .map(arrays::owned_vec)
+                        .unwrap_or_default(),
+                    prompt_score_token_ids: prompt_score_token_ids
+                        .map(arrays::owned_vec)
+                        .unwrap_or_default(),
+                    prompt_score_indptr: prompt_score_indptr
+                        .map(arrays::owned_vec)
+                        .unwrap_or_else(|| vec![0; sequence_count + 1]),
                 },
                 payloads: Arc::new(payloads),
                 positions: OnceLock::new(),
@@ -1785,24 +1783,22 @@ mod tests {
         .unwrap();
         BatchPlan {
             batch: NativeBatchPlan {
-                cohort: Arc::new(BatchCohort {
-                    prompt_score_indices: Vec::new(),
-                    prompt_score_token_ids: Vec::new(),
-                    prompt_score_indptr: vec![0, 0],
-                    prompt_score_top_counts: Vec::new(),
-                    prompt_target_indptr: vec![0],
-                    prompt_target_token_ids: Vec::new(),
-                    sequence_ids: vec![1],
-                    prefill_lengths: vec![2],
-                    token_indptr: vec![0, 2],
-                    phase: Phase::Prefill,
-                    batch_key: None,
-                    sampling_mask: vec![true],
-                }),
-                context_lengths: vec![0],
-                token_ids: vec![1, 2],
                 batch_id: 1,
+                batch_key: None,
+                phase: Phase::Prefill,
+                sequence_ids: vec![1],
+                context_lengths: vec![0],
+                prefill_lengths: vec![2],
+                token_ids: vec![1, 2],
+                token_indptr: vec![0, 2],
+                sampling_mask: vec![true],
                 cache_groups: Arc::new([group]),
+                prompt_score_indices: Vec::new(),
+                prompt_score_token_ids: Vec::new(),
+                prompt_score_indptr: vec![0, 0],
+                prompt_score_top_counts: Vec::new(),
+                prompt_target_indptr: vec![0],
+                prompt_target_token_ids: Vec::new(),
             },
             payloads: Arc::new(vec![RequestPayload {
                 sampling_params: SamplingParams {
@@ -1874,8 +1870,8 @@ mod tests {
             ] {
                 let mut plan = wire_plan(0).batch;
                 match case {
-                    0 => Arc::make_mut(&mut plan.cohort).token_indptr[0] = 1,
-                    1 => Arc::make_mut(&mut plan.cohort).prefill_lengths[0] = 1,
+                    0 => plan.token_indptr[0] = 1,
+                    1 => plan.prefill_lengths[0] = 1,
                     _ => {
                         let group = &mut Arc::make_mut(&mut plan.cache_groups)[0];
                         match case {

@@ -23,7 +23,7 @@ mod planning;
 pub mod resources;
 mod scheduler;
 
-pub use batch::{BatchCohort, BatchPlan, SequenceStep, TokenRange};
+pub use batch::{BatchPlan, SequenceStep, TokenRange};
 pub use ids::RequestId;
 pub use parallelism::{Parallelism, ParallelismError};
 pub use planning::{PlanningConfig, PlanningError, RequestProgress, schedule_ready_prefix};
