@@ -1,9 +1,11 @@
 """The routed session retains the ordinary actor's bounded-stream lifecycle."""
 
+import json
 from collections.abc import Sequence
+from threading import Event
 
 import pytest
-from http_packets import decoded_events, ingress
+from http_packets import admit_and_wait, decoded_events, ingress
 from output_helpers import forward_output
 
 import resin
@@ -66,7 +68,7 @@ def test_session_overflow_terminates_client_and_keeps_other_requests_usable(
 
     engine = Engine(Runner())
     session = _HttpSession(engine, Recipe(), stream_interval=stream_interval)
-    session.admit(admission("overflow", 100))
+    admit_and_wait(session, admission("overflow", 100))
     first = decoded_events(session.process(engine.step()))
     assert [event["type"] for _, event in first] == [
         "started",
@@ -84,7 +86,7 @@ def test_session_overflow_terminates_client_and_keeps_other_requests_usable(
     assert not engine.has_work() and not engine.closed and not engine.poisoned
     assert session.process([]).to_bytes() == b""
 
-    session.admit(admission("ordinary", 1))
+    admit_and_wait(session, admission("ordinary", 1))
     ordinary = decoded_events(session.process(engine.step()))
     assert [event["type"] for _, event in ordinary] == [
         "started",
@@ -148,7 +150,8 @@ def test_http_admission_passes_typed_messages_tools_and_render_controls():
 
     engine = Engine(Runner())
     session = _HttpSession(engine, Recipe())
-    session.admit(
+    admit_and_wait(
+        session,
         ingress(
             [
                 {
@@ -199,7 +202,7 @@ def test_http_admission_passes_typed_messages_tools_and_render_controls():
                     "extra": {"reasoning_effort": "low", "enable_thinking": False},
                 }
             ]
-        )
+        ),
     )
     events = decoded_events(session.process(engine.step()))
     assert not [event for _, event in events if event["type"] == "error"]
@@ -243,7 +246,8 @@ def test_http_session_snapshots_recipe_stops_before_rendering():
     recipe.stops = [5]
     try:
         for request_id in ("first", "second"):
-            session.admit(
+            admit_and_wait(
+                session,
                 ingress(
                     [
                         {
@@ -265,7 +269,7 @@ def test_http_session_snapshots_recipe_stops_before_rendering():
                             "extra": {},
                         }
                     ]
-                )
+                ),
             )
             output = decoded_events(session.process(engine.step()))
             finished = [event for _, event in output if event["type"] == "finished"]
@@ -277,6 +281,68 @@ def test_http_session_snapshots_recipe_stops_before_rendering():
     finally:
         session.close()
         engine.close()
+
+
+def test_canceling_an_in_flight_render_acknowledges_release_after_it_finishes():
+    rendering = Event()
+    unblock = Event()
+
+    class Recipe:
+        tokenizer = None
+        stop_token_ids = []
+
+        def render(self, messages, *, tools=(), options=None):
+            rendering.set()
+            assert unblock.wait(10), "the test did not release its render worker"
+            return resin.recipe.RenderedPrompt([1])
+
+        def create_parser(self, prompt):
+            return self
+
+        def feed(self, ids):
+            return []
+
+    class Runner:
+        def forward(self, plan):
+            raise AssertionError("a canceled render must never reach the runner")
+
+    packet = ingress(
+        [
+            {
+                "id": "canceled",
+                "model": "test",
+                "messages": [],
+                "tools": [],
+                "temperature": 1.0,
+                "top_p": 1.0,
+                "logprobs": False,
+                "top_logprobs": 0,
+                "prompt_logprobs": False,
+                "stop": [],
+                "extra": {},
+            }
+        ]
+    )
+    with Engine(Runner()) as engine:
+        session = _HttpSession(engine, Recipe(), render_workers=1)
+        try:
+            assert session.admit(packet) == 0
+            assert rendering.wait(5), "the render worker did not start"
+            assert session.admit(ingress(canceled=["canceled"])) == 0
+            assert session.admit(ingress()) == 0
+            assert session.process([]).to_bytes() == b""
+            assert not engine.has_work()
+
+            unblock.set()
+            admit_and_wait(session, ingress())
+            result = json.loads(session.process([]).to_bytes())
+            assert result["released"] == ["canceled"]
+            assert not result["events"]
+            assert not engine.has_work()
+            assert session.process([]).to_bytes() == b""
+        finally:
+            unblock.set()
+            session.close()
 
 
 def test_http_priority_survives_transport_and_orders_waiting_admission():
@@ -328,8 +394,9 @@ def test_http_priority_survives_transport_and_orders_waiting_admission():
 
     packet = _HttpIngress.from_bytes(packet.to_bytes())
     engine = Engine(Runner(), max_running_requests=1)
-    session = _HttpSession(engine, Recipe())
-    session.admit(packet)
+    # Multiple workers may finish out of ingress order, as in the local server.
+    session = _HttpSession(engine, Recipe(), render_workers=1)
+    admit_and_wait(session, packet, expected=5)
     completed = []
     while engine.has_work():
         completed.extend(

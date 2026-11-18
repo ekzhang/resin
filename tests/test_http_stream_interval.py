@@ -10,7 +10,7 @@ from functools import partial
 import numpy as np
 import pytest
 import test_http_lifecycle as lifecycle
-from http_packets import decoded_events, ingress
+from http_packets import admit_and_wait, decoded_events, ingress
 from test_http_logprobs import collect_scores, events, request, score_bytes
 from test_recipe import _byte_tokenizer
 
@@ -176,7 +176,7 @@ def test_first_output_is_immediate_then_token_interval_and_final_residual(
     interval, expected
 ):
     with session_case(list("abcdef"), interval) as (session, engine, _, recipe):
-        session.admit(admission("one", 6))
+        admit_and_wait(session, admission("one", 6))
         output = []
         for delta in expected:
             step = tick(session, engine)
@@ -195,7 +195,7 @@ def test_verified_blocks_count_tokens_and_coalesce_without_waiting_for_more_step
         _,
         recipe,
     ):
-        session.admit(admission("block", 7))
+        admit_and_wait(session, admission("block", 7))
         output = []
         for expected in ("a", "", "bcde", "fg"):
             step = tick(session, engine)
@@ -213,7 +213,7 @@ def test_raw_only_flushes_never_consume_the_first_semantic_output():
         _,
         recipe,
     ):
-        session.admit(admission("headers", 4))
+        admit_and_wait(session, admission("headers", 4))
         output = []
         for index, expected in enumerate(("", "", "a", "b")):
             step = tick(session, engine)
@@ -255,7 +255,7 @@ def test_terminal_paths_flush_residual_and_stops_still_parse_every_step(
 ):
     eos = pieces[-1] if ending == "eos" else None
     with session_case(pieces, 8, eos=eos) as (session, engine, runner, recipe):
-        session.admit(admission("terminal", limit, stops=stops))
+        admit_and_wait(session, admission("terminal", limit, stops=stops))
         first = tick(session, engine)
         assert [data["delta"] for _, data in text_events(first)] == ["a"]
         output = first
@@ -280,10 +280,10 @@ def test_intervals_belong_to_each_request_and_cancel_discards_only_its_pending_o
             output.extend(step)
             return text_events(step)
 
-        session.admit(admission("first", 6))
+        admit_and_wait(session, admission("first", 6))
         assert [request_id for request_id, _ in next_text()] == ["first"]
         assert next_text() == []
-        session.admit(admission("second", 6))
+        admit_and_wait(session, admission("second", 6))
         assert [(name, data["delta"]) for name, data in next_text()] == [
             ("second", "a")
         ]

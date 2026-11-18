@@ -15,13 +15,8 @@ use crate::http::AdmissionConfig;
 
 /// Native ingress stays typed across the Python coordinator. Only transport
 /// between ranks encodes it; JSON never becomes a Python object graph.
-#[pyclass(
-    name = "_HttpIngress",
-    frozen,
-    skip_from_py_object,
-    module = "resin._resin"
-)]
-#[derive(Clone, Default, Deserialize, Serialize)]
+#[pyclass(name = "_HttpIngress", skip_from_py_object, module = "resin._resin")]
+#[derive(Default, Deserialize, Serialize)]
 #[serde(default, deny_unknown_fields)]
 pub(crate) struct HttpIngress {
     pub(crate) requests: Vec<ConversationRequest>,
@@ -79,6 +74,8 @@ impl HttpIngress {
 pub(crate) struct HttpEvents {
     pub(crate) events: Vec<(String, GenerationEvent)>,
     pub(crate) metrics: Vec<Vec<u8>>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub(crate) released: Vec<String>,
 }
 
 #[pymethods]
@@ -97,7 +94,8 @@ impl HttpEvents {
     }
 
     fn to_bytes<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyBytes>> {
-        let bytes = if self.events.is_empty() && self.metrics.is_empty() {
+        let bytes = if self.events.is_empty() && self.metrics.is_empty() && self.released.is_empty()
+        {
             Vec::new()
         } else {
             serde_json::to_vec(self).map_err(|error| PyValueError::new_err(error.to_string()))?
@@ -109,6 +107,7 @@ impl HttpEvents {
         Self {
             events: self.events.clone(),
             metrics: snapshots,
+            released: self.released.clone(),
         }
     }
 
@@ -123,8 +122,18 @@ impl HttpEvents {
                 .iter()
                 .flat_map(|packet| packet.events.iter().cloned())
                 .collect(),
+            released: packets
+                .iter()
+                .flat_map(|packet| packet.released.iter().cloned())
+                .collect(),
         }
     }
+}
+
+struct Client {
+    // After disconnect, hold the admission slot until the replica releases it.
+    events: Option<mpsc::Sender<GenerationEvent>>,
+    enqueued_at: Instant,
 }
 
 pub(crate) fn run(
@@ -135,12 +144,11 @@ pub(crate) fn run(
     admission: AdmissionConfig,
     metrics: Option<MetricsEndpoint>,
 ) -> Result<(), String> {
-    let mut clients = HashMap::<String, mpsc::Sender<GenerationEvent>>::new();
+    let mut clients = HashMap::<String, Client>::new();
     let mut disconnected = false;
     let mut canceled_next = Vec::new();
     let mut next_rank = 0;
     let mut next_metrics = Instant::now();
-    let mut started = HashMap::<String, Instant>::new();
     loop {
         if let Some(endpoint) = &metrics {
             endpoint.set_queue_size(jobs.len());
@@ -151,14 +159,12 @@ pub(crate) fn run(
         }
         let mut admissions = Vec::new();
         let mut canceled = std::mem::take(&mut canceled_next);
-        canceled.extend(
-            clients
-                .iter()
-                .filter_map(|(id, client)| client.is_closed().then_some(id.clone())),
-        );
-        for id in &canceled {
-            clients.remove(id);
-            started.remove(id);
+        canceled.retain(|id| clients.contains_key(id));
+        for (id, client) in &mut clients {
+            if client.events.as_ref().is_some_and(mpsc::Sender::is_closed) {
+                client.events = None;
+                canceled.push(id.clone());
+            }
         }
         let mut ingress_error = None;
         for _ in 0..admission.admissions_per_step.saturating_mul(replicas) {
@@ -186,9 +192,14 @@ pub(crate) fn run(
                     job.request.routed_dp_rank = Some(rank);
                     if let Some(endpoint) = &metrics {
                         endpoint.observe_queue_time(job.enqueued_at.elapsed().as_secs_f64());
-                        started.insert(job.request.id.clone(), job.enqueued_at);
                     }
-                    clients.insert(job.request.id.clone(), job.events);
+                    clients.insert(
+                        job.request.id.clone(),
+                        Client {
+                            events: Some(job.events),
+                            enqueued_at: job.enqueued_at,
+                        },
+                    );
                     admissions.push(job.request);
                 }
                 Ok(_) => {}
@@ -217,7 +228,7 @@ pub(crate) fn run(
             Ok(output) => output,
             Err(error) => {
                 let message = format!("distributed HTTP execution failed: {error}");
-                for client in clients.values() {
+                for client in clients.values().filter_map(|client| client.events.as_ref()) {
                     let _ = client.try_send(GenerationEvent::Error {
                         message: message.clone(),
                     });
@@ -233,45 +244,45 @@ pub(crate) fn run(
                 .map_err(|error| error.to_string())?;
         }
         for (id, event) in output.events {
-            if let Some(endpoint) = &metrics
-                && let Some(since) = started.get(&id)
-            {
-                match &event {
-                    GenerationEvent::FirstToken => {
-                        endpoint.observe_first_token(since.elapsed().as_secs_f64())
-                    }
-                    GenerationEvent::Finished { .. } => {
-                        endpoint.observe_completed(since.elapsed().as_secs_f64())
-                    }
-                    _ => {}
-                }
-            }
-            if matches!(event, GenerationEvent::FirstToken) {
-                continue;
-            }
             let terminal = matches!(
                 event,
                 GenerationEvent::Finished { .. } | GenerationEvent::Error { .. }
             );
-            if let Some(client) = clients.get(&id) {
+            if let Some(client) = clients.get_mut(&id) {
+                if let Some(endpoint) = &metrics {
+                    let since = client.enqueued_at;
+                    match &event {
+                        GenerationEvent::FirstToken => {
+                            endpoint.observe_first_token(since.elapsed().as_secs_f64())
+                        }
+                        GenerationEvent::Finished { .. } => {
+                            endpoint.observe_completed(since.elapsed().as_secs_f64())
+                        }
+                        _ => {}
+                    }
+                }
                 // Backpressure remains local to one client. Cancel its owner
                 // on the next round instead of delaying every active replica.
-                if client.try_send(event).is_err() {
-                    clients.remove(&id);
-                    if !terminal {
-                        canceled_next.push(id.clone());
-                    }
+                if !matches!(event, GenerationEvent::FirstToken)
+                    && let Some(sender) = &client.events
+                    && sender.try_send(event).is_err()
+                    && !terminal
+                {
+                    client.events = None;
+                    canceled_next.push(id.clone());
                 }
             }
             if terminal {
                 clients.remove(&id);
-                started.remove(&id);
             }
+        }
+        for id in output.released {
+            clients.remove(&id);
         }
         if closed {
             return Ok(());
         }
-        if clients.is_empty() {
+        if clients.values().all(|client| client.events.is_none()) {
             thread::sleep(Duration::from_millis(1));
         }
     }
