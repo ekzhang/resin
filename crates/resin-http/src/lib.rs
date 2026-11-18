@@ -15,12 +15,13 @@ use std::{
 };
 
 use axum::{
-    Router,
+    Json, Router,
     extract::DefaultBodyLimit,
     http::{HeaderMap, StatusCode},
     routing::{get, post},
 };
 use resin_core::logprobs::DEFAULT_MAX_TOP_LOGPROBS;
+use serde_json::Value;
 use tokio::sync::{mpsc, oneshot};
 
 pub use metrics::{
@@ -94,6 +95,25 @@ struct AppState {
     context_length: u32,
 }
 
+/// Request fields echoed by response serializers. The engine owns the prompt.
+struct ResponseMetadata {
+    id: String,
+    model: String,
+    reasoning_effort: Option<String>,
+    temperature: f64,
+    top_p: f64,
+    max_output_tokens: Option<usize>,
+    logprobs: bool,
+    prompt_logprobs: bool,
+}
+
+type RequestError = (StatusCode, Json<Value>);
+type RequestResult<T> = Result<T, RequestError>;
+
+fn request_error(status: StatusCode, message: impl Into<String>, kind: &str) -> RequestError {
+    (status, Json(protocol::json_error(message, kind)))
+}
+
 impl AppState {
     fn request_id(&self, prefix: &str) -> String {
         let sequence = self.next_id.fetch_add(1, Ordering::Relaxed);
@@ -103,21 +123,34 @@ impl AppState {
     fn enqueue(
         &self,
         request: ConversationRequest,
-    ) -> Result<mpsc::Receiver<GenerationEvent>, (StatusCode, &'static str)> {
+        error_kind: &str,
+    ) -> RequestResult<(ResponseMetadata, mpsc::Receiver<GenerationEvent>)> {
+        let metadata = ResponseMetadata {
+            id: request.id.clone(),
+            model: request.model.clone(),
+            reasoning_effort: request.reasoning_effort.clone(),
+            temperature: request.temperature,
+            top_p: request.top_p,
+            max_output_tokens: request.max_output_tokens,
+            logprobs: request.logprobs,
+            prompt_logprobs: request.prompt_logprobs,
+        };
         let (events, receiver) = mpsc::channel(EVENT_QUEUE_CAPACITY);
         match self.jobs.try_send(GenerationJob {
             request,
             events,
             enqueued_at: Instant::now(),
         }) {
-            Ok(()) => Ok(receiver),
-            Err(mpsc::error::TrySendError::Full(_)) => Err((
+            Ok(()) => Ok((metadata, receiver)),
+            Err(mpsc::error::TrySendError::Full(_)) => Err(request_error(
                 StatusCode::TOO_MANY_REQUESTS,
                 "the inference request queue is full; retry later",
+                error_kind,
             )),
-            Err(mpsc::error::TrySendError::Closed(_)) => Err((
+            Err(mpsc::error::TrySendError::Closed(_)) => Err(request_error(
                 StatusCode::SERVICE_UNAVAILABLE,
                 "the inference engine is not running",
+                error_kind,
             )),
         }
     }

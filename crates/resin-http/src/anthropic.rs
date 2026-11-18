@@ -14,12 +14,12 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use tokio::sync::mpsc;
 
-use crate::AppState;
 use crate::openai::{
-    RequestResult, invalid_request, request_priority, routed_rank, token_count_response,
+    invalid_request, request_priority, routed_rank, token_count_response, validate_model,
     validate_sampling,
 };
 use crate::protocol::{ConversationRequest, GenerationEvent, ResponseAccumulator, json_error};
+use crate::{AppState, RequestResult, ResponseMetadata};
 
 #[derive(Debug, Deserialize)]
 pub(crate) struct MessagesRequest {
@@ -58,38 +58,27 @@ pub async fn messages(
     State(state): State<AppState>,
     headers: HeaderMap,
     Json(body): Json<MessagesRequest>,
-) -> Response {
+) -> RequestResult<Response> {
     let stream = body.stream;
-    let request = match conversation_request(&state, &headers, body) {
-        Ok(request) => request,
-        Err(response) => return *response,
-    };
-    let receiver = match state.enqueue(request.clone()) {
-        Ok(receiver) => receiver,
-        Err((status, message)) => {
-            return (status, Json(json_error(message, "api_error"))).into_response();
-        }
-    };
-    if stream {
-        messages_stream(request, receiver).into_response()
+    let request = conversation_request(&state, &headers, body)?;
+    let (metadata, receiver) = state.enqueue(request, "api_error")?;
+    Ok(if stream {
+        messages_stream(metadata, receiver).into_response()
     } else {
-        messages_response(request, receiver).await
-    }
+        messages_response(metadata, receiver).await
+    })
 }
 
 pub async fn count_tokens(
     State(state): State<AppState>,
     headers: HeaderMap,
     Json(mut body): Json<MessagesRequest>,
-) -> Response {
+) -> RequestResult<Response> {
     // The count endpoint has no generation budget. Reuse the Messages prompt
     // normalization without requiring the generation-only max_tokens field.
     body.max_tokens = Some(1);
-    let request = match conversation_request(&state, &headers, body) {
-        Ok(request) => request,
-        Err(response) => return *response,
-    };
-    token_count_response(&state, request, false).await
+    let request = conversation_request(&state, &headers, body)?;
+    Ok(token_count_response(&state, request, false).await)
 }
 
 fn conversation_request(
@@ -98,21 +87,7 @@ fn conversation_request(
     mut body: MessagesRequest,
 ) -> RequestResult<ConversationRequest> {
     let routed_dp_rank = routed_rank(state, headers, body.routed_dp_rank)?;
-    if body.model != state.model.as_ref() {
-        return Err(Box::new(
-            (
-                axum::http::StatusCode::NOT_FOUND,
-                Json(json_error(
-                    format!(
-                        "model {:?} is not served; expected {:?}",
-                        body.model, state.model
-                    ),
-                    "not_found_error",
-                )),
-            )
-                .into_response(),
-        ));
-    }
+    validate_model(state, &body.model, "not_found_error")?;
     if body.messages.is_empty() {
         return Err(invalid_request("messages must not be empty"));
     }
@@ -270,7 +245,7 @@ fn content_text(content: &Value) -> RequestResult<String> {
 }
 
 async fn messages_response(
-    request: ConversationRequest,
+    request: ResponseMetadata,
     receiver: mpsc::Receiver<GenerationEvent>,
 ) -> Response {
     let response = match ResponseAccumulator::collect(receiver).await {
@@ -310,7 +285,7 @@ async fn messages_response(
 }
 
 fn messages_stream(
-    request: ConversationRequest,
+    request: ResponseMetadata,
     mut receiver: mpsc::Receiver<GenerationEvent>,
 ) -> Sse<impl futures_core::Stream<Item = Result<Event, Infallible>>> {
     let output = stream! {

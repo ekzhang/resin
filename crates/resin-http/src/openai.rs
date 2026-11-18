@@ -19,15 +19,14 @@ use serde_json::{Value, json};
 use tokio::sync::{mpsc, oneshot};
 
 use crate::{
-    AppState,
+    AppState, RequestError, RequestResult, ResponseMetadata,
     protocol::{
         ConversationRequest, FinishReason, GenerationEvent, ResponseAccumulator, ResponseOutput,
         json_error,
     },
+    request_error,
     ui::index_html,
 };
-
-pub(crate) type RequestResult<T> = Result<T, Box<Response>>;
 
 #[derive(Debug, Deserialize)]
 #[serde(untagged)]
@@ -159,24 +158,16 @@ pub async fn chat_completions(
     State(state): State<AppState>,
     headers: HeaderMap,
     Json(body): Json<ChatRequest>,
-) -> Response {
+) -> RequestResult<Response> {
     let stream = body.stream;
     let include_usage = body.stream_options.include_usage;
-    let request = match chat_request(&state, &headers, body) {
-        Ok(request) => request,
-        Err(response) => return *response,
-    };
-    let receiver = match state.enqueue(request.clone()) {
-        Ok(receiver) => receiver,
-        Err((status, message)) => {
-            return (status, Json(json_error(message, "server_error"))).into_response();
-        }
-    };
-    if stream {
-        chat_stream(request, receiver, include_usage).into_response()
+    let request = chat_request(&state, &headers, body)?;
+    let (metadata, receiver) = state.enqueue(request, "server_error")?;
+    Ok(if stream {
+        chat_stream(metadata, receiver, include_usage).into_response()
     } else {
-        chat_response(request, receiver).await
-    }
+        chat_response(metadata, receiver).await
+    })
 }
 
 fn chat_request(
@@ -185,7 +176,7 @@ fn chat_request(
     body: ChatRequest,
 ) -> RequestResult<ConversationRequest> {
     let routed_dp_rank = routed_rank(state, headers, body.routed_dp_rank)?;
-    validate_model(state, &body.model)?;
+    validate_model(state, &body.model, "invalid_request_error")?;
     validate_sampling(body.temperature, body.top_p, body.top_k, body.seed)?;
     validate_logprobs(body.top_logprobs, state.max_top_logprobs)?;
     validate_stops(body.stop.as_ref())?;
@@ -224,7 +215,7 @@ fn chat_request(
 }
 
 async fn chat_response(
-    request: ConversationRequest,
+    request: ResponseMetadata,
     receiver: mpsc::Receiver<GenerationEvent>,
 ) -> Response {
     let response = match ResponseAccumulator::collect(receiver).await {
@@ -269,7 +260,7 @@ async fn chat_response(
 }
 
 fn chat_stream(
-    request: ConversationRequest,
+    request: ResponseMetadata,
     mut receiver: mpsc::Receiver<GenerationEvent>,
     include_usage: bool,
 ) -> Sse<impl futures_core::Stream<Item = Result<Event, Infallible>>> {
@@ -350,7 +341,7 @@ fn chat_stream(
 }
 
 fn chat_chunk(
-    request: &ConversationRequest,
+    request: &ResponseMetadata,
     created: u64,
     delta: Value,
     finish_reason: Option<&str>,
@@ -368,36 +359,25 @@ pub async fn responses(
     State(state): State<AppState>,
     headers: HeaderMap,
     Json(body): Json<ResponsesRequest>,
-) -> Response {
+) -> RequestResult<Response> {
     let stream = body.stream;
-    let request = match responses_request(&state, &headers, body) {
-        Ok(request) => request,
-        Err(response) => return *response,
-    };
-    let receiver = match state.enqueue(request.clone()) {
-        Ok(receiver) => receiver,
-        Err((status, message)) => {
-            return (status, Json(json_error(message, "server_error"))).into_response();
-        }
-    };
-    if stream {
-        responses_stream(request, receiver).into_response()
+    let request = responses_request(&state, &headers, body)?;
+    let (metadata, receiver) = state.enqueue(request, "server_error")?;
+    Ok(if stream {
+        responses_stream(metadata, receiver).into_response()
     } else {
-        responses_response(request, receiver).await
-    }
+        responses_response(metadata, receiver).await
+    })
 }
 
 pub async fn input_tokens(
     State(state): State<AppState>,
     headers: HeaderMap,
     Json(mut body): Json<ResponsesRequest>,
-) -> Response {
+) -> RequestResult<Response> {
     body.max_output_tokens = None;
-    let request = match responses_request(&state, &headers, body) {
-        Ok(request) => request,
-        Err(response) => return *response,
-    };
-    token_count_response(&state, request, true).await
+    let request = responses_request(&state, &headers, body)?;
+    Ok(token_count_response(&state, request, true).await)
 }
 
 pub(crate) async fn token_count_response(
@@ -433,7 +413,7 @@ fn responses_request(
     mut body: ResponsesRequest,
 ) -> RequestResult<ConversationRequest> {
     let routed_dp_rank = routed_rank(state, headers, body.routed_dp_rank)?;
-    validate_model(state, &body.model)?;
+    validate_model(state, &body.model, "invalid_request_error")?;
     validate_sampling(body.temperature, body.top_p, body.top_k, body.seed)?;
     validate_logprobs(body.top_logprobs, state.max_top_logprobs)?;
     validate_stops(body.stop.as_ref())?;
@@ -515,7 +495,7 @@ fn response_input_messages(input: Value) -> RequestResult<Vec<Value>> {
 }
 
 async fn responses_response(
-    request: ConversationRequest,
+    request: ResponseMetadata,
     receiver: mpsc::Receiver<GenerationEvent>,
 ) -> Response {
     let accumulator = match ResponseAccumulator::collect(receiver).await {
@@ -525,7 +505,7 @@ async fn responses_response(
     Json(response_object(&request, &accumulator)).into_response()
 }
 
-fn response_object(request: &ConversationRequest, response: &ResponseAccumulator) -> Value {
+fn response_object(request: &ResponseMetadata, response: &ResponseAccumulator) -> Value {
     let (status, incomplete_details) = match response.reason {
         Some(FinishReason::Length) => ("incomplete", json!({"reason": "max_output_tokens"})),
         _ => ("completed", Value::Null),
@@ -594,7 +574,7 @@ fn response_object(request: &ConversationRequest, response: &ResponseAccumulator
 }
 
 fn responses_stream(
-    request: ConversationRequest,
+    request: ResponseMetadata,
     mut receiver: mpsc::Receiver<GenerationEvent>,
 ) -> Sse<impl futures_core::Stream<Item = Result<Event, Infallible>>> {
     let output = stream! {
@@ -709,21 +689,15 @@ fn function_tools(tools: Vec<Value>) -> RequestResult<Vec<Value>> {
         .collect()
 }
 
-fn validate_model(state: &AppState, model: &str) -> RequestResult<()> {
-    if model == state.model.as_ref() {
-        Ok(())
-    } else {
-        Err(Box::new(
-            (
-                StatusCode::NOT_FOUND,
-                Json(json_error(
-                    format!("model {model:?} is not served; expected {:?}", state.model),
-                    "invalid_request_error",
-                )),
-            )
-                .into_response(),
-        ))
+pub(crate) fn validate_model(state: &AppState, model: &str, kind: &str) -> RequestResult<()> {
+    if model != state.model.as_ref() {
+        return Err(request_error(
+            StatusCode::NOT_FOUND,
+            format!("model {model:?} is not served; expected {:?}", state.model),
+            kind,
+        ));
     }
+    Ok(())
 }
 
 pub(crate) fn request_priority(
@@ -761,14 +735,8 @@ pub(crate) fn validate_sampling(
     Ok(())
 }
 
-pub(crate) fn invalid_request(message: impl Into<String>) -> Box<Response> {
-    Box::new(
-        (
-            StatusCode::BAD_REQUEST,
-            Json(json_error(message, "invalid_request_error")),
-        )
-            .into_response(),
-    )
+pub(crate) fn invalid_request(message: impl Into<String>) -> RequestError {
+    request_error(StatusCode::BAD_REQUEST, message, "invalid_request_error")
 }
 
 fn internal_error(message: impl Into<String>) -> Response {
@@ -836,7 +804,7 @@ pub(crate) fn routed_rank(
     Ok(rank)
 }
 
-fn chat_logprobs(request: &ConversationRequest, tokens: &[crate::GeneratedTokenLogprob]) -> Value {
+fn chat_logprobs(request: &ResponseMetadata, tokens: &[crate::GeneratedTokenLogprob]) -> Value {
     if request.logprobs {
         json!({"content": tokens, "refusal": null})
     } else {
@@ -844,7 +812,7 @@ fn chat_logprobs(request: &ConversationRequest, tokens: &[crate::GeneratedTokenL
     }
 }
 
-fn raw_scores(request: &ConversationRequest, response: &ResponseAccumulator) -> Value {
+fn raw_scores(request: &ResponseMetadata, response: &ResponseAccumulator) -> Value {
     let mut scores = json!({});
     if request.logprobs {
         scores["generation_logprobs"] = json!(response.logprobs);
