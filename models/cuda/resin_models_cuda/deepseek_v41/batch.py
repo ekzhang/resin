@@ -194,7 +194,7 @@ def _reference(cache, positions, ratios, draft, valid_tokens):
     counts = end.clamp(0, cache.geometry.window_size)
     columns = torch.arange(cache.geometry.window_size, device=positions.device)
     history = end[..., None] - counts[..., None] + columns
-    read = cache.window_rows(0, history)
+    read = cache.window_rows(history)
     read = torch.where((columns < counts[..., None]) & valid[..., None], read, -1)
     ca_positions, ca_stores, lengths = {}, {}, {}
     for ratio in ratios:
@@ -238,7 +238,7 @@ def _reference(cache, positions, ratios, draft, valid_tokens):
         context_lens=(positions + 1).int(),
         valid_token_mask=valid.flatten(),
         slot_mapping_store_swa=torch.where(
-            valid, cache.window_rows(0, positions), -1
+            valid, cache.window_rows(positions), -1
         ).int(),
         kv_swa_index=read,
         positions_c=ca_positions,

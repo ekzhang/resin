@@ -179,7 +179,7 @@ def _cache():
             )
         )
         parent += math.ceil(6 / packing)
-    arena = CacheArena("cpu", geometry.layout(parent), geometry, dtype=torch.bfloat16)
+    arena = CacheArena("cpu", geometry.layout(parent), geometry)
     arena.storage.zero_()
     return arena._make_graph_cache(tuple(groups))
 
@@ -274,38 +274,26 @@ def test_ratio2_rejected_tail_needs_no_relocation_or_accepted_state_mutation(
 def test_fp32_compressor_sources_and_packed_index_keys_never_alias():
     cache = _cache()
     positions = torch.arange(258).expand(2, -1)
+    compressor = cache.compressor_values
     saved = []
     for source in (1, 3):
         values, scores = cache.compressor_rows(source, positions)
-        cache.compressor_values[values] = source + 10
-        cache.compressor_values[scores] = source + 20
-        saved.extend([(values, source + 10), (scores, source + 20)])
+        compressor[values] = source + 10
+        compressor[scores] = source + 20
+        saved.extend(
+            [(compressor, values, source + 10), (compressor, scores, source + 20)]
+        )
     for source in (1, 3, 5):
         rows = cache.compressed_rows(
             source, cache.geometry.ratios[source], positions
         ).long()
-        keys = cache.index_rows(source, positions).long()
-        packed = cache.compressed_cache(source)
-        packed[rows // packed.shape[1], rows % packed.shape[1], 0] = source + 30
-        values, scales = cache.index_parts(source)
-        pages, offsets = keys // packed.shape[1], keys % packed.shape[1]
-        values[pages, offsets] = source + 40
-        scales[pages, offsets] = source + 50
-    for source in (1, 3, 5):
-        rows = cache.compressed_rows(
-            source, cache.geometry.ratios[source], positions
-        ).long()
-        keys = cache.index_rows(source, positions).long()
-        packed = cache.compressed_cache(source)
-        assert (
-            packed[rows // packed.shape[1], rows % packed.shape[1], 0] == source + 30
-        ).all()
-        values, scales = cache.index_parts(source)
-        pages, offsets = keys // packed.shape[1], keys % packed.shape[1]
-        assert (values[pages, offsets] == source + 40).all()
-        assert (scales[pages, offsets] == source + 50).all()
-    for rows, value in saved:
-        assert (cache.compressor_values[rows] == value).all()
+        packed, keys = cache.compressed_cache(source), cache.index_cache(source)
+        pages = (rows // packed.shape[1]).unique()
+        packed[pages] = source + 30
+        keys[pages] = source + 40
+        saved.extend([(packed, pages, source + 30), (keys, pages, source + 40)])
+    for tensor, indices, value in saved:
+        assert (tensor[indices] == value).all()
 
 
 def test_published_index_query_sources_share_keys_from_latest_kv_owner():
@@ -566,7 +554,7 @@ def test_dspark_query_rope_starts_at_anchor_while_main_history_ends_before_it(
     for row, start in enumerate((0, 2)):
         expected = (
             real_cache.row(row)
-            .window_rows(0, torch.arange(start, int(anchor[row]))[None])
+            .window_rows(torch.arange(start, int(anchor[row]))[None])
             .flatten()
         )
         for query in history[row]:

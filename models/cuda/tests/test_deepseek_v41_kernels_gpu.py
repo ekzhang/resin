@@ -326,7 +326,7 @@ def _attention_checks():
         prefill_chunk_size=256,
         max_batch_size=4,
     )
-    arena = CacheArena("cuda", geometry.layout(8), geometry, dtype=torch.bfloat16)
+    arena = CacheArena("cuda", geometry.layout(8), geometry)
     groups = tuple(
         DevicePageGroup(
             torch.tensor([[i + 1, i + 5]], device="cuda", dtype=torch.int32),
@@ -338,7 +338,7 @@ def _attention_checks():
     cache = arena._make_graph_cache(groups)
     logical = torch.arange(256, device="cuda", dtype=torch.int32)[None]
     window_ids, compressed_ids = (
-        cache.window_rows(0, logical),
+        cache.window_rows(logical),
         cache.compressed_rows(0, 1, logical),
     )
     window, compressed = cache.window_cache(0), cache.compressed_cache(0)

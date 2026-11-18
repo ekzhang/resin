@@ -119,7 +119,7 @@ def test_prefill_gather_clamps_consumer_swa_but_keeps_complete_c1(monkeypatch, l
 
     monkeypatch.setattr(attention, "gather_kv", gather)
     fake_cache = SimpleNamespace(
-        window_rows=lambda _layer, history: history + 1000,
+        window_rows=lambda history: history + 1000,
         window_cache=lambda _layer: None,
         compressed_rows=lambda _layer, _ratio, history: history + 2000,
         compressed_cache=lambda _layer: None,

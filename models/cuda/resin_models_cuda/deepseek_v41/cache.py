@@ -47,7 +47,6 @@ class CacheGeometry:
         prefill_chunk_size: int,
         max_batch_size: int = 1,
         replay_suffix_tokens: int = 0,
-        **_,
     ):
         count = args.n_layers + args.n_mtp_layers
         ratios = tuple(args.compress_ratios)
@@ -180,7 +179,7 @@ class DeviceCache:
         pages = parents * self.geometry.packings[group] + slots
         return (pages * (PAGE_TOKENS // ratio) + offsets // ratio).int()
 
-    def window_rows(self, layer, positions):
+    def window_rows(self, positions):
         return self._rows(WINDOW, positions, 1)
 
     def compressed_rows(self, layer, ratio, positions):
@@ -224,11 +223,6 @@ class DeviceCache:
             * self.geometry.parent_bytes,
         )
 
-    def index_rows(self, layer, positions):
-        if self.geometry.index_offsets[layer] is None:
-            raise ValueError("layer does not consume shared index keys")
-        return self._rows(COMPRESSED, positions, self.geometry.ratios[layer])
-
     def index_cache(self, layer):
         """DeepGEMM's FP4 index ABI: page-wide values followed by scales."""
         offset = self.geometry.index_offsets[layer]
@@ -237,32 +231,6 @@ class DeviceCache:
         return self._view(
             COMPRESSED, offset, PAGE_TOKENS // self.geometry.ratios[layer], INDEX_BYTES
         )
-
-    def index_parts(self, layer):
-        """Typed zero-copy views used by the upstream fused cache-store kernel."""
-        cache = self.index_cache(layer)
-        pages, tokens = cache.shape[:2]
-        values = self.storage.view(torch.int8).as_strided(
-            (pages, tokens, 64), (cache.stride(0), 64, 1), cache.storage_offset()
-        )
-        scales = self.storage.view(torch.int32).as_strided(
-            (pages, tokens),
-            (cache.stride(0) // 4, 1),
-            (cache.storage_offset() + tokens * 64) // 4,
-        )
-        return values, scales
-
-    def index_block_table(self, query_tokens):
-        """Adapt Engine parent/child IDs without materializing historical keys.
-
-        DeepGEMM's varlen API indexes the table by flattened query offset.
-        Each request's queries must therefore repeat that request's own table.
-        """
-        group = self.groups[COMPRESSED]
-        pages = (
-            group.parent_ids * self.geometry.packings[COMPRESSED] + group.child_slots
-        )
-        return pages.repeat_interleave(query_tokens, dim=0).int()
 
     def compressor_rows(self, layer, positions):
         base, offsets = self._bytes(COMPRESSOR, positions)
@@ -303,7 +271,7 @@ class CacheArena(GraphPageTableArena):
     graph_input_names = PARENT_PAGE_NAMES
     graph_label = "DeepSeek-V4.1"
 
-    def __init__(self, device, layout, geometry, *, dtype):
+    def __init__(self, device, layout, geometry):
         self.device, self.layout, self.geometry = device, layout, geometry
         self.binding = CachePoolBinding(layout, resource="DeepSeek-V4.1 KV")
         self.storage = torch.empty(

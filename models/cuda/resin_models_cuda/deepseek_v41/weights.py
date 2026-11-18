@@ -81,20 +81,7 @@ def _attention_shard(tensor, name, rank, size):
     return tensor.narrow(axis, rank * width, width)
 
 
-def _dequantize_output(weight, scales):
-    """The published converter materializes grouped wo_a in BF16."""
-    return (
-        (
-            weight.float().unflatten(0, (-1, 32)).unflatten(-1, (-1, 32))
-            * scales.float()[:, None, :, None]
-        )
-        .flatten(2, 3)
-        .flatten(0, 1)
-        .bfloat16()
-    )
-
-
-def load_weights(model_path, model, *, rank, tensor_parallel_size, device):
+def load_weights(model_path, model, *, rank, tensor_parallel_size):
     if not 0 <= rank < tensor_parallel_size:
         raise ValueError("attention rank is outside its group")
     files = indexed_tensor_files(Path(model_path), require_index=True)
