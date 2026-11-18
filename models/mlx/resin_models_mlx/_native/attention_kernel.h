@@ -5,10 +5,12 @@
     const uint lane = thread_index_in_simdgroup;
     const uint group = simdgroup_index_in_threadgroup;
     const uint tid = thread_position_in_threadgroup.x;
-    // Runtime geometry: page-table width, partition count and layer offset.
+    // Runtime geometry: page-table width, partition count, layer offset and
+    // the first readable history position (earlier slots are never read).
     const int PAGES = geometry[0];
     const int PARTITIONS = geometry[1];
     const int layer = geometry[2];
+    const int skip = geometry[3];
 
     const int work = threadgroup_position_in_grid.z;
     const int partition = work % PARTITIONS;
@@ -45,7 +47,7 @@
     const int first = start + int(group) * run;
     const int last = min(first + run, stop);
     const int cached = min(last, history);
-    int p = first;
+    int p = max(first, skip);
     while (p < cached) {
         const int page_end = min(cached, (p / PAGE + 1) * PAGE);
         const long unit = long(pages[row * PAGES + p / PAGE]) + layer;

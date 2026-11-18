@@ -42,7 +42,10 @@ def test_runtime_prepares_persistent_cute_cache(tmp_path, name):
     assert Path(env["CUTE_DSL_CACHE_DIR"]).is_dir()
 
 
-@pytest.mark.parametrize("name", ["ornith-1.0-35b", "qwen3.5-0.8b-mlx"])
+@pytest.mark.parametrize(
+    "name",
+    ["ornith-1.0-35b", "qwen3.5-0.8b-mlx", "qwen3.5-0.8b-mtp-mlx", "qwen3.8-27b-mlx"],
+)
 def test_mlx_factory_constructs_single_device_runner(monkeypatch, tmp_path, name):
     pytest.importorskip("mlx.core")
     spec = get_model(name)
@@ -74,12 +77,13 @@ def test_mlx_factory_constructs_single_device_runner(monkeypatch, tmp_path, name
                 "max_seq_len": 8192,
                 "max_batch_size": 8,
                 "include_vision": not spec.text_only,
+                "speculative_draft_tokens": 0,
             },
         )
     ]
-    with pytest.raises(ValueError, match="use draft_tokens=0"):
-        create(draft_tokens=4)
-    with pytest.raises(ValueError, match="use draft_tokens=0"):
+    create(draft_tokens=3)
+    assert calls[-1][1]["speculative_draft_tokens"] == 3
+    with pytest.raises(ValueError, match="no assistant checkpoint"):
         create(draft_tokens=1, assistant_checkpoint=tmp_path / "mtp")
     with pytest.raises(ValueError, match="one Apple Silicon device"):
         create(groups=object())

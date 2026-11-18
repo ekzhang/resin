@@ -28,6 +28,11 @@ def main(argv=None) -> None:
     parser.add_argument("--context-length", type=int)
     parser.add_argument("--max-batch-size", type=int)
     parser.add_argument(
+        "--draft-tokens",
+        type=int,
+        help="MTP draft tokens per decode step (default: the preset's; 0 disables)",
+    )
+    parser.add_argument(
         "--wired-limit-gib",
         type=float,
         help="MLX wired budget in GiB (default: live memory + 1 GiB, capped at Metal's recommended limit; 0 disables)",
@@ -55,7 +60,9 @@ def main(argv=None) -> None:
         context_length=context_length,
         max_batch_size=max_batch_size,
         prefill_chunk_size=spec.prefill_chunk_size,
-        draft_tokens=0,
+        draft_tokens=spec.draft_tokens
+        if args.draft_tokens is None
+        else args.draft_tokens,
     )
     recipe = create_recipe(spec, args.checkpoint.expanduser(), runner=runner)
     batch_tokens = getattr(

@@ -117,13 +117,34 @@ class PagedHistory:
     logical layer index times ``layer_stride`` to address another layer.
     ``lengths`` is each row's int32 history length. Metadata may contain
     unused padded rows; queries determine the logical batch size. The
-    default stride preserves consecutive-layer external page tables.
+    default stride preserves consecutive-layer external page tables. A step
+    may carry several causal tokens per row; none of them is in the arena.
     """
 
     units: mx.array
     pages: mx.array
     lengths: mx.array
     layer_stride: int = 1
+    # History positions before ``skip`` are never read.
+    skip: int = 0
+    # Unwritten keys and values after the history, ``[rows, count, kv, dim]``.
+    prior: tuple[mx.array, mx.array] | None = None
+
+
+class BlockInputs(NamedTuple):
+    """One DeltaNet layer's recurrence inputs for a multi-token block.
+
+    Retained so the state after any accepted prefix of the block can be
+    recomputed without running the model again.
+    """
+
+    queries: mx.array
+    keys: mx.array
+    values: mx.array
+    a: mx.array
+    b: mx.array
+    recurrent: mx.array
+    window: mx.array
 
 
 class LinearState(NamedTuple):
@@ -190,7 +211,11 @@ class GatedDeltaNet(_GatedDeltaNet):
         self.A_log = mx.zeros((self.num_v_heads,))
 
     def __call__(
-        self, hidden: mx.array, recurrent: mx.array, convolution: mx.array
+        self,
+        hidden: mx.array,
+        recurrent: mx.array,
+        convolution: mx.array,
+        retain: list[BlockInputs] | None = None,
     ) -> tuple[mx.array, mx.array, mx.array]:
         rows, tokens, _ = hidden.shape
         if (joined := getattr(self, "_joined_input", None)) is None:
@@ -200,6 +225,7 @@ class GatedDeltaNet(_GatedDeltaNet):
             mixed, z, b, a = joined(hidden)
         z = z.reshape(rows, tokens, self.num_v_heads, self.head_v_dim)
 
+        raw_window = None
         if tokens == 1 and self.conv_kernel_size == 4:
             q, k, v, convolution = conv4_silu_qkv(
                 mixed,
@@ -213,6 +239,7 @@ class GatedDeltaNet(_GatedDeltaNet):
         else:
             window = mx.concatenate([convolution.astype(mixed.dtype), mixed], axis=1)
             convolution = window[:, -(self.conv_kernel_size - 1) :]
+            raw_window = window
             mixed = nn.silu(self.conv1d(window))
             key_width = self.key_dim
             q = mixed[..., :key_width]
@@ -222,6 +249,10 @@ class GatedDeltaNet(_GatedDeltaNet):
             k = k.reshape(rows, tokens, self.num_k_heads, self.head_k_dim)
             v = v.reshape(rows, tokens, self.num_v_heads, self.head_v_dim)
         q, k = normalize_qk(q, k, inv_scale=self.head_k_dim**-0.5, eps=1e-6)
+        if retain is not None:
+            if raw_window is None:
+                raise ValueError("block inputs are retained for multi-token steps")
+            retain.append(BlockInputs(q, k, v, a, b, recurrent, raw_window))
         # The decay is computed in float32, as in the reference model.
         output, recurrent = gated_delta_update(
             q, k, v, a, b, self.A_log, self.dt_bias, recurrent
@@ -276,6 +307,19 @@ class GatedAttention(nn.Module):
             offset=offsets,
         )
 
+    def keys_values(
+        self, hidden: mx.array, offsets: mx.array, rotary_positions=None
+    ) -> tuple[mx.array, mx.array]:
+        """Only this layer's new ``[rows, tokens, kv_heads, head_dim]`` K/V."""
+
+        rows, tokens, _ = hidden.shape
+        key = self.k_proj(hidden).reshape(rows, tokens, self.kv_heads, -1)
+        value = self.v_proj(hidden).reshape(rows, tokens, self.kv_heads, -1)
+        key = self._rope(
+            self.k_norm(key).transpose(0, 2, 1, 3), offsets, rotary_positions
+        )
+        return key.transpose(0, 2, 1, 3), value
+
     def __call__(
         self,
         hidden: mx.array,
@@ -309,18 +353,36 @@ class GatedAttention(nn.Module):
         new_key, new_value = key, value
 
         if isinstance(history, PagedHistory):
-            from resin_models_mlx.paged_attention import paged_decode_attention
+            from resin_models_mlx.paged_attention import (
+                paged_block_attention,
+                paged_decode_attention,
+            )
 
-            output = paged_decode_attention(
-                query[:, :, 0],
-                key[:, :, 0],
-                value[:, :, 0],
-                history.units,
-                history.pages,
-                history.lengths,
-                layer * history.layer_stride,
-                self.scale,
-            )[:, :, None]
+            if tokens == 1 and history.prior is None:
+                output = paged_decode_attention(
+                    query[:, :, 0],
+                    key[:, :, 0],
+                    value[:, :, 0],
+                    history.units,
+                    history.pages,
+                    history.lengths,
+                    layer * history.layer_stride,
+                    self.scale,
+                    history.skip,
+                )[:, :, None]
+            else:
+                output = paged_block_attention(
+                    query.transpose(0, 2, 1, 3),
+                    key.transpose(0, 2, 1, 3),
+                    value.transpose(0, 2, 1, 3),
+                    history.units,
+                    history.pages,
+                    history.lengths,
+                    layer * history.layer_stride,
+                    self.scale,
+                    history.skip,
+                    history.prior,
+                ).transpose(0, 2, 1, 3)
             return self._project(output, gate, rows, tokens, new_key, new_value)
         if history is not None:
             key = mx.concatenate([history.keys.transpose(0, 2, 1, 3), key], axis=2)
@@ -446,6 +508,7 @@ class Qwen35Model(nn.Module):
         config: Qwen35Config,
         *,
         norm_weights_are_offset: bool = True,
+        include_mtp: bool = False,
     ) -> None:
         super().__init__()
         self.config = config
@@ -460,9 +523,19 @@ class Qwen35Model(nn.Module):
         )
         if not config.tie_word_embeddings:
             self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
+        if include_mtp:
+            config.require_mtp()
+            self.mtp = Qwen35Mtp(
+                config, norm_weights_are_offset=norm_weights_are_offset
+            )
+
+    @property
+    def has_mtp(self) -> bool:
+        return "mtp" in self
 
     def _projection_groups(self):
-        for layer in self.layers:
+        layers = [*self.layers, *(self.mtp.layers if self.has_mtp else ())]
+        for layer in layers:
             attention = layer.linear_attn if layer.is_linear else layer.self_attn
             names = (
                 ("in_proj_qkv", "in_proj_z", "in_proj_b", "in_proj_a")
@@ -502,8 +575,13 @@ class Qwen35Model(nn.Module):
         *,
         input_embeddings=None,
         rotary_positions=None,
+        retain: list[BlockInputs] | None = None,
     ) -> StepOutput:
-        """Run ``[rows, tokens]`` inputs starting at per-row position ``offsets``."""
+        """Run ``[rows, tokens]`` inputs starting at per-row position ``offsets``.
+
+        ``retain`` collects each DeltaNet layer's block inputs, from which
+        ``commit_block`` recomputes the state after an accepted prefix.
+        """
 
         hidden = (
             self.embed_tokens(token_ids)
@@ -525,6 +603,7 @@ class Qwen35Model(nn.Module):
                     normed,
                     state.recurrent[linear_index],
                     state.convolution[linear_index],
+                    retain,
                 )
                 recurrent.append(layer_recurrent)
                 convolution.append(layer_convolution)
@@ -569,6 +648,44 @@ class Qwen35Model(nn.Module):
             return self.embed_tokens.as_linear(hidden)
         return self.lm_head(hidden)
 
+    def commit_block(
+        self, retained: Sequence[BlockInputs], accepted: mx.array
+    ) -> LinearState:
+        """DeltaNet state after the first ``accepted + 1`` tokens of each row.
+
+        ``accepted`` is ``[rows]`` int32. The recurrence is replayed from the
+        block's initial state with later tokens masked, so no projection,
+        attention or MLP runs again.
+        """
+
+        keep = accepted.astype(mx.int32) + 1
+        recurrent, convolution = [], []
+        for inputs, layer in zip(
+            retained, (layer for layer in self.layers if layer.is_linear), strict=True
+        ):
+            attention = layer.linear_attn
+            tokens = inputs.queries.shape[1]
+            mask = mx.arange(tokens)[None, :] < keep[:, None]
+            _, state = gated_delta_update(
+                inputs.queries,
+                inputs.keys,
+                inputs.values,
+                inputs.a,
+                inputs.b,
+                attention.A_log,
+                attention.dt_bias,
+                inputs.recurrent,
+                mask,
+            )
+            recurrent.append(state)
+            # The tail ends after the last kept token of the padded window.
+            tail = attention.conv_kernel_size - 1
+            index = keep[:, None] + mx.arange(tail)[None, :]
+            convolution.append(
+                mx.take_along_axis(inputs.window, index[:, :, None], axis=1)
+            )
+        return LinearState(tuple(recurrent), tuple(convolution))
+
     def initial_state(self, rows: int) -> LinearState:
         config = self.config
         layers = config.linear_layer_count
@@ -589,10 +706,98 @@ class Qwen35Model(nn.Module):
         )
 
 
+class Qwen35Mtp(nn.Module):
+    """The bundled multi-token-prediction head.
+
+    Each input pairs a target hidden state at position ``p`` with the token
+    at ``p + 1``; the output hidden state predicts the token at ``p + 2``
+    through the target's ``logits``. One full-attention decoder layer reads
+    its own cache of earlier pairs.
+    """
+
+    def __init__(self, config: Qwen35Config, *, norm_weights_are_offset: bool) -> None:
+        super().__init__()
+        hidden = config.hidden_size
+
+        def norm():
+            return OffsetRMSNorm(
+                hidden, config.rms_norm_eps, offset=norm_weights_are_offset
+            )
+
+        self.pre_fc_norm_embedding = norm()
+        self.pre_fc_norm_hidden = norm()
+        self.fc = nn.Linear(2 * hidden, hidden, bias=False)
+        self.layers = [
+            DecoderLayer(
+                config,
+                "full_attention",
+                norm_weights_are_offset=norm_weights_are_offset,
+            )
+        ]
+        self.norm = norm()
+
+    def _input(self, embeddings: mx.array, previous_hidden: mx.array) -> mx.array:
+        return self.fc(
+            mx.concatenate(
+                [
+                    self.pre_fc_norm_embedding(embeddings),
+                    self.pre_fc_norm_hidden(previous_hidden),
+                ],
+                axis=-1,
+            )
+        )
+
+    def keys_values(
+        self,
+        embeddings: mx.array,
+        previous_hidden: mx.array,
+        offsets: mx.array,
+        *,
+        rotary_positions=None,
+    ) -> tuple[mx.array, mx.array]:
+        """The pairs' cache entries alone; they do not depend on the history."""
+
+        layer = self.layers[0]
+        return layer.self_attn.keys_values(
+            layer.input_layernorm(self._input(embeddings, previous_hidden)),
+            offsets,
+            rotary_positions,
+        )
+
+    def __call__(
+        self,
+        embeddings: mx.array,
+        previous_hidden: mx.array,
+        offsets: mx.array,
+        history: AttentionHistory | PagedHistory | None,
+        *,
+        rotary_positions=None,
+    ) -> tuple[mx.array, mx.array, mx.array]:
+        """Return the normalized hidden state and the layer's new keys/values.
+
+        ``embeddings`` and ``previous_hidden`` are ``[rows, tokens, hidden]``;
+        ``offsets`` are the rotary positions of each row's first target hidden.
+        """
+
+        hidden = self._input(embeddings, previous_hidden)
+        layer = self.layers[0]
+        mixed, key, value = layer.self_attn(
+            layer.input_layernorm(hidden),
+            offsets,
+            history,
+            rotary_positions=rotary_positions,
+        )
+        hidden, normed = layer.post_attention_layernorm.add_and_normalize(hidden, mixed)
+        _, hidden = self.norm.add_and_normalize(hidden, layer.mlp(normed))
+        return hidden, key, value
+
+
 __all__ = [
     "AttentionHistory",
+    "BlockInputs",
     "LinearState",
     "PagedHistory",
     "Qwen35Model",
+    "Qwen35Mtp",
     "StepOutput",
 ]

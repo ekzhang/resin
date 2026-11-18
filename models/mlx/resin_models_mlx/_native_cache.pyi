@@ -43,5 +43,6 @@ def _paged_attention_partials(
     lengths: mlx.core.array,
     layer: int,
     scale: float,
+    skip: int = 0,
 ) -> list[mlx.core.array]: ...
 def _warm_paged_attention() -> None: ...
