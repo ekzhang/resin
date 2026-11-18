@@ -32,9 +32,6 @@ pub trait Recipe: Send + Sync {
     fn input_modalities(&self) -> &'static [&'static str] {
         &["text"]
     }
-    fn image_checkerboard(&self) -> bool {
-        false
-    }
     fn prepare_media(
         &self,
         _: Vec<crate::media::Source>,

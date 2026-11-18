@@ -90,7 +90,7 @@ impl Config {
         for source in sources {
             match source {
                 Source::Image(image) => {
-                    let (pixels, count) = self.image_processor.process(image, false)?;
+                    let (pixels, count) = self.image_processor.process(image.into_rgb()?, false)?;
                     let ids = std::iter::once(boi)
                         .chain(std::iter::repeat_n(image_id, count))
                         .chain([eoi])
@@ -307,6 +307,7 @@ fn timestamp(index: usize, fps: f64) -> Result<String, Error> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::media::ImageSource;
     use crate::media::tests::Encoder;
     use serde_json::json;
 
@@ -328,7 +329,7 @@ mod tests {
         cfg.image_processor.image_std = [0.5, 0.25, 2.0];
         let rgb = image(4, 2);
         let prepared = cfg
-            .prepare(vec![Source::Image(rgb.clone())], &Encoder)
+            .prepare(vec![Source::Image(ImageSource::Rgb(rgb.clone()))], &Encoder)
             .unwrap();
         let pixels = crate::media::tests::pixels(&prepared, 0);
         assert_eq!(pixels.shape, [2, 4, 3]);
@@ -354,13 +355,13 @@ mod tests {
     fn mixed_sources_keep_expansion_order_video_sampling_and_original_timestamps() {
         let frames = (0..5).map(|_| image(2, 2)).collect();
         let sources = vec![
-            Source::Image(image(2, 2)),
+            Source::Image(ImageSource::Rgb(image(2, 2))),
             Source::Video(Video {
                 frames,
                 fps: 2.0,
                 frame_indices: vec![120, 121, 124, 125, 130],
             }),
-            Source::Image(image(2, 2)),
+            Source::Image(ImageSource::Rgb(image(2, 2))),
         ];
         let result = config().prepare(sources, &Encoder).unwrap();
         assert_eq!(crate::media::tests::pixels(&result, 0).shape, [2, 2, 3]);
@@ -419,7 +420,7 @@ mod tests {
         let result = cfg
             .prepare(
                 vec![
-                    Source::Image(image.clone()),
+                    Source::Image(ImageSource::Rgb(image.clone())),
                     Source::Video(Video {
                         frames: vec![image],
                         fps: 24.0,
@@ -466,7 +467,7 @@ mod tests {
         let mut bad = cfg.clone();
         bad.image_processor.patch_size = 0;
         assert!(
-            bad.prepare(vec![Source::Image(image(2, 2))], &Encoder)
+            bad.prepare(vec![Source::Image(ImageSource::Rgb(image(2, 2)))], &Encoder)
                 .is_err()
         );
     }

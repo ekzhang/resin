@@ -51,6 +51,7 @@ impl Config {
         let mut expansions = Vec::new();
         let mut items = Vec::new();
         for image in images(sources)? {
+            let image = image.into_rgb()?;
             let (height, width) = self.resize_shape(image.width, image.height)?;
             let image = if (width, height) == (image.width, image.height) {
                 image
@@ -164,6 +165,7 @@ impl Config {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::media::ImageSource;
     use crate::media::{RgbImage, tests::Encoder};
 
     #[test]
@@ -226,7 +228,10 @@ mod tests {
             .collect();
         let image = RgbImage::new(width, height, data).unwrap();
         let prepared = config
-            .prepare(vec![Source::Image(image.clone())], &Encoder)
+            .prepare(
+                vec![Source::Image(ImageSource::Rgb(image.clone()))],
+                &Encoder,
+            )
             .unwrap();
         let pixels = crate::media::tests::pixels(&prepared, 0);
         assert_eq!(pixels.shape, [height, width, 3]);

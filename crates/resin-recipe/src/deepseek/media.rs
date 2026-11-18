@@ -40,6 +40,7 @@ impl Config {
         let mut expansions = Vec::new();
         let mut items = Vec::new();
         for image in images(sources)? {
+            let image = image.into_rgb()?;
             let pixels = self.process_image(&image)?;
             let (rows, columns) = (
                 pixels.shape[0] / self.patch_size,
@@ -206,6 +207,7 @@ fn pad(image: &RgbImage, width: usize, height: usize) -> Result<RgbImage, Error>
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::media::ImageSource;
     use crate::media::tests::Encoder;
 
     #[test]
@@ -273,7 +275,10 @@ mod tests {
             .collect();
         let source = RgbImage::new(width, height, data).unwrap();
         let prepared = config
-            .prepare(vec![Source::Image(source.clone())], &Encoder)
+            .prepare(
+                vec![Source::Image(ImageSource::Rgb(source.clone()))],
+                &Encoder,
+            )
             .unwrap();
         let pixels = crate::media::tests::pixels(&prepared, 0);
         assert_eq!(pixels.shape, [height, width, 3]);

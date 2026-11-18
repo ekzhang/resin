@@ -32,6 +32,7 @@ impl Config {
         let mut expansions = Vec::new();
         let mut items = Vec::new();
         for image in images(sources)? {
+            let image = image.into_rgb()?;
             let [height, width, content_height, content_width] =
                 self.resize_shape(image.height, image.width)?;
             let resized = if (content_height, content_width) == (image.height, image.width) {

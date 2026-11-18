@@ -192,6 +192,47 @@ def test_image_sources_share_one_owned_rgb_boundary() -> None:
     np.testing.assert_array_equal(payloads[0][0].image, before)
 
 
+@pytest.mark.parametrize("data_url", [False, True], ids=["bytes", "data-url"])
+@pytest.mark.parametrize(
+    "alpha,light,dark",
+    [
+        (0, (204, 204, 204), (153, 153, 153)),
+        (128, (112, 152, 222), (86, 126, 197)),
+        (255, (20, 100, 240), (20, 100, 240)),
+    ],
+    ids=["transparent", "half-transparent", "opaque"],
+)
+def test_inkling_png_alpha_uses_eight_pixel_checkerboard(data_url, alpha, light, dark):
+    rgba = np.empty((16, 16, 4), dtype=np.uint8)
+    rgba[:] = (20, 100, 240, alpha)
+    encoded = io.BytesIO()
+    Image.fromarray(rgba).save(encoded, format="PNG")
+    source = (
+        resin.recipe.Image(
+            source="data:image/png;base64,"
+            + base64.b64encode(encoded.getvalue()).decode()
+        )
+        if data_url
+        else resin.recipe.Image.from_bytes(encoded.getvalue(), media_type="image/png")
+    )
+    checkerboard = np.empty((16, 16, 3), dtype=np.uint8)
+    checkerboard[:8, :8] = checkerboard[8:, 8:] = light
+    checkerboard[:8, 8:] = checkerboard[8:, :8] = dark
+    for name, config, expected in (
+        (
+            "inkling2",
+            {"size": {"height": 2, "width": 2}, "do_normalize": False},
+            checkerboard,
+        ),
+        ("gemma4", GEMMA_CONFIG, rgba[:, :, :3]),
+    ):
+        recipe = get_native_recipe(name, Tokenizer(), media_config=config)
+        (media,) = render_media(recipe, [source])
+        np.testing.assert_allclose(
+            media.image, expected.astype(np.float32) / 255, rtol=0, atol=1e-7
+        )
+
+
 @pytest.mark.parametrize("recipe_name", ["inkling2", "qwen3_5"])
 def test_image_only_recipes_reject_video(recipe_name) -> None:
     recipe = get_native_recipe(recipe_name, Tokenizer())

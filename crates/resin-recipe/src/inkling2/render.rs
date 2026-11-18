@@ -237,9 +237,6 @@ impl crate::Recipe for Inkling2Recipe {
     fn input_modalities(&self) -> &'static [&'static str] {
         &["text", "image"]
     }
-    fn image_checkerboard(&self) -> bool {
-        true
-    }
     fn prepare_media(
         &self,
         sources: Vec<crate::media::Source>,

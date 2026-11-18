@@ -1,7 +1,7 @@
 //! Inkling2 image padding and normalization, matching the pinned Hugging Face processor.
 //! Inputs are RGB/HWC in [0,1]; padding corresponds to -1 on the original byte scale.
 
-use crate::media::{Input, Prepared, Source, Tensor, image_tokens, images};
+use crate::media::{ImageSource, Input, Prepared, RgbImage, Source, Tensor, image_tokens, images};
 use crate::{Encoder, Error};
 use serde::Deserialize;
 
@@ -54,6 +54,7 @@ impl Config {
         let mut expansions = Vec::new();
         let mut items = Vec::new();
         for image in images(sources)? {
+            let image = into_rgb(image)?;
             let rows = image.height.div_ceil(patch);
             let columns = image.width.div_ceil(patch);
             let height = rows
@@ -101,6 +102,25 @@ impl Config {
     }
 }
 
+fn into_rgb(source: ImageSource) -> Result<RgbImage, Error> {
+    let rgba = match source {
+        ImageSource::Decoded(image) if image.color().has_alpha() => image.into_rgba8(),
+        source => return source.into_rgb(),
+    };
+    // Inkling composites transparent pixels over an 8-pixel gray checkerboard.
+    let mut pixels = Vec::with_capacity(rgba.width() as usize * rgba.height() as usize * 3);
+    for (x, y, pixel) in rgba.enumerate_pixels() {
+        let background = if (x / 8 + y / 8) % 2 == 0 { 204 } else { 153 };
+        let alpha = u32::from(pixel[3]);
+        for channel in 0..3 {
+            let value =
+                (u32::from(pixel[channel]) * alpha + background * (255 - alpha) + 127) / 255;
+            pixels.push(value as f32 / 255.0);
+        }
+    }
+    RgbImage::new(rgba.width() as usize, rgba.height() as usize, pixels)
+}
+
 impl Default for Config {
     fn default() -> Self {
         Self {
@@ -127,7 +147,7 @@ mod tests {
             .prepare(
                 [image(40, 40), image(80, 40), image(39, 41), image(41, 39)]
                     .into_iter()
-                    .map(Source::Image)
+                    .map(|image| Source::Image(ImageSource::Rgb(image)))
                     .collect(),
                 &Encoder,
             )
@@ -158,7 +178,7 @@ mod tests {
         };
         let image = RgbImage::new(2, 1, vec![0.0, 0.5, 1.0, 0.25, 0.75, 0.5]).unwrap();
         let result = config
-            .prepare(vec![Source::Image(image)], &Encoder)
+            .prepare(vec![Source::Image(ImageSource::Rgb(image))], &Encoder)
             .unwrap();
         let pixels = crate::media::tests::pixels(&result, 0);
         assert_eq!(pixels.shape, [2, 2, 3]);

@@ -13,7 +13,7 @@ use pyo3::{
 };
 use resin_recipe::{
     Encoder, Prompt, Recipe,
-    media::{self, Prepared, RgbImage, Source, Video},
+    media::{self, ImageSource, Prepared, RgbImage, Source, Video},
 };
 use sha2::{Digest, Sha256};
 
@@ -49,7 +49,7 @@ impl MediaCache {
         let sources = if cached.is_some() {
             Vec::new()
         } else {
-            self::sources(py, sources, recipe.image_checkerboard())?
+            self::sources(py, sources)?
         };
         let (ids, spans, input) = py.detach(|| -> PyResult<_> {
             let prepared = if let Some(prepared) = cached {
@@ -190,15 +190,9 @@ fn cache_key(py: Python<'_>, sources: &MediaSources) -> PyResult<Option<CacheKey
     Ok(Some(hash.finalize().into()))
 }
 
-fn image_source(
-    py: Python<'_>,
-    source: &Bound<'_, PyAny>,
-    checkerboard: bool,
-) -> PyResult<RgbImage> {
+fn image_source(py: Python<'_>, source: &Bound<'_, PyAny>) -> PyResult<ImageSource> {
     if let Ok(value) = source.extract::<String>() {
-        return py
-            .detach(|| RgbImage::data_url_with_background(&value, checkerboard))
-            .map_err(error);
+        return py.detach(|| ImageSource::data_url(&value)).map_err(error);
     }
     if let Ok(pair) = source.cast::<PyTuple>()
         && pair.len() == 2
@@ -206,13 +200,13 @@ fn image_source(
         let data: Vec<u8> = pair.get_item(0)?.extract()?;
         let mime: String = pair.get_item(1)?.extract()?;
         return py
-            .detach(|| RgbImage::decode_with_background(&data, &mime, checkerboard))
+            .detach(|| ImageSource::decode(&data, &mime))
             .map_err(error);
     }
     let array = source
         .extract::<PyReadonlyArrayDyn<'_, f32>>()
         .map_err(|_| error("images must be numpy arrays with dtype float32"))?;
-    rgb_array(array, std::convert::identity)
+    rgb_array(array, std::convert::identity).map(ImageSource::Rgb)
 }
 
 fn rgb_array<T: numpy::Element + Copy>(
@@ -257,7 +251,8 @@ fn video_source(py: Python<'_>, source: &Bound<'_, PyAny>) -> PyResult<Video> {
         if let Ok(array) = frame.extract::<PyReadonlyArrayDyn<'_, u8>>() {
             images.push(rgb_array(array, |v| f32::from(v) / 255.)?);
         } else {
-            images.push(image_source(py, &frame, false)?);
+            let image = image_source(py, &frame)?;
+            images.push(py.detach(|| image.into_rgb()).map_err(error)?);
         }
     }
     let frame_indices = indices.unwrap_or_else(|| (0..images.len()).collect());
@@ -270,11 +265,11 @@ fn video_source(py: Python<'_>, source: &Bound<'_, PyAny>) -> PyResult<Video> {
         frame_indices,
     })
 }
-fn sources(py: Python<'_>, sources: MediaSources, checkerboard: bool) -> PyResult<Vec<Source>> {
+fn sources(py: Python<'_>, sources: MediaSources) -> PyResult<Vec<Source>> {
     sources
         .into_iter()
         .map(|(kind, source)| match kind {
-            "image" => image_source(py, source.bind(py), checkerboard).map(Source::Image),
+            "image" => image_source(py, source.bind(py)).map(Source::Image),
             "video" => video_source(py, source.bind(py)).map(Source::Video),
             _ => Err(error("this recipe does not support audio input")),
         })
