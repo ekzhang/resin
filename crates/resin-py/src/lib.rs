@@ -648,6 +648,10 @@ crate::arrays::array_methods! {
             Self::decode_wire(bytes)?.restore_requests(requests, pending)
         }
 
+        fn _validate_cache_layout(&self, layout: &CacheLayout, decode_lookahead: u64) -> PyResult<()> {
+            planning::validate_cache_layout(self, layout.inner_native(), decode_lookahead)
+        }
+
         #[new]
         #[pyo3(signature = (
             *,
