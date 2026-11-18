@@ -62,6 +62,7 @@ from resin.backend.topology import ParallelGroups, ParallelismCapabilities
 from resin.backend.torch import use_default_dtype
 from resin.models.vision import image_patches, media_identity
 from resin.recipe import Media
+from resin_models_cuda.deepseek_v41.cache import CacheArena, CacheGeometry
 from resin_models_cuda.deepseek_v41.checkpoint import load_config, resolve_model_path
 
 if TYPE_CHECKING:
@@ -333,7 +334,6 @@ class DeepSeekV41CudaRunner(CudaRunner):
         self._prepare_model_weights()
         self._configure_parallel_graphs(self._model, parallel_groups)
 
-        cache_backend = self._cache_backend()
         self.cache_geometry = self._build_cache_geometry(args)
         torch.cuda.synchronize(self.device)
         free_memory, total_memory = torch.cuda.mem_get_info(self.device)
@@ -374,14 +374,8 @@ class DeepSeekV41CudaRunner(CudaRunner):
             * capacity_plan.bytes_per_parent,
         )
         self.cache_layout = self.cache_geometry.layout(local_capacity)
-        self._cache = cache_backend.CacheArena(
-            self.device,
-            self.cache_layout,
-            self.cache_geometry,
-            dtype=torch.bfloat16,
-        )
+        self._cache = CacheArena(self.device, self.cache_layout, self.cache_geometry)
         self._configure_cache_binding(self._cache.binding)
-        self._model.bind_cache_arena(self._cache)
         self.runner_config = RunnerConfig(
             max_batch_tokens=max_batch_size * self.prefill_chunk_size,
             prefill_chunk_size=self.prefill_chunk_size,
@@ -474,12 +468,6 @@ class DeepSeekV41CudaRunner(CudaRunner):
         path = resolve_model_path(model)
         return path, load_config(path)
 
-    @staticmethod
-    def _cache_backend():
-        from resin_models_cuda.deepseek_v41 import cache
-
-        return cache
-
     def _build_cache_geometry(self, args):
         boundary = self._model.prefill_boundary
         replay = (
@@ -500,7 +488,7 @@ class DeepSeekV41CudaRunner(CudaRunner):
                 raise ValueError(
                     "SWA replay requires producer KV/Engram and consumer DSpark taps"
                 )
-        return self._cache_backend().CacheGeometry.build(
+        return CacheGeometry.build(
             args,
             prefill_chunk_size=self.prefill_chunk_size,
             max_batch_size=self.max_batch_size,
@@ -535,7 +523,6 @@ class DeepSeekV41CudaRunner(CudaRunner):
             self._model,
             rank=self.tensor_parallel_rank,
             tensor_parallel_size=self.tensor_parallel_size,
-            device=self.device,
         )
 
     def _prepare_model_weights(self):
@@ -1421,7 +1408,7 @@ class DeepSeekV41CudaRunner(CudaRunner):
                         and candidate[1]
                         > int(np.max(plan.positions)) + self.speculative_draft_tokens
                         and self._cache.graph_can_fit_plan(
-                            prepared.cache_plan, candidate
+                            cast(PagedCachePlan, prepared.cache_plan), candidate
                         )
                     ),
                 )

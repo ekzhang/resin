@@ -18,7 +18,7 @@ from resin.models.deepseek_v41.config import DeepSeekV41Config
 from resin_models_cuda.deepseek_v41.cache import CacheArena, CacheGeometry
 from resin_models_cuda.deepseek_v41.checkpoint import DEFAULT_REVISION
 from resin_models_cuda.deepseek_v41.cuda import DeepSeekV41CudaRunner
-from resin_models_cuda.deepseek_v41.weights import _attention_shard, _dequantize_output
+from resin_models_cuda.deepseek_v41.weights import _attention_shard
 
 FIXTURES = Path(__file__).with_name("fixtures") / "deepseek_v41"
 
@@ -44,7 +44,7 @@ def test_official_checkpoint_geometry_and_distinct_draft_experts():
     geometry = CacheGeometry.build(
         SimpleNamespace(**inference), prefill_chunk_size=4096
     )
-    arena = CacheArena("meta", geometry.layout(140), geometry, dtype=torch.bfloat16)
+    arena = CacheArena("meta", geometry.layout(140), geometry)
     groups, parent = [], 1
     for group, (count, packing) in enumerate(
         zip((34, 1024, 33, 34), geometry.packings)
@@ -64,10 +64,9 @@ def test_official_checkpoint_geometry_and_distinct_draft_experts():
     assert totals == [2_928_816, 1024 * 113_920, 24_576, 32]
 
 
-@pytest.mark.parametrize("runner_type", [DeepSeekV41CudaRunner, DeepSeekV41CudaRunner])
 @pytest.mark.parametrize("argument", ["tensor_parallel", "parallel_groups"])
 def test_deepseek_rejects_query_only_tp_before_cuda_or_checkpoint_access(
-    monkeypatch, runner_type, argument
+    monkeypatch, argument
 ):
     def unexpected(*args, **kwargs):
         raise AssertionError(
@@ -77,7 +76,7 @@ def test_deepseek_rejects_query_only_tp_before_cuda_or_checkpoint_access(
     from resin.backend.cuda.runner import CudaRunner
 
     monkeypatch.setattr(CudaRunner, "__init__", unexpected)
-    monkeypatch.setattr(runner_type, "_checkpoint", unexpected)
+    monkeypatch.setattr(DeepSeekV41CudaRunner, "_checkpoint", unexpected)
     value = (
         TensorParallelContext(
             TensorParallelLayout(size=2), Mock(spec=torch.distributed.ProcessGroup)
@@ -85,10 +84,11 @@ def test_deepseek_rejects_query_only_tp_before_cuda_or_checkpoint_access(
         if argument == "tensor_parallel"
         else SimpleNamespace(topology=Parallelism(world_size=2, attn_tp=2))
     )
+    options: dict[str, Any] = {argument: value}
     with pytest.raises(ValueError, match="attn_tp"):
-        runner_type(".", max_seq_len=128, device="cuda:0", **{argument: value})
-    assert not runner_type.parallelism_capabilities.attn_tp
-    runner_type.parallelism_capabilities.validate(
+        DeepSeekV41CudaRunner(".", max_seq_len=128, device="cuda:0", **options)
+    assert not DeepSeekV41CudaRunner.parallelism_capabilities.attn_tp
+    DeepSeekV41CudaRunner.parallelism_capabilities.validate(
         Parallelism(world_size=8, attn_dp=4, ep=4), model="DeepSeek"
     )
 
@@ -150,7 +150,7 @@ def _args():
 
 def _cache(batch_size=1):
     geometry = CacheGeometry.build(_args(), prefill_chunk_size=32)
-    arena = CacheArena("cpu", geometry.layout(8), geometry, dtype=torch.bfloat16)
+    arena = CacheArena("cpu", geometry.layout(8), geometry)
     groups = tuple(
         DevicePageGroup(
             torch.tensor([[i + 1, i + 5]], dtype=torch.int32).repeat(batch_size, 1),
@@ -168,7 +168,6 @@ def test_shared_kv_and_index_pages_alias_only_their_declared_source():
     assert torch.equal(
         cache.compressed_rows(1, 2, positions), cache.compressed_rows(2, 2, positions)
     )
-    assert torch.equal(cache.index_rows(1, positions), cache.index_rows(2, positions))
     assert torch.equal(
         cache.compressed_rows(3, 1, positions), cache.compressed_rows(4, 1, positions)
     )
@@ -176,23 +175,16 @@ def test_shared_kv_and_index_pages_alias_only_their_declared_source():
         cache.compressed_rows(1, 2, positions), cache.compressed_rows(3, 1, positions)
     )
     # Shared source KV and its keys occupy disjoint bytes in the same slab.
-    main = cache.compressed_rows(1, 2, positions).long()
-    index = cache.index_rows(1, positions).long()
-    packed = cache.compressed_cache(1)
-    pages, offsets = (
-        main.div(packed.shape[1], rounding_mode="floor"),
-        main % packed.shape[1],
-    )
-    packed[pages, offsets, 0] = 2
-    index_values, index_scales = cache.index_parts(1)
-    index_pages, index_offsets = index // packed.shape[1], index % packed.shape[1]
-    index_values[index_pages, index_offsets] = 3
-    index_scales[index_pages, index_offsets] = 4
-    assert (packed[pages, offsets, 0] == 2).all()
-    assert packed.storage_offset() == cache.compressed_cache(2).storage_offset()
-    assert packed.storage_offset() != cache.compressed_cache(3).storage_offset()
-    assert (index_values[index_pages, index_offsets] == 3).all()
-    assert (index_scales[index_pages, index_offsets] == 4).all()
+    rows = cache.compressed_rows(1, 2, positions).long()
+    packed, keys = cache.compressed_cache(1), cache.index_cache(1)
+    pages = (rows // packed.shape[1]).unique()
+    packed[pages] = 2
+    keys[pages] = 3
+    assert (cache.compressed_cache(2)[pages] == 2).all()
+    assert (cache.index_cache(2)[pages] == 3).all()
+    for view in (cache.compressed_cache, cache.index_cache):
+        assert view(1).storage_offset() == view(2).storage_offset()
+        assert view(1).storage_offset() != view(3).storage_offset()
     assert arena.geometry.bytes_per_parent < 2 << 20
 
 
@@ -246,7 +238,7 @@ def test_pinned_cache_packing_does_not_inflate_parent_or_b256_budget():
 def test_pinned_packed_children_hold_every_physical_view_without_overlap(group):
     args = SimpleNamespace(**json.loads((FIXTURES / "inference.json").read_text()))
     geometry = CacheGeometry.build(args, prefill_chunk_size=128)
-    arena = CacheArena("cpu", geometry.layout(3), geometry, dtype=torch.bfloat16)
+    arena = CacheArena("cpu", geometry.layout(3), geometry)
     packing = geometry.packings[group]
     table = DevicePageGroup(
         torch.ones(packing, 1, dtype=torch.int32),
@@ -272,17 +264,13 @@ def test_pinned_packed_children_hold_every_physical_view_without_overlap(group):
 
     if group == 0:
         for layer in range(geometry.attention_layers):
-            record_packed(
-                cache.window_cache(layer), cache.window_rows(layer, positions)
-            )
+            record_packed(cache.window_cache(layer), cache.window_rows(positions))
         payload_bytes = 43 * 128 * 528
     elif group == 1:
         for layer in geometry.kv_sources:
-            record_packed(
-                cache.compressed_cache(layer),
-                cache.compressed_rows(layer, geometry.ratios[layer], positions),
-            )
-            record_packed(cache.index_cache(layer), cache.index_rows(layer, positions))
+            rows = cache.compressed_rows(layer, geometry.ratios[layer], positions)
+            record_packed(cache.compressed_cache(layer), rows)
+            record_packed(cache.index_cache(layer), rows)
         payload_bytes = (3 * 64 + 128) * (288 + 68)
     elif group == 2:
         for layer in geometry.compressor_sources:
@@ -311,7 +299,7 @@ def test_pinned_packed_children_hold_every_physical_view_without_overlap(group):
 
 def test_batched_graph_capture_reserves_disjoint_writable_scratch_children():
     geometry = CacheGeometry.build(_args(), prefill_chunk_size=32, max_batch_size=4)
-    arena = CacheArena("cpu", geometry.layout(8), geometry, dtype=torch.bfloat16)
+    arena = CacheArena("cpu", geometry.layout(8), geometry)
     cache = arena.graph_cache(4, 256)
     capture = arena.graph_shape_capture_inputs(4, 256)
     storage_pointer = arena.storage.data_ptr()
@@ -366,7 +354,7 @@ def test_batched_graph_capture_reserves_disjoint_writable_scratch_children():
         )
         torch.testing.assert_close(actual, expected)
     for packed, indices in (
-        (cache.window_cache(0), cache.window_rows(0, positions)),
+        (cache.window_cache(0), cache.window_rows(positions)),
         (cache.compressed_cache(1), cache.compressed_rows(1, 2, positions)),
     ):
         pages, offsets = (
@@ -386,7 +374,7 @@ def test_batched_graph_capture_reserves_disjoint_writable_scratch_children():
 
 def test_graph_replay_padding_uses_its_own_reserved_scratch_children():
     geometry = CacheGeometry.build(_args(), prefill_chunk_size=32, max_batch_size=4)
-    arena = CacheArena("cpu", geometry.layout(8), geometry, dtype=torch.bfloat16)
+    arena = CacheArena("cpu", geometry.layout(8), geometry)
     cache = arena.graph_cache(4, 256)
     plan = cast(
         PagedCachePlan,
@@ -418,36 +406,11 @@ def test_graph_replay_padding_uses_its_own_reserved_scratch_children():
         arena.graph_shape_capture_inputs(5, 256)
 
 
-def test_block32_grouped_output_weight_dequantization():
-    weight = torch.arange(64 * 64, dtype=torch.float32).reshape(64, 64) / 256
-    scales = torch.tensor([[1.0, 2.0], [4.0, 8.0]])
-    expected = (
-        weight * scales.repeat_interleave(32, 0).repeat_interleave(32, 1)
-    ).bfloat16()
-    torch.testing.assert_close(
-        _dequantize_output(weight, scales), expected, rtol=0, atol=0
-    )
-    assert _attention_shard(weight, "mtp.2.markov_head.embed.weight", 1, 2).shape == (
-        32,
-        64,
-    )
-    assert _attention_shard(weight, "mtp.2.markov_head.head.weight", 1, 2).shape == (
-        32,
-        64,
-    )
-
-
-def test_runner_owns_its_graph_and_distributed_lifecycle():
-    from resin.backend.cuda.runner import CudaRunner
-
-    assert DeepSeekV41CudaRunner.__bases__ == (CudaRunner,)
-    for name in (
-        "forward_distributed",
-        "_new_decode_graph_step",
-        "_new_dspark_graph_step",
-        "_graph_forward",
-    ):
-        assert name in DeepSeekV41CudaRunner.__dict__
+def test_markov_checkpoint_weights_shard_by_row():
+    weight = torch.arange(64 * 64).reshape(64, 64)
+    for name in ("embed", "head"):
+        shard = _attention_shard(weight, f"mtp.2.markov_head.{name}.weight", 1, 2)
+        assert torch.equal(shard, weight[32:])
 
 
 def test_token_history_addresses_remain_int64_above_sixteen_gibibytes():

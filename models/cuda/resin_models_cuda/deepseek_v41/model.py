@@ -845,9 +845,6 @@ class Transformer(nn.Module):
             elif isinstance(module, Indexer):
                 module.allreduce = indexer_reducer or reducer
 
-    def bind_cache_arena(self, _arena):
-        pass  # Every state access receives the current immutable page tables.
-
     def forward_experts_empty(self, *, stage="target", prefill=False):
         hooks = (
             self.engram_runtime.fetch(None)

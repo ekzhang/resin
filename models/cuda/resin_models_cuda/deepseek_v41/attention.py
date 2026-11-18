@@ -54,7 +54,7 @@ def prefill_inputs(attention, cache, metadata, capacity, runtime):
             & metadata.valid_token_mask.reshape_as(positions)[..., None]
         )
         layout["window"] = (
-            cache.window_rows(attention.layer_id, history),
+            cache.window_rows(history),
             torch.where(visible, windows - start, -1),
         )
     rows, indices = layout["window"]

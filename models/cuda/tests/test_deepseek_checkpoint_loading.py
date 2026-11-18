@@ -10,11 +10,6 @@ from torch import nn
 from resin_models_cuda.deepseek_v41.weights import load_weights
 
 
-@pytest.fixture
-def loader():
-    return load_weights
-
-
 def checkpoint(tmp_path, *, columns=4):
     values = {
         "layers.0.engram.embed.weight": torch.arange(9 * columns)
@@ -61,12 +56,12 @@ def forbid_source_device_copy(monkeypatch):
 
 
 def test_loader_copies_cpu_casts_and_fp4_bytes_into_existing_storage(
-    loader, tmp_path, monkeypatch
+    tmp_path, monkeypatch
 ):
     values, target = checkpoint(tmp_path), model()
     pointers = {name: tensor.data_ptr() for name, tensor in target.state_dict().items()}
     forbid_source_device_copy(monkeypatch)
-    report = loader(tmp_path, target, rank=0, tensor_parallel_size=1, device="cpu")
+    report = load_weights(tmp_path, target, rank=0, tensor_parallel_size=1)
     loaded = target.state_dict()
     assert pointers == {name: tensor.data_ptr() for name, tensor in loaded.items()}
     assert torch.equal(
@@ -77,12 +72,12 @@ def test_loader_copies_cpu_casts_and_fp4_bytes_into_existing_storage(
     assert report == {"tensors": 2, "bytes": 80}
 
 
-def test_loader_rejects_shape_mismatch_before_copy(loader, tmp_path, monkeypatch):
+def test_loader_rejects_shape_mismatch_before_copy(tmp_path, monkeypatch):
     checkpoint(tmp_path, columns=5)
     target = model()
     forbid_source_device_copy(monkeypatch)
     with pytest.raises(ValueError, match="checkpoint shape.*does not match model"):
-        loader(tmp_path, target, rank=0, tensor_parallel_size=1, device="cpu")
+        load_weights(tmp_path, target, rank=0, tensor_parallel_size=1)
     assert target.layers[0].engram.embed.weight.eq(-1).all()
 
 
@@ -114,9 +109,7 @@ def test_v41_loader_uses_embedding_ownership_independent_of_attention_rank(
         json.dumps({"weight_map": {name: "model.safetensors" for name in values}})
     )
     forbid_source_device_copy(monkeypatch)
-    report = load_weights(
-        tmp_path, target, rank=0, tensor_parallel_size=1, device="cpu"
-    )
+    report = load_weights(tmp_path, target, rank=0, tensor_parallel_size=1)
     assert (embedding.start, embedding.stop, embedding.weight.shape) == (
         12,
         16,
