@@ -166,16 +166,6 @@ class CacheStorage {
     check_epoch(epoch);
     return operation(Kind::Read, {epoch});
   }
-  mx::array snapshot(const mx::array& epoch) {
-    check_epoch(epoch);
-    auto stream = checked_stream();
-    auto raw = mx::view(read_epoch(epoch), storage_->dtype() == mx::bfloat16 ? mx::uint16 : mx::uint32, stream);
-    // Copy integer words to preserve NaN payloads. The persistent owner retains
-    // the source Data, so Full cannot donate its buffer. mx::copy would alias.
-    auto result = mx::view(mx::full(raw.shape(), raw, raw.dtype(), stream), storage_->dtype(), stream);
-    pending_snapshots_.push_back(result);
-    return result;
-  }
   mx::array scatter_rows(const mx::array& epoch, const mx::array& indices,
                          const mx::array& updates, const std::vector<mx::array>& after) {
     check_epoch(epoch);
@@ -200,38 +190,19 @@ class CacheStorage {
     return operation(Kind::Slice, {epoch, mx::contiguous(mx::reshape(updates, {-1}))}, start, after);
   }
   size_t nbytes() const { return storage_->nbytes(); }
-  uintptr_t identity() const { return reinterpret_cast<uintptr_t>(storage_.get()); }
   uintptr_t buffer_identity() const { return reinterpret_cast<uintptr_t>(storage_->buffer().ptr()); }
-  size_t allocation_count() const { return 1; }
-  std::vector<int> shape() const { return {storage_->shape().begin(), storage_->shape().end()}; }
 
  private:
-  mx::array after_snapshots(const mx::array& epoch, std::vector<mx::array>& dependencies) {
-    if (pending_snapshots_.empty()) return epoch;
-    dependencies.insert(dependencies.end(), pending_snapshots_.begin(), pending_snapshots_.end());
-    auto ordered = mx::depends({epoch}, pending_snapshots_)[0];
-    return ordered;
-  }
-  mx::array operation(Kind kind, const std::vector<mx::array>& inputs, uint64_t start = 0,
+  mx::array operation(Kind kind, std::vector<mx::array> inputs, uint64_t start = 0,
                       const std::vector<mx::array>& after = {}) {
-    auto stream = checked_stream();
-    auto ordered_inputs = inputs;
-    if (kind == Kind::Rows || kind == Kind::Slice) {
-      auto dependencies = after;
-      ordered_inputs[0] = after_snapshots(inputs[0], dependencies);
-      ordered_inputs.insert(ordered_inputs.end(), dependencies.begin(), dependencies.end());
-    }
-    bool is_read = kind == Kind::Read;
-    auto result = mx::array(is_read ? storage_->shape() : mx::Shape{kEpochElements},
-                     is_read ? storage_->dtype() : mx::uint32,
-                     std::make_shared<CacheOperation>(stream, storage_, kind, start), ordered_inputs);
-    if (kind == Kind::Rows || kind == Kind::Slice) pending_snapshots_.clear();
-    return result;
+    inputs.insert(inputs.end(), after.begin(), after.end());
+    const bool read = kind == Kind::Read;
+    return mx::array(read ? storage_->shape() : mx::Shape{kEpochElements},
+                     read ? storage_->dtype() : mx::uint32,
+                     std::make_shared<CacheOperation>(checked_stream(), storage_, kind, start), inputs);
   }
   std::shared_ptr<mx::array> storage_;
   mx::array initial_;
-  // Keep reader roots on the wrapper, avoiding an owner→primitive→owner cycle.
-  std::vector<mx::array> pending_snapshots_;
 };
 }  // namespace
 
@@ -241,14 +212,10 @@ NB_MODULE(MLX_EXTENSION_NAME, module) {
       .def(nb::init<const std::vector<int>&, mx::Dtype>(), "shape"_a, "dtype"_a)
       .def("initial_epoch", &CacheStorage::initial_epoch)
       .def("read_epoch", &CacheStorage::read_epoch, "epoch"_a)
-      .def("snapshot", &CacheStorage::snapshot, "epoch"_a)
       .def("scatter_rows", &CacheStorage::scatter_rows, "epoch"_a, "row_indices"_a, "updates"_a,
            nb::kw_only(), "after"_a = std::vector<mx::array>{})
       .def("write_slice", &CacheStorage::write_slice, "epoch"_a, "flat_start"_a, "updates"_a,
            nb::kw_only(), "after"_a = std::vector<mx::array>{})
       .def_prop_ro("nbytes", &CacheStorage::nbytes)
-      .def_prop_ro("identity", &CacheStorage::identity)
-      .def_prop_ro("buffer_identity", &CacheStorage::buffer_identity)
-      .def_prop_ro("shape", &CacheStorage::shape)
-      .def_prop_ro("allocation_count", &CacheStorage::allocation_count);
+      .def_prop_ro("buffer_identity", &CacheStorage::buffer_identity);
 }

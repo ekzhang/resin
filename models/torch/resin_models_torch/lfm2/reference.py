@@ -2,8 +2,9 @@
 
 from __future__ import annotations
 
+from collections import defaultdict
 from pathlib import Path
-from typing import TYPE_CHECKING, cast
+from typing import TYPE_CHECKING
 
 import numpy as np
 import torch
@@ -101,12 +102,10 @@ class Lfm2TorchRunner(Runner):
         self.eos_token_id = self.config.get("eos_token_id")
         self.vocab_size = self.config["vocab_size"]
         self._sampler = TorchSampler()
-        self._cache: dict[int, Lfm2State] = {}
+        self._cache: defaultdict[int, Lfm2State] = defaultdict(self._model.make_cache)
         self.forward_calls = 0
 
     def forward(self, plan: BatchPlan) -> ForwardOutput:
-        logits_rows = []
-        prompt_rows = []
         self.forward_calls += 1
         batch = BatchView.from_plan(plan)
         for index, sequence_id in enumerate(batch.sequence_ids):
@@ -124,73 +123,47 @@ class Lfm2TorchRunner(Runner):
             if np.any(batch.token_ids[token_slice] >= self.vocab_size):
                 raise ValueError(f"token id is out of range for request {sequence_id}")
 
+        # Allocate caches only after validating every row in the plan.
         with torch.inference_mode():
-            if batch.num_sequences > 1 and np.all(batch.query_lengths == 1):
-                caches = []
-                for sequence_id in batch.sequence_ids:
-                    sequence_id = int(sequence_id)
-                    cache = self._cache.get(sequence_id)
-                    if cache is None:
-                        cache = self._model.make_cache()
-                        self._cache[sequence_id] = cache
-                    caches.append(cache)
-                inputs = torch.tensor(
-                    batch.token_ids[:, None],
-                    dtype=torch.long,
-                    device=self.device,
-                )
-                position_tensor = torch.tensor(
-                    batch.positions[:, None],
-                    dtype=torch.long,
-                    device=self.device,
-                )
-                logits = self._model.forward_batch(inputs, caches, position_tensor)
-                logits_rows.append(logits[:, -1, :])
-                if plan.needs_prompt_logprobs:
-                    prompt_rows.append(prompt_scores(plan, logits[:, 0]))
+            caches = [self._cache[int(sequence)] for sequence in batch.sequence_ids]
+            tokens = torch.tensor(batch.token_ids, dtype=torch.long, device=self.device)
+            positions = torch.tensor(
+                batch.positions, dtype=torch.long, device=self.device
+            )
+            if len(caches) > 1 and np.all(batch.query_lengths == 1):
+                logits = self._model.forward_batch(
+                    tokens[:, None], caches, positions[:, None]
+                )[:, 0]
+                scores = prompt_scores(plan, logits)
             else:
-                self._forward_rows(batch, logits_rows, plan, prompt_rows)
-        sampler = getattr(self, "_sampler", None)
-        if sampler is None:
-            sampler = self._sampler = TorchSampler()
-        logits = torch.cat(logits_rows)
-        scores = PromptScores.concat(cast(list[PromptScores], prompt_rows))
-        return format_output(
-            logits, sampler(logits, plan), plan, prompt_logprobs=scores
-        )
-
-    def _forward_rows(self, batch, logits_rows, plan, prompt_rows) -> None:
-        for index, sequence_id in enumerate(batch.sequence_ids):
-            sequence_id = int(sequence_id)
-            token_slice = batch.token_slice(index)
-            cache = self._cache.get(sequence_id)
-            if cache is None:
-                cache = self._model.make_cache()
-                self._cache[sequence_id] = cache
-            inputs = torch.tensor(
-                batch.token_ids[token_slice][None], dtype=torch.long, device=self.device
-            )
-            position_tensor = torch.tensor(
-                batch.positions[token_slice][None], dtype=torch.long, device=self.device
-            )
-            logits = self._model(
-                inputs,
-                cache,
-                position_tensor,
-                logits_to_keep=None if plan.needs_prompt_logprobs else 1,
-                **({"return_hidden": True} if plan.needs_prompt_logprobs else {}),
-            )
-            if plan.needs_prompt_logprobs:
-                prompt_rows.append(
-                    prompt_scores(
-                        plan,
-                        logits[0],
-                        self._model.logits,
-                        token_start=token_slice.start,
+                logits_rows, prompt_rows = [], []
+                for index, cache in enumerate(caches):
+                    segment = batch.token_slice(index)
+                    output = self._model(
+                        tokens[None, segment],
+                        cache,
+                        positions[None, segment],
+                        logits_to_keep=None if plan.needs_prompt_logprobs else 1,
+                        return_hidden=plan.needs_prompt_logprobs,
                     )
+                    if plan.needs_prompt_logprobs:
+                        row = prompt_scores(
+                            plan,
+                            output[0],
+                            self._model.logits,
+                            token_start=segment.start,
+                        )
+                        assert row is not None
+                        prompt_rows.append(row)
+                        output = self._model.logits(output[:, -1:])
+                    logits_rows.append(output[:, -1])
+                logits = (
+                    logits_rows[0] if len(logits_rows) == 1 else torch.cat(logits_rows)
                 )
-                logits = self._model.logits(logits[:, -1:])
-            logits_rows.append(logits[:, -1, :])
+                scores = PromptScores.concat(prompt_rows)
+        return format_output(
+            logits, self._sampler(logits, plan), plan, prompt_logprobs=scores
+        )
 
     def release(self, request_ids: list[int]) -> None:
         for request_id in request_ids:

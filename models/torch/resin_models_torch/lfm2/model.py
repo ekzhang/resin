@@ -127,77 +127,54 @@ class Attention(nn.Module):
         return queries, keys, values
 
     def forward(
-        self, hidden: Tensor, positions: Tensor, state: FullAttentionState
+        self, hidden: Tensor, positions: Tensor, states: Sequence[FullAttentionState]
     ) -> Tensor:
         batch, length, _ = hidden.shape
         queries, keys, values = self._project(hidden, positions)
-
-        previous = state.length
-        keys, values = state.append(keys, values)
-        keys = keys.repeat_interleave(self.kv_groups, dim=1)
-        values = values.repeat_interleave(self.kv_groups, dim=1)
         mask = None
-        if length > 1:
-            query_positions = torch.arange(
-                previous, previous + length, device=hidden.device
-            )
-            key_positions = torch.arange(keys.shape[-2], device=hidden.device)
-            mask = key_positions[None, :] <= query_positions[:, None]
-        output = F.scaled_dot_product_attention(
-            queries, keys, values, attn_mask=mask, dropout_p=0.0, scale=self.scale
-        )
-        output = output.transpose(1, 2).contiguous().view(batch, length, -1)
-        return self.out_proj(output)
-
-    def forward_batch(
-        self,
-        hidden: Tensor,
-        positions: Tensor,
-        states: Sequence[FullAttentionState],
-    ) -> Tensor:
-        """Decode one token for each independently cached sequence."""
-
-        batch, length, _ = hidden.shape
-        if length != 1 or len(states) != batch:
-            raise ValueError("batched attention requires one state and token per row")
-        queries, new_keys, new_values = self._project(hidden, positions)
-        for index, state in enumerate(states):
-            state.append(new_keys[index : index + 1], new_values[index : index + 1])
-
-        max_length = max(state.length for state in states)
-        keys = []
-        values = []
-        for state in states:
-            if state.keys is None or state.values is None:
-                raise RuntimeError("attention cache was not populated")
-            padding = max_length - state.length
-            keys.append(
-                F.pad(state.keys, (0, 0, 0, padding)) if padding else state.keys
-            )
-            values.append(
-                F.pad(state.values, (0, 0, 0, padding)) if padding else state.values
-            )
-        keys_tensor = torch.cat(keys).repeat_interleave(self.kv_groups, dim=1)
-        values_tensor = torch.cat(values).repeat_interleave(self.kv_groups, dim=1)
-        mask = None
-        if any(state.length != max_length for state in states):
-            cache_lengths = torch.tensor(
-                [state.length for state in states], device=hidden.device
-            )
-            key_positions = torch.arange(max_length, device=hidden.device)
-            mask = (
-                key_positions[None, None, None, :] < cache_lengths[:, None, None, None]
-            )
+        if batch == 1:
+            previous = states[0].length
+            keys, values = states[0].append(keys, values)
+            if length > 1:
+                queries_at = torch.arange(
+                    previous, previous + length, device=hidden.device
+                )
+                keys_at = torch.arange(keys.shape[-2], device=hidden.device)
+                mask = keys_at[None, :] <= queries_at[:, None]
+        else:
+            # Decode rows can have different history lengths. Pad only the
+            # attention input; each request owns its unpadded KV tensors.
+            history = [
+                state.append(keys[i : i + 1], values[i : i + 1])
+                for i, state in enumerate(states)
+            ]
+            lengths = [state.length for state in states]
+            maximum = max(lengths)
+            if min(lengths) != maximum:
+                history = [
+                    (F.pad(k, (0, 0, 0, maximum - n)), F.pad(v, (0, 0, 0, maximum - n)))
+                    if n < maximum
+                    else (k, v)
+                    for (k, v), n in zip(history, lengths, strict=True)
+                ]
+                keys_at = torch.arange(maximum, device=hidden.device)
+                mask = (
+                    keys_at[None, None, None, :]
+                    < torch.tensor(lengths, device=hidden.device)[:, None, None, None]
+                )
+            keys = torch.cat([k for k, _ in history])
+            values = torch.cat([v for _, v in history])
         output = F.scaled_dot_product_attention(
             queries,
-            keys_tensor,
-            values_tensor,
+            keys.repeat_interleave(self.kv_groups, dim=1),
+            values.repeat_interleave(self.kv_groups, dim=1),
             attn_mask=mask,
             dropout_p=0.0,
             scale=self.scale,
         )
-        output = output.transpose(1, 2).contiguous().view(batch, length, -1)
-        return self.out_proj(output)
+        return self.out_proj(
+            output.transpose(1, 2).contiguous().view(batch, length, -1)
+        )
 
 
 class ShortConv(nn.Module):
@@ -215,49 +192,27 @@ class ShortConv(nn.Module):
         self.in_proj = nn.Linear(self.width, 3 * self.width, bias=config.conv_bias)
         self.out_proj = nn.Linear(self.width, self.width, bias=config.conv_bias)
 
-    def forward(self, hidden: Tensor, state: RecurrentState) -> Tensor:
+    def forward(self, hidden: Tensor, states: Sequence[RecurrentState]) -> Tensor:
         gate_b, gate_c, value = self.in_proj(hidden).chunk(3, dim=-1)
         gated = (gate_b * value).transpose(1, 2)
-        previous = state.value
-        if previous is None:
-            previous = gated.new_zeros(
-                gated.shape[0], gated.shape[1], self.state_length
-            )
-        convolution_input = torch.cat((previous, gated), dim=-1)
-        state.value = (
-            convolution_input[..., -self.state_length :]
-            if self.state_length
-            else convolution_input[..., :0]
-        )
-        output = F.conv1d(
-            convolution_input, self.conv.weight, self.conv.bias, groups=self.width
-        )
-        return self.out_proj(gate_c * output.transpose(1, 2))
-
-    def forward_batch(self, hidden: Tensor, states: Sequence[RecurrentState]) -> Tensor:
-        """Decode one token for each independently cached sequence."""
-
-        batch, length, _ = hidden.shape
-        if length != 1 or len(states) != batch:
-            raise ValueError("batched convolution requires one state and token per row")
-        gate_b, gate_c, value = self.in_proj(hidden).chunk(3, dim=-1)
-        gated = (gate_b * value).transpose(1, 2)
-        previous = torch.cat(
-            [
-                state.value
-                if state.value is not None
-                else gated.new_zeros(1, self.width, self.state_length)
-                for state in states
-            ]
-        )
-        convolution_input = torch.cat((previous, gated), dim=-1)
-        next_state = (
-            convolution_input[..., -self.state_length :]
-            if self.state_length
-            else convolution_input[..., :0]
-        )
-        for index, state in enumerate(states):
-            state.value = next_state[index : index + 1]
+        previous = [
+            state.value
+            if state.value is not None
+            else gated.new_zeros(1, self.width, self.state_length)
+            for state in states
+        ]
+        history = previous[0] if len(previous) == 1 else torch.cat(previous)
+        convolution_input = torch.cat((history, gated), dim=-1)
+        # Keep only the convolution tail after a multi-token prefill. A view
+        # into convolution_input would retain all input tokens until decode.
+        tail = convolution_input[..., hidden.shape[1] :]
+        if hidden.shape[1] > 1:
+            tail = tail.clone()
+        if len(states) == 1:
+            states[0].value = tail
+        else:
+            for state, row in zip(states, tail.split(1), strict=True):
+                state.value = row
         output = F.conv1d(
             convolution_input, self.conv.weight, self.conv.bias, groups=self.width
         )
@@ -293,24 +248,16 @@ class DecoderLayer(nn.Module):
         self.operator_norm = RMSNorm(config.hidden_size, config.norm_eps)
         self.ffn_norm = RMSNorm(config.hidden_size, config.norm_eps)
 
-    def forward(self, hidden: Tensor, positions: Tensor, state: LayerState) -> Tensor:
-        normalized = self.operator_norm(hidden)
-        if self.is_attention_layer:
-            hidden = hidden + self.self_attn(normalized, positions, state)
-        else:
-            hidden = hidden + self.conv(normalized, state)
-        return hidden + self.feed_forward(self.ffn_norm(hidden))
-
-    def forward_batch(
+    def forward(
         self, hidden: Tensor, positions: Tensor, states: list[LayerState]
     ) -> Tensor:
         normalized = self.operator_norm(hidden)
         if self.is_attention_layer:
-            hidden = hidden + self.self_attn.forward_batch(
+            hidden = hidden + self.self_attn(
                 normalized, positions, cast(Sequence[FullAttentionState], states)
             )
         else:
-            hidden = hidden + self.conv.forward_batch(
+            hidden = hidden + self.conv(
                 normalized, cast(Sequence[RecurrentState], states)
             )
         return hidden + self.feed_forward(self.ffn_norm(hidden))
@@ -327,19 +274,15 @@ class Lfm2Model(nn.Module):
         )
         self.embedding_norm = RMSNorm(config.hidden_size, config.norm_eps)
 
-    def forward(self, tokens: Tensor, positions: Tensor, state: Lfm2State) -> Tensor:
-        hidden = self.embed_tokens(tokens)
-        for layer, layer_state in zip(self.layers, state.layers, strict=True):
-            hidden = layer(hidden, positions, layer_state)
-        return self.embedding_norm(hidden)
-
-    def forward_batch(
+    def forward(
         self, tokens: Tensor, positions: Tensor, states: list[Lfm2State]
     ) -> Tensor:
+        if any(len(state.layers) != len(self.layers) for state in states):
+            raise ValueError("state must contain one entry per model layer")
         hidden = self.embed_tokens(tokens)
         for index, layer in enumerate(cast(Sequence[DecoderLayer], self.layers)):
             layer_states = [state.layers[index] for state in states]
-            hidden = layer.forward_batch(hidden, positions, layer_states)
+            hidden = layer(hidden, positions, layer_states)
         return self.embedding_norm(hidden)
 
 
@@ -379,7 +322,7 @@ class Lfm2ForCausalLM(nn.Module):
             ).unsqueeze(0)
         if positions.shape != tokens.shape:
             raise ValueError("positions must have the same shape as tokens")
-        hidden = self.model(tokens, positions, state)
+        hidden = self.model(tokens, positions, [state])
         state.length += tokens.shape[1]
         if logits_to_keep is not None:
             if logits_to_keep <= 0:
@@ -410,7 +353,7 @@ class Lfm2ForCausalLM(nn.Module):
             )
         if positions.shape != tokens.shape:
             raise ValueError("positions must have the same shape as tokens")
-        hidden = self.model.forward_batch(tokens, positions, states)
+        hidden = self.model(tokens, positions, states)
         for state in states:
             state.length += 1
-        return F.linear(hidden, self.model.embed_tokens.weight)
+        return self.logits(hidden)

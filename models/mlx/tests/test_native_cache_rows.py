@@ -18,8 +18,7 @@ def test_real_prefill_49152_rows_preserves_every_row_and_column():
     epoch = storage.scatter_rows(
         storage.initial_epoch(), mx.array(indices), mx.array(payload).view(mx.bfloat16)
     )
-    actual = np.asarray(storage.snapshot(epoch).view(mx.uint16))
+    actual = np.asarray(storage.read_epoch(epoch).view(mx.uint16))
     np.testing.assert_array_equal(actual[:count], payload[::-1])
     np.testing.assert_array_equal(actual[count], np.zeros(width, np.uint16))
     np.testing.assert_array_equal(np.asarray(epoch), np.full(8, 1, np.uint32))
-    assert storage.buffer_identity != 0 and storage.allocation_count == 1
