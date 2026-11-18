@@ -83,7 +83,7 @@ nested Python-literal strings use a fixed Python 3.13 / Unicode 15.1 printable
 repertoire for deterministic rendering across deployment Python versions.
 
 Run `cargo test -p resin-recipe` for native invariants,
-`uv run pytest tests/test_recipe*.py -q` for integration, and
+`uv run pytest tests/test_recipe*.py tests/runtime/test_recipe*.py -q` for integration, and
 `uv run pytest tests/recipe_fuzz -q` for shared differential fuzzing.
 See the [fuzz README](../../tests/recipe_fuzz/README.md) for budgets and oracle
 limitations.
