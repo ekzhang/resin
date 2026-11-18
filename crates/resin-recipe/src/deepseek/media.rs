@@ -6,12 +6,13 @@ use half::bf16;
 use image::imageops::FilterType;
 use serde::{Deserialize, Serialize};
 
-use super::{RgbImage, Tensor};
-use crate::Error;
+use crate::media::{Input, Prepared, RgbImage, Source, Tensor, image_tokens, images};
+use crate::{Encoder, Error};
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(default)]
-pub struct Config {
+pub struct Processor {
+    pub image_token_id: Option<u32>,
     pub patch_size: usize,
     pub downsample_ratio: usize,
     pub max_image_tokens: usize,
@@ -19,9 +20,43 @@ pub struct Config {
     pub max_wh_ratio: Option<f64>,
 }
 
-impl Default for Config {
+impl crate::MediaProcessor for Processor {
+    fn prepare(&self, sources: Vec<Source>, encoder: &dyn Encoder) -> Result<Prepared, Error> {
+        let marker = "<｜deepseek_image｜>";
+        let image_token_id = encoder.special_id(marker)?;
+        if self
+            .image_token_id
+            .is_some_and(|expected| expected != image_token_id)
+        {
+            return Err(Error::new(
+                "tokenizer image token does not match checkpoint image_token_id",
+            ));
+        }
+        self.validate()?;
+        let mut expansions = Vec::new();
+        let mut items = Vec::new();
+        for image in images(sources)? {
+            let pixels = self.process_image(&image)?;
+            let (rows, columns) = (
+                pixels.shape[0] / self.patch_size,
+                pixels.shape[1] / self.patch_size,
+            );
+            let count = rows.div_ceil(3) * (columns.div_ceil(3) + 1) + 2;
+            expansions.push(image_tokens(marker, image_token_id, count));
+            items.push(Input::Image {
+                pixels,
+                span: (0, count),
+                atomic: false,
+            });
+        }
+        Ok(Prepared::new(expansions, items))
+    }
+}
+
+impl Default for Processor {
     fn default() -> Self {
         Self {
+            image_token_id: None,
             patch_size: 14,
             downsample_ratio: 3,
             max_image_tokens: 1024,
@@ -31,26 +66,7 @@ impl Default for Config {
     }
 }
 
-#[derive(Clone, Debug)]
-pub struct Image {
-    pub patches: Tensor<f32>,
-    pub n_vit_h: usize,
-    pub n_vit_w: usize,
-    pub types: Vec<u32>,
-}
-
-#[derive(Clone, Debug)]
-pub struct Prepared {
-    pub images: Vec<Image>,
-}
-
-impl Prepared {
-    pub fn token_counts(&self) -> Vec<usize> {
-        self.images.iter().map(|image| image.types.len()).collect()
-    }
-}
-
-impl Config {
+impl Processor {
     fn validate(&self) -> Result<(), Error> {
         if self.patch_size != 14 || self.downsample_ratio != 3 {
             return Err(Error::new(
@@ -114,17 +130,7 @@ impl Config {
         Ok(((best_h / patch) as usize, (best_w / patch) as usize))
     }
 
-    pub fn process(&self, images: &[RgbImage]) -> Result<Prepared, Error> {
-        self.validate()?;
-        Ok(Prepared {
-            images: images
-                .iter()
-                .map(|image| self.process_image(image))
-                .collect::<Result<_, _>>()?,
-        })
-    }
-
-    fn process_image(&self, image: &RgbImage) -> Result<Image, Error> {
+    fn process_image(&self, image: &RgbImage) -> Result<Tensor<f32>, Error> {
         let (n_vit_h, n_vit_w) = self.grid(image.width, image.height)?;
         let (height, width) = (n_vit_h * self.patch_size, n_vit_w * self.patch_size);
         // The checkpoint processor decodes to RGB8 before interpolation.
@@ -145,26 +151,15 @@ impl Config {
         } else {
             pad(&source, width, height)?
         };
-        let mut data = Vec::with_capacity(resized.data.len());
-        super::append_patches(
-            &mut data,
-            [n_vit_h, n_vit_w],
-            self.patch_size,
-            1,
-            1,
-            |y, x, c| {
-                let rgb8 = (resized.data[(y * width + x) * 3 + c] * 255.0)
-                    .round_ties_even()
-                    .clamp(0.0, 255.0);
+        let data = resized
+            .data
+            .into_iter()
+            .map(|value| {
+                let rgb8 = (value * 255.0).round_ties_even().clamp(0.0, 255.0);
                 bf16::from_f32((rgb8 / 255.0 - 0.5) / 0.5).to_f32()
-            },
-        );
-        Ok(Image {
-            patches: Tensor::new(vec![n_vit_h * n_vit_w, 3, 14, 14], data)?,
-            n_vit_h,
-            n_vit_w,
-            types: image_token_types(n_vit_h.div_ceil(3), n_vit_w.div_ceil(3)),
-        })
+            })
+            .collect();
+        Tensor::new(vec![height, width, 3], data)
     }
 }
 
@@ -204,20 +199,11 @@ fn pad(image: &RgbImage, width: usize, height: usize) -> Result<RgbImage, Error>
     })
 }
 
-pub fn image_token_types(height: usize, width: usize) -> Vec<u32> {
-    let mut types = Vec::with_capacity(height * (width + 1) + 2);
-    types.push(0);
-    for _ in 0..height {
-        types.extend(std::iter::repeat_n(1, width));
-        types.push(2);
-    }
-    types.push(3);
-    types
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::MediaProcessor;
+    use crate::media::tests::Encoder;
 
     #[test]
     fn geometry_matches_released_checkpoint_fixtures() {
@@ -226,9 +212,9 @@ mod tests {
         ))
         .unwrap();
         for case in fixtures["cases"].as_array().unwrap() {
-            let config = Config {
+            let config = Processor {
                 max_wh_ratio: case["max_wh_ratio"].as_f64(),
-                ..Config::default()
+                ..Processor::default()
             };
             let (w, h) = (
                 case["width"].as_u64().unwrap() as usize,
@@ -242,16 +228,13 @@ mod tests {
                     case["grid"][1].as_u64().unwrap()
                 )
             );
-            assert!(
-                image_token_types(grid.0.div_ceil(3), grid.1.div_ceil(3)).len()
-                    <= config.max_image_tokens
-            );
+            assert!(grid.0.div_ceil(3) * (grid.1.div_ceil(3) + 1) + 2 <= config.max_image_tokens);
         }
     }
 
     #[test]
     fn geometry_matches_official_recipe_for_varied_aspect_ratios() {
-        let config = Config::default();
+        let config = Processor::default();
         // Token counts from deepseek-recipe 0.2.0's image_token_adjustment + 1.
         // Check large and extreme dimensions without allocating image pixels.
         for (width, height, expected) in [
@@ -266,18 +249,15 @@ mod tests {
             (43, 13, 202),
         ] {
             let (h, w) = config.grid(width, height).unwrap();
-            assert_eq!(
-                image_token_types(h.div_ceil(3), w.div_ceil(3)).len(),
-                expected
-            );
+            assert_eq!(h.div_ceil(3) * (w.div_ceil(3) + 1) + 2, expected);
         }
     }
 
     #[test]
-    fn patches_are_patch_major_chw_bfloat16() {
-        let config = Config {
+    fn bitmap_preserves_rgb_order_and_bfloat16_normalization() {
+        let config = Processor {
             min_pixels: 0,
-            ..Config::default()
+            ..Processor::default()
         };
         let (width, height) = (28, 14);
         let data = (0..height)
@@ -289,23 +269,15 @@ mod tests {
             })
             .collect();
         let source = RgbImage::new(width, height, data).unwrap();
-        let prepared = config.process(std::slice::from_ref(&source)).unwrap();
-        let image = &prepared.images[0];
-        assert_eq!(image.patches.shape, [2, 3, 14, 14]);
-        assert_eq!(image.types, [0, 1, 2, 3]);
-        for patch in 0..2 {
-            for channel in 0..3 {
-                for y in 0..14 {
-                    for x in 0..14 {
-                        let pixel = source.data[(y * width + patch * 14 + x) * 3 + channel];
-                        let expected = bf16::from_f32((pixel - 0.5) / 0.5).to_f32();
-                        assert_eq!(
-                            image.patches.data[((patch * 3 + channel) * 14 + y) * 14 + x],
-                            expected
-                        );
-                    }
-                }
-            }
+        let prepared = config
+            .prepare(vec![Source::Image(source.clone())], &Encoder)
+            .unwrap();
+        let pixels = crate::media::tests::pixels(&prepared, 0);
+        assert_eq!(pixels.shape, [height, width, 3]);
+        assert_eq!(prepared.expansions[0].token_ids.len(), 4);
+        for (actual, pixel) in pixels.data.iter().zip(&source.data) {
+            let expected = bf16::from_f32((pixel - 0.5) / 0.5).to_f32();
+            assert_eq!(*actual, expected);
         }
     }
 
@@ -325,28 +297,28 @@ mod tests {
 
     #[test]
     fn invalid_geometry_options_fail_before_processing() {
-        assert!(Config::default().grid(0, 32).is_err());
-        assert!(Config::default().grid(usize::MAX, 32).is_err());
+        assert!(Processor::default().grid(0, 32).is_err());
+        assert!(Processor::default().grid(usize::MAX, 32).is_err());
         assert!(
-            Config {
+            Processor {
                 patch_size: 16,
-                ..Config::default()
+                ..Processor::default()
             }
-            .process(&[])
+            .prepare(vec![], &Encoder)
             .is_err()
         );
         assert!(
-            Config {
+            Processor {
                 max_wh_ratio: Some(f64::NAN),
-                ..Config::default()
+                ..Processor::default()
             }
             .grid(2, 2)
             .is_err()
         );
         assert!(
-            Config {
+            Processor {
                 max_image_tokens: 3,
-                ..Config::default()
+                ..Processor::default()
             }
             .grid(2, 2)
             .is_err()

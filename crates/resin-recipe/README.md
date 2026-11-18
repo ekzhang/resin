@@ -2,15 +2,16 @@
 
 Stock model conversation formats, independent of Python, HTTP and GPU execution.
 Concrete recipes implement the `Recipe` trait for GPT-OSS, DeepSeek V4.1,
-Inkling2, Qwen3.5/3.8, Gemma4, GLM-5.3-Flash or LFM2.5. Each family owns serde construction
-parameters, such as `GptOssRecipeParams`, and its matching renderer, parser,
-message policy and stop markers.
+Inkling2, Qwen3.5/3.8, Gemma4, GLM-5.3-Flash or LFM2.5. Each family owns its
+configuration, renderer, parser, message policy and stop markers.
 
-Rust callers construct a recipe once from its parameters. `render` merges and
-validates each request's `extra` controls against those defaults. The matching
-parser uses the same recipe parameters and the actual rendered prefix. Media
-configuration is captured at construction and stays outside per-request
-rendering controls.
+`Recipe::from_config` resolves model defaults through a lazy provider for processor
+metadata and dates. `render` validates request controls against those defaults;
+parsers use the same recipe and rendered prefix. `Recipe::media_processor` returns
+a boxed `MediaProcessor`, such as `qwen::media::Processor`, which declares supported
+modalities, prepares normalized RGB bitmaps and expands media placeholders.
+Processors return the same `Prepared` type; one Python adapter handles preparation
+caching, prompt encoding and binding to immutable `Media` objects.
 
 Model code describes format rules. Shared `Parser<G>` owns token batching,
 decoder boundaries, EOS handling and finalization; each grammar handles only
@@ -22,16 +23,17 @@ A renderer produces a `Prompt`: ordinary text plus explicit control-token spans.
 Adjacent text coalesces before encoding, preserving BPE boundaries. A prepared
 `TokenizerEncoder` shares the tokenizer and encodes ordinary marker spellings as
 text. Native image/video processor expansions replace only explicit media
-slots, then use the same encoding boundary. Model-owned modules under `media/`
-prepare pixels and model geometry using the Rust `image` crate. The Python
-binding exposes owned NumPy payload arrays and cache identities; runners execute
-the GPU vision encoder. Resize pixels can differ from HF filters; strict
-no-resize oracles check normalization, padding and patch order.
+slots, then use the same encoding boundary. Each model's `media` module uses the
+Rust `image` crate for resizing, padding and normalization. Runners derive patch
+geometry from the bitmaps and pack their tensor layout before vision encoding.
+Resize pixels can differ from HF filters; strict no-resize oracles check
+normalization, padding and patch order.
 
-Direct payload constructors accept NumPy arrays with their declared dtypes:
-`float32` pixels/patches and `int64` geometry. They copy the data into owned
-storage, including strided inputs. Runners perform any Torch/device conversion
-when preparing the vision encoder inputs.
+`Media(span, image=...)` accepts a `float32` HWC RGB array and snapshots its
+contents, including strided inputs. Video uses a tuple of frame arrays plus frame
+spans and timing; audio uses samples and a sample rate. The arrays are read-only.
+`RenderedPrompt.media` is an ordered tuple of these objects; token IDs remain in
+`RenderedPrompt.token_ids` and are required separately for Engine submission.
 
 `ResponseParser::feed` consumes only new token IDs. `finish(Stop | Length)` flushes
 buffered text, including truncated UTF-8; finalization is idempotent. A shared
@@ -43,13 +45,13 @@ not invent complete arguments for an unfinished call.
 
 Python's `get_native_recipe(name, tokenizer_or_processor)` factory returns the
 common `NativeRecipe`, implementing the structural `Recipe` protocol. See the
-[Python API example](../../README.md#modal-http-endpoints) for construction,
-formatting defaults, typed messages, media preparation and Engine submission.
+[Python API example](../../README.md#minimal-use) for Engine submission.
 
 A native `RenderedPrompt` belongs to the recipe instance that rendered it.
 Each `create_parser(prompt)` call creates independent response state without
-retaining pixels. Pass `recipe.stop_token_ids` to `SamplingParams` for direct
-Engine submissions; HTTP serving applies those stops automatically.
+retaining pixels. Submit with `token_ids=prompt.token_ids, media=prompt.media` and
+pass `recipe.stop_token_ids` to `SamplingParams`; HTTP serving applies those stops
+automatically.
 
 These parsers use one common native handle; the HTTP actor consumes Rust events
 directly. Python callers receive immutable `ParserEvent` variants: `TextDelta`,
@@ -83,8 +85,7 @@ Run `cargo test -p resin-recipe` for native invariants,
 `uv run pytest tests/test_recipe*.py -q` for integration, and
 `uv run pytest tests/recipe_fuzz -q` for shared differential fuzzing.
 See the [fuzz README](../../tests/recipe_fuzz/README.md) for budgets and oracle
-limitations and the [Python API example](../../README.md#modal-http-endpoints)
-for native recipe construction.
+limitations.
 
 GLM-5.3-Flash uses `get_native_recipe("glm5_3_flash", tokenizer)`, with the
 NVIDIA NVFP4 checkpoint template pinned to
@@ -93,10 +94,10 @@ reasoning (`low`, `high`, or the template default `max`), `clear_thinking`, and
 GLM XML tool calls. The three static stops are `<|endoftext|>`, `<|user|>` and
 `<|observation|>`. The template always opens `<think>`; it does not implement an
 `enable_thinking=False` mode. Images use a native processor with aspect-preserving
-bicubic resize, a black-padded aligned canvas, CLIP normalization, and the
-checkpoint's temporal/spatial patch order. `Glm53FlashMedia` owns pixel/grid
-buffers, absolute image positions and pixel-dependent cache identity; it supports
-distributed transport and partial image prefill. Native defaults match the pinned
-checkpoint; `media_config` can supply the checkpoint's `image_processor` object.
+bicubic resize, a black-padded aligned canvas and CLIP normalization. The runner
+packs the generic `Media` bitmaps in checkpoint temporal/spatial patch order;
+their spans and content identities support distributed transport and partial
+image prefill. Native defaults match the pinned checkpoint; `media_config` can
+supply the checkpoint's `image_processor` object.
 Video and audio input remain unsupported. The pinned text/format oracle is `tests/fixtures/glm_hf.json`;
 `licenses/glm-MIT.txt` retains the upstream Z.AI notice.

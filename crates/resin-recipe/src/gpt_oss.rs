@@ -225,7 +225,7 @@ impl Grammar for GptOssGrammar {
 
 #[derive(Clone, Debug, Default, serde::Deserialize, serde::Serialize)]
 #[serde(default, deny_unknown_fields)]
-pub struct GptOssRecipeParams {
+pub struct GptOssRecipe {
     pub add_generation_prompt: Option<bool>,
     pub reasoning_effort: Option<String>,
     pub use_system_prompt: Option<bool>,
@@ -235,19 +235,16 @@ pub struct GptOssRecipeParams {
     pub auto_drop_analysis: Option<bool>,
 }
 
-#[derive(Clone, Debug, Default)]
-pub struct GptOssRecipe {
-    params: GptOssRecipeParams,
-}
-
-impl GptOssRecipe {
-    pub fn new(params: GptOssRecipeParams) -> Self {
-        Self { params }
-    }
-}
 impl crate::Recipe for GptOssRecipe {
+    fn from_config(mut params: Value, defaults: &crate::RecipeDefaults<'_>) -> Result<Self, Error> {
+        crate::recipe::default(&mut params, "conversation_start_date", || {
+            defaults("conversation_start_date")
+        })?;
+        crate::recipe::params(params)
+    }
+
     fn render(&self, request: &Value) -> Result<crate::Prompt, crate::Error> {
-        let options = crate::recipe::options("gpt_oss", &self.params, request)?;
+        let options = crate::recipe::options("gpt_oss", self, request)?;
         let messages = messages(request, "GPT-OSS")?;
         let tools = list(&request["tools"]);
         let effort = options

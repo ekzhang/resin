@@ -3,7 +3,6 @@
 import hashlib
 import json
 from contextlib import closing
-from dataclasses import dataclass
 from time import sleep
 from types import SimpleNamespace
 
@@ -16,13 +15,6 @@ from test_http_lifecycle import post, request_body, running_server
 from resin import CacheGroupLayout, CacheLayout, Engine, SamplingParams, recipe
 from resin._cache_storage import _PrefixStorage
 from resin.cache_storage import MemoryCacheStorage
-
-
-@dataclass
-class Media:
-    cache_key: tuple[int, ...] = (101, 102, 103, 104, 105)
-    token_ids = (1, 2, 3, 4, 5)
-    token_spans = ()
 
 
 def complete(engine, **kwargs):
@@ -49,7 +41,11 @@ def test_engine_rejects_non_string_cache_salts(salt):
 @pytest.mark.parametrize("media", [False, True])
 @pytest.mark.parametrize("policy", ["write_through", "write_through_selective"])
 def test_storage_namespace_survives_reads_writes_and_engine_recreation(media, policy):
-    prompt = {"media": Media()} if media else {"token_ids": [1, 2, 3, 4, 5]}
+    prompt = {"token_ids": [1, 2, 3, 4, 5]}
+    if media:
+        prompt["media"] = (
+            recipe.Media((0, 5), image=np.ones((1, 1, 3), dtype=np.float32)),
+        )
     with closing(MemoryCacheStorage(max_bytes=4096)) as store:
         for salt, expected in (
             ("alice", 0),

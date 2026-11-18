@@ -111,7 +111,7 @@ def test_mlx_presets_use_matching_media_capabilities(
     from tokenizers.models import WordLevel
 
     import resin.recipe
-    from resin.recipe import Image, Message, Qwen35Media, Role, Text
+    from resin.recipe import Image, Media, Message, Role, Text
 
     tokenizer = Tokenizer(WordLevel({"[UNK]": 0}, unk_token="[UNK]"))
     tokenizer.add_special_tokens(
@@ -147,9 +147,8 @@ def test_mlx_presets_use_matching_media_capabilities(
         with pytest.raises(ValueError, match="does not support media"):
             recipe.render([Message(Role.USER, [image])])
     else:
-        assert isinstance(
-            recipe.render([Message(Role.USER, [image])]).media, Qwen35Media
-        )
+        items = recipe.render([Message(Role.USER, [image])]).media
+        assert items and isinstance(items[0], Media)
 
 
 def make_checkpoint(path, required_files):

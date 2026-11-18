@@ -3,13 +3,20 @@
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serde_json::Value;
 
-use crate::{Decoder, Encoder, Error, Prompt, ResponseParser, media};
+use crate::{Decoder, Encoder, Error, Prompt, ResponseParser};
+
+/// Lazily supplies processor metadata or environment-dependent recipe defaults.
+pub type RecipeDefaults<'a> = dyn Fn(&str) -> Result<Value, Error> + 'a;
 
 /// A model's complete conversation format and request policy.
 ///
 /// Rendering combines constructor defaults with request options. The same
 /// immutable recipe owns the defaults used when constructing a parser.
 pub trait Recipe: Send + Sync {
+    fn from_config(params: Value, defaults: &RecipeDefaults<'_>) -> Result<Self, Error>
+    where
+        Self: Sized;
+
     fn message_policy(&self) -> MessagePolicy {
         MessagePolicy::STANDARD
     }
@@ -22,7 +29,7 @@ pub trait Recipe: Send + Sync {
         prompt_ids: &[u32],
     ) -> Result<Box<dyn ResponseParser>, Error>;
     fn stop_token_ids(&self, encoder: &dyn Encoder) -> Result<Vec<u32>, Error>;
-    fn media_config(&self) -> Option<MediaConfig> {
+    fn media_processor(&self) -> Option<Box<dyn MediaProcessor>> {
         None
     }
 }
@@ -62,14 +69,21 @@ pub enum BlockKind {
     Result,
 }
 
-/// Model-owned media geometry captured when a recipe is constructed.
-#[derive(Clone, Debug)]
-pub enum MediaConfig {
-    DeepSeek(media::deepseek::Config, Option<u32>),
-    Gemma(media::gemma::Config),
-    Glm(media::glm::Config),
-    Inkling2(media::inkling2::Config),
-    Qwen(media::qwen::Config),
+/// Model-owned media decoding, preprocessing and token expansion.
+pub trait MediaProcessor: Send + Sync {
+    fn prepare(
+        &self,
+        _: Vec<crate::media::Source>,
+        _: &dyn Encoder,
+    ) -> Result<crate::media::Prepared, Error> {
+        Err(Error::new("this recipe does not support media"))
+    }
+    fn input_modalities(&self) -> &'static [&'static str] {
+        &["text", "image"]
+    }
+    fn image_checkerboard(&self) -> bool {
+        false
+    }
 }
 
 /// Effort controls that accept either an API name or a numeric model budget.
@@ -78,6 +92,24 @@ pub enum MediaConfig {
 pub enum ReasoningEffort {
     Name(String),
     Number(serde_json::Number),
+}
+
+pub(crate) fn params<T: DeserializeOwned>(value: Value) -> Result<T, Error> {
+    serde_json::from_value(value).map_err(|error| Error::new(error.to_string()))
+}
+
+pub(crate) fn default(
+    params: &mut Value,
+    key: &str,
+    value: impl FnOnce() -> Result<Value, Error>,
+) -> Result<(), Error> {
+    let params = params
+        .as_object_mut()
+        .ok_or_else(|| Error::new("recipe parameters must be an object"))?;
+    if params.get(key).is_none_or(Value::is_null) {
+        params.insert(key.into(), value()?);
+    }
+    Ok(())
 }
 
 pub(crate) fn options<T>(name: &str, params: &T, request: &Value) -> Result<T, Error>

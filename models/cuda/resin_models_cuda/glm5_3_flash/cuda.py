@@ -9,7 +9,7 @@ from pathlib import Path
 import numpy as np
 import torch
 
-from resin import BatchPhase, RunnerConfig
+from resin import BatchPhase, BatchPlan, RunnerConfig
 from resin.backend.capacity import plan_cache_capacity
 from resin.backend.cuda.completion import (
     CudaContinuation,
@@ -38,6 +38,13 @@ from resin.backend.plans import PagedCachePlan
 from resin.backend.speculative import SpeculativeStats
 from resin.backend.topology import ParallelismCapabilities
 from resin.backend.torch import use_default_dtype
+from resin.models.vision import (
+    image_grid,
+    media_identity,
+    media_key,
+    packed_images,
+    span_slices,
+)
 from resin_models_cuda.glm5_3_flash.cache import CacheArena, CacheGeometry
 from resin_models_cuda.glm5_3_flash.checkpoint import load_model, resolve_model_path
 
@@ -342,7 +349,7 @@ class Glm53FlashCudaRunner(CudaRunner):
             phase_timing=phase_timing,
         )
 
-    def _validate_plan(self, plan):
+    def _validate_plan(self, plan: BatchPlan) -> tuple[tuple[int, int], ...]:
         rows = validate_hybrid_plan(
             plan,
             label="GLM-5.3-Flash",
@@ -352,13 +359,6 @@ class Glm53FlashCudaRunner(CudaRunner):
             # Engine leases and graph page tables reserve the verification tail.
             decode_lookahead=0,
         )
-        from resin.recipe import Glm53FlashMedia
-
-        if any(
-            value is not None and not isinstance(value, Glm53FlashMedia)
-            for value in plan.media
-        ):
-            raise TypeError("GLM requires its native prepared image payload")
         return rows
 
     def _prepare(self, plan):
@@ -539,50 +539,62 @@ class Glm53FlashCudaRunner(CudaRunner):
         output = self._sampler(logits, plan)
         return format_output(logits, output, plan, prompt_logprobs=scores)
 
-    def _media_embeddings(self, plan, token_ids):
+    def _media_embeddings(
+        self, plan: BatchPlan, token_ids: torch.Tensor
+    ) -> torch.Tensor | None:
         if all(value is None for value in plan.media):
             return None
-        from resin_models_cuda.glm5_3_flash.vision import replace_image_embeddings
-
         embeddings = torch.nn.functional.embedding(token_ids, self._model.embedding)
         for row, media in enumerate(plan.media):
             if media is None:
                 continue
+            begin, end = map(int, plan.token_indptr[row : row + 2])
+            context = int(plan.context_lengths[row])
+            slices = tuple(
+                span_slices(
+                    (item.span for item in media), context, context + end - begin
+                )
+            )
+            if not slices:
+                continue
             sequence_id = int(plan.sequence_ids[row])
             stored = self._media_features.get(sequence_id)
-            if stored is not None and stored[0] != media.digest:
+            if stored is not None and stored[0] != media_identity(media):
                 raise ValueError("GLM image payload changed during a request")
             if stored is None:
-                cached = self._vision_feature_cache.get(media.digest)
+                vision = self._model.vision
+                if vision is None:
+                    raise ValueError("GLM checkpoint has no vision encoder")
+                config = vision.config
+                image_grid(media, config.patch_size, config.spatial_merge_size)
+                cached = self._vision_feature_cache.get(media_key(media))
                 if cached is None:
-                    vision = self._model.vision
-                    if vision is None:
-                        raise ValueError("GLM checkpoint has no vision encoder")
-                    pixels = torch.as_tensor(
-                        np.array(media.pixel_values),
-                        device=self.device,
-                        dtype=torch.bfloat16,
+                    pixels, grid = packed_images(
+                        media,
+                        config.patch_size,
+                        merge=config.spatial_merge_size,
+                        temporal=config.temporal_patch_size,
                     )
-                    features = vision.encode(pixels, media.image_grid_thw.tolist())
+                    pixels = torch.as_tensor(
+                        pixels, device=self.device, dtype=torch.bfloat16
+                    )
+                    features = vision.encode(pixels, grid.tolist())
                     if features.shape != (
-                        len(media.image_positions),
+                        sum(item.span[1] for item in media),
                         embeddings.shape[-1],
                     ):
                         raise ValueError(
                             "GLM vision features do not match image placeholders"
                         )
-                    cached = self._vision_feature_cache.put(media.digest, (features,))
+                    cached = self._vision_feature_cache.put(
+                        media_key(media), (features,)
+                    )
                 (features,) = cached
                 assert features is not None
-                stored = media.digest, features
+                stored = media_identity(media), features
                 self._media_features[sequence_id] = stored
-            start, end = int(plan.token_indptr[row]), int(plan.token_indptr[row + 1])
-            replace_image_embeddings(
-                embeddings[start:end],
-                stored[1],
-                media.image_positions,
-                int(plan.context_lengths[row]),
-            )
+            for destination, source in slices:
+                embeddings[begin:end][destination].copy_(stored[1][source])
         return embeddings
 
     def release(self, sequence_ids):

@@ -25,20 +25,15 @@ from resin import (
 )
 from resin.backend.distributed import DistributedEngine, DistributedWorker
 from resin.backend.topology import ParallelGroups
-from resin.recipe import Inkling2Media
+from resin.recipe import Media
 
 TOKENS = (10, 11, 77, 12, 13, 14)
-PIXEL_SHAPE = (1, 384, 384, 3)
+PIXEL_SHAPE = (384, 384, 3)
 PIXEL_BYTES = int(np.prod(PIXEL_SHAPE)) * 4
 
 
-def _media() -> Inkling2Media:
-    return Inkling2Media(
-        token_ids=TOKENS,
-        image_token_id=77,
-        pixel_values=np.full(PIXEL_SHAPE, 0.25, dtype=np.float32),
-        image_grid_thw=np.array([[1, 1, 1]], dtype=np.int64),
-    )
+def _media() -> tuple[Media, ...]:
+    return (Media((2, 1), image=np.full(PIXEL_SHAPE, 0.25, dtype=np.float32)),)
 
 
 class _MediaRunner:
@@ -65,14 +60,14 @@ class _MediaRunner:
             plan.sequence_ids, plan.media, plan.sampling_params, strict=True
         ):
             sequence_id = int(raw_id)
-            assert isinstance(media, Inkling2Media)
+            assert isinstance(media, tuple) and isinstance(media[0], Media)
             if sequence_id in self.active:
                 assert self.active[sequence_id] is media
             else:
-                assert media.token_ids == TOKENS
-                assert media.pixel_values is not None
-                assert media.pixel_values.shape == PIXEL_SHAPE
-                assert np.all(media.pixel_values == 0.25)
+                assert media[0].span == (2, 1)
+                assert media[0].image is not None
+                assert media[0].image.shape == PIXEL_SHAPE
+                assert np.all(media[0].image == 0.25)
                 self.active[sequence_id] = media
             assert sampling.temperature == 0.75
             assert sampling.top_p == 0.875
@@ -155,7 +150,7 @@ def _transport_process(rank, rendezvous, directory):
                 )
 
                 def submit():
-                    return engine.submit(media=media, sampling_params=sampling)
+                    return engine.submit(TOKENS, media=media, sampling_params=sampling)
 
                 completed = submit()
                 never_started = submit()

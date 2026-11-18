@@ -11,7 +11,7 @@ import numpy as np
 import numpy.typing as npt
 
 from resin import BatchPlan, SamplingParams
-from resin.protocols import MediaInput
+from resin.recipe import Media
 
 _VERSION = 1
 _SAMPLING_FIELDS = (
@@ -48,7 +48,7 @@ class PlanPacket:
 @dataclass(frozen=True, slots=True)
 class _Request:
     sampling_params: SamplingParams
-    media: MediaInput | None
+    media: tuple[Media, ...] | None
 
 
 def _is_json_extra(value: Any) -> bool:

@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import base64
 import io
-from typing import Any
 
 import numpy as np
 import pytest
@@ -11,99 +10,49 @@ from PIL import Image
 from recipe_fuzz.qwen import QwenAdapter
 
 import resin
-from resin import MediaInput
-from resin.recipe import Qwen35Media, get_native_recipe
-
-
-def _media() -> Qwen35Media:
-    return Qwen35Media(
-        token_ids=(2, 8, 8, 8, 8, 3),
-        image_positions=(1, 2, 3, 4),
-        pixel_values=np.ones((16, 12), dtype=np.float32),
-        image_grid_thw=np.array([[1, 4, 4]], dtype=np.int64),
-        spatial_merge_size=2,
-        image_token_id=8,
-    )
-
-
-def test_qwen_media_owns_pixels_cache_identity_and_mrope_positions() -> None:
-    media = _media()
-
-    assert isinstance(media, MediaInput)
-    assert media.token_spans == ()
-    assert media.position_ids.tolist() == [
-        [0, 1, 1, 1, 1, 3],
-        [0, 1, 1, 2, 2, 3],
-        [0, 1, 2, 1, 2, 3],
-    ]
-    assert media.rope_delta == -2
-    assert len(media.digest) == 64
-    assert media.cache_key[0] == media.token_ids[0]
-    assert media.cache_key[1] != media.token_ids[1]
-
-
-@pytest.mark.parametrize(
-    ("field", "invalid"),
-    [
-        ("pixel_values", torch.ones(16, 12)),
-        ("pixel_values", np.ones((16, 12), dtype=np.float64)),
-        ("image_grid_thw", torch.tensor([[1, 4, 4]])),
-        ("image_grid_thw", np.array([[1, 4, 4]], dtype=np.int32)),
-    ],
+from resin.models.vision import (
+    image_patches,
+    mrope_delta,
+    mrope_positions,
+    packed_images,
 )
-def test_qwen_media_requires_exact_numpy_storage(field: str, invalid: Any) -> None:
-    arrays: dict[str, Any] = {
-        "pixel_values": np.ones((16, 12), dtype=np.float32),
-        "image_grid_thw": np.array([[1, 4, 4]], dtype=np.int64),
-    }
-    arrays[field] = invalid
-    with pytest.raises(TypeError):
-        Qwen35Media(
-            token_ids=(2, 8, 8, 8, 8, 3),
-            image_positions=(1, 2, 3, 4),
-            **arrays,
-            spatial_merge_size=2,
-            image_token_id=8,
-        )
+from resin.recipe import Media, get_native_recipe
 
 
-def test_qwen_media_copies_strided_numpy_arrays_in_logical_order() -> None:
-    pixels = np.arange(16 * 24, dtype=np.float32).reshape(16, 24)[:, ::2]
-    grid = np.array([[1, 99, 4, 99, 4, 99]], dtype=np.int64)[:, ::2]
-    expected_pixels, expected_grid = pixels.copy(), grid.copy()
-    assert not pixels.flags.c_contiguous and not grid.flags.c_contiguous
-    media = Qwen35Media(
-        token_ids=(2, 8, 8, 8, 8, 3),
-        image_positions=(1, 2, 3, 4),
-        pixel_values=pixels,
-        image_grid_thw=grid,
-        spatial_merge_size=2,
-        image_token_id=8,
-    )
-    pixels.fill(0)
-    grid.fill(0)
-
-    np.testing.assert_array_equal(media.pixel_values, expected_pixels)
-    np.testing.assert_array_equal(media.image_grid_thw, expected_grid)
-    assert not np.shares_memory(media.pixel_values, pixels)
-    assert not np.shares_memory(media.image_grid_thw, grid)
+def _media():
+    return (Media(span=(1, 4), image=np.ones((8, 8, 3), dtype=np.float32)),)
 
 
-def test_qwen_media_keeps_adjacent_images_distinct_for_mrope() -> None:
-    media = Qwen35Media(
-        token_ids=(2, 8, 8, 8, 8, 8, 8, 3),
-        image_positions=(1, 2, 3, 4, 5, 6),
-        pixel_values=np.ones((24, 12), dtype=np.float32),
-        image_grid_thw=np.array([[1, 4, 4], [1, 2, 4]], dtype=np.int64),
-        spatial_merge_size=2,
-        image_token_id=8,
-    )
-    assert media.position_ids.tolist() == [
+def test_qwen_media_keeps_adjacent_images_distinct_for_mrope():
+    media = (*_media(), Media(span=(5, 2), image=np.ones((4, 8, 3), dtype=np.float32)))
+    positions = mrope_positions(media, np.arange(8), 2, 2)
+    assert positions.tolist() == [
         [0, 1, 1, 1, 1, 3, 3, 5],
         [0, 1, 1, 2, 2, 3, 3, 5],
         [0, 1, 2, 1, 2, 3, 4, 5],
     ]
-    assert media.rope_delta == -2
+    assert mrope_delta(media, 2, 2) == -2
+    np.testing.assert_array_equal(
+        mrope_positions(media, np.arange(3, 7), 2, 2), positions[:, 3:7]
+    )
+
+
+def test_patch_packing_preserves_spatial_channel_merge_and_temporal_order():
+    image = np.arange(4 * 8 * 3, dtype=np.float32).reshape(4, 8, 3)
+    origins = [(0, 0), (0, 2), (2, 0), (2, 2), (0, 4), (0, 6), (2, 4), (2, 6)]
+    expected = np.stack(
+        [image[y : y + 2, x : x + 2].transpose(2, 0, 1) for y, x in origins]
+    )
+    actual = image_patches(image, 2, merge=2, temporal=2).reshape(8, 3, 2, 2, 2)
+    np.testing.assert_array_equal(actual[:, :, 0], expected)
+    np.testing.assert_array_equal(actual[:, :, 1], expected)
+    spatial = np.stack(
+        [image[y : y + 2, x : x + 2] for y in (0, 2) for x in (0, 2, 4, 6)]
+    )
+    np.testing.assert_array_equal(image_patches(image, 2, channels_last=True), spatial)
+    np.testing.assert_array_equal(
+        image_patches(image, 2).reshape(8, 3, 2, 2), spatial.transpose(0, 3, 1, 2)
+    )
 
 
 def _data_url() -> str:
@@ -138,14 +87,14 @@ def test_qwen_recipe_normalizes_images_and_attaches_processor_payload() -> None:
         ]
     )
     assert model_recipe.stop_token_ids
-    assert isinstance(output.media, Qwen35Media)
+    assert output.media is not None
+    assert isinstance(output.media[0], Media)
     assert output.token_ids.tolist().count(image_id) == 4
-    assert output.media.pixel_values.shape == (4, 12)
-    assert output.media.pixel_values.dtype == np.float32
-    assert output.media.image_grid_thw.tolist() == [[1, 2, 2]]
-    np.testing.assert_allclose(
-        output.media.pixel_values, [[1.0] * 4 + [-1.0] * 8] * 4, atol=1e-6
-    )
+    pixels, grid = packed_images(output.media, 2)
+    assert pixels.shape == (4, 12)
+    assert pixels.dtype == np.float32
+    assert grid.tolist() == [[1, 2, 2]]
+    np.testing.assert_allclose(pixels, [[1.0] * 4 + [-1.0] * 8] * 4, atol=1e-6)
 
 
 def test_native_qwen_rotary_positions_cover_prompt_and_decode_continuation():
@@ -153,10 +102,13 @@ def test_native_qwen_rotary_positions_cover_prompt_and_decode_continuation():
 
     runner = object.__new__(Qwen3_5CudaRunner)
     runner.device = torch.device("cpu")
+    runner.vision_patch_size, runner.spatial_merge_size = 2, 2
     media = _media()
     positions = torch.arange(8)[None]
     result = runner._prefill_rotary_positions(media, positions)
-    expected = np.concatenate((media.position_ids, [[4, 5]] * 3), axis=1)
+    expected = np.array(
+        [[0, 1, 1, 1, 1, 3, 4, 5], [0, 1, 1, 2, 2, 3, 4, 5], [0, 1, 2, 1, 2, 3, 4, 5]]
+    )
     np.testing.assert_array_equal(result[:, 0].numpy(), expected)
 
 

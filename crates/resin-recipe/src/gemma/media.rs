@@ -1,10 +1,12 @@
-//! Gemma 4 image/video patchification. Geometry and layouts follow the Apache-2.0
+//! Gemma 4 image/video sizing and normalization. Geometry follows the Apache-2.0
 //! Transformers Gemma4 image/video processors; resizing uses our shared Rust filter.
 
 use serde::{Deserialize, Deserializer};
 
-use super::{RgbImage, Source, Tensor, Video, resize_filter};
-use crate::Error;
+use crate::media::{
+    Input, MediaTokens, Prepared, RgbImage, Source, Tensor, Video, bitmap, resize_filter,
+};
+use crate::{Encoder, Error};
 
 #[derive(Clone, Debug, Deserialize)]
 #[serde(default)]
@@ -68,95 +70,90 @@ impl Default for VideoConfig {
 }
 #[derive(Clone, Debug, Default, Deserialize)]
 #[serde(default)]
-pub struct Config {
+pub struct Processor {
     pub image_processor: PatchConfig,
     pub video_processor: VideoConfig,
 }
 
-#[derive(Clone, Debug)]
-pub struct Frame {
-    pub timestamp: Option<String>,
-    pub token_count: usize,
-}
-#[derive(Clone, Debug)]
-pub struct Expansion {
-    pub is_video: bool,
-    pub frames: Vec<Frame>,
-}
-#[derive(Clone, Debug, Default)]
-pub struct Prepared {
-    pub pixel_values: Option<Tensor<f32>>,
-    pub image_position_ids: Option<Tensor<i64>>,
-    pub pixel_values_videos: Option<Tensor<f32>>,
-    pub video_position_ids: Option<Tensor<i64>>,
-    /// One expansion per source, retaining mixed image/video ordering.
-    pub expansions: Vec<Expansion>,
-}
-
-impl Config {
-    pub fn process(&self, sources: &[Source]) -> Result<Prepared, Error> {
-        let mut prepared = Prepared::default();
+impl crate::MediaProcessor for Processor {
+    fn input_modalities(&self) -> &'static [&'static str] {
+        &["text", "image", "video"]
+    }
+    fn prepare(&self, sources: Vec<Source>, encoder: &dyn Encoder) -> Result<Prepared, Error> {
+        let image_id = encoder.special_id("<|image|>")?;
+        let video_id = encoder.special_id("<|video|>")?;
+        let boi = encoder.special_id("<|image>")?;
+        let eoi = encoder.special_id("<image|>")?;
+        let mut expansions = Vec::new();
+        let mut items = Vec::new();
         for source in sources {
             match source {
                 Source::Image(image) => {
-                    let (pixels, positions, token_count) =
-                        self.image_processor.process(image, false)?;
-                    push(&mut prepared.pixel_values, pixels)?;
-                    push(&mut prepared.image_position_ids, positions)?;
-                    prepared.expansions.push(Expansion {
-                        is_video: false,
-                        frames: vec![Frame {
-                            timestamp: None,
-                            token_count,
-                        }],
+                    let (pixels, count) = self.image_processor.process(image, false)?;
+                    let ids = std::iter::once(boi)
+                        .chain(std::iter::repeat_n(image_id, count))
+                        .chain([eoi])
+                        .collect();
+                    expansions.push(MediaTokens::from_parts(
+                        "<|image|>",
+                        ids,
+                        String::new(),
+                        String::new(),
+                    ));
+                    items.push(Input::Image {
+                        pixels,
+                        span: (1, count),
+                        atomic: true,
                     });
                 }
                 Source::Video(video) => {
-                    let indices = self.video_processor.select(video)?;
-                    let mut pixels = None;
-                    let mut positions = None;
-                    let mut frames = Vec::with_capacity(indices.len());
-                    for index in indices {
-                        let (frame_pixels, frame_positions, token_count) = self
-                            .video_processor
-                            .patches
-                            .process(&video.frames[index], true)?;
-                        push(&mut pixels, frame_pixels)?;
-                        push(&mut positions, frame_positions)?;
-                        frames.push(Frame {
-                            timestamp: Some(timestamp(video.frame_indices[index], video.fps)?),
-                            token_count,
-                        });
+                    let selected = self.video_processor.select(&video)?;
+                    let mut frames = Vec::new();
+                    let mut frame_spans = Vec::new();
+                    let mut frame_indices = Vec::new();
+                    let mut ids = Vec::new();
+                    let mut prefix = String::new();
+                    for (index, frame) in video
+                        .frames
+                        .into_iter()
+                        .enumerate()
+                        .filter(|(index, _)| selected.binary_search(index).is_ok())
+                    {
+                        let (pixels, count) = self.video_processor.patches.process(frame, true)?;
+                        let text =
+                            format!("{} ", timestamp(video.frame_indices[index], video.fps)?);
+                        if frames.is_empty() {
+                            prefix = text;
+                        } else {
+                            ids.extend(encoder.encode_text(&format!(" {text}"))?);
+                        }
+                        ids.push(boi);
+                        frame_spans.push((ids.len(), count));
+                        ids.extend(std::iter::repeat_n(video_id, count));
+                        ids.push(eoi);
+                        frames.push(pixels);
+                        frame_indices.push(video.frame_indices[index]);
                     }
-                    push(&mut prepared.pixel_values_videos, pixels.unwrap())?;
-                    push(&mut prepared.video_position_ids, positions.unwrap())?;
-                    prepared.expansions.push(Expansion {
-                        is_video: true,
+                    expansions.push(MediaTokens::from_parts(
+                        "<|video|>",
+                        ids,
+                        prefix,
+                        String::new(),
+                    ));
+                    items.push(Input::Video {
                         frames,
+                        frame_spans,
+                        fps: video.fps,
+                        frame_indices,
+                        atomic: true,
                     });
                 }
             }
         }
-        Ok(prepared)
+        Ok(Prepared::new(expansions, items))
     }
 }
 
-/// Stack a source without re-copying its flattened storage or losing shape checks.
-fn push<T>(batch: &mut Option<Tensor<T>>, mut source: Tensor<T>) -> Result<(), Error> {
-    if let Some(batch) = batch {
-        if batch.shape[1..] != source.shape {
-            return Err(Error::new(
-                "Gemma media tensors in a batch must have matching shapes",
-            ));
-        }
-        batch.shape[0] += 1;
-        batch.data.append(&mut source.data);
-    } else {
-        source.shape.insert(0, 1);
-        *batch = Some(source);
-    }
-    Ok(())
-}
 fn product(values: &[usize]) -> Result<usize, Error> {
     values
         .iter()
@@ -207,25 +204,21 @@ impl PatchConfig {
         }
         Ok((target_height, target_width))
     }
-    fn process(
-        &self,
-        image: &RgbImage,
-        is_video: bool,
-    ) -> Result<(Tensor<f32>, Tensor<i64>, usize), Error> {
+    fn process(&self, image: RgbImage, is_video: bool) -> Result<(Tensor<f32>, usize), Error> {
         let max_patches = self.max_patches(is_video)?;
-        let resized = if self.do_resize {
+        let image = if self.do_resize {
             let (height, width) = self.target_size(image.height, image.width, max_patches)?;
-            if (height, width) != (image.height, image.width) {
-                Some(image.resize(width, height, resize_filter(self.resample)?)?)
+            if (height, width) == (image.height, image.width) {
+                image
             } else {
-                None
+                image.resize(width, height, resize_filter(self.resample)?)?
             }
         } else {
-            None
+            image
         };
-        let image = resized.as_ref().unwrap_or(image);
-        let patch = self.patch_size;
-        if !image.height.is_multiple_of(patch) || !image.width.is_multiple_of(patch) {
+        if !image.height.is_multiple_of(self.patch_size)
+            || !image.width.is_multiple_of(self.patch_size)
+        {
             return Err(Error::new(
                 "Gemma image dimensions must be divisible by patch_size",
             ));
@@ -239,37 +232,13 @@ impl PatchConfig {
                 "Gemma normalization needs finite means and positive standard deviations",
             ));
         }
-        let (rows, cols) = (image.height / patch, image.width / patch);
-        let count = product(&[rows, cols])?;
-        let padded = count.max(max_patches);
-        let patch_width = product(&[patch, patch, 3])?;
-        let mut pixels = vec![0.0; product(&[padded, patch_width])?];
-        let mut positions = vec![-1; product(&[padded, 2])?];
-        for py in 0..rows {
-            for px in 0..cols {
-                let index = py * cols + px;
-                positions[2 * index] = px as i64;
-                positions[2 * index + 1] = py as i64;
-                for y in 0..patch {
-                    for x in 0..patch {
-                        for channel in 0..3 {
-                            let value = image.data
-                                [((py * patch + y) * image.width + px * patch + x) * 3 + channel];
-                            pixels[index * patch_width + (y * patch + x) * 3 + channel] =
-                                if normalize {
-                                    (value - self.image_mean[channel]) / self.image_std[channel]
-                                } else {
-                                    value
-                                };
-                        }
-                    }
-                }
-            }
-        }
+        let count = product(&[
+            image.height / self.patch_size,
+            image.width / self.patch_size,
+        ])? / product(&[self.pooling_kernel_size, self.pooling_kernel_size])?;
         Ok((
-            Tensor::new(vec![padded, patch_width], pixels)?,
-            Tensor::new(vec![padded, 2], positions)?,
-            count / product(&[self.pooling_kernel_size, self.pooling_kernel_size])?,
+            bitmap(image, normalize, self.image_mean, self.image_std)?,
+            count,
         ))
     }
 }
@@ -337,9 +306,10 @@ fn timestamp(index: usize, fps: f64) -> Result<String, Error> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{MediaProcessor, media::tests::Encoder};
     use serde_json::json;
 
-    fn config() -> Config {
+    fn config() -> Processor {
         serde_json::from_value(json!({
             "image_processor": {"patch_size":2,"pooling_kernel_size":1,"max_soft_tokens":70,"do_resize":false},
             "video_processor": {"patch_size":2,"pooling_kernel_size":1,"max_soft_tokens":70,"do_resize":false,"num_frames":2}
@@ -350,36 +320,39 @@ mod tests {
         RgbImage::new(width, height, (0..n).map(|i| i as f32 / n as f32).collect()).unwrap()
     }
     #[test]
-    fn patches_preserve_rgb_pixel_order_positions_normalization_and_padding() {
+    fn bitmap_preserves_rgb_order_normalization_and_atomic_placeholder_span() {
         let mut cfg = config();
         cfg.image_processor.do_normalize = Some(true);
         cfg.image_processor.image_mean = [0.1, 0.2, 0.3];
         cfg.image_processor.image_std = [0.5, 0.25, 2.0];
         let rgb = image(4, 2);
-        let prepared = cfg.process(&[Source::Image(rgb.clone())]).unwrap();
-        let pixels = prepared.pixel_values.unwrap();
-        assert_eq!(pixels.shape, [1, 70, 12]);
-        let indices = [
-            0, 1, 2, 3, 4, 5, 12, 13, 14, 15, 16, 17, 6, 7, 8, 9, 10, 11, 18, 19, 20, 21, 22, 23,
-        ];
-        for (actual, source) in pixels.data.iter().zip(indices) {
-            let channel = source % 3;
+        let prepared = cfg
+            .prepare(vec![Source::Image(rgb.clone())], &Encoder)
+            .unwrap();
+        let pixels = crate::media::tests::pixels(&prepared, 0);
+        assert_eq!(pixels.shape, [2, 4, 3]);
+        for (index, (actual, source)) in pixels.data.iter().zip(&rgb.data).enumerate() {
+            let channel = index % 3;
             assert_eq!(
                 *actual,
-                (rgb.data[source] - cfg.image_processor.image_mean[channel])
+                (source - cfg.image_processor.image_mean[channel])
                     / cfg.image_processor.image_std[channel]
             );
         }
-        assert!(pixels.data[24..].iter().all(|v| *v == 0.0));
-        let positions = prepared.image_position_ids.unwrap();
-        assert_eq!(&positions.data[..4], [0, 0, 1, 0]);
-        assert!(positions.data[4..].iter().all(|v| *v == -1));
-        assert_eq!(prepared.expansions[0].frames[0].token_count, 2);
+        assert!(matches!(
+            &prepared.items[0],
+            Input::Image {
+                span: (1, 2),
+                atomic: true,
+                ..
+            }
+        ));
+        assert_eq!(prepared.expansions[0].token_ids, [1003, 1001, 1001, 1004]);
     }
     #[test]
     fn mixed_sources_keep_expansion_order_video_sampling_and_original_timestamps() {
         let frames = (0..5).map(|_| image(2, 2)).collect();
-        let sources = [
+        let sources = vec![
             Source::Image(image(2, 2)),
             Source::Video(Video {
                 frames,
@@ -388,26 +361,38 @@ mod tests {
             }),
             Source::Image(image(2, 2)),
         ];
-        let result = config().process(&sources).unwrap();
-        assert_eq!(result.pixel_values.unwrap().shape, [2, 70, 12]);
-        assert_eq!(result.pixel_values_videos.unwrap().shape, [1, 2, 70, 12]);
-        assert_eq!(result.video_position_ids.unwrap().shape, [1, 2, 70, 2]);
+        let result = config().prepare(sources, &Encoder).unwrap();
+        assert_eq!(crate::media::tests::pixels(&result, 0).shape, [2, 2, 3]);
+        assert_eq!(crate::media::tests::pixels(&result, 2).shape, [2, 2, 3]);
+        let Input::Video {
+            frames,
+            frame_spans,
+            fps,
+            frame_indices,
+            atomic,
+        } = &result.items[1]
+        else {
+            panic!("expected video")
+        };
+        assert_eq!(frames.len(), 2);
+        assert!(frames.iter().all(|frame| frame.shape == [2, 2, 3]));
+        assert_eq!(*fps, 2.0);
+        assert_eq!(frame_indices, &[120, 124]);
+        assert_eq!(frame_spans, &[(1, 1), (11, 1)]);
+        assert!(*atomic);
         assert_eq!(
             result
                 .expansions
                 .iter()
-                .map(|e| e.is_video)
+                .map(|e| e.placeholder.as_str())
                 .collect::<Vec<_>>(),
-            [false, true, false]
+            ["<|image|>", "<|video|>", "<|image|>"]
         );
-        assert_eq!(
-            result.expansions[1]
-                .frames
-                .iter()
-                .map(|f| f.timestamp.as_deref().unwrap())
-                .collect::<Vec<_>>(),
-            ["01:00", "01:02"]
-        );
+        assert_eq!(result.expansions[1].prefix, "01:00 ");
+        let mut expected = vec![1003, 1002, 1004];
+        expected.extend(" 01:02 ".bytes().map(u32::from));
+        expected.extend([1003, 1002, 1004]);
+        assert_eq!(result.expansions[1].token_ids, expected);
     }
     #[test]
     fn aspect_geometry_matches_reference_including_extreme_ratios() {
@@ -425,49 +410,63 @@ mod tests {
     }
     #[test]
     fn partial_configs_keep_distinct_image_and_video_defaults() {
-        let cfg: Config = serde_json::from_value(json!({
+        let cfg: Processor = serde_json::from_value(json!({
             "image_processor": {"patch_size":1,"pooling_kernel_size":1,"do_resize":false,"image_mean":0.5},
             "video_processor": {"patch_size":1,"pooling_kernel_size":1,"do_resize":false,"image_mean":0.5,"do_sample_frames":false}
         })).unwrap();
         let image = RgbImage::new(1, 1, vec![0.25; 3]).unwrap();
         let result = cfg
-            .process(&[
-                Source::Image(image.clone()),
-                Source::Video(Video {
-                    frames: vec![image],
-                    fps: 24.0,
-                    frame_indices: vec![0],
-                }),
-            ])
+            .prepare(
+                vec![
+                    Source::Image(image.clone()),
+                    Source::Video(Video {
+                        frames: vec![image],
+                        fps: 24.0,
+                        frame_indices: vec![0],
+                    }),
+                ],
+                &Encoder,
+            )
             .unwrap();
-        let images = result.pixel_values.unwrap();
-        let videos = result.pixel_values_videos.unwrap();
-        assert_eq!(images.shape, [1, 280, 3]);
-        assert_eq!(videos.shape, [1, 1, 70, 3]);
-        assert_eq!(&images.data[..3], &[0.25; 3]);
-        assert_eq!(&videos.data[..3], &[-0.25; 3]);
+        let image = crate::media::tests::pixels(&result, 0);
+        let Input::Video { frames, .. } = &result.items[1] else {
+            panic!("expected video")
+        };
+        assert_eq!(image.shape, [1, 1, 3]);
+        assert_eq!(frames[0].shape, [1, 1, 3]);
+        assert_eq!(image.data, [0.25; 3]);
+        assert_eq!(frames[0].data, [-0.25; 3]);
     }
     #[test]
     fn malformed_geometry_video_metadata_and_sampling_fail_before_work() {
         let cfg = config();
         assert!(
-            cfg.process(&[Source::Video(Video {
-                frames: vec![],
-                fps: 24.0,
-                frame_indices: vec![]
-            })])
+            cfg.prepare(
+                vec![Source::Video(Video {
+                    frames: vec![],
+                    fps: 24.0,
+                    frame_indices: vec![]
+                })],
+                &Encoder
+            )
             .is_err()
         );
         assert!(
-            cfg.process(&[Source::Video(Video {
-                frames: vec![image(2, 2)],
-                fps: 24.0,
-                frame_indices: vec![0]
-            })])
+            cfg.prepare(
+                vec![Source::Video(Video {
+                    frames: vec![image(2, 2)],
+                    fps: 24.0,
+                    frame_indices: vec![0]
+                })],
+                &Encoder
+            )
             .is_err()
         );
         let mut bad = cfg.clone();
         bad.image_processor.patch_size = 0;
-        assert!(bad.process(&[Source::Image(image(2, 2))]).is_err());
+        assert!(
+            bad.prepare(vec![Source::Image(image(2, 2))], &Encoder)
+                .is_err()
+        );
     }
 }

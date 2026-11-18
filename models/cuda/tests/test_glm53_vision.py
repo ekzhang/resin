@@ -7,10 +7,11 @@ import numpy as np
 import pytest
 import torch
 
+from resin.models.vision import span_slices
+from resin.protocols import MediaTokenSpan
 from resin_models_cuda.glm5_3_flash.vision import (
     GlmVisionConfig,
     GlmVisionModel,
-    replace_image_embeddings,
 )
 
 FIXTURE = Path(__file__).parent / "fixtures/glm53_vision_hf.npz"
@@ -64,8 +65,11 @@ def test_image_placement_matches_every_partial_prefill_slice_and_prefix(vision):
     for start in range(15):
         for end in range(start, 15):
             chunk = original[start:end].clone()
-            result = replace_image_embeddings(chunk, features, positions, start)
-            torch.testing.assert_close(result, expected[start:end])
+            for destination, source in span_slices(
+                (MediaTokenSpan(2, 4), MediaTokenSpan(9, 2)), start, end
+            ):
+                chunk[destination] = features[source]
+            torch.testing.assert_close(chunk, expected[start:end])
 
 
 def test_vision_rejects_video_and_inconsistent_pixel_rows(vision):
@@ -73,8 +77,6 @@ def test_vision_rejects_video_and_inconsistent_pixel_rows(vision):
     for grid in ([[2, 2, 6]], [[1, 3, 8]], [[1, 4, 8]], []):
         with pytest.raises(ValueError, match="GLM"):
             model(pixels, grid)
-    with pytest.raises(ValueError, match="features"):
-        replace_image_embeddings(torch.zeros(4, 24), torch.zeros(1, 24), (1, 2), 0)
 
 
 def test_vision_weight_loading_requires_every_checkpoint_tensor(vision):

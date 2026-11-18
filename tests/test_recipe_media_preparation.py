@@ -15,7 +15,7 @@ import torch
 from PIL import Image
 
 import resin
-from resin.recipe import get_native_recipe
+from resin.recipe import Media, get_native_recipe
 
 
 class Tokenizer:
@@ -59,97 +59,109 @@ GEMMA_CONFIG = {
 
 def render_media(recipe, blocks):
     prompt = recipe.render([resin.recipe.Message(resin.recipe.Role.USER, blocks)])
-    assert prompt.media is not None
-    assert tuple(prompt.token_ids) == prompt.media.token_ids
+    assert isinstance(prompt.media, tuple) and prompt.media
+    assert all(isinstance(item, Media) for item in prompt.media)
+    assert all(
+        item.span.position + item.span.length <= len(prompt.token_ids)
+        for item in prompt.media
+    )
     return prompt.media
 
 
-def assert_buffer_roundtrip(media, *array_fields) -> Any:
+def assert_buffer_roundtrip(media):
     metadata, buffers = resin._resin._media_to_buffers(media)
-    assert json.loads(metadata)["version"] == 1
+    assert json.loads(metadata)["version"] == 2
     assert isinstance(buffers, tuple)
-    assert buffers[0].dtype == np.uint32
-    assert not buffers[0].flags.writeable
-    assert tuple(buffers[0]) == media.token_ids
-    assert all(value.flags.c_contiguous for value in buffers)
-    assert "__reduce__" not in type(media).__dict__
-    with pytest.raises(TypeError):
-        pickle.dumps(media)
-    restored: Any = resin._resin._media_from_buffers(metadata, buffers)
-    assert type(restored) is type(media)
-    assert restored.token_ids == media.token_ids
-    assert restored.token_spans == media.token_spans
-    assert restored.digest == media.digest
-    assert restored.cache_key == media.cache_key
-    for name in array_fields:
-        original, copied = getattr(media, name), getattr(restored, name)
-        if name != "position_ids":  # Qwen derives mRoPE on registration.
-            assert any(value is original for value in buffers), name
-        assert np.array_equal(original, copied), name
-        assert not np.shares_memory(original, copied), name
+    assert all(
+        value.dtype == np.float32 and value.flags.c_contiguous for value in buffers
+    )
+    assert all(not value.flags.writeable for value in buffers)
+    restored = resin._resin._media_from_buffers(metadata, buffers)
+    assert isinstance(restored, tuple)
+    copied_metadata, copied_buffers = resin._resin._media_to_buffers(restored)
+    assert copied_metadata == metadata
+    for original, copied in zip(media, restored, strict=True):
+        assert isinstance(copied, Media)
+        assert copied.digest == original.digest
+        assert copied.span == original.span
+        assert copied.atomic == original.atomic
+        assert copied.video_frame_spans == original.video_frame_spans
+        assert copied.video_frame_indices == original.video_frame_indices
+        with pytest.raises(TypeError):
+            pickle.dumps(original)
+    for original, copied in zip(buffers, copied_buffers, strict=True):
+        np.testing.assert_array_equal(original, copied)
+        assert not np.shares_memory(original, copied)
+        assert not copied.flags.writeable
     return restored
 
 
 def test_media_transfer_rejects_unknown_types_versions_and_malformed_buffers():
-    custom: Any = SimpleNamespace(token_ids=(1,))
-    with pytest.raises(TypeError, match="custom media.*local"):
-        resin._resin._media_to_buffers(custom)
-    media = resin.recipe.Inkling2Media(
-        token_ids=(2, 8),
-        image_token_id=8,
-        pixel_values=np.ones((1, 2, 2, 3), dtype=np.float32),
-        image_grid_thw=np.array([[1, 1, 1]], dtype=np.int64),
-    )
+    with pytest.raises(TypeError):
+        resin._resin._media_to_buffers((SimpleNamespace(token_ids=(1,)),))  # ty: ignore[invalid-argument-type]
+    image = np.ones((2, 2, 3), dtype=np.float32)
+    media = (Media((1, 1), image=image),)
     metadata, buffers = resin._resin._media_to_buffers(media)
     descriptor = json.loads(metadata)
     descriptor["version"] = 99
     with pytest.raises(ValueError, match="version"):
         resin._resin._media_from_buffers(json.dumps(descriptor).encode(), buffers)
     descriptor = json.loads(metadata)
-    descriptor["media"]["type"] = "builtins.eval"
+    descriptor["items"][0]["content"]["kind"] = "builtins.eval"
     with pytest.raises(ValueError, match="unknown variant"):
         resin._resin._media_from_buffers(json.dumps(descriptor).encode(), buffers)
     with pytest.raises(ValueError, match="missing.*buffer"):
-        resin._resin._media_from_buffers(metadata, buffers[:-1])
+        resin._resin._media_from_buffers(metadata, ())
     with pytest.raises(ValueError, match="unexpected.*buffer"):
-        resin._resin._media_from_buffers(metadata, (*buffers, buffers[-1]))
+        resin._resin._media_from_buffers(metadata, (*buffers, buffers[0]))
     with pytest.raises(TypeError):
-        resin._resin._media_from_buffers(
-            metadata, (buffers[0].astype(np.int64), *buffers[1:])
-        )
-    with pytest.raises(ValueError, match="rank 1"):
-        resin._resin._media_from_buffers(metadata, (buffers[0][None], *buffers[1:]))
-    with pytest.raises(ValueError, match="placeholder count"):
-        resin._resin._media_from_buffers(
-            metadata, (buffers[0], np.ones((2, 2, 2, 3), dtype=np.float32), buffers[2])
-        )
+        resin._resin._media_from_buffers(metadata, (image.astype(np.int64),))
+    for invalid in (image[None], np.full_like(image, np.nan)):
+        with pytest.raises(ValueError, match="finite.*HWC"):
+            resin._resin._media_from_buffers(metadata, (invalid,))
+    for span in ((0, 0), (2**32 - 1, 1)):
+        with pytest.raises(ValueError, match="spans"):
+            Media(span, image=image)
+    with pytest.raises(ValueError, match="ordered"):
+        resin._resin._media_to_buffers((media[0], media[0]))
+
+    # The same transport supports PCM without introducing a model payload type.
+    pcm = np.linspace(-1, 1, 16, dtype=np.float32)
+    audio = Media((2, 4), audio=pcm, audio_sample_rate=24000)
+    restored = assert_buffer_roundtrip((audio,))[0]
+    assert (
+        restored.audio_sample_rate == 24000 and restored.image is restored.video is None
+    )
+    np.testing.assert_array_equal(restored.audio, pcm)
+    assert Media((2, 4), audio=pcm, audio_sample_rate=16000).digest != audio.digest
+    for sample_rate in (None, 0):
+        with pytest.raises(ValueError, match="sample rate|sample_rate"):
+            Media((2, 4), audio=pcm, audio_sample_rate=sample_rate)
+    with pytest.raises(ValueError, match="exactly one"):
+        Media((2, 4), audio=pcm, image=image, audio_sample_rate=24000)
 
 
 def test_media_transfer_snapshots_receiver_and_keeps_sender_buffers_alive():
-    media = resin.recipe.Inkling2Media(
-        token_ids=(2, 8),
-        image_token_id=8,
-        pixel_values=np.ones((1, 2, 2, 3), dtype=np.float32),
-        image_grid_thw=np.array([[1, 1, 1]], dtype=np.int64),
-    )
+    source = np.ones((2, 2, 3), dtype=np.float32)
+    media = (Media((1, 1), image=source),)
     metadata, buffers = resin._resin._media_to_buffers(media)
-    assert buffers[1] is media.pixel_values
+    assert buffers[0] is media[0].image
+    source.fill(0)
     del media
-    # The token view owns its frozen native payload, including its other arrays.
-    assert buffers[0].tolist() == [2, 8]
+    assert np.all(buffers[0] == 1)
     for buffer in buffers:
         assert not buffer.flags.writeable
         with pytest.raises(ValueError, match="WRITEABLE"):
             buffer.setflags(write=True)
     # Transport may deliver mutable buffers; the receiver snapshots those too.
     incoming = tuple(buffer.copy() for buffer in buffers)
-    restored: Any = resin._resin._media_from_buffers(metadata, incoming)
-    before = restored.pixel_values.copy()
-    incoming[1].fill(0)
-    assert not restored.pixel_values.flags.writeable
+    restored = resin._resin._media_from_buffers(metadata, incoming)
+    incoming[0].fill(0)
+    assert restored[0].image is not None
+    assert not restored[0].image.flags.writeable
     with pytest.raises(ValueError, match="read-only"):
-        restored.pixel_values.fill(0)
-    np.testing.assert_array_equal(restored.pixel_values, before)
+        restored[0].image.fill(0)
+    assert np.all(restored[0].image == 1)
 
 
 def test_image_sources_share_one_owned_rgb_boundary() -> None:
@@ -169,16 +181,15 @@ def test_image_sources_share_one_owned_rgb_boundary() -> None:
         ),
     )
     payloads = [render_media(recipe, [source]) for source in sources]
-    assert_buffer_roundtrip(payloads[0], "pixel_values")
-    for payload in payloads:
-        assert np.array_equal(payload.pixel_values, payloads[0].pixel_values)
-        assert payload.pixel_values.flags.c_contiguous
-        assert not np.shares_memory(payload.pixel_values, rgb)
-        assert payload.digest == payloads[0].digest
-        assert payload.cache_key == payloads[0].cache_key
-    before = payloads[0].pixel_values.copy()
+    assert_buffer_roundtrip(payloads[0])
+    for (payload,) in payloads:
+        np.testing.assert_array_equal(payload.image, payloads[0][0].image)
+        assert payload.image.flags.c_contiguous
+        assert not np.shares_memory(payload.image, rgb)
+        assert payload.digest == payloads[0][0].digest
+    before = payloads[0][0].image.copy()
     rgb.fill(0)
-    assert np.array_equal(payloads[0].pixel_values, before)
+    np.testing.assert_array_equal(payloads[0][0].image, before)
 
 
 @pytest.mark.parametrize("recipe_name", ["inkling2", "qwen3_5"])
@@ -201,49 +212,64 @@ def test_gemma_interleaved_geometry_and_atomic_spans() -> None:
         [
             resin.recipe.Text("first"),
             resin.recipe.Image.from_rgb(first),
-            resin.recipe.Video(source=frames),
+            resin.recipe.Video(
+                source={"frames": frames, "fps": 2.0, "frame_indices": [3, 9]}
+            ),
             resin.recipe.Image.from_rgb(second),
             resin.recipe.Text("last"),
         ],
     )
-    assert media.pixel_values.shape == (2, 70, 12)
-    assert media.pixel_values_videos.shape == (1, 2, 70, 12)
-    assert np.array_equal(
-        media.pixel_values[:, 0], np.stack([first, second]).reshape(2, 12)
-    )
-    assert np.array_equal(media.pixel_values_videos[0, :, 0], frames.reshape(2, 12))
-    assert np.count_nonzero(media.pixel_values[:, 1:]) == 0
-    assert np.array_equal(media.image_position_ids[:, 0], np.zeros((2, 2)))
-    assert np.all(media.image_position_ids[:, 1:] == -1)
-    first_position, second_position = media.image_positions
+    left, video, right = media
+    np.testing.assert_array_equal(left.image, first)
+    np.testing.assert_array_equal(right.image, second)
+    assert isinstance(video.video, tuple)
+    np.testing.assert_array_equal(np.stack(video.video), frames)
+    assert left.span.length == right.span.length == 1
+    assert all(item.atomic for item in media)
+    assert left.span.position < video.span.position < right.span.position
+    assert video.video_fps == 2.0 and video.video_frame_indices == (3, 9)
+    assert len(video.video_frame_spans) == 2
+    assert all(span.length == 1 for span in video.video_frame_spans)
+    assert video.span.position <= video.video_frame_spans[0].position
     assert (
-        first_position
-        < media.video_positions[0]
-        < media.video_positions[1]
-        < second_position
+        video.video_frame_spans[-1].position < video.span.position + video.span.length
     )
-    assert [(span.position, span.length) for span in media.token_spans] == [
-        (position, 1)
-        for position in sorted((*media.image_positions, *media.video_positions))
-    ]
-    assert media.cache_key[0] == media.token_ids[0]
-    assert media.cache_key[-1] == media.token_ids[-1]
+    assert video.video_frame_spans[0].position + 1 < video.video_frame_spans[1].position
     first.fill(0)
     frames.fill(0)
-    assert media.pixel_values[0, 0].sum() == 3
-    assert media.pixel_values_videos[0, :, 0].sum() == 18
-    restored = assert_buffer_roundtrip(
-        media,
-        "pixel_values",
-        "image_position_ids",
-        "pixel_values_videos",
-        "video_position_ids",
+    assert left.image.sum() == 3
+    assert sum(frame.sum() for frame in video.video) == 18
+    assert_buffer_roundtrip(media)
+
+    # Content identity follows frame timing and relative placement, not prompt position.
+    kwargs: dict[str, Any] = dict(
+        video=video.video,
+        video_fps=video.video_fps,
+        video_frame_indices=video.video_frame_indices,
+        atomic=True,
     )
-    assert restored.image_positions == media.image_positions
-    assert restored.video_positions == media.video_positions
+    moved = Media(
+        (video.span.position + 10, video.span.length),
+        video_frame_spans=[(p + 10, n) for p, n in video.video_frame_spans],
+        **kwargs,
+    )
+    assert moved.digest == video.digest
+    kwargs["video_fps"] = 3.0
+    changed = Media(video.span, video_frame_spans=video.video_frame_spans, **kwargs)
+    assert changed.digest != video.digest
+    with pytest.raises(ValueError, match="frame spans"):
+        Media(
+            video.span,
+            video_frame_spans=[(0, 1), video.video_frame_spans[-1]],
+            **kwargs,
+        )
+    for invalid_video in (list(video.video), np.stack(video.video)):
+        kwargs["video"] = invalid_video
+        with pytest.raises(TypeError, match="tuple"):
+            Media(video.span, video_frame_spans=video.video_frame_spans, **kwargs)
 
 
-def test_qwen_and_inkling2_native_patch_counts_and_layout() -> None:
+def test_qwen_and_inkling2_native_bitmap_geometry_and_token_counts() -> None:
     pixels = np.full((4, 8, 3), 0.5, dtype=np.float32)
     qwen = get_native_recipe(
         "qwen3_5",
@@ -257,27 +283,19 @@ def test_qwen_and_inkling2_native_patch_counts_and_layout() -> None:
             "image_std": [0.5] * 3,
         },
     )
-    media = render_media(qwen, [resin.recipe.Image.from_rgb(pixels)])
-    assert len(media.image_positions) == 2
-    assert media.image_grid_thw.tolist() == [[1, 2, 4]]
-    assert media.pixel_values.shape == (8, 24)
-    assert np.count_nonzero(media.pixel_values) == 0
-    assert media.token_spans == ()
-    restored = assert_buffer_roundtrip(
-        media, "pixel_values", "image_grid_thw", "position_ids"
-    )
-    assert restored.rope_delta == media.rope_delta
+    (media,) = render_media(qwen, [resin.recipe.Image.from_rgb(pixels)])
+    assert media.span.length == 2 and not media.atomic
+    assert media.image.shape == (4, 8, 3)
+    assert np.count_nonzero(media.image) == 0
+    assert_buffer_roundtrip((media,))
     inkling2 = get_native_recipe(
         "inkling2",
         Tokenizer(),
         media_config={"size": {"height": 2, "width": 2}, "do_normalize": False},
     )
-    media = render_media(inkling2, [resin.recipe.Image.from_rgb(pixels)])
-    assert len(media.image_positions) == 8
-    assert media.pixel_values.shape == (8, 2, 2, 3)
-    assert media.image_grid_thw.tolist() == [[1, 2, 4]]
-    assert np.all(media.pixel_values == 0.5)
-    assert media.token_spans == ()
+    (media,) = render_media(inkling2, [resin.recipe.Image.from_rgb(pixels)])
+    assert media.span.length == 8 and not media.atomic
+    np.testing.assert_array_equal(media.image, pixels)
 
 
 def test_deepseek_geometry_positions_and_cache_identity() -> None:
@@ -291,26 +309,17 @@ def test_deepseek_geometry_positions_and_cache_identity() -> None:
         resin.recipe.Image.from_rgb(source),
     ]
     media = render_media(recipe, blocks)
-    assert len(media.images) == 2
-    assert [image.patches.shape for image in media.images] == [(2, 3, 14, 14)] * 2
-    assert media.images[0].start + 4 < media.images[1].start
-    assert media.token_spans == ()
+    assert len(media) == 2
+    assert all(
+        item.image.shape == (14, 28, 3) and item.span.length == 4 for item in media
+    )
+    assert media[0].span.position + 4 < media[1].span.position
+    assert all(not item.atomic for item in media)
     repeated = render_media(recipe, blocks)
-    assert media.digest == repeated.digest
-    assert media.cache_key == repeated.cache_key
+    assert [item.digest for item in media] == [item.digest for item in repeated]
     source.fill(0)
-    assert np.all(media.images[0].patches == 1)
-    restored = assert_buffer_roundtrip(media)
-    for actual, expected in zip(restored.images, media.images, strict=True):
-        assert "__reduce__" not in type(actual).__dict__
-        with pytest.raises(TypeError):
-            pickle.dumps(actual)
-        assert actual.start == expected.start
-        assert actual.n_vit_h == expected.n_vit_h
-        assert actual.n_vit_w == expected.n_vit_w
-        assert actual.types == expected.types
-        assert np.array_equal(actual.patches, expected.patches)
-        assert not np.shares_memory(actual.patches, expected.patches)
+    assert np.all(media[0].image == 1)
+    assert_buffer_roundtrip(media)
 
 
 def test_gemma_text_only_skips_media_embeddings_and_custom_attention_mask() -> None:
@@ -361,8 +370,9 @@ def test_native_media_does_not_import_python_image_or_tensor_libraries() -> None
             image = resin.recipe.Image.from_rgb(np.zeros((*size, 3), dtype=np.float32))
             prompt = recipe.render([resin.recipe.Message(resin.recipe.Role.USER, [image])])
             assert prompt.media is not None
-            assert isinstance(prompt.media.token_ids, tuple)
-            assert resin._resin._media_from_buffers(*resin._resin._media_to_buffers(prompt.media)).cache_key == prompt.media.cache_key
+            assert isinstance(prompt.media, tuple) and isinstance(prompt.media[0], resin.recipe.Media)
+            restored = resin._resin._media_from_buffers(*resin._resin._media_to_buffers(prompt.media))
+            assert [item.digest for item in restored] == [item.digest for item in prompt.media]
             if name == 'inkling2':
                 encoded = resin.recipe.Image.from_bytes({encoded.getvalue()!r}, media_type='image/png')
                 assert recipe.render([resin.recipe.Message(resin.recipe.Role.USER, [encoded])]).media is not None

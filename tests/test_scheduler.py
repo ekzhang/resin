@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-from types import SimpleNamespace
 from typing import Any
 
 import numpy as np
@@ -20,6 +19,7 @@ from resin import (
     SamplingParams,
     SchedulerConfig,
 )
+from resin.recipe import Media
 
 
 class RecordingRunner:
@@ -253,15 +253,14 @@ class TestSchedulerConfigContract:
         with pytest.raises(AttributeError):
             setattr(plan, "sampling_mask", [True, False, False])
 
-    def test_opaque_media_preserves_identity(self) -> None:
-        payload = object()
+    def test_media_tuple_preserves_identity(self) -> None:
+        payload = (Media((0, 1), image=np.zeros((1, 1, 3), dtype=np.float32)),)
         plan = BatchPlan(
             sequence_ids=[7, 8],
             context_lengths=[0, 0],
             token_ids=[10, 20],
             token_indptr=[0, 1, 2],
-            # BatchPlan deliberately preserves opaque model-owned payloads.
-            media=[payload, None],  # ty: ignore[invalid-argument-type]
+            media=[payload, None],
         )
 
         assert plan.media[0] is payload
@@ -284,9 +283,7 @@ class TestSchedulerConfigContract:
 
         runner = ChunkedRunner()
         engine = Engine(runner)
-        payload = SimpleNamespace(
-            token_ids=(1, 2, 3), cache_key=(1, 2, 3), token_spans=(), image=object()
-        )
+        payload = (Media((1, 1), image=np.zeros((1, 1, 3), dtype=np.float32)),)
         engine.submit(
             [1, 2, 3],
             sampling_params=SamplingParams(max_output_tokens=2),
@@ -303,35 +300,37 @@ class TestSchedulerConfigContract:
         ]
         assert all(plan.media == (payload,) for plan in runner.plans)
 
-    def test_media_can_supply_its_own_token_ids(self) -> None:
-        class Media:
-            token_ids = [4, 5]
-            cache_key = (4, 5)
-            token_spans = ()
-
+    def test_media_requires_explicit_prompt_token_ids(self) -> None:
         runner = RecordingRunner()
         engine = Engine(runner)
-        media = Media()
-
-        engine.submit(sampling_params=SamplingParams(max_output_tokens=1), media=media)
+        media = (Media((0, 1), image=np.zeros((1, 1, 3), dtype=np.float32)),)
+        with pytest.raises(TypeError, match="token_ids"):
+            engine.submit(media=media)  # ty: ignore[missing-argument]
+        engine.submit(
+            [4, 5], sampling_params=SamplingParams(max_output_tokens=1), media=media
+        )
         engine.step()
-
         assert runner.plans[0].token_ids.tolist() == [4, 5]
-        assert runner.plans[0].media == (media,)
+        assert runner.plans[0].media is not None and runner.plans[0].media[0] is media
 
-        with pytest.raises(ValueError, match="only when media supplies"):
-            engine.submit(sampling_params=SamplingParams(max_output_tokens=1))
-
-    @pytest.mark.parametrize("missing", ["cache_key", "token_spans"])
-    @pytest.mark.parametrize("tokens", [None, [1, 2]])
-    def test_incomplete_media_is_rejected_before_admission(self, missing, tokens):
+    @pytest.mark.parametrize("invalid", ["object", "element", "bounds", "overlap"])
+    def test_invalid_media_is_rejected_before_admission(self, invalid):
         runner = RecordingRunner()
         engine = Engine(runner)
-        media = SimpleNamespace(token_ids=(1, 2), cache_key=(1, 2), token_spans=())
-        delattr(media, missing)
-        with pytest.raises(AttributeError, match=missing):
+        item = Media((0, 1), image=np.zeros((1, 1, 3), dtype=np.float32))
+        media = {
+            "object": object(),
+            "element": (object(),),
+            "bounds": (Media((2, 1), image=item.image),),
+            "overlap": (item, item),
+        }[invalid]
+        with pytest.raises(
+            TypeError if invalid in ("object", "element") else ValueError
+        ):
             engine.submit(
-                tokens, sampling_params=SamplingParams(max_output_tokens=1), media=media
+                [1, 2],
+                sampling_params=SamplingParams(max_output_tokens=1),
+                media=media,  # ty: ignore[invalid-argument-type]
             )
         assert not engine.has_work() and not engine.poisoned
         assert runner.plans == []

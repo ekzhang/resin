@@ -176,6 +176,12 @@ IDs, sampling, and logprob options. Use the recipe's `stop_token_ids`
 for chat requests, or supply the model's stop tokens explicitly for raw token
 requests. `Engine` has no default EOS token.
 
+For chat, a recipe returns a `RenderedPrompt`. Submit its `token_ids` explicitly
+and pass `media=rendered.media` for multimodal requests. Media is a tuple of
+immutable `Media` objects containing a prompt span and a normalized RGB image,
+a tuple of video frames, or audio samples. Model runners pack these buffers for their vision
+or audio encoders.
+
 A custom synchronous runner only needs one method:
 
 ```python

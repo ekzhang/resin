@@ -27,9 +27,9 @@ DeepSelect `bfa4507d`, and TileKernels 1.0.0; full revisions live in
 
 `resin.recipe.get_native_recipe("deepseek_v41", tokenizer)` prepares typed image content independently of HTTP.
 Its resize, padding, normalization and patch order follow the pinned checkpoint's
-image processor. The Rust recipe expands trusted image slots; `DeepSeekV41Media`
-owns the CPU patches and includes their identity in prefix-cache keys. The runner
-encodes each image once per live request and slices its embeddings across causal
+image processor. The Rust recipe expands trusted image slots; `Media`
+owns the normalized CPU bitmap and includes its identity in prefix-cache keys. The runner
+packs and encodes each uncached image once and slices its embeddings across causal
 prefill chunks, including partial prefix-cache restores. Image rows use the
 checkpoint's vision routing bias and are masked from Engram; generated tokens
 keep the ordinary text path. Vision encoding runs outside the language-model

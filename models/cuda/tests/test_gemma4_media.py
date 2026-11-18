@@ -9,8 +9,9 @@ from PIL import Image
 from recipe_fuzz.gemma import GemmaAdapter
 
 import resin
-from resin import Engine, MediaInput, MediaTokenSpan, SamplingParams
-from resin.recipe import Gemma4Media, get_native_recipe
+from resin import Engine, SamplingParams
+from resin.models.vision import padded_patches
+from resin.recipe import Media, get_native_recipe
 
 
 def _png_bytes() -> bytes:
@@ -40,12 +41,13 @@ def test_encoded_image_boundary_is_bytes_plus_explicit_mime() -> None:
             )
         ]
     )
-    assert isinstance(prompt.media, Gemma4Media)
-    pixels = prompt.media.pixel_values
+    assert prompt.media is not None
+    assert isinstance(prompt.media[0], Media)
+    pixels = prompt.media[0].image
     assert pixels is not None
-    assert pixels.shape == (1, 70, 3)
+    assert pixels.shape == (3, 4, 3)
     np.testing.assert_allclose(
-        pixels[0, :12], np.tile(np.array([10, 20, 30]) / 255, (12, 1))
+        pixels.reshape(-1, 3), np.tile(np.array([10, 20, 30]) / 255, (12, 1))
     )
     with pytest.raises(ValueError, match="media type"):
         recipe.render(
@@ -60,37 +62,6 @@ def test_encoded_image_boundary_is_bytes_plus_explicit_mime() -> None:
                 )
             ]
         )
-
-
-def test_media_owns_processor_tensors_and_absolute_placeholder_mapping() -> None:
-    pixels = np.ones((1, 9, 12), dtype=np.float32)
-    media = Gemma4Media(
-        token_ids=(2, 8, 8, 3, 9, 9),
-        mm_token_type_ids=(0, 1, 1, 0, 2, 2),
-        pixel_values=pixels,
-        image_position_ids=np.zeros((1, 9, 2), dtype=np.int64),
-        pixel_values_videos=np.ones((1, 1, 9, 12), dtype=np.float32),
-        video_position_ids=np.zeros((1, 1, 9, 2), dtype=np.int64),
-    )
-    pixels.fill(0)
-
-    assert isinstance(media, MediaInput)
-    assert media.token_ids == (2, 8, 8, 3, 9, 9)
-    assert media.image_positions == (1, 2)
-    assert media.video_positions == (4, 5)
-    assert media.block_ids == (-1, 0, 0, -1, 1, 1)
-    assert media.token_spans == (
-        MediaTokenSpan(position=1, length=2),
-        MediaTokenSpan(position=4, length=2),
-    )
-    assert media.pixel_values is not None
-    assert media.pixel_values.sum().item() == 108
-    media.validate_placeholder_tokens(image_token_id=8, video_token_id=9)
-    assert len(media.digest) == 64
-    assert len(media.cache_key) == len(media.token_ids)
-    assert isinstance(hash(media.cache_key), int)
-    assert media.cache_key[0] == media.token_ids[0]
-    assert media.cache_key[1] != media.token_ids[1]
 
 
 @pytest.mark.parametrize("is_video", [False, True])
@@ -148,26 +119,34 @@ def test_native_patches_match_reference_without_resize_and_own_input(is_video) -
         expected_text, add_special_tokens=False
     )
     image.fill(0)
-    assert isinstance(prompt.media, Gemma4Media)
+    assert prompt.media is not None
+    assert isinstance(prompt.media[0], Media)
+    item = prompt.media[0]
     if is_video:
-        np.testing.assert_array_equal(
-            prompt.media.pixel_values_videos, expected["pixel_values_videos"]
-        )
-        np.testing.assert_array_equal(
-            prompt.media.video_position_ids, expected["video_position_ids"]
-        )
-        assert len(prompt.media.video_positions) == 4
+        assert item.video is not None
+        bitmaps = item.video
     else:
-        np.testing.assert_array_equal(
-            prompt.media.pixel_values, expected["pixel_values"]
-        )
-        np.testing.assert_array_equal(
-            prompt.media.image_position_ids, expected["image_position_ids"]
-        )
-        assert len(prompt.media.image_positions) == 2
+        assert item.image is not None
+        bitmaps = (item.image,)
+    pixels, positions = padded_patches(bitmaps, 2)
+    reference_pixels = (
+        expected["pixel_values_videos"][0] if is_video else expected["pixel_values"]
+    )
+    reference_positions = (
+        expected["video_position_ids"][0]
+        if is_video
+        else expected["image_position_ids"]
+    )
+    np.testing.assert_array_equal(pixels, reference_pixels[:, : pixels.shape[1]])
+    np.testing.assert_array_equal(
+        positions, reference_positions[:, : positions.shape[1]]
+    )
+    assert sum(
+        length for _, length in (item.video_frame_spans if is_video else (item.span,))
+    ) == (4 if is_video else 2)
 
 
-def test_submit_media_uses_its_tokenized_prompt_without_engine_media_logic() -> None:
+def test_submit_passes_tokens_and_media_to_runner() -> None:
     class Runner:
         plans = []
 
@@ -176,15 +155,12 @@ def test_submit_media_uses_its_tokenized_prompt_without_engine_media_logic() -> 
             cls.plans.append(plan)
             return forward_output([7])
 
-    media = Gemma4Media(
-        token_ids=(2, 8),
-        mm_token_type_ids=(0, 1),
-        pixel_values=np.ones((1, 9, 12), dtype=np.float32),
-        image_position_ids=np.zeros((1, 9, 2), dtype=np.int64),
-    )
+    media = (Media(span=(1, 1), image=np.ones((2, 2, 3), dtype=np.float32)),)
     engine = Engine(Runner())
 
-    engine.submit(media=media, sampling_params=SamplingParams(max_output_tokens=1))
+    engine.submit(
+        [2, 8], media=media, sampling_params=SamplingParams(max_output_tokens=1)
+    )
     engine.step()
 
     assert Runner.plans[0].token_ids.tolist() == [2, 8]

@@ -28,12 +28,20 @@ fn pinned_hf_templates_match_all_variants_tools_history_and_vision() {
 
 #[test]
 fn text_only_recipes_reject_media() {
-    assert!(OrnithRecipe::default().media_config().is_some());
+    assert!(
+        (&OrnithRecipe::default() as &dyn Recipe)
+            .media_processor()
+            .is_some()
+    );
     let params = QwenRecipeParams {
         text_only: true,
         ..Default::default()
     };
-    assert!(OrnithRecipe::new(params).media_config().is_none());
+    assert!(
+        (&OrnithRecipe::new(params) as &dyn Recipe)
+            .media_processor()
+            .is_none()
+    );
 }
 
 #[test]

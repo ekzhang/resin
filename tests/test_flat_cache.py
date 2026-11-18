@@ -16,12 +16,12 @@ from resin import (
     CacheRetention,
     Engine,
     ForwardOutput,
-    MediaTokenSpan,
     ResourceBinding,
     RunnerConfig,
     SamplingParams,
     SchedulerConfig,
 )
+from resin.recipe import Media
 
 
 class RecordingCachedRunner:
@@ -365,25 +365,24 @@ class TestFlatCacheEngine:
             assert request.take_result() == [100]
 
     def test_media_digest_identity_controls_prefix_reuse(self) -> None:
-        class Media:
-            token_ids = [1, 2, 3, 4]
-            token_spans = ()
-
-            def __init__(self, identity: list[int]) -> None:
-                self.cache_key = tuple(identity)
-
         layout = CacheLayout(parent_capacity=4, groups=[CacheGroupLayout(2)])
         runner = RecordingCachedRunner(layout)
         engine = Engine(runner, prefix_cache=True)
 
-        first = Media([1, 101, 102, 4])
-        engine.submit(media=first, sampling_params=SamplingParams(max_output_tokens=1))
+        first = (Media((1, 2), image=np.zeros((1, 1, 3), dtype=np.float32)),)
+        engine.submit(
+            [1, 2, 3, 4],
+            media=first,
+            sampling_params=SamplingParams(max_output_tokens=1),
+        )
         while engine.has_work():
             engine.step()
 
-        same_media = Media([1, 101, 102, 4])
+        same_media = (Media((1, 2), image=np.zeros((1, 1, 3), dtype=np.float32)),)
         repeated = engine.submit(
-            media=same_media, sampling_params=SamplingParams(max_output_tokens=1)
+            [1, 2, 3, 4],
+            media=same_media,
+            sampling_params=SamplingParams(max_output_tokens=1),
         )
         assert repeated.cached_tokens == 2
         while engine.has_work():
@@ -391,26 +390,36 @@ class TestFlatCacheEngine:
         assert runner.plans[-1].context_lengths.tolist() == [2]
         assert runner.plans[-1].media == (same_media,)
 
-        changed_media = Media([1, 201, 202, 4])
+        changed_media = (Media((1, 2), image=np.ones((1, 1, 3), dtype=np.float32)),)
         engine.submit(
-            media=changed_media, sampling_params=SamplingParams(max_output_tokens=1)
+            [1, 2, 3, 4],
+            media=changed_media,
+            sampling_params=SamplingParams(max_output_tokens=1),
         )
         engine.step()
         assert runner.plans[-1].context_lengths.tolist() == [0]
 
-    def test_media_atomic_prefill_span_is_not_cut_at_cache_alignment(self) -> None:
-        class Media:
-            token_ids = [1, 2, 3, 4, 5, 6]
-            cache_key = (1, 20, 30, 40, 50, 6)
-            token_spans = (MediaTokenSpan(1, 4),)
+        # Text inside a media span (such as video timestamps) remains in its identity.
+        changed_tokens = engine.submit(
+            [1, 9, 3, 4],
+            media=same_media,
+            sampling_params=SamplingParams(max_output_tokens=1),
+        )
+        assert changed_tokens.cached_tokens == 0
+        engine.cancel(changed_tokens)
 
+    def test_media_atomic_prefill_span_is_not_cut_at_cache_alignment(self) -> None:
         runner = RecordingCachedRunner(
             CacheLayout(parent_capacity=4, groups=[CacheGroupLayout(4)])
         )
         engine = Engine(runner, prefix_cache=True)
 
         engine.submit(
-            media=Media(), sampling_params=SamplingParams(max_output_tokens=1)
+            [1, 2, 3, 4, 5, 6],
+            media=(
+                Media((1, 4), image=np.ones((1, 1, 3), dtype=np.float32), atomic=True),
+            ),
+            sampling_params=SamplingParams(max_output_tokens=1),
         )
         engine.step()
 

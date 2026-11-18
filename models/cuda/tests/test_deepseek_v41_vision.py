@@ -12,10 +12,7 @@ from torch import nn
 from resin import BatchPhase, BatchPlan
 from resin.backend.cuda.completion import CudaContinuation
 from resin.backend.cuda.vision_cache import VisionFeatureCache
-from resin.recipe import (
-    DeepSeekV41Image,
-    DeepSeekV41Media,
-)
+from resin.recipe import Media
 from resin_models_cuda.deepseek_v41.cuda import DeepSeekV41CudaRunner
 from resin_models_cuda.deepseek_v41.vision import Aligner, ViT, get_vision_cos_sin
 
@@ -60,18 +57,11 @@ def test_vision_rope_and_aligner_match_checkpoint_spatial_order():
     assert "blocks.0.mlp.w1.weight" in vit.state_dict()
 
 
+TOKENS = (7, 8) + (129264,) * 8 + (9, 10)
+
+
 def media_fixture():
-    types = (0, 1, 1, 2, 1, 1, 2, 3)
-    image = DeepSeekV41Image(
-        start=2,
-        patches=np.zeros((16, 3, 14, 14), dtype=np.float32),
-        n_vit_h=4,
-        n_vit_w=4,
-        types=types,
-    )
-    return DeepSeekV41Media(
-        token_ids=(7, 8) + (129264,) * len(types) + (9, 10), images=(image,)
-    )
+    return (Media(span=(2, 8), image=np.zeros((56, 56, 3), dtype=np.float32)),)
 
 
 def runner_fixture():
@@ -103,7 +93,7 @@ def plan_for(media, start, end, *, request=42):
     return BatchPlan(
         sequence_ids=[request],
         context_lengths=[start],
-        token_ids=media.token_ids[start:end],
+        token_ids=TOKENS[start:end],
         token_indptr=[0, end - start],
         phase=BatchPhase.PREFILL,
         media=[media],
@@ -132,9 +122,7 @@ def test_image_embeddings_reuse_features_across_chunks_and_prefix_restore():
     for start, end in ((0, 5), (5, 7), (7, 12)):
         plan = plan_for(media, start, end)
         runner._validate_plan(plan)
-        result = runner._media_embeddings(
-            plan, 0, torch.tensor([media.token_ids[start:end]])
-        )
+        result = runner._media_embeddings(plan, 0, torch.tensor([TOKENS[start:end]]))
         torch.testing.assert_close(result[0], expected[start:end])
     assert len(calls) == 1
     runner.release([42])
@@ -142,15 +130,13 @@ def test_image_embeddings_reuse_features_across_chunks_and_prefix_restore():
     # A prefix-cache hit can leave only the last part of an image to prefill.
     plan = plan_for(media, 7, 12)
     runner._validate_plan(plan)
-    result = runner._media_embeddings(plan, 0, torch.tensor([media.token_ids[7:12]]))
+    result = runner._media_embeddings(plan, 0, torch.tensor([TOKENS[7:12]]))
     torch.testing.assert_close(result[0], expected[7:12])
     assert len(calls) == 1
     text = plan_for(media, 10, 12)
     assert runner._media_embeddings(text, 0, torch.tensor([[9, 10]])) is None
-    changed = DeepSeekV41Media(
-        token_ids=media.token_ids[:-1] + (11,), images=media.images
-    )
-    with pytest.raises(ValueError, match="changed its media or prompt"):
+    changed = (Media(span=media[0].span, image=media[0].image + 1),)
+    with pytest.raises(ValueError, match="changed its media"):
         runner._validate_plan(plan_for(changed, 0, 5))
 
 
@@ -171,7 +157,7 @@ def test_image_validation_rejects_unbacked_or_mismatched_prompt_tokens():
         runner._validate_plan(
             BatchPlan(
                 sequence_ids=[1],
-                context_lengths=[0],
+                context_lengths=[2],
                 token_ids=[11],
                 token_indptr=[0, 1],
                 phase=BatchPhase.PREFILL,

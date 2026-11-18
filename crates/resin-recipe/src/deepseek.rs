@@ -1,5 +1,6 @@
 //! Checkpoint-owned DeepSeek V4.1 conversation rendering and DSML parsing.
 
+pub mod media;
 mod parser;
 
 use serde_json::Value;
@@ -279,7 +280,7 @@ pub struct DeepSeekV41RecipeParams {
     pub enable_thinking: Option<bool>,
     pub response_format: Option<Value>,
     #[serde(skip_serializing)]
-    pub vision_config: Option<crate::media::deepseek::Config>,
+    pub vision_config: Option<media::Processor>,
     #[serde(skip_serializing)]
     pub image_token_id: Option<u32>,
 }
@@ -330,6 +331,10 @@ impl DeepSeekV41Recipe {
     }
 }
 impl crate::Recipe for DeepSeekV41Recipe {
+    fn from_config(params: Value, _defaults: &crate::RecipeDefaults<'_>) -> Result<Self, Error> {
+        Self::new(crate::recipe::params(params)?)
+    }
+
     fn message_policy(&self) -> crate::MessagePolicy {
         crate::MessagePolicy {
             roles: &[
@@ -569,11 +574,11 @@ impl crate::Recipe for DeepSeekV41Recipe {
     fn stop_token_ids(&self, encoder: &dyn crate::Encoder) -> Result<Vec<u32>, crate::Error> {
         Ok(vec![encoder.special_id(EOS)?])
     }
-    fn media_config(&self) -> Option<crate::MediaConfig> {
-        Some(crate::MediaConfig::DeepSeek(
-            self.params.vision_config.clone().unwrap_or_default(),
-            self.params.image_token_id,
-        ))
+    fn media_processor(&self) -> Option<Box<dyn crate::MediaProcessor>> {
+        Some(Box::new(media::Processor {
+            image_token_id: self.params.image_token_id,
+            ..self.params.vision_config.clone().unwrap_or_default()
+        }))
     }
 }
 

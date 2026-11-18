@@ -5,7 +5,6 @@ Adapted from Hugging Face Transformers (Apache-2.0), revision
 The tower retains the checkpoint's BF16 weights; NVFP4 applies to the text MoE.
 """
 
-from bisect import bisect_left
 from collections.abc import Mapping, Sequence
 from contextlib import nullcontext
 from dataclasses import dataclass, fields
@@ -136,9 +135,7 @@ class VisionAttention(nn.Module):
         k = apply_rotary(self.k_norm(k), cos, sin)
         # Keep the image batch axis explicit so CUDA can select fused SDPA.
         # Avoid cuDNN's first-use plan build for each new image geometry.
-        with (
-            sdpa_kernel(SDPBackend.FLASH_ATTENTION) if x.is_cuda else nullcontext()
-        ):
+        with sdpa_kernel(SDPBackend.FLASH_ATTENTION) if x.is_cuda else nullcontext():
             out = F.scaled_dot_product_attention(
                 q.transpose(0, 1).unsqueeze(0),
                 k.transpose(0, 1).unsqueeze(0),
@@ -262,36 +259,3 @@ class GlmVisionModel(nn.Module):
         self, pixel_values: torch.Tensor, grid_thw: Sequence[Sequence[int]]
     ) -> torch.Tensor:
         return self(pixel_values, grid_thw)
-
-
-def replace_image_embeddings(
-    embeddings: torch.Tensor,
-    features: torch.Tensor,
-    image_positions: Sequence[int],
-    prompt_start: int,
-) -> torch.Tensor:
-    """Replace the image slots intersecting one absolute-position prefill chunk.
-
-    Features and positions retain full prompt order, including images before a
-    reused prefix. The caller caches features by the native payload's digest.
-    """
-    if (
-        embeddings.ndim != 2
-        or features.ndim != 2
-        or features.shape[1] != embeddings.shape[1]
-        or features.shape[0] != len(image_positions)
-    ):
-        raise ValueError(
-            "GLM image features do not match positions and embedding width"
-        )
-    if prompt_start < 0:
-        raise ValueError("GLM prefill start must be nonnegative")
-    first = bisect_left(image_positions, prompt_start)
-    last = bisect_left(image_positions, prompt_start + embeddings.shape[0])
-    if first != last:
-        slots = torch.tensor(
-            [p - prompt_start for p in image_positions[first:last]],
-            device=embeddings.device,
-        )
-        embeddings.index_copy_(0, slots, features[first:last].to(embeddings))
-    return embeddings

@@ -1,4 +1,4 @@
-"""Qwen3.5 MLX-VLM vision tower over the native recipe's patch rows."""
+"""Qwen3.5 MLX-VLM vision tower over packed image patches."""
 
 from __future__ import annotations
 

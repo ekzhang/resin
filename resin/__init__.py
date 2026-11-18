@@ -20,6 +20,7 @@ from resin._resin import (
     Engine,
     EngineMetrics,
     ForwardOutput,
+    Media,
     Parallelism,
     RequestLease,
     ResourceBinding,
@@ -35,7 +36,6 @@ from resin.cache_storage import CacheStorage, MemoryCacheStorage
 from resin.protocols import (
     CacheExporter,
     ManagedRunner,
-    MediaInput,
     MediaTokenSpan,
     Runner,
 )
@@ -55,9 +55,9 @@ __all__ = [
     "EngineMetrics",
     "ForwardOutput",
     "ManagedRunner",
+    "Media",
     "MemoryCacheStorage",
     "Parallelism",
-    "MediaInput",
     "MediaTokenSpan",
     "ResourceBinding",
     "RequestLease",

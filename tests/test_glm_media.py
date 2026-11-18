@@ -1,23 +1,15 @@
-"""GLM's native image processor, payload ownership, and transport contract."""
+"""GLM bitmap preprocessing and runner packing against pinned HF fixtures."""
 
 import json
 from pathlib import Path
-from typing import Any
 
 import numpy as np
 import pytest
 from test_glm_recipe import backend as backend
 
 import resin._resin as native
-from resin.recipe import (
-    Glm53FlashMedia,
-    Image,
-    Message,
-    Role,
-    Text,
-    Video,
-    get_native_recipe,
-)
+from resin.models.vision import image_grid, packed_images
+from resin.recipe import Image, Message, Role, Text, Video, get_native_recipe
 
 FIXTURE = Path(__file__).parent / "recipe_fuzz/templates/glm53_images_hf.npz"
 
@@ -37,18 +29,23 @@ def test_native_processor_matches_pinned_hf_geometry_pixels_and_padding(backend)
             == "50e35cc0ca18ec19b80653690de553e6decf74f5"
         )
         for case in metadata["cases"]:
-            name = case["name"]
-            media = render(backend, [fixture[name + "_input"]], **case["config"]).media
-            assert isinstance(media, Glm53FlashMedia)
-            np.testing.assert_array_equal(media.image_grid_thw, fixture[name + "_grid"])
-            np.testing.assert_allclose(
-                media.pixel_values,
-                fixture[name + "_pixels"],
-                atol=1e-5,
-                rtol=1e-5,
-                err_msg=name,
+            name, config = case["name"], case["config"]
+            media = render(backend, [fixture[name + "_input"]], **config).media
+            assert media and len(media) == 1 and isinstance(media[0], native.Media)
+            pixels, grid = packed_images(
+                media,
+                config.get("patch_size", 14),
+                merge=config.get("merge_size", 2),
+                temporal=config.get("temporal_patch_size", 2),
             )
-            assert len(media.image_positions) == np.prod(media.image_grid_thw) // 4
+            np.testing.assert_array_equal(grid, fixture[name + "_grid"])
+            np.testing.assert_allclose(
+                pixels, fixture[name + "_pixels"], atol=1e-5, rtol=1e-5, err_msg=name
+            )
+            assert (
+                media[0].span.length
+                == np.prod(grid) // config.get("merge_size", 2) ** 2
+            )
 
 
 def test_image_order_cache_identity_and_distributed_transport(backend):
@@ -56,64 +53,47 @@ def test_image_order_cache_identity_and_distributed_transport(backend):
     second = np.ones((56, 28, 3), dtype=np.float32)
     prompt = render(backend, [first, second], min_image_tokens=1)
     media = prompt.media
-    assert isinstance(media, Glm53FlashMedia)
-    assert media.image_grid_thw.tolist() == [[1, 2, 4], [1, 4, 2]]
-    np.testing.assert_array_equal(
-        media.pixel_values[:8],
-        render(backend, [first], min_image_tokens=1).media.pixel_values,
-    )
-    np.testing.assert_array_equal(
-        media.pixel_values[8:],
-        render(backend, [second], min_image_tokens=1).media.pixel_values,
-    )
-    assert len(media.image_positions) == 4
-    assert media.token_ids == tuple(prompt.token_ids)
-    assert all(
-        media.token_ids[p] == media.image_token_id for p in media.image_positions
-    )
-    assert media.image_positions[2] - media.image_positions[1] == 3
-    assert not media.token_spans  # Chunked prefill can cross image boundaries.
-    stored = media.pixel_values.copy()
+    assert media is not None
+    pixels, grid = packed_images(media, 14, merge=2, temporal=2)
+    assert grid.tolist() == [[1, 2, 4], [1, 4, 2]]
+    before = []
+    for item, source in zip(media, [first, second], strict=True):
+        image = item.image
+        single = render(backend, [source], min_image_tokens=1).media
+        assert image is not None and single is not None
+        np.testing.assert_array_equal(image, single[0].image)
+        before.append(image.copy())
+    positions = [p for item in media for p in range(item.span.position, sum(item.span))]
+    assert len(positions) == 4
+    assert all(prompt.token_ids[p] == prompt.token_ids[positions[0]] for p in positions)
+    assert positions[2] - positions[1] == 3
+    assert not any(item.atomic for item in media)
     first.fill(0.5)
     second.fill(0.25)
-    np.testing.assert_array_equal(stored, media.pixel_values)
-    changed = render(backend, [first, second], min_image_tokens=1).media
-    assert changed.token_ids == media.token_ids
-    assert changed.digest != media.digest and changed.cache_key != media.cache_key
-    for i, token in enumerate(media.token_ids):
-        if i not in media.image_positions:
-            assert media.cache_key[i] == token
+    changed = render(backend, [first, second], min_image_tokens=1)
+    assert changed.media is not None
+    np.testing.assert_array_equal(changed.token_ids, prompt.token_ids)
+    for item, different, stored in zip(media, changed.media, before, strict=True):
+        np.testing.assert_array_equal(item.image, stored)
+        assert item.digest != different.digest
     restored = native._media_from_buffers(*native._media_to_buffers(media))
-    assert isinstance(restored, Glm53FlashMedia)
-    assert restored.digest == media.digest and restored.cache_key == media.cache_key
-    assert restored.image_positions == media.image_positions
-    np.testing.assert_array_equal(restored.pixel_values, media.pixel_values)
-    np.testing.assert_array_equal(restored.image_grid_thw, media.image_grid_thw)
+    for item, copy in zip(media, restored, strict=True):
+        assert copy.span == item.span and copy.digest == item.digest
+        assert not np.shares_memory(item.image, copy.image)
+        np.testing.assert_array_equal(copy.image, item.image)
+    restored_pixels, restored_grid = packed_images(restored, 14, merge=2, temporal=2)
+    np.testing.assert_array_equal(restored_pixels, pixels)
+    np.testing.assert_array_equal(restored_grid, grid)
 
 
-def test_payload_rejects_mismatched_slots_grids_and_video(backend):
-    media = render(
-        backend, [np.zeros((28, 28, 3), np.float32)], min_image_tokens=1
-    ).media
-    values: dict[str, Any] = dict(
-        token_ids=media.token_ids,
-        image_positions=media.image_positions,
-        pixel_values=media.pixel_values,
-        image_grid_thw=media.image_grid_thw,
-        spatial_merge_size=2,
-        image_token_id=media.image_token_id,
-    )
-    for overrides in (
-        {"image_positions": [0]},
-        {"image_grid_thw": np.array([[2, 2, 2]], np.int64)},
-        {"image_grid_thw": np.array([[1, 3, 2]], np.int64)},
-        {"pixel_values": media.pixel_values[:-1]},
-        {"spatial_merge_size": 0},
-    ):
-        with pytest.raises(ValueError, match="GLM"):
-            arguments: dict[str, Any] = dict(values)
-            arguments.update(overrides)
-            Glm53FlashMedia(**arguments)
+def test_payload_rejects_mismatched_layout_and_video(backend):
+    with pytest.raises(ValueError, match="HWC"):
+        native.Media((0, 1), image=np.zeros((1, 3, 14, 14), np.float32))
+    unaligned = native.Media((0, 1), image=np.zeros((15, 28, 3), np.float32))
+    with pytest.raises(ValueError, match="geometry"):
+        image_grid((unaligned,), 14)
+    with pytest.raises(ValueError, match="geometry"):
+        packed_images((unaligned,), 14, merge=2, temporal=2)
     recipe = get_native_recipe("glm5_3_flash", backend)
     with pytest.raises(ValueError, match="video"):
         recipe.render(

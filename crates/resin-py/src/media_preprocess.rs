@@ -1,41 +1,92 @@
 //! Native recipe media preparation. Python is only the input/output buffer boundary.
 
-use std::{collections::VecDeque, mem::size_of, sync::Arc};
+use std::{
+    collections::VecDeque,
+    mem::size_of,
+    sync::{Arc, Mutex, MutexGuard},
+};
 
 use numpy::{PyReadonlyArrayDyn, PyUntypedArrayMethods};
 use pyo3::{
     prelude::*,
     types::{PyBytes, PyDict, PyString, PyTuple},
 };
-use pythonize::depythonize;
 use resin_recipe::{
-    Encoder, Error, MediaConfig,
-    media::{self, RgbImage, Source, Video},
+    Encoder, MediaProcessor, Prompt,
+    media::{self, Prepared, RgbImage, Source, Video},
 };
-use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
-use crate::{
-    media_payload::{
-        DeepSeekV41Image, DeepSeekV41Media, Gemma4Media, Glm53FlashMedia, Inkling2Media,
-        Qwen35Media, error,
-    },
-    recipe_media::MediaTokens,
-    recipe_types::MediaSources,
-};
+use crate::{media_payload::error, recipe_types::MediaSources};
 
-#[derive(Clone)]
-enum Payload {
-    DeepSeek(media::deepseek::Prepared, u32),
-    Gemma(media::gemma::Prepared, u32, u32),
-    Inkling2(media::inkling2::Prepared, u32),
-    Qwen(media::qwen::Prepared, usize, u32),
-    Glm(media::qwen::Prepared, usize, u32),
+type CacheInfo = [(&'static str, usize); 4];
+pub(crate) const EMPTY_CACHE_INFO: CacheInfo = [
+    ("entries", 0),
+    ("retained_bytes", 0),
+    ("hits", 0),
+    ("misses", 0),
+];
+pub(crate) struct Processor {
+    processor: Box<dyn MediaProcessor>,
+    cache: Mutex<PreparationCache>,
 }
-#[derive(Clone)]
-pub(crate) struct Prepared {
-    pub(crate) expansions: Vec<MediaTokens>,
-    payload: Payload,
+impl Processor {
+    pub(crate) fn new(processor: Box<dyn MediaProcessor>) -> Self {
+        Self {
+            processor,
+            cache: Mutex::default(),
+        }
+    }
+    fn cache(&self) -> MutexGuard<'_, PreparationCache> {
+        self.cache
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+    }
+    pub(crate) fn input_modalities(&self) -> &'static [&'static str] {
+        self.processor.input_modalities()
+    }
+    pub(crate) fn cache_info(&self) -> CacheInfo {
+        self.cache().info()
+    }
+    pub(crate) fn render(
+        &self,
+        py: Python<'_>,
+        prompt: Prompt,
+        sources: MediaSources,
+        encoder: &dyn Encoder,
+        cacheable: bool,
+    ) -> PyResult<(Vec<u32>, Py<PyTuple>)> {
+        let key = if cacheable {
+            cache_key(py, &sources)?
+        } else {
+            None
+        };
+        let cached = key.and_then(|key| self.cache().get(key));
+        // Cache lookup precedes decoding and resizing.
+        let sources = if cached.is_some() {
+            Vec::new()
+        } else {
+            self::sources(py, sources, self.processor.image_checkerboard())?
+        };
+        let (ids, spans, input) = py.detach(|| -> PyResult<_> {
+            let prepared = if let Some(prepared) = cached {
+                prepared
+            } else {
+                let prepared = Arc::new(self.processor.prepare(sources, encoder).map_err(error)?);
+                if let Some(key) = key {
+                    self.cache().insert(key, prepared.clone());
+                }
+                prepared
+            };
+            let (ids, spans) =
+                media::encode(prompt, &prepared.expansions, encoder).map_err(error)?;
+            // Cached tensors copy outside the GIL; uncached tensors move. Expansions never copy.
+            let input = Arc::try_unwrap(prepared).map_or_else(|p| p.items.clone(), |p| p.items);
+            Ok((ids, spans, input))
+        })?;
+        let media = crate::media_payload::bind(py, input, &spans)?;
+        Ok((ids, media))
+    }
 }
 
 pub(crate) type CacheKey = [u8; 32];
@@ -48,9 +99,8 @@ struct CacheEntry {
 
 /// Owned by one immutable native recipe, so processor/tokenizer configuration is
 /// implicit in the key. No Python object, source string, or conversation survives
-/// in this cache. Cache the ordered image set because its prepared tensors may
-/// share padded batch dimensions; bind positions against each new prompt.
-pub(crate) struct PreparationCache {
+/// in this cache. Image order is part of the key. Each prompt binds its own spans.
+struct PreparationCache {
     entries: VecDeque<CacheEntry>,
     retained_bytes: usize,
     max_entries: usize,
@@ -110,7 +160,7 @@ impl PreparationCache {
         });
     }
 
-    pub(crate) fn info(&self) -> [(&'static str, usize); 4] {
+    fn info(&self) -> CacheInfo {
         [
             ("entries", self.entries.len()),
             ("retained_bytes", self.retained_bytes),
@@ -157,295 +207,6 @@ pub(crate) fn cache_key(py: Python<'_>, sources: &MediaSources) -> PyResult<Opti
     Ok(Some(hash.finalize().into()))
 }
 
-fn vector_bytes<T>(values: &Vec<T>) -> usize {
-    values.capacity() * size_of::<T>()
-}
-
-fn tensor_bytes<T>(tensor: &media::Tensor<T>) -> usize {
-    vector_bytes(&tensor.shape) + vector_bytes(&tensor.data)
-}
-
-pub(crate) fn config_of(owner: &Bound<'_, PyAny>, name: &str) -> PyResult<Value> {
-    let Some(processor) = crate::recipe::optional_attr(owner, name)? else {
-        return Ok(json!({}));
-    };
-    if processor.is_none() || !processor.hasattr("to_dict")? {
-        return Ok(json!({}));
-    }
-    Ok(depythonize(&processor.call_method0("to_dict")?)?)
-}
-pub(crate) fn process(
-    config: &MediaConfig,
-    sources: Vec<Source>,
-    encoder: &dyn Encoder,
-) -> Result<Prepared, Error> {
-    let mut expansions = Vec::new();
-    if let MediaConfig::Gemma(config) = config {
-        let prepared = config.process(&sources)?;
-        let image_id = encoder.special_id("<|image|>")?;
-        let video_id = encoder.special_id("<|video|>")?;
-        let boi = encoder.special_id("<|image>")?;
-        let eoi = encoder.special_id("<image|>")?;
-        for expansion in &prepared.expansions {
-            let mut ids = Vec::new();
-            let mut prefix = String::new();
-            for (index, frame) in expansion.frames.iter().enumerate() {
-                if let Some(timestamp) = &frame.timestamp {
-                    let text = format!("{timestamp} ");
-                    if index == 0 {
-                        prefix = text;
-                    } else {
-                        ids.extend(encoder.encode_text(&format!(" {text}"))?);
-                    }
-                }
-                ids.push(boi);
-                ids.extend(std::iter::repeat_n(
-                    if expansion.is_video {
-                        video_id
-                    } else {
-                        image_id
-                    },
-                    frame.token_count,
-                ));
-                ids.push(eoi);
-            }
-            expansions.push(MediaTokens::from_parts(
-                if expansion.is_video {
-                    "<|video|>"
-                } else {
-                    "<|image|>"
-                },
-                ids,
-                prefix,
-                String::new(),
-            ));
-        }
-        return Ok(Prepared {
-            expansions,
-            payload: Payload::Gemma(prepared, image_id, video_id),
-        });
-    }
-    let images = sources
-        .into_iter()
-        .map(|source| match source {
-            Source::Image(image) => Ok(image),
-            Source::Video(_) => Err(Error::new("this recipe does not support video input")),
-        })
-        .collect::<Result<Vec<_>, _>>()?;
-    let (counts, marker, payload) = match config {
-        MediaConfig::DeepSeek(config, expected) => {
-            let id = encoder.special_id("<｜deepseek_image｜>")?;
-            if expected.is_some_and(|v| v != id) {
-                return Err(Error::new(
-                    "tokenizer image token does not match checkpoint image_token_id",
-                ));
-            }
-            let prepared = config.process(&images)?;
-            (
-                prepared.token_counts(),
-                "<｜deepseek_image｜>",
-                Payload::DeepSeek(prepared, id),
-            )
-        }
-        MediaConfig::Inkling2(config) => {
-            let id = encoder.special_id("<|unused_200054|>")?;
-            let prepared = config.process(&images)?;
-            (
-                prepared.token_counts.clone(),
-                "<|unused_200054|>",
-                Payload::Inkling2(prepared, id),
-            )
-        }
-        MediaConfig::Qwen(config) => {
-            let id = encoder.special_id("<|image_pad|>")?;
-            let prepared = config.process(&images)?;
-            (
-                prepared.token_counts.clone(),
-                "<|image_pad|>",
-                Payload::Qwen(prepared, config.merge_size, id),
-            )
-        }
-        MediaConfig::Glm(config) => {
-            let id = encoder.special_id("<|image|>")?;
-            let prepared = config.process(&images)?;
-            (
-                prepared.token_counts.clone(),
-                "<|image|>",
-                Payload::Glm(prepared, config.merge_size, id),
-            )
-        }
-        MediaConfig::Gemma(_) => unreachable!(),
-    };
-    let id = encoder.special_id(marker)?;
-    for count in counts {
-        expansions.push(MediaTokens::from_parts(
-            marker,
-            vec![id; count],
-            String::new(),
-            String::new(),
-        ));
-    }
-    Ok(Prepared {
-        expansions,
-        payload,
-    })
-}
-impl Prepared {
-    fn retained_bytes(&self) -> usize {
-        let payload = match &self.payload {
-            Payload::DeepSeek(data, _) => {
-                vector_bytes(&data.images)
-                    + data
-                        .images
-                        .iter()
-                        .map(|image| tensor_bytes(&image.patches) + vector_bytes(&image.types))
-                        .sum::<usize>()
-            }
-            Payload::Gemma(data, _, _) => {
-                data.pixel_values.as_ref().map_or(0, tensor_bytes)
-                    + data.image_position_ids.as_ref().map_or(0, tensor_bytes)
-                    + data.pixel_values_videos.as_ref().map_or(0, tensor_bytes)
-                    + data.video_position_ids.as_ref().map_or(0, tensor_bytes)
-                    + vector_bytes(&data.expansions)
-                    + data
-                        .expansions
-                        .iter()
-                        .map(|expansion| {
-                            vector_bytes(&expansion.frames)
-                                + expansion
-                                    .frames
-                                    .iter()
-                                    .map(|frame| {
-                                        frame.timestamp.as_ref().map_or(0, String::capacity)
-                                    })
-                                    .sum::<usize>()
-                        })
-                        .sum::<usize>()
-            }
-            Payload::Inkling2(data, _) => {
-                tensor_bytes(&data.pixel_values)
-                    + tensor_bytes(&data.image_grid_thw)
-                    + vector_bytes(&data.token_counts)
-            }
-            Payload::Qwen(data, _, _) | Payload::Glm(data, _, _) => {
-                tensor_bytes(&data.pixel_values)
-                    + tensor_bytes(&data.image_grid_thw)
-                    + vector_bytes(&data.token_counts)
-            }
-        };
-        size_of::<Self>()
-            + vector_bytes(&self.expansions)
-            + self
-                .expansions
-                .iter()
-                .map(MediaTokens::heap_bytes)
-                .sum::<usize>()
-            + payload
-    }
-
-    pub(crate) fn bind(
-        self,
-        py: Python<'_>,
-        token_ids: &[u32],
-        spans: &[(usize, usize)],
-    ) -> PyResult<Py<PyAny>> {
-        let tokens = token_ids.to_vec();
-        Ok(match self.payload {
-            Payload::Glm(data, merge, marker) => {
-                let positions = spans.iter().flat_map(|&(p, n)| p..p + n).collect();
-                Py::new(
-                    py,
-                    Glm53FlashMedia::build(
-                        py,
-                        tokens,
-                        positions,
-                        data.pixel_values,
-                        data.image_grid_thw,
-                        merge,
-                        marker,
-                    )?,
-                )?
-                .into_any()
-            }
-            Payload::Inkling2(data, marker) => Py::new(
-                py,
-                Inkling2Media::build(
-                    py,
-                    tokens,
-                    marker,
-                    Some(data.pixel_values),
-                    Some(data.image_grid_thw),
-                )?,
-            )?
-            .into_any(),
-            Payload::Qwen(data, merge, marker) => {
-                let positions = spans.iter().flat_map(|&(p, n)| p..p + n).collect();
-                Py::new(
-                    py,
-                    Qwen35Media::build(
-                        py,
-                        tokens,
-                        positions,
-                        data.pixel_values,
-                        data.image_grid_thw,
-                        merge,
-                        marker,
-                    )?,
-                )?
-                .into_any()
-            }
-            Payload::Gemma(data, image_id, video_id) => {
-                let mut types = vec![0u8; tokens.len()];
-                for &(position, length) in spans {
-                    for i in position..position + length {
-                        types[i] = if tokens[i] == image_id {
-                            1
-                        } else if tokens[i] == video_id {
-                            2
-                        } else {
-                            0
-                        };
-                    }
-                }
-                Py::new(
-                    py,
-                    Gemma4Media::build(
-                        py,
-                        tokens,
-                        types,
-                        data.pixel_values,
-                        data.image_position_ids,
-                        data.pixel_values_videos,
-                        data.video_position_ids,
-                    )?,
-                )?
-                .into_any()
-            }
-            Payload::DeepSeek(data, marker) => {
-                let images = data
-                    .images
-                    .into_iter()
-                    .zip(spans)
-                    .map(|(image, &(start, _))| {
-                        Py::new(
-                            py,
-                            DeepSeekV41Image::build(
-                                py,
-                                start,
-                                image.patches,
-                                image.n_vit_h,
-                                image.n_vit_w,
-                                image.types,
-                            )?,
-                        )
-                    })
-                    .collect::<PyResult<Vec<_>>>()?;
-                Py::new(py, DeepSeekV41Media::build(py, tokens, images, marker)?)?.into_any()
-            }
-        })
-    }
-}
-
 pub(crate) fn image_source(
     py: Python<'_>,
     source: &Bound<'_, PyAny>,
@@ -468,6 +229,13 @@ pub(crate) fn image_source(
     let array = source
         .extract::<PyReadonlyArrayDyn<'_, f32>>()
         .map_err(|_| error("images must be numpy arrays with dtype float32"))?;
+    rgb_array(array, std::convert::identity)
+}
+
+fn rgb_array<T: numpy::Element + Copy>(
+    array: PyReadonlyArrayDyn<'_, T>,
+    pixel: impl Fn(T) -> f32,
+) -> PyResult<RgbImage> {
     let shape = array.shape();
     if shape.len() != 3 || shape[2] != 3 {
         return Err(error("images must have RGB/HWC shape [height, width, 3]"));
@@ -475,7 +243,7 @@ pub(crate) fn image_source(
     RgbImage::new(
         shape[1],
         shape[0],
-        array.as_array().iter().copied().collect(),
+        array.as_array().iter().copied().map(pixel).collect(),
     )
     .map_err(error)
 }
@@ -504,22 +272,7 @@ fn video_source(py: Python<'_>, source: &Bound<'_, PyAny>) -> PyResult<Video> {
     for frame in frames.try_iter()? {
         let frame = frame?;
         if let Ok(array) = frame.extract::<PyReadonlyArrayDyn<'_, u8>>() {
-            let shape = array.shape();
-            if shape.len() != 3 || shape[2] != 3 {
-                return Err(error("video frames must be RGB/HWC"));
-            }
-            images.push(
-                RgbImage::new(
-                    shape[1],
-                    shape[0],
-                    array
-                        .as_array()
-                        .iter()
-                        .map(|&v| f32::from(v) / 255.)
-                        .collect(),
-                )
-                .map_err(error)?,
-            );
+            images.push(rgb_array(array, |v| f32::from(v) / 255.)?);
         } else {
             images.push(image_source(py, &frame, false)?);
         }
@@ -554,23 +307,16 @@ mod tests {
     use super::*;
 
     fn prepared(capacity: usize) -> Arc<Prepared> {
-        let mut data = Vec::with_capacity(capacity);
-        data.push(1.0);
+        let mut expansions = Vec::with_capacity(capacity);
+        expansions.push(media::MediaTokens::from_parts(
+            "image",
+            vec![1],
+            String::new(),
+            String::new(),
+        ));
         Arc::new(Prepared {
-            expansions: vec![MediaTokens::from_parts(
-                "image",
-                vec![1],
-                String::new(),
-                String::new(),
-            )],
-            payload: Payload::Inkling2(
-                media::inkling2::Prepared {
-                    pixel_values: media::Tensor::new(vec![1], data).unwrap(),
-                    image_grid_thw: media::Tensor::new(vec![1, 3], vec![1, 1, 1]).unwrap(),
-                    token_counts: vec![1],
-                },
-                1,
-            ),
+            expansions,
+            items: vec![],
         })
     }
 
@@ -612,13 +358,16 @@ mod tests {
     }
 
     #[test]
-    fn preparation_cache_accounts_for_tensor_spare_capacity_and_metadata() {
+    fn preparation_cache_accounts_for_spare_capacity_and_metadata() {
         let small = prepared(1);
         let large = prepared(1024);
-        assert!(large.retained_bytes() >= 1024 * size_of::<f32>() + size_of::<Prepared>());
+        assert!(
+            large.retained_bytes()
+                >= 1024 * size_of::<media::MediaTokens>() + size_of::<Prepared>()
+        );
         assert_eq!(
             large.retained_bytes() - small.retained_bytes(),
-            1023 * size_of::<f32>()
+            1023 * size_of::<media::MediaTokens>()
         );
     }
 }

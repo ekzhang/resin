@@ -5,11 +5,98 @@ use image::{ImageBuffer, ImageFormat, Rgb, imageops::FilterType};
 
 use crate::Error;
 
-pub mod deepseek;
-pub mod gemma;
-pub mod glm;
-pub mod inkling2;
-pub mod qwen;
+mod prompt;
+pub use prompt::{MediaTokens, encode};
+
+/// Resized RGB bitmaps and their placeholder ranges within one source expansion.
+#[derive(Clone)]
+pub enum Input {
+    Image {
+        pixels: Tensor<f32>,
+        span: (usize, usize),
+        atomic: bool,
+    },
+    Video {
+        frames: Vec<Tensor<f32>>,
+        frame_spans: Vec<(usize, usize)>,
+        fps: f64,
+        frame_indices: Vec<usize>,
+        atomic: bool,
+    },
+}
+impl Input {
+    fn heap_bytes(&self) -> usize {
+        match self {
+            Self::Image { pixels, .. } => pixels.heap_bytes(),
+            Self::Video {
+                frames,
+                frame_spans,
+                frame_indices,
+                ..
+            } => {
+                vector_bytes(frames)
+                    + vector_bytes(frame_spans)
+                    + vector_bytes(frame_indices)
+                    + frames.iter().map(Tensor::heap_bytes).sum::<usize>()
+            }
+        }
+    }
+}
+
+/// Model-independent media and token expansions. Tensor packing belongs to runners.
+#[derive(Clone)]
+pub struct Prepared {
+    pub expansions: Vec<MediaTokens>,
+    pub items: Vec<Input>,
+}
+impl Prepared {
+    pub fn new(expansions: Vec<MediaTokens>, items: Vec<Input>) -> Self {
+        Self { expansions, items }
+    }
+    pub fn retained_bytes(&self) -> usize {
+        std::mem::size_of::<Self>()
+            + vector_bytes(&self.expansions)
+            + vector_bytes(&self.items)
+            + self
+                .expansions
+                .iter()
+                .map(MediaTokens::heap_bytes)
+                .sum::<usize>()
+            + self.items.iter().map(Input::heap_bytes).sum::<usize>()
+    }
+}
+
+pub(crate) fn bitmap(
+    mut image: RgbImage,
+    normalize: bool,
+    mean: [f32; 3],
+    std: [f32; 3],
+) -> Result<Tensor<f32>, Error> {
+    if normalize {
+        for (index, pixel) in image.data.iter_mut().enumerate() {
+            *pixel = (*pixel - mean[index % 3]) / std[index % 3];
+        }
+    }
+    Tensor::new(vec![image.height, image.width, 3], image.data)
+}
+
+pub(crate) fn vector_bytes<T>(values: &Vec<T>) -> usize {
+    values.capacity() * std::mem::size_of::<T>()
+}
+
+pub(crate) fn images(sources: Vec<Source>) -> Result<Vec<RgbImage>, Error> {
+    sources
+        .into_iter()
+        .map(|source| match source {
+            Source::Image(image) => Ok(image),
+            Source::Video(_) => Err(Error::new("this recipe does not support video input")),
+        })
+        .collect()
+}
+
+pub(crate) fn image_tokens(marker: &str, id: u32, count: usize) -> MediaTokens {
+    MediaTokens::from_parts(marker, vec![id; count], String::new(), String::new())
+}
 
 #[derive(Clone, Debug)]
 pub struct Tensor<T> {
@@ -18,6 +105,10 @@ pub struct Tensor<T> {
 }
 
 impl<T> Tensor<T> {
+    pub fn heap_bytes(&self) -> usize {
+        vector_bytes(&self.shape) + vector_bytes(&self.data)
+    }
+
     pub fn new(shape: Vec<usize>, data: Vec<T>) -> Result<Self, Error> {
         if shape.iter().try_fold(1usize, |n, &d| n.checked_mul(d)) != Some(data.len()) {
             return Err(Error::new("media tensor shape does not match its storage"));
@@ -54,10 +145,6 @@ impl RgbImage {
             height,
             data,
         })
-    }
-
-    pub fn decode(data: &[u8], media_type: &str) -> Result<Self, Error> {
-        Self::decode_with_background(data, media_type, false)
     }
 
     pub fn decode_with_background(
@@ -104,10 +191,6 @@ impl RgbImage {
             decoded.height() as usize,
             decoded.into_raw(),
         )
-    }
-
-    pub fn data_url(source: &str) -> Result<Self, Error> {
-        Self::data_url_with_background(source, false)
     }
 
     pub fn data_url_with_background(source: &str, checkerboard: bool) -> Result<Self, Error> {
@@ -161,38 +244,6 @@ pub enum Source {
     Video(Video),
 }
 
-/// Append merge-block-major patches, each laid out as channel/time/height/width.
-fn append_patches(
-    output: &mut Vec<f32>,
-    [grid_h, grid_w]: [usize; 2],
-    patch: usize,
-    merge: usize,
-    temporal: usize,
-    pixel: impl Fn(usize, usize, usize) -> f32,
-) {
-    for block_y in 0..grid_h / merge {
-        for block_x in 0..grid_w / merge {
-            for merge_y in 0..merge {
-                for merge_x in 0..merge {
-                    for channel in 0..3 {
-                        for _ in 0..temporal {
-                            for y in 0..patch {
-                                for x in 0..patch {
-                                    output.push(pixel(
-                                        (block_y * merge + merge_y) * patch + y,
-                                        (block_x * merge + merge_x) * patch + x,
-                                        channel,
-                                    ));
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
-}
-
 pub fn resize_filter(value: u32) -> Result<FilterType, Error> {
     match value {
         0 => Ok(FilterType::Nearest),
@@ -200,5 +251,30 @@ pub fn resize_filter(value: u32) -> Result<FilterType, Error> {
         2 => Ok(FilterType::Triangle),
         3 => Ok(FilterType::CatmullRom),
         _ => Err(Error::new("unsupported image resampling filter")),
+    }
+}
+
+#[cfg(test)]
+pub(crate) mod tests {
+    pub fn pixels(prepared: &super::Prepared, index: usize) -> &super::Tensor<f32> {
+        match &prepared.items[index] {
+            super::Input::Image { pixels, .. } => pixels,
+            _ => panic!("expected image"),
+        }
+    }
+    pub struct Encoder;
+    impl crate::Encoder for Encoder {
+        fn encode_text(&self, text: &str) -> Result<Vec<u32>, crate::Error> {
+            Ok(text.bytes().map(u32::from).collect())
+        }
+        fn special_id(&self, token: &str) -> Result<u32, crate::Error> {
+            Ok(match token {
+                "<|image|>" => 1001,
+                "<|video|>" => 1002,
+                "<|image>" => 1003,
+                "<image|>" => 1004,
+                _ => 1000,
+            })
+        }
     }
 }

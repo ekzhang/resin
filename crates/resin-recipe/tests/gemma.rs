@@ -68,10 +68,10 @@ fn pinned_hf_template_rendering() {
 fn edge_checkpoint_generation_prefix_matches_pinned_hf_template() {
     // google/gemma-4-E2B-it@3e22461f65e89153144f8adb70e3b8c2cc9845a7
     // ends at the model header without adding an empty thought channel.
-    let recipe = Gemma4Recipe::new(resin_recipe::gemma::Gemma4RecipeParams {
+    let recipe = Gemma4Recipe {
         empty_thought_prefix: Some(false),
         ..Default::default()
-    });
+    };
     let prompt = recipe
         .render(&json!({"messages":[{"role":"user","content":"Hello"}]}))
         .unwrap();

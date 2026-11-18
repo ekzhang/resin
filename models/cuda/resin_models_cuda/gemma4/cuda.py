@@ -60,7 +60,9 @@ from resin.models.gemma4.plan import (
     expand_gemma4_decode_batch,
     gemma4_assistant_context,
 )
-from resin.recipe import Gemma4Media
+from resin.models.vision import media_identity, media_key, padded_patches, span_slices
+from resin.protocols import MediaTokenSpan
+from resin.recipe import Media
 from resin_models_cuda.gemma4.assistant_checkpoint import (
     DEFAULT_ASSISTANT,
     load_assistant,
@@ -202,10 +204,11 @@ class _DevicePagedPlan:
 
 @dataclass(frozen=True, slots=True)
 class _MediaFeatures:
-    media: Gemma4Media
+    media: tuple[Media, ...]
     image: Tensor | None
     video: Tensor | None
-    positions: dict[int, tuple[str, int]]
+    image_spans: tuple[MediaTokenSpan, ...]
+    video_spans: tuple[MediaTokenSpan, ...]
 
 
 class Gemma4CudaRunner(CudaRunner):
@@ -604,58 +607,75 @@ class Gemma4CudaRunner(CudaRunner):
         )
         return self._local_decode, self._global_decode
 
-    def _features_for(self, sequence_id: int, media: Gemma4Media) -> _MediaFeatures:
+    def _features_for(
+        self, sequence_id: int, media: tuple[Media, ...]
+    ) -> _MediaFeatures:
         existing = self._media_features.get(sequence_id)
         if existing is not None:
-            if existing.media is not media:
+            if media_identity(existing.media) != media_identity(media):
                 raise ValueError("a live Gemma 4 sequence changed its media object")
             return existing
-        media.validate_placeholder_tokens(
-            image_token_id=self.config.image_token_id,
-            video_token_id=self.config.video_token_id,
-        )
-        cached = self._vision_feature_cache.get(media.vision_digest)
+        config = self._model.transformers_config.vision_config
+        side = config.patch_size * config.pooling_kernel_size
+        for item in media:
+            bitmaps, spans = (
+                ((item.image,), (item.span,))
+                if item.image is not None
+                else (item.video, item.video_frame_spans)
+            )
+            if bitmaps is None:
+                raise ValueError("Gemma vision requires image or video media")
+            for bitmap, span in zip(bitmaps, spans, strict=True):
+                height, width = bitmap.shape[:2]
+                if (
+                    height % side
+                    or width % side
+                    or (height // side) * (width // side) != span[1]
+                ):
+                    raise ValueError(
+                        "Gemma image geometry does not match its placeholder span"
+                    )
+        cached = self._vision_feature_cache.get(media_key(media))
+        image_spans = [item.span for item in media if item.image is not None]
+        video_spans = [
+            span
+            for item in media
+            if item.video is not None
+            for span in item.video_frame_spans
+        ]
         if cached is None:
+            images = [item.image for item in media if item.image is not None]
+            frames = [
+                frame
+                for item in media
+                if item.video is not None
+                for frame in item.video
+            ]
+            patch_size = config.patch_size
+            encoded = []
             with torch.inference_mode():
-                image = None
-                if media.pixel_values is not None:
-                    assert media.image_position_ids is not None
-                    image = self._model.get_image_features(
-                        torch.from_numpy(media.pixel_values).to(
-                            self.device, dtype=torch.bfloat16
-                        ),
-                        torch.from_numpy(media.image_position_ids).to(self.device),
+                for bitmaps, video in ((images, False), (frames, True)):
+                    if not bitmaps:
+                        encoded.append(None)
+                        continue
+                    pixels, coordinates = padded_patches(bitmaps, patch_size)
+                    pixels = torch.from_numpy(pixels).to(
+                        self.device, dtype=torch.bfloat16
                     )
-                video = None
-                if media.pixel_values_videos is not None:
-                    assert media.video_position_ids is not None
-                    video = self._model.get_video_features(
-                        torch.from_numpy(media.pixel_values_videos).to(
-                            self.device, dtype=torch.bfloat16
-                        ),
-                        torch.from_numpy(media.video_position_ids).to(self.device),
+                    coordinates = torch.from_numpy(coordinates).to(self.device)
+                    encoded.append(
+                        self._model.get_video_features(pixels[None], coordinates[None])
+                        if video
+                        else self._model.get_image_features(pixels, coordinates)
                     )
-            if image is not None and len(image) != len(media.image_positions):
-                raise ValueError("vision features do not match image placeholder count")
-            if video is not None and len(video) != len(media.video_positions):
-                raise ValueError("vision features do not match video placeholder count")
-            cached = self._vision_feature_cache.put(media.vision_digest, (image, video))
+            cached = self._vision_feature_cache.put(media_key(media), tuple(encoded))
         image, video = cached
-        if image is not None and len(image) != len(media.image_positions):
-            raise ValueError("vision features do not match image placeholder count")
-        if video is not None and len(video) != len(media.video_positions):
-            raise ValueError("vision features do not match video placeholder count")
-        positions = {
-            position: ("image", index)
-            for index, position in enumerate(media.image_positions)
-        }
-        positions.update(
-            {
-                position: ("video", index)
-                for index, position in enumerate(media.video_positions)
-            }
+        for tensor, spans in ((image, image_spans), (video, video_spans)):
+            if tensor is not None and len(tensor) != sum(length for _, length in spans):
+                raise ValueError("vision features do not match media placeholder count")
+        features = _MediaFeatures(
+            media, image, video, tuple(image_spans), tuple(video_spans)
         )
-        features = _MediaFeatures(media, image, video, positions)
         self._media_features[sequence_id] = features
         return features
 
@@ -664,24 +684,19 @@ class Gemma4CudaRunner(CudaRunner):
 
     @staticmethod
     def _validate_unsplit_vision_blocks(
-        media: Gemma4Media, query_start: int, query_end: int
+        media: tuple[Media, ...], query_start: int, query_end: int
     ) -> None:
-        blocks = media.block_ids
-        for position in range(query_start, min(query_end, len(blocks))):
-            block = blocks[position]
-            if block < 0:
-                continue
-            start = position
-            while start and blocks[start - 1] == block:
-                start -= 1
-            end = position + 1
-            while end < len(blocks) and blocks[end] == block:
-                end += 1
-            if start < query_start or end > query_end:
-                raise ValueError(
-                    "a Gemma 4 vision block crosses a prefill chunk boundary; "
-                    "reduce earlier prompt length or increase the runner chunk size"
-                )
+        for item in media:
+            for start, length in item.video_frame_spans or (item.span,):
+                end = start + length
+                if (
+                    start < query_end
+                    and query_start < end
+                    and (start < query_start or end > query_end)
+                ):
+                    raise ValueError(
+                        "a Gemma 4 vision block crosses a prefill chunk boundary"
+                    )
 
     def _merge_media_embeddings(
         self,
@@ -694,36 +709,33 @@ class Gemma4CudaRunner(CudaRunner):
         for row, media in enumerate(native.media):
             if media is None:
                 continue
-            if not isinstance(media, Gemma4Media):
-                raise TypeError("Gemma4CudaRunner media must be Gemma4Media")
             start, end = map(int, batch.token_indptr[row : row + 2])
             positions = batch.positions[start:end]
-            prompt_tokens = media.token_ids
-            for flat_index, position in zip(range(start, end), positions, strict=True):
-                absolute = int(position)
-                if absolute < len(prompt_tokens) and (
-                    int(batch.token_ids[flat_index]) != prompt_tokens[absolute]
-                ):
-                    raise ValueError(
-                        "scheduled token does not match Gemma4Media prompt"
-                    )
-            vision_positions = set(media.image_positions + media.video_positions)
-            if not any(int(position) in vision_positions for position in positions):
+            spans = [
+                span
+                for item in media
+                for span in (item.video_frame_spans or (item.span,))
+            ]
+            if not any(
+                begin < int(positions[-1]) + 1 and int(positions[0]) < begin + length
+                for begin, length in spans
+            ):
                 continue
             self._validate_unsplit_vision_blocks(
                 media, int(positions[0]), int(positions[-1]) + 1
             )
             features = self._features_for(int(sequence_ids[row]), media)
             features_by_row[row] = features
-            for flat_index, position in zip(range(start, end), positions, strict=True):
-                absolute = int(position)
-                location = features.positions.get(absolute)
-                if location is None:
+            for tensor, spans in (
+                (features.image, features.image_spans),
+                (features.video, features.video_spans),
+            ):
+                if tensor is None:
                     continue
-                kind, feature_index = location
-                source = features.image if kind == "image" else features.video
-                assert source is not None
-                hidden[flat_index].copy_(source[feature_index])
+                for destination, source in span_slices(
+                    spans, int(positions[0]), int(positions[-1]) + 1
+                ):
+                    hidden[start:end][destination].copy_(tensor[source])
         return features_by_row
 
     def _local_custom_mask(
@@ -743,13 +755,13 @@ class Gemma4CudaRunner(CudaRunner):
             allowed = (keys <= query) & (keys >= query - self.sliding_window + 1)
             features = features_by_row.get(row)
             if features is not None:
-                block_ids = np.asarray(features.media.block_ids, dtype=np.int64)
-                query_blocks = np.full(query.shape, -1, dtype=np.int64)
-                key_blocks = np.full(keys.shape, -1, dtype=np.int64)
-                valid_q = query[:, 0] < len(block_ids)
-                valid_k = keys[0] < len(block_ids)
-                query_blocks[valid_q, 0] = block_ids[query[valid_q, 0]]
-                key_blocks[0, valid_k] = block_ids[keys[0, valid_k]]
+                query_blocks = np.full(query.shape, -1, dtype=np.int32)
+                key_blocks = np.full(keys.shape, -1, dtype=np.int32)
+                for block, (begin, length) in enumerate(
+                    (*features.image_spans, *features.video_spans)
+                ):
+                    query_blocks[(query >= begin) & (query < begin + length)] = block
+                    key_blocks[(keys >= begin) & (keys < begin + length)] = block
                 same = (query_blocks >= 0) & (query_blocks == key_blocks)
                 if np.any(same & ~allowed):
                     any_bidirectional = True

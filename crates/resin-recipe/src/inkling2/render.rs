@@ -53,8 +53,13 @@ fn emit_effort(prompt: &mut Prompt, effort: &str) {
 }
 
 impl crate::Recipe for Inkling2Recipe {
+    fn from_config(mut params: Value, defaults: &crate::RecipeDefaults<'_>) -> Result<Self, Error> {
+        crate::recipe::default(&mut params, "media_config", || defaults("image_processor"))?;
+        crate::recipe::params(params)
+    }
+
     fn render(&self, request: &Value) -> Result<crate::Prompt, crate::Error> {
-        let options = crate::recipe::options("inkling2", &self.params, request)?;
+        let options = crate::recipe::options("inkling2", self, request)?;
         let messages = request["messages"]
             .as_array()
             .ok_or_else(|| Error::new("messages must be an array"))?;
@@ -229,9 +234,7 @@ impl crate::Recipe for Inkling2Recipe {
     fn stop_token_ids(&self, encoder: &dyn crate::Encoder) -> Result<Vec<u32>, crate::Error> {
         Ok(vec![encoder.special_id("<|content_model_end_sampling|>")?])
     }
-    fn media_config(&self) -> Option<crate::MediaConfig> {
-        Some(crate::MediaConfig::Inkling2(
-            self.params.media_config.clone().unwrap_or_default(),
-        ))
+    fn media_processor(&self) -> Option<Box<dyn crate::MediaProcessor>> {
+        Some(Box::new(self.media_config.clone().unwrap_or_default()))
     }
 }

@@ -2,6 +2,7 @@
 //! Source: nvidia/GLM-5.3-Flash-NVFP4@da920bb0b9f4a06727223a349e55468e38352348.
 //! The original Z.AI MIT notice is retained in licenses/glm-MIT.txt.
 
+pub mod media;
 mod parser;
 pub use parser::{GlmParser, GlmTokens};
 
@@ -18,22 +19,12 @@ const TOOL_SUFFIX: &str = "</tools>\n\nFor each function call, output the functi
 /// instruction; `clear_thinking` removes reasoning before the latest user turn.
 #[derive(Clone, Debug, Default, serde::Deserialize, serde::Serialize)]
 #[serde(default, deny_unknown_fields)]
-pub struct Glm53FlashRecipeParams {
+pub struct Glm53FlashRecipe {
     pub add_generation_prompt: Option<bool>,
     pub reasoning_effort: Option<String>,
     pub clear_thinking: Option<bool>,
     #[serde(skip_serializing)]
-    pub media_config: Option<crate::media::glm::Config>,
-}
-
-#[derive(Clone, Debug, Default)]
-pub struct Glm53FlashRecipe {
-    params: Glm53FlashRecipeParams,
-}
-impl Glm53FlashRecipe {
-    pub fn new(params: Glm53FlashRecipeParams) -> Self {
-        Self { params }
-    }
+    pub media_config: Option<media::Processor>,
 }
 
 fn visible_content(value: &Value) -> Result<Prompt, Error> {
@@ -199,10 +190,13 @@ fn tool_block(
 }
 
 impl crate::Recipe for Glm53FlashRecipe {
-    fn media_config(&self) -> Option<crate::MediaConfig> {
-        Some(crate::MediaConfig::Glm(
-            self.params.media_config.clone().unwrap_or_default(),
-        ))
+    fn from_config(mut params: Value, defaults: &crate::RecipeDefaults<'_>) -> Result<Self, Error> {
+        crate::recipe::default(&mut params, "media_config", || defaults("image_processor"))?;
+        crate::recipe::params(params)
+    }
+
+    fn media_processor(&self) -> Option<Box<dyn crate::MediaProcessor>> {
+        Some(Box::new(self.media_config.clone().unwrap_or_default()))
     }
     fn message_policy(&self) -> crate::MessagePolicy {
         crate::MessagePolicy {
@@ -211,7 +205,7 @@ impl crate::Recipe for Glm53FlashRecipe {
         }
     }
     fn render(&self, request: &Value) -> Result<Prompt, Error> {
-        let options = crate::recipe::options("GLM-5.3-Flash", &self.params, request)?;
+        let options = crate::recipe::options("GLM-5.3-Flash", self, request)?;
         let messages = messages(request, "GLM-5.3-Flash")?;
         let effort = match options.reasoning_effort.as_deref() {
             Some("low") => "Low",
