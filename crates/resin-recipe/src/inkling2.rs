@@ -1,4 +1,4 @@
-pub mod media;
+mod media;
 mod render;
 
 use crate::parser::{EventSink, Grammar, Parser, emit_tool, tokens};
@@ -138,6 +138,6 @@ impl Grammar for Inkling2Grammar {
 pub struct Inkling2Recipe {
     pub add_generation_prompt: Option<bool>,
     pub reasoning_effort: Option<crate::ReasoningEffort>,
-    #[serde(skip_serializing)]
-    pub media_config: Option<media::Processor>,
+    #[serde(skip_serializing, deserialize_with = "crate::recipe::default_if_null")]
+    pub media_config: media::Config,
 }

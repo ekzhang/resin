@@ -5,7 +5,7 @@ use std::{
     sync::{Arc, Mutex, OnceLock},
 };
 
-use crate::media_preprocess;
+use crate::media_preprocess::MediaCache;
 use crate::recipe_events::{self, ParserEvent};
 use crate::recipe_types::{MediaSources, Message, RenderOptions, Role, Tool};
 use numpy::PyArray1;
@@ -407,7 +407,7 @@ pub(crate) struct NativeRecipe {
     recipe: Box<dyn resin_recipe::Recipe>,
     id: u64,
     stop_token_ids: OnceLock<Vec<u32>>,
-    media_processor: Option<media_preprocess::Processor>,
+    media_cache: MediaCache,
 }
 impl NativeRecipe {
     pub(crate) fn resolved_stop_token_ids(&self) -> PyResult<&[u32]> {
@@ -492,13 +492,16 @@ impl NativeRecipe {
                 None,
             )
         } else {
-            let processor = self
-                .media_processor
-                .as_ref()
-                .ok_or_else(|| PyValueError::new_err("this recipe does not support media"))?;
+            let modalities = self.recipe.input_modalities();
+            if let Some((kind, _)) = sources.iter().find(|(kind, _)| !modalities.contains(kind)) {
+                return Err(PyValueError::new_err(format!(
+                    "this recipe does not support media of type {kind}"
+                )));
+            }
             let prompt = py.detach(|| self.recipe.render(&request).map_err(recipe_error))?;
-            let (ids, media) = processor.render(
+            let (ids, media) = self.media_cache.render(
                 py,
+                self.recipe.as_ref(),
                 prompt,
                 sources,
                 self.encoder.as_ref(),
@@ -521,13 +524,7 @@ impl NativeRecipe {
 #[pymethods]
 impl NativeRecipe {
     fn _media_preparation_cache_info(&self) -> HashMap<&'static str, usize> {
-        self.media_processor
-            .as_ref()
-            .map_or(media_preprocess::EMPTY_CACHE_INFO, |processor| {
-                processor.cache_info()
-            })
-            .into_iter()
-            .collect()
+        self.media_cache.info().into_iter().collect()
     }
 
     #[getter]
@@ -537,10 +534,7 @@ impl NativeRecipe {
 
     #[getter]
     fn input_modalities(&self) -> Vec<&'static str> {
-        self.media_processor
-            .as_ref()
-            .map_or(&["text"][..], |processor| processor.input_modalities())
-            .to_vec()
+        self.recipe.input_modalities().to_vec()
     }
     #[pyo3(signature=(messages: "Sequence[Message]", *, tools: "Sequence[Tool]" = Vec::new(), options=None))]
     pub(crate) fn render(
@@ -678,9 +672,6 @@ fn native_recipe<R: resin_recipe::Recipe + 'static>(
             .into_inner()
             .unwrap_or_else(|| recipe_error(error))
     })?;
-    let media_processor = recipe
-        .media_processor()
-        .map(media_preprocess::Processor::new);
     static NEXT_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
     let original_tokenizer = optional_attr(owner, "tokenizer")?.unwrap_or_else(|| owner.clone());
     let tokenizer = RecipeTokenizer::new(&original_tokenizer)?;
@@ -690,7 +681,7 @@ fn native_recipe<R: resin_recipe::Recipe + 'static>(
         recipe: Box::new(recipe),
         id: NEXT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
         stop_token_ids: stop_token_ids.map(OnceLock::from).unwrap_or_default(),
-        media_processor,
+        media_cache: MediaCache::default(),
     })
 }
 

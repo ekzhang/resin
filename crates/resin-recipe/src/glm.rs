@@ -2,7 +2,7 @@
 //! Source: nvidia/GLM-5.3-Flash-NVFP4@da920bb0b9f4a06727223a349e55468e38352348.
 //! The original Z.AI MIT notice is retained in licenses/glm-MIT.txt.
 
-pub mod media;
+mod media;
 mod parser;
 pub use parser::{GlmParser, GlmTokens};
 
@@ -23,8 +23,8 @@ pub struct Glm53FlashRecipe {
     pub add_generation_prompt: Option<bool>,
     pub reasoning_effort: Option<String>,
     pub clear_thinking: Option<bool>,
-    #[serde(skip_serializing)]
-    pub media_config: Option<media::Processor>,
+    #[serde(skip_serializing, deserialize_with = "crate::recipe::default_if_null")]
+    pub media_config: media::Config,
 }
 
 fn visible_content(value: &Value) -> Result<Prompt, Error> {
@@ -195,8 +195,15 @@ impl crate::Recipe for Glm53FlashRecipe {
         crate::recipe::params(params)
     }
 
-    fn media_processor(&self) -> Option<Box<dyn crate::MediaProcessor>> {
-        Some(Box::new(self.media_config.clone().unwrap_or_default()))
+    fn input_modalities(&self) -> &'static [&'static str] {
+        &["text", "image"]
+    }
+    fn prepare_media(
+        &self,
+        sources: Vec<crate::media::Source>,
+        encoder: &dyn crate::Encoder,
+    ) -> Result<crate::media::Prepared, Error> {
+        self.media_config.prepare(sources, encoder)
     }
     fn message_policy(&self) -> crate::MessagePolicy {
         crate::MessagePolicy {

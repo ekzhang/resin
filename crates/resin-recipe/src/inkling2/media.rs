@@ -22,7 +22,7 @@ impl Default for Size {
 
 #[derive(Clone, Debug, Deserialize)]
 #[serde(default)]
-pub struct Processor {
+pub struct Config {
     pub size: Size,
     pub do_normalize: bool,
     pub do_rescale: bool,
@@ -30,11 +30,12 @@ pub struct Processor {
     pub image_mean: [f32; 3],
     pub image_std: [f32; 3],
 }
-impl crate::MediaProcessor for Processor {
-    fn image_checkerboard(&self) -> bool {
-        true
-    }
-    fn prepare(&self, sources: Vec<Source>, encoder: &dyn Encoder) -> Result<Prepared, Error> {
+impl Config {
+    pub(super) fn prepare(
+        &self,
+        sources: Vec<Source>,
+        encoder: &dyn Encoder,
+    ) -> Result<Prepared, Error> {
         let marker = "<|unused_200054|>";
         let image_token_id = encoder.special_id(marker)?;
         if self.size.height == 0 || self.size.height != self.size.width {
@@ -100,7 +101,7 @@ impl crate::MediaProcessor for Processor {
     }
 }
 
-impl Default for Processor {
+impl Default for Config {
     fn default() -> Self {
         Self {
             size: Size::default(),
@@ -116,14 +117,13 @@ impl Default for Processor {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::MediaProcessor;
     use crate::media::{RgbImage, tests::Encoder};
     fn image(width: usize, height: usize) -> RgbImage {
         RgbImage::new(width, height, vec![0.5; width * height * 3]).unwrap()
     }
     #[test]
     fn exact_patch_multiples_do_not_add_a_column() {
-        let result = Processor::default()
+        let result = Config::default()
             .prepare(
                 [image(40, 40), image(80, 40), image(39, 41), image(41, 39)]
                     .into_iter()
@@ -149,12 +149,12 @@ mod tests {
     }
     #[test]
     fn padding_is_negative_one_on_the_byte_scale() {
-        let config = Processor {
+        let config = Config {
             size: Size {
                 height: 2,
                 width: 2,
             },
-            ..Processor::default()
+            ..Config::default()
         };
         let image = RgbImage::new(2, 1, vec![0.0, 0.5, 1.0, 0.25, 0.75, 0.5]).unwrap();
         let result = config

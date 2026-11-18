@@ -234,7 +234,17 @@ impl crate::Recipe for Inkling2Recipe {
     fn stop_token_ids(&self, encoder: &dyn crate::Encoder) -> Result<Vec<u32>, crate::Error> {
         Ok(vec![encoder.special_id("<|content_model_end_sampling|>")?])
     }
-    fn media_processor(&self) -> Option<Box<dyn crate::MediaProcessor>> {
-        Some(Box::new(self.media_config.clone().unwrap_or_default()))
+    fn input_modalities(&self) -> &'static [&'static str] {
+        &["text", "image"]
+    }
+    fn image_checkerboard(&self) -> bool {
+        true
+    }
+    fn prepare_media(
+        &self,
+        sources: Vec<crate::media::Source>,
+        encoder: &dyn crate::Encoder,
+    ) -> Result<crate::media::Prepared, Error> {
+        self.media_config.prepare(sources, encoder)
     }
 }

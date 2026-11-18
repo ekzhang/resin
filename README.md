@@ -179,8 +179,9 @@ requests. `Engine` has no default EOS token.
 For chat, a recipe returns a `RenderedPrompt`. Submit its `token_ids` explicitly
 and pass `media=rendered.media` for multimodal requests. Media is a tuple of
 immutable `Media` objects containing a prompt span and a normalized RGB image,
-a tuple of video frames, or audio samples. Model runners pack these buffers for their vision
-or audio encoders.
+a tuple of video frames, or audio samples. Gemma's recipe inserts timestamps
+and delimiters between frames and records each frame's visual token range in
+`video_frame_spans`. Model runners pack these buffers for their encoders.
 
 A custom synchronous runner only needs one method:
 

@@ -1,6 +1,6 @@
 //! Gemma 4's turn, thought-channel, and structured tool-call format.
 
-pub mod media;
+mod media;
 mod values;
 
 use serde_json::Value;
@@ -230,8 +230,8 @@ pub struct Gemma4Recipe {
     /// Older 31B templates close an empty thought channel in the generation
     /// prefix. The original Edge checkpoints instead end at the model header.
     pub empty_thought_prefix: Option<bool>,
-    #[serde(skip_serializing)]
-    pub media_config: Option<media::Processor>,
+    #[serde(skip_serializing, deserialize_with = "crate::recipe::default_if_null")]
+    pub media_config: media::Config,
 }
 
 impl crate::Recipe for Gemma4Recipe {
@@ -449,7 +449,14 @@ impl crate::Recipe for Gemma4Recipe {
             encoder.special_id("<eos>")?,
         ])
     }
-    fn media_processor(&self) -> Option<Box<dyn crate::MediaProcessor>> {
-        Some(Box::new(self.media_config.clone().unwrap_or_default()))
+    fn input_modalities(&self) -> &'static [&'static str] {
+        &["text", "image", "video"]
+    }
+    fn prepare_media(
+        &self,
+        sources: Vec<crate::media::Source>,
+        encoder: &dyn crate::Encoder,
+    ) -> Result<crate::media::Prepared, Error> {
+        self.media_config.prepare(sources, encoder)
     }
 }

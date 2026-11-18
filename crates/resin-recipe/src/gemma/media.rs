@@ -70,16 +70,17 @@ impl Default for VideoConfig {
 }
 #[derive(Clone, Debug, Default, Deserialize)]
 #[serde(default)]
-pub struct Processor {
+pub struct Config {
     pub image_processor: PatchConfig,
     pub video_processor: VideoConfig,
 }
 
-impl crate::MediaProcessor for Processor {
-    fn input_modalities(&self) -> &'static [&'static str] {
-        &["text", "image", "video"]
-    }
-    fn prepare(&self, sources: Vec<Source>, encoder: &dyn Encoder) -> Result<Prepared, Error> {
+impl Config {
+    pub(super) fn prepare(
+        &self,
+        sources: Vec<Source>,
+        encoder: &dyn Encoder,
+    ) -> Result<Prepared, Error> {
         let image_id = encoder.special_id("<|image|>")?;
         let video_id = encoder.special_id("<|video|>")?;
         let boi = encoder.special_id("<|image>")?;
@@ -306,10 +307,10 @@ fn timestamp(index: usize, fps: f64) -> Result<String, Error> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{MediaProcessor, media::tests::Encoder};
+    use crate::media::tests::Encoder;
     use serde_json::json;
 
-    fn config() -> Processor {
+    fn config() -> Config {
         serde_json::from_value(json!({
             "image_processor": {"patch_size":2,"pooling_kernel_size":1,"max_soft_tokens":70,"do_resize":false},
             "video_processor": {"patch_size":2,"pooling_kernel_size":1,"max_soft_tokens":70,"do_resize":false,"num_frames":2}
@@ -410,7 +411,7 @@ mod tests {
     }
     #[test]
     fn partial_configs_keep_distinct_image_and_video_defaults() {
-        let cfg: Processor = serde_json::from_value(json!({
+        let cfg: Config = serde_json::from_value(json!({
             "image_processor": {"patch_size":1,"pooling_kernel_size":1,"do_resize":false,"image_mean":0.5},
             "video_processor": {"patch_size":1,"pooling_kernel_size":1,"do_resize":false,"image_mean":0.5,"do_sample_frames":false}
         })).unwrap();

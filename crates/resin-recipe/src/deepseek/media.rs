@@ -11,7 +11,7 @@ use crate::{Encoder, Error};
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(default)]
-pub struct Processor {
+pub struct Config {
     pub image_token_id: Option<u32>,
     pub patch_size: usize,
     pub downsample_ratio: usize,
@@ -20,8 +20,12 @@ pub struct Processor {
     pub max_wh_ratio: Option<f64>,
 }
 
-impl crate::MediaProcessor for Processor {
-    fn prepare(&self, sources: Vec<Source>, encoder: &dyn Encoder) -> Result<Prepared, Error> {
+impl Config {
+    pub(super) fn prepare(
+        &self,
+        sources: Vec<Source>,
+        encoder: &dyn Encoder,
+    ) -> Result<Prepared, Error> {
         let marker = "<｜deepseek_image｜>";
         let image_token_id = encoder.special_id(marker)?;
         if self
@@ -53,7 +57,7 @@ impl crate::MediaProcessor for Processor {
     }
 }
 
-impl Default for Processor {
+impl Default for Config {
     fn default() -> Self {
         Self {
             image_token_id: None,
@@ -66,7 +70,7 @@ impl Default for Processor {
     }
 }
 
-impl Processor {
+impl Config {
     fn validate(&self) -> Result<(), Error> {
         if self.patch_size != 14 || self.downsample_ratio != 3 {
             return Err(Error::new(
@@ -202,7 +206,6 @@ fn pad(image: &RgbImage, width: usize, height: usize) -> Result<RgbImage, Error>
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::MediaProcessor;
     use crate::media::tests::Encoder;
 
     #[test]
@@ -212,9 +215,9 @@ mod tests {
         ))
         .unwrap();
         for case in fixtures["cases"].as_array().unwrap() {
-            let config = Processor {
+            let config = Config {
                 max_wh_ratio: case["max_wh_ratio"].as_f64(),
-                ..Processor::default()
+                ..Config::default()
             };
             let (w, h) = (
                 case["width"].as_u64().unwrap() as usize,
@@ -234,7 +237,7 @@ mod tests {
 
     #[test]
     fn geometry_matches_official_recipe_for_varied_aspect_ratios() {
-        let config = Processor::default();
+        let config = Config::default();
         // Token counts from deepseek-recipe 0.2.0's image_token_adjustment + 1.
         // Check large and extreme dimensions without allocating image pixels.
         for (width, height, expected) in [
@@ -255,9 +258,9 @@ mod tests {
 
     #[test]
     fn bitmap_preserves_rgb_order_and_bfloat16_normalization() {
-        let config = Processor {
+        let config = Config {
             min_pixels: 0,
-            ..Processor::default()
+            ..Config::default()
         };
         let (width, height) = (28, 14);
         let data = (0..height)
@@ -297,28 +300,40 @@ mod tests {
 
     #[test]
     fn invalid_geometry_options_fail_before_processing() {
-        assert!(Processor::default().grid(0, 32).is_err());
-        assert!(Processor::default().grid(usize::MAX, 32).is_err());
+        use crate::{Recipe, deepseek::DeepSeekV41Recipe};
+
+        for (outer, nested) in [(1000, 1001), (1001, 1000)] {
+            let recipe = DeepSeekV41Recipe::from_config(
+                serde_json::json!({"image_token_id": outer, "vision_config": {"image_token_id": nested}}),
+                &|_| unreachable!(),
+            ).unwrap();
+            assert_eq!(
+                recipe.prepare_media(vec![], &Encoder).is_ok(),
+                outer == 1000
+            );
+        }
+        assert!(Config::default().grid(0, 32).is_err());
+        assert!(Config::default().grid(usize::MAX, 32).is_err());
         assert!(
-            Processor {
+            Config {
                 patch_size: 16,
-                ..Processor::default()
+                ..Config::default()
             }
             .prepare(vec![], &Encoder)
             .is_err()
         );
         assert!(
-            Processor {
+            Config {
                 max_wh_ratio: Some(f64::NAN),
-                ..Processor::default()
+                ..Config::default()
             }
             .grid(2, 2)
             .is_err()
         );
         assert!(
-            Processor {
+            Config {
                 max_image_tokens: 3,
-                ..Processor::default()
+                ..Config::default()
             }
             .grid(2, 2)
             .is_err()

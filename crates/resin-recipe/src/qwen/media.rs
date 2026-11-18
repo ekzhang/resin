@@ -24,7 +24,7 @@ impl Default for Size {
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(default)]
-pub struct Processor {
+pub struct Config {
     pub size: Size,
     pub min_pixels: Option<usize>,
     pub max_pixels: Option<usize>,
@@ -38,8 +38,12 @@ pub struct Processor {
     pub resample: u32,
 }
 
-impl crate::MediaProcessor for Processor {
-    fn prepare(&self, sources: Vec<Source>, encoder: &dyn Encoder) -> Result<Prepared, Error> {
+impl Config {
+    pub(super) fn prepare(
+        &self,
+        sources: Vec<Source>,
+        encoder: &dyn Encoder,
+    ) -> Result<Prepared, Error> {
         let marker = "<|image_pad|>";
         let image_token_id = encoder.special_id(marker)?;
         self.validate()?;
@@ -66,7 +70,7 @@ impl crate::MediaProcessor for Processor {
     }
 }
 
-impl Default for Processor {
+impl Default for Config {
     fn default() -> Self {
         Self {
             size: Size::default(),
@@ -84,7 +88,7 @@ impl Default for Processor {
     }
 }
 
-impl Processor {
+impl Config {
     fn validate(&self) -> Result<(usize, usize, usize), Error> {
         let min = self.min_pixels.unwrap_or(self.size.shortest_edge);
         let max = self.max_pixels.unwrap_or(self.size.longest_edge);
@@ -160,25 +164,39 @@ impl Processor {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::MediaProcessor;
     use crate::media::{RgbImage, tests::Encoder};
 
     #[test]
     fn checkpoint_config_and_smart_resize() {
-        let config: Processor = serde_json::from_value(serde_json::json!({
+        use crate::{Recipe, qwen::OrnithRecipe};
+
+        for params in [
+            serde_json::json!({}),
+            serde_json::json!({"media_config": null}),
+            serde_json::json!({"media_config": {}}),
+        ] {
+            let recipe = OrnithRecipe::from_config(params, &|_| Ok(serde_json::json!({}))).unwrap();
+            assert!(recipe.prepare_media(vec![], &Encoder).is_ok());
+            let text_only = OrnithRecipe::new(crate::qwen::QwenRecipeParams {
+                text_only: true,
+                ..Default::default()
+            });
+            assert!(text_only.prepare_media(vec![], &Encoder).is_err());
+        }
+        let config: Config = serde_json::from_value(serde_json::json!({
             "size": {"shortest_edge":65536,"longest_edge":16777216},
             "patch_size":16,"temporal_patch_size":2,"merge_size":2,
             "image_mean":[0.5,0.5,0.5],"image_std":[0.5,0.5,0.5],"do_rescale":true
         }))
         .unwrap();
         assert_eq!(
-            serde_json::to_value(Processor::default()).unwrap(),
+            serde_json::to_value(Config::default()).unwrap(),
             serde_json::to_value(&config).unwrap()
         );
         assert_eq!(config.resize_shape(64, 64).unwrap(), (256, 256));
         assert_eq!(config.resize_shape(512, 256).unwrap(), (256, 512));
         assert_eq!(config.resize_shape(80, 80).unwrap(), (256, 256));
-        let small = Processor {
+        let small = Config {
             min_pixels: Some(1),
             ..config
         };
@@ -189,14 +207,14 @@ mod tests {
 
     #[test]
     fn bitmap_normalization_and_placeholder_geometry_match_hf() {
-        let config = Processor {
+        let config = Config {
             patch_size: 2,
             temporal_patch_size: 2,
             merge_size: 2,
             do_resize: false,
             image_mean: [0.5; 3],
             image_std: [0.5; 3],
-            ..Processor::default()
+            ..Config::default()
         };
         let (width, height) = (8, 4);
         let data = (0..height)
@@ -221,43 +239,43 @@ mod tests {
     #[test]
     fn malformed_sizes_and_normalization_fail_without_allocating_pixels() {
         for config in [
-            Processor {
+            Config {
                 patch_size: 0,
-                ..Processor::default()
+                ..Config::default()
             },
-            Processor {
+            Config {
                 patch_size: usize::MAX,
-                ..Processor::default()
+                ..Config::default()
             },
-            Processor {
+            Config {
                 temporal_patch_size: usize::MAX,
-                ..Processor::default()
+                ..Config::default()
             },
-            Processor {
+            Config {
                 min_pixels: Some(0),
-                ..Processor::default()
+                ..Config::default()
             },
-            Processor {
+            Config {
                 max_pixels: Some(1),
-                ..Processor::default()
+                ..Config::default()
             },
-            Processor {
+            Config {
                 image_std: [0.0; 3],
-                ..Processor::default()
+                ..Config::default()
             },
-            Processor {
+            Config {
                 image_mean: [f32::NAN; 3],
-                ..Processor::default()
+                ..Config::default()
             },
         ] {
             assert!(config.prepare(vec![], &Encoder).is_err());
         }
-        assert!(Processor::default().resize_shape(0, 32).is_err());
-        assert!(Processor::default().resize_shape(usize::MAX, 32).is_err());
+        assert!(Config::default().resize_shape(0, 32).is_err());
+        assert!(Config::default().resize_shape(usize::MAX, 32).is_err());
         assert!(
-            Processor {
+            Config {
                 do_resize: false,
-                ..Processor::default()
+                ..Config::default()
             }
             .resize_shape(31, 32)
             .is_err()

@@ -7,11 +7,12 @@ configuration, renderer, parser, message policy and stop markers.
 
 `Recipe::from_config` resolves model defaults through a lazy provider for processor
 metadata and dates. `render` validates request controls against those defaults;
-parsers use the same recipe and rendered prefix. `Recipe::media_processor` returns
-a boxed `MediaProcessor`, such as `qwen::media::Processor`, which declares supported
-modalities, prepares normalized RGB bitmaps and expands media placeholders.
-Processors return the same `Prepared` type; one Python adapter handles preparation
-caching, prompt encoding and binding to immutable `Media` objects.
+parsers use the same recipe and rendered prefix. The recipe also declares input
+modalities and prepares normalized RGB bitmaps and media placeholders through
+`prepare_media`. Its private `media` module owns the family's settings and pixel
+processing. Settings are parsed once; preparation borrows them and returns the
+shared `Prepared` type. One Python adapter handles preparation caching, prompt
+encoding and binding to immutable `Media` objects.
 
 Model code describes format rules. Shared `Parser<G>` owns token batching,
 decoder boundaries, EOS handling and finalization; each grammar handles only

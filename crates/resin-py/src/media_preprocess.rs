@@ -12,7 +12,7 @@ use pyo3::{
     types::{PyBytes, PyDict, PyString, PyTuple},
 };
 use resin_recipe::{
-    Encoder, MediaProcessor, Prompt,
+    Encoder, Prompt, Recipe,
     media::{self, Prepared, RgbImage, Source, Video},
 };
 use sha2::{Digest, Sha256};
@@ -20,37 +20,20 @@ use sha2::{Digest, Sha256};
 use crate::{media_payload::error, recipe_types::MediaSources};
 
 type CacheInfo = [(&'static str, usize); 4];
-pub(crate) const EMPTY_CACHE_INFO: CacheInfo = [
-    ("entries", 0),
-    ("retained_bytes", 0),
-    ("hits", 0),
-    ("misses", 0),
-];
-pub(crate) struct Processor {
-    processor: Box<dyn MediaProcessor>,
-    cache: Mutex<PreparationCache>,
-}
-impl Processor {
-    pub(crate) fn new(processor: Box<dyn MediaProcessor>) -> Self {
-        Self {
-            processor,
-            cache: Mutex::default(),
-        }
-    }
+#[derive(Default)]
+pub(crate) struct MediaCache(Mutex<PreparationCache>);
+
+impl MediaCache {
     fn cache(&self) -> MutexGuard<'_, PreparationCache> {
-        self.cache
-            .lock()
-            .unwrap_or_else(|poison| poison.into_inner())
+        self.0.lock().unwrap_or_else(|poison| poison.into_inner())
     }
-    pub(crate) fn input_modalities(&self) -> &'static [&'static str] {
-        self.processor.input_modalities()
-    }
-    pub(crate) fn cache_info(&self) -> CacheInfo {
+    pub(crate) fn info(&self) -> CacheInfo {
         self.cache().info()
     }
     pub(crate) fn render(
         &self,
         py: Python<'_>,
+        recipe: &dyn Recipe,
         prompt: Prompt,
         sources: MediaSources,
         encoder: &dyn Encoder,
@@ -66,13 +49,13 @@ impl Processor {
         let sources = if cached.is_some() {
             Vec::new()
         } else {
-            self::sources(py, sources, self.processor.image_checkerboard())?
+            self::sources(py, sources, recipe.image_checkerboard())?
         };
         let (ids, spans, input) = py.detach(|| -> PyResult<_> {
             let prepared = if let Some(prepared) = cached {
                 prepared
             } else {
-                let prepared = Arc::new(self.processor.prepare(sources, encoder).map_err(error)?);
+                let prepared = Arc::new(recipe.prepare_media(sources, encoder).map_err(error)?);
                 if let Some(key) = key {
                     self.cache().insert(key, prepared.clone());
                 }
@@ -89,7 +72,7 @@ impl Processor {
     }
 }
 
-pub(crate) type CacheKey = [u8; 32];
+type CacheKey = [u8; 32];
 
 struct CacheEntry {
     key: CacheKey,
@@ -127,7 +110,7 @@ impl PreparationCache {
         }
     }
 
-    pub(crate) fn get(&mut self, key: CacheKey) -> Option<Arc<Prepared>> {
+    fn get(&mut self, key: CacheKey) -> Option<Arc<Prepared>> {
         let Some(index) = self.entries.iter().position(|entry| entry.key == key) else {
             self.misses = self.misses.saturating_add(1);
             return None;
@@ -139,7 +122,7 @@ impl PreparationCache {
         Some(prepared)
     }
 
-    pub(crate) fn insert(&mut self, key: CacheKey, prepared: Arc<Prepared>) {
+    fn insert(&mut self, key: CacheKey, prepared: Arc<Prepared>) {
         // Include tensor capacities, metadata, Arc counters, and entry storage.
         let bytes = prepared.retained_bytes() + 2 * size_of::<usize>() + size_of::<CacheEntry>();
         if self.max_entries == 0 || bytes > self.max_bytes {
@@ -177,7 +160,7 @@ fn hash_field(hash: &mut Sha256, value: &[u8]) {
 
 /// Hash encoded immutable sources before decoding. Mutable arrays/bytearrays and
 /// videos follow the uncached path; object identity is never a content key.
-pub(crate) fn cache_key(py: Python<'_>, sources: &MediaSources) -> PyResult<Option<CacheKey>> {
+fn cache_key(py: Python<'_>, sources: &MediaSources) -> PyResult<Option<CacheKey>> {
     if sources.is_empty() || sources.iter().any(|(kind, _)| *kind != "image") {
         return Ok(None);
     }
@@ -207,7 +190,7 @@ pub(crate) fn cache_key(py: Python<'_>, sources: &MediaSources) -> PyResult<Opti
     Ok(Some(hash.finalize().into()))
 }
 
-pub(crate) fn image_source(
+fn image_source(
     py: Python<'_>,
     source: &Bound<'_, PyAny>,
     checkerboard: bool,
@@ -287,11 +270,7 @@ fn video_source(py: Python<'_>, source: &Bound<'_, PyAny>) -> PyResult<Video> {
         frame_indices,
     })
 }
-pub(crate) fn sources(
-    py: Python<'_>,
-    sources: MediaSources,
-    checkerboard: bool,
-) -> PyResult<Vec<Source>> {
+fn sources(py: Python<'_>, sources: MediaSources, checkerboard: bool) -> PyResult<Vec<Source>> {
     sources
         .into_iter()
         .map(|(kind, source)| match kind {

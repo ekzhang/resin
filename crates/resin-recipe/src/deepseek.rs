@@ -1,6 +1,6 @@
 //! Checkpoint-owned DeepSeek V4.1 conversation rendering and DSML parsing.
 
-pub mod media;
+mod media;
 mod parser;
 
 use serde_json::Value;
@@ -279,8 +279,8 @@ pub struct DeepSeekV41RecipeParams {
     pub thinking_mode: Option<String>,
     pub enable_thinking: Option<bool>,
     pub response_format: Option<Value>,
-    #[serde(skip_serializing)]
-    pub vision_config: Option<media::Processor>,
+    #[serde(skip_serializing, deserialize_with = "crate::recipe::default_if_null")]
+    pub vision_config: media::Config,
     #[serde(skip_serializing)]
     pub image_token_id: Option<u32>,
 }
@@ -292,6 +292,7 @@ pub struct DeepSeekV41Recipe {
 
 impl DeepSeekV41Recipe {
     pub fn new(mut params: DeepSeekV41RecipeParams) -> Result<Self, Error> {
+        params.vision_config.image_token_id = params.image_token_id;
         if let Some(enabled) = params.enable_thinking.take() {
             let mode = if enabled { "thinking" } else { "chat" };
             if params
@@ -574,11 +575,15 @@ impl crate::Recipe for DeepSeekV41Recipe {
     fn stop_token_ids(&self, encoder: &dyn crate::Encoder) -> Result<Vec<u32>, crate::Error> {
         Ok(vec![encoder.special_id(EOS)?])
     }
-    fn media_processor(&self) -> Option<Box<dyn crate::MediaProcessor>> {
-        Some(Box::new(media::Processor {
-            image_token_id: self.params.image_token_id,
-            ..self.params.vision_config.clone().unwrap_or_default()
-        }))
+    fn input_modalities(&self) -> &'static [&'static str] {
+        &["text", "image"]
+    }
+    fn prepare_media(
+        &self,
+        sources: Vec<crate::media::Source>,
+        encoder: &dyn crate::Encoder,
+    ) -> Result<crate::media::Prepared, Error> {
+        self.params.vision_config.prepare(sources, encoder)
     }
 }
 

@@ -29,8 +29,18 @@ pub trait Recipe: Send + Sync {
         prompt_ids: &[u32],
     ) -> Result<Box<dyn ResponseParser>, Error>;
     fn stop_token_ids(&self, encoder: &dyn Encoder) -> Result<Vec<u32>, Error>;
-    fn media_processor(&self) -> Option<Box<dyn MediaProcessor>> {
-        None
+    fn input_modalities(&self) -> &'static [&'static str] {
+        &["text"]
+    }
+    fn image_checkerboard(&self) -> bool {
+        false
+    }
+    fn prepare_media(
+        &self,
+        _: Vec<crate::media::Source>,
+        _: &dyn Encoder,
+    ) -> Result<crate::media::Prepared, Error> {
+        Err(Error::new("this recipe does not support media"))
     }
 }
 
@@ -69,23 +79,6 @@ pub enum BlockKind {
     Result,
 }
 
-/// Model-owned media decoding, preprocessing and token expansion.
-pub trait MediaProcessor: Send + Sync {
-    fn prepare(
-        &self,
-        _: Vec<crate::media::Source>,
-        _: &dyn Encoder,
-    ) -> Result<crate::media::Prepared, Error> {
-        Err(Error::new("this recipe does not support media"))
-    }
-    fn input_modalities(&self) -> &'static [&'static str] {
-        &["text", "image"]
-    }
-    fn image_checkerboard(&self) -> bool {
-        false
-    }
-}
-
 /// Effort controls that accept either an API name or a numeric model budget.
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(untagged)]
@@ -96,6 +89,14 @@ pub enum ReasoningEffort {
 
 pub(crate) fn params<T: DeserializeOwned>(value: Value) -> Result<T, Error> {
     serde_json::from_value(value).map_err(|error| Error::new(error.to_string()))
+}
+
+pub(crate) fn default_if_null<'de, D, T>(deserializer: D) -> Result<T, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de> + Default,
+{
+    Ok(Option::<T>::deserialize(deserializer)?.unwrap_or_default())
 }
 
 pub(crate) fn default(

@@ -1,6 +1,6 @@
 //! Qwen3.5, Qwen3.8 and Ornith conversation formats.
 
-pub mod media;
+mod media;
 mod parser;
 pub use parser::{QwenParser, QwenTokens};
 
@@ -92,8 +92,8 @@ pub struct QwenRecipeParams {
     /// Rejects media for runners that serve only the language model.
     #[serde(skip_serializing)]
     pub text_only: bool,
-    #[serde(skip_serializing)]
-    pub media_config: Option<media::Processor>,
+    #[serde(skip_serializing, deserialize_with = "crate::recipe::default_if_null")]
+    pub media_config: media::Config,
 }
 
 /// Checkpoint template variants rendered by [`QwenRecipe`].
@@ -343,10 +343,21 @@ impl<const FORMAT: u8> crate::Recipe for QwenRecipe<FORMAT> {
             encoder.special_id("<|endoftext|>")?,
         ])
     }
-    fn media_processor(&self) -> Option<Box<dyn crate::MediaProcessor>> {
-        (!self.params.text_only).then(|| {
-            Box::new(self.params.media_config.clone().unwrap_or_default())
-                as Box<dyn crate::MediaProcessor>
-        })
+    fn input_modalities(&self) -> &'static [&'static str] {
+        if self.params.text_only {
+            &["text"]
+        } else {
+            &["text", "image"]
+        }
+    }
+    fn prepare_media(
+        &self,
+        sources: Vec<crate::media::Source>,
+        encoder: &dyn crate::Encoder,
+    ) -> Result<crate::media::Prepared, Error> {
+        if self.params.text_only {
+            return Err(Error::new("this recipe does not support media"));
+        }
+        self.params.media_config.prepare(sources, encoder)
     }
 }

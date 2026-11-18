@@ -7,7 +7,7 @@ use crate::{Encoder, Error};
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(default)]
-pub struct Processor {
+pub struct Config {
     pub patch_size: usize,
     pub temporal_patch_size: usize,
     pub merge_size: usize,
@@ -20,8 +20,12 @@ pub struct Processor {
     pub image_std: [f32; 3],
     pub resample: u8,
 }
-impl crate::MediaProcessor for Processor {
-    fn prepare(&self, sources: Vec<Source>, encoder: &dyn Encoder) -> Result<Prepared, Error> {
+impl Config {
+    pub(super) fn prepare(
+        &self,
+        sources: Vec<Source>,
+        encoder: &dyn Encoder,
+    ) -> Result<Prepared, Error> {
         let marker = "<|image|>";
         let image_token_id = encoder.special_id(marker)?;
         self.factor()?;
@@ -72,7 +76,7 @@ impl crate::MediaProcessor for Processor {
     }
 }
 
-impl Default for Processor {
+impl Default for Config {
     fn default() -> Self {
         Self {
             patch_size: 14,
@@ -89,7 +93,7 @@ impl Default for Processor {
         }
     }
 }
-impl Processor {
+impl Config {
     fn factor(&self) -> Result<usize, Error> {
         let factor = self
             .patch_size
