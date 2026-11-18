@@ -1126,7 +1126,6 @@ impl Engine {
     ) -> PyResult<Vec<Py<TokenEvent>>> {
         self.core.raise_if_open().map_err(core_error)?;
         self.core.poll_storage(false).map_err(core_error)?;
-        let mut events = Vec::new();
         if self.pending.is_some() {
             let feedback = if self.overlap
                 && allow_overlap
@@ -1151,70 +1150,13 @@ impl Engine {
             // cannot safely launch the next reserved position (for example a
             // small-batch attention plan). Inspect before consuming a batch ID
             // or constructing conservative continuation metadata.
-            let next = if feedback.is_some() {
-                self.core.continuation_plan().map_err(core_error)?
-            } else {
-                None
-            };
-            if let Some(next) = next {
-                let next_plan = Py::new(py, planning::from_core(next))?;
-                let kwargs = pyo3::types::PyDict::new(py);
-                kwargs.set_item("feedback", feedback.expect("continuation has feedback"))?;
-                let enqueue = self
-                    .runner_enqueue
-                    .as_ref()
-                    .expect("pending runner can enqueue");
-                let result = match enqueue.bind(py).call((&next_plan,), Some(&kwargs)) {
-                    Ok(result) => result.unbind(),
-                    Err(error) => {
-                        self.core
-                            .poison_message(format!("overlapped enqueue failed: {error}"));
-                        return Err(error);
-                    }
-                };
-                let asynchronous = match runner_result_is_async(result.bind(py)) {
-                    Ok(asynchronous) => asynchronous,
-                    Err(error) => {
-                        self.failed_executions.push(result);
-                        self.core.poison_message(format!(
-                            "accepted completion inspection failed: {error}"
-                        ));
-                        return Err(error);
-                    }
-                };
-                if !asynchronous {
-                    // Distributed peers may collectively choose a synchronous
-                    // fallback. It still executed the future step, so harvest
-                    // and commit both results without releasing pages between.
-                    let previous_events = match self.harvest(py, true) {
-                        Ok(events) => events,
-                        Err(error) => {
-                            self.failed_executions.push(result);
-                            return Err(error);
-                        }
-                    };
-                    events.extend(previous_events);
-                    events.extend(self.consume_output(py, &next_plan, result.bind(py), false)?);
-                    return Ok(events);
-                }
-                let previous_events = match self.harvest(py, true) {
-                    Ok(events) => events,
-                    Err(error) => {
-                        self.failed_executions.push(result);
-                        return Err(error);
-                    }
-                };
-                self.pending = Some(PendingExecution {
-                    plan: next_plan,
-                    completion: result,
-                });
-                self.overlap_enqueues += 1;
-                self.overlap_continuations += 1;
-                events.extend(previous_events);
-            } else {
-                events.extend(self.harvest(py, false)?);
+            if let Some(feedback) = feedback
+                && let Some(next) = self.core.continuation_plan().map_err(core_error)?
+            {
+                let plan = Py::new(py, planning::from_core(next))?;
+                return self.enqueue(py, plan, Some(feedback));
             }
-            return Ok(events);
+            return self.harvest(py, false);
         }
 
         let mut runner = PythonRunner::new(py, self.runner_release.as_ref());
@@ -1226,10 +1168,8 @@ impl Engine {
             self.core
                 .prepare_step(&mut runner, phase.map(BatchPhase::core))
         };
-        let Some(plan) =
-            prepared.map_err(|error| runner.error.take().unwrap_or_else(|| core_error(error)))?
-        else {
-            return Ok(events);
+        let Some(plan) = runner.result(prepared)? else {
+            return Ok(Vec::new());
         };
         drop(runner);
         let can_enqueue = overlap_admission
@@ -1240,38 +1180,81 @@ impl Engine {
             Err(error) => return Err(self.fail_output(py, error, false)),
         };
         if can_enqueue {
-            let enqueue = self.runner_enqueue.as_ref().expect("checked enqueue");
-            match enqueue.bind(py).call1((&plan,)) {
-                Ok(output) => {
-                    let asynchronous = match runner_result_is_async(&output) {
-                        Ok(asynchronous) => asynchronous,
-                        Err(error) => {
-                            self.failed_executions.push(output.unbind());
-                            return Err(self.fail_output(py, error, true));
-                        }
-                    };
-                    if asynchronous {
-                        self.pending = Some(PendingExecution {
-                            plan,
-                            completion: output.unbind(),
-                        });
-                        self.overlap_enqueues += 1;
-                        return Ok(events);
-                    }
-                    match self.consume_output(py, &plan, &output, false) {
-                        Ok(completed) => events.extend(completed),
-                        Err(error) => {
-                            self.failed_executions.push(output.unbind());
-                            return Err(error);
-                        }
-                    }
-                }
-                Err(error) => return Err(self.fail_output(py, error, false)),
-            }
+            return self.enqueue(py, plan, None);
+        }
+        match self.runner_forward.bind(py).call1((&plan,)) {
+            Ok(output) => self.consume_output(py, &plan, &output, false),
+            Err(error) => Err(self.fail_output(py, error, false)),
+        }
+    }
+
+    fn enqueue(
+        &mut self,
+        py: Python<'_>,
+        plan: Py<BatchPlan>,
+        feedback: Option<Bound<'_, PyAny>>,
+    ) -> PyResult<Vec<Py<TokenEvent>>> {
+        let continuing = feedback.is_some();
+        let enqueue = self
+            .runner_enqueue
+            .as_ref()
+            .expect("checked enqueue")
+            .bind(py);
+        let result = if let Some(feedback) = feedback {
+            let kwargs = PyDict::new(py);
+            kwargs.set_item("feedback", feedback)?;
+            enqueue.call((&plan,), Some(&kwargs))
         } else {
-            match self.runner_forward.bind(py).call1((&plan,)) {
-                Ok(output) => events.extend(self.consume_output(py, &plan, &output, false)?),
-                Err(error) => return Err(self.fail_output(py, error, false)),
+            enqueue.call1((&plan,))
+        }
+        .map_err(|error| {
+            if continuing {
+                self.core
+                    .poison_message(format!("overlapped enqueue failed: {error}"));
+                error
+            } else {
+                self.fail_output(py, error, false)
+            }
+        })?;
+        let asynchronous = match runner_result_is_async(&result) {
+            Ok(asynchronous) => asynchronous,
+            Err(error) => {
+                self.failed_executions.push(result.unbind());
+                if continuing {
+                    self.core
+                        .poison_message(format!("accepted completion inspection failed: {error}"));
+                    return Err(error);
+                }
+                return Err(self.fail_output(py, error, true));
+            }
+        };
+
+        // A continuation has already used the previous step's lease, even
+        // when the runner completed synchronously. Commit in launch order.
+        let mut events = Vec::new();
+        if continuing {
+            match self.harvest(py, true) {
+                Ok(previous) => events = previous,
+                Err(error) => {
+                    self.failed_executions.push(result.unbind());
+                    return Err(error);
+                }
+            }
+        }
+        if asynchronous {
+            self.pending = Some(PendingExecution {
+                plan,
+                completion: result.unbind(),
+            });
+            self.overlap_enqueues += 1;
+            self.overlap_continuations += u64::from(continuing);
+        } else {
+            match self.consume_output(py, &plan, &result, false) {
+                Ok(completed) => events.extend(completed),
+                Err(error) => {
+                    self.failed_executions.push(result.unbind());
+                    return Err(error);
+                }
             }
         }
         Ok(events)
