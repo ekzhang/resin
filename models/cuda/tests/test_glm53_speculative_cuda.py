@@ -15,10 +15,6 @@ pytestmark = pytest.mark.skipif(not torch.cuda.is_available(), reason="requires 
 
 def _fixture(rows, width, *, heads=2, dim=16, dtype=torch.bfloat16):
     channels = heads * dim
-    forget = torch.randn(rows * width, channels + 6, device="cuda", dtype=dtype)[
-        :, 3 : 3 + channels
-    ].reshape(rows * width, heads, dim)
-    beta = torch.randn(rows * width, heads * 2, device="cuda", dtype=dtype)[:, ::2]
     history = torch.randn(rows, 3, channels, 6, device="cuda", dtype=dtype)[..., ::2]
     packed = torch.randn(rows * width, 3 * channels + 320, device="cuda", dtype=dtype)
     raw = packed[:, 7 : 7 + 3 * channels].reshape(rows * width, 3, channels)
@@ -26,25 +22,20 @@ def _fixture(rows, width, *, heads=2, dim=16, dtype=torch.bfloat16):
     counts = ((torch.arange(rows, device="cuda") % width) + 1).repeat_interleave(2)[::2]
     contexts = torch.arange(rows * 2, device="cuda", dtype=torch.int32)[::2] * 8192 - 1
     if rows:
-        forget[0, 0, 0] = -0.0
-        beta[0, 0] = -0.0
         history[0, 0, 0, 1] = -0.0
         raw[0, 0, 0] = -0.0
         hidden[0, 0] = -0.0
         # Noncanonical NaN bits distinguish a copy from an unintended conversion.
         bits = torch.int16 if dtype == torch.bfloat16 else torch.int32
         payload = 0x7FC1 if dtype == torch.bfloat16 else 0x7FC00001
-        for value in (forget, beta, history, raw, hidden):
+        for value in (history, raw, hidden):
             value.view(bits)[tuple(-1 for _ in value.shape)] = payload
-    return counts, contexts, forget, beta, history, raw, hidden
+    return counts, contexts, history, raw, hidden
 
 
 def _reference(data, width):
-    counts, contexts, forget, beta, history, raw, hidden = data
+    counts, contexts, history, raw, hidden = data
     rows = counts.shape[0]
-    accepted = (torch.arange(width, device="cuda")[None] < counts[:, None]).flatten()
-    masked_f = forget.masked_fill(~accepted[:, None, None], -torch.inf)
-    masked_b = beta.masked_fill(~accepted[:, None], -torch.inf)
     source = torch.cat(
         (history.permute(0, 3, 1, 2), raw.reshape(rows, width, *raw.shape[1:])), 1
     )
@@ -57,19 +48,17 @@ def _reference(data, width):
     selected = hidden.reshape(rows, width, -1)[
         torch.arange(rows, device="cuda"), counts.long() - 1
     ]
-    return masked_f, masked_b, selected_history, selected, contexts + counts
+    return selected_history, selected, contexts + counts
 
 
 def _actual(data, width):
     from resin_models_cuda.glm5_3_flash.speculative_cuda import (
         finish_commit,
-        prepare_replay,
         select_history,
     )
 
-    counts, contexts, forget, beta, history, raw, hidden = data
+    counts, contexts, history, raw, hidden = data
     return (
-        *prepare_replay(counts, width, forget, beta, history, raw)[:2],
         select_history(counts, width, history, raw),
         *finish_commit(counts, width, contexts, hidden),
     )
@@ -85,7 +74,7 @@ def _bits(actual, expected):
 @pytest.mark.parametrize("width", range(1, 9))
 @pytest.mark.parametrize("dtype", [torch.bfloat16, torch.float32])
 @torch.inference_mode()
-def test_replay_preparation_matches_original_torch_bitwise(width, dtype):
+def test_commit_selection_matches_torch_bitwise(width, dtype):
     data = _fixture(9, width, dtype=dtype)
     saved = [tensor.clone() for tensor in data]
     actual, expected = _actual(data, width), _reference(data, width)
@@ -105,7 +94,7 @@ def test_replay_preparation_matches_original_torch_bitwise(width, dtype):
 
 
 @torch.inference_mode()
-def test_replay_preparation_real_geometry_and_graph_lifetime():
+def test_commit_selection_real_geometry_and_graph_lifetime():
     data, width = _fixture(8, 4, heads=64, dim=128), 4
     for _ in range(2):
         _actual(data, width)
@@ -129,15 +118,17 @@ def test_replay_preparation_real_geometry_and_graph_lifetime():
 
 
 @torch.inference_mode()
-def test_actual_tape_owns_initial_states_and_matches_preparation(monkeypatch):
+def test_actual_tape_owns_initial_states_and_matches_selection(monkeypatch):
     from resin_models_cuda.glm5_3_flash import kda_state_cuda
 
     data, width = _fixture(3, 4), 4
-    counts, contexts, forget, beta, history, raw, hidden = data
+    counts, contexts, history, raw, hidden = data
     initial = torch.randn(3, 2, 16, 16, device="cuda")
     prior = initial.clone()
     q = torch.randn(12, 2, 16, device="cuda", dtype=torch.bfloat16)
-    expected = _reference(data, width)
+    forget = torch.randn_like(q)
+    beta = torch.randn(12, 2, device="cuda", dtype=torch.bfloat16)
+    expected_history, expected_hidden, expected_lengths = _reference(data, width)
 
     def recurrence(key, value, raw_f, raw_b, a, dt, state, offsets, accepted, bound):
         assert state is initial
@@ -166,9 +157,9 @@ def test_actual_tape_owns_initial_states_and_matches_preparation(monkeypatch):
         -5.0,
     )
     selected = tape.commit(counts, hidden)
-    _bits(selected, expected[3])
-    _bits(batch.lengths, expected[4])
-    _bits(layer.convolution, expected[2])
+    _bits(selected, expected_hidden)
+    _bits(batch.lengths, expected_lengths)
+    _bits(layer.convolution, expected_history)
     _bits(initial, prior)
     assert (
         layer.recurrent.untyped_storage().data_ptr()
@@ -183,7 +174,7 @@ def _entries():
     device = torch.cuda.current_device()
     return {
         name: set(getattr(module, name).device_caches[device][0])
-        for name in ("_prepare_replay", "_select_history", "_finish_commit")
+        for name in ("_select_history", "_finish_commit")
     }
 
 
@@ -209,7 +200,6 @@ def test_rows_width_counts_contexts_and_strides_do_not_specialize():
 def test_source_addresses_above_two_gib_are_not_truncated():
     from resin_models_cuda.glm5_3_flash.speculative_cuda import (
         finish_commit,
-        prepare_replay,
         select_history,
     )
 
@@ -222,11 +212,8 @@ def test_source_addresses_above_two_gib_are_not_truncated():
     raw[0].fill_(13)
     raw[1].fill_(27)
     counts = torch.tensor([2], device="cuda")
-    forget = torch.zeros(2, 1, 4, device="cuda", dtype=torch.bfloat16)
-    beta = torch.zeros(2, 1, device="cuda", dtype=torch.bfloat16)
     history = torch.full((1, 3, 4, 3), 5, device="cuda", dtype=torch.bfloat16)
-    _, _, repaired = prepare_replay(counts, 2, forget, beta, history, raw)
-    _bits(select_history(counts, 2, history, raw), repaired)
+    repaired = select_history(counts, 2, history, raw)
     _bits(repaired[..., 0], history[..., 2])
     _bits(repaired[..., 1], raw[0][None])
     _bits(repaired[..., 2], raw[1][None])
