@@ -66,6 +66,7 @@ jobs:
             tests/test_recipe.py tests/test_recipe_media_preparation.py \
             tests/test_control_plane.py tests/test_distributed_transport.py \
             'tests/test_distributed_http.py::test_distributed_http_routes_real_replica_engines[normal-4]' \
+            'tests/test_distributed_http.py::test_distributed_http_routes_real_replica_engines[blocked_render-4]' \
             'tests/test_distributed_http.py::test_distributed_http_routes_real_replica_engines[ingress_decode-2]'
 
   lint-and-types:
