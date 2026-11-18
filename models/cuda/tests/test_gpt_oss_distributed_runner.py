@@ -8,6 +8,7 @@ import numpy as np
 import pytest
 import torch
 
+import resin_models_cuda.gpt_oss.cuda as implementation
 from resin import BatchPhase, BatchPlan, ForwardOutput, Parallelism, SamplingParams
 from resin.backend.cuda.graphs import CudaGraphMode
 from resin.backend.cuda.parallel import TensorParallelContext
@@ -53,7 +54,6 @@ class _Guard(nullcontext):
 
 
 def _runner(monkeypatch, groups):
-    import resin_models_cuda.gpt_oss.cuda as implementation
 
     runner = GptOssCudaRunner.__new__(GptOssCudaRunner)
     runner.parallel_groups = groups
@@ -97,39 +97,30 @@ def _runner(monkeypatch, groups):
         ),
     )
 
-    def batches(plan, cache_layout):
+    def build_batch(plan, cache_layout):
         assert cache_layout is runner.cache_layout
         lowered.append(plan)
         batch = SimpleNamespace(
-            token_indices=torch.arange(len(plan.token_ids)),
-            sequence_indices=tuple(range(plan.num_sequences)),
-            last_token_indices=torch.tensor(plan.token_indptr[1:].astype(np.int64) - 1),
             phase=plan.phase,
             query_lengths=tuple(np.diff(plan.token_indptr)),
             group=lambda name: SimpleNamespace(
                 width=1 if name == "full" else runner.window_table_width
             ),
         )
-        return ((batch,), None) if plan.phase == BatchPhase.PREFILL else ((), batch)
+        return batch
 
-    def tensorize(host, staging, prefix):
-        tensorized.append(prefix)
-        return SimpleNamespace(
-            token_indices=host.token_indices,
-            sequence_indices=torch.tensor(host.sequence_indices),
-            last_token_indices=host.last_token_indices,
-        )
+    def tensorize(host, staging):
+        tensorized.append(host.phase)
+        return host
 
-    def forward(
-        token_ids, positions, batch, *, context_parallel=None, full_hidden=False
-    ):
+    def forward(token_ids, positions, batch, *, context_parallel=None):
         calls.append(("batch", len(token_ids), positions.tolist()))
         return torch.nn.functional.one_hot(
-            token_ids if full_hidden else token_ids[batch.last_token_indices],
+            token_ids,
             num_classes=runner.hidden_size,
         ).bfloat16()
 
-    monkeypatch.setattr(implementation, "build_attention_batches", batches)
+    monkeypatch.setattr(implementation, "build_attention_batch", build_batch)
     monkeypatch.setattr(
         implementation,
         "TensorStager",
@@ -139,7 +130,7 @@ def _runner(monkeypatch, groups):
             )
         ),
     )
-    setattr(runner, "_tensorize", tensorize)
+    monkeypatch.setattr(implementation, "stage_paged_attention_batch", tensorize)
     setattr(runner, "_forward_batch", forward)
     return runner
 
@@ -201,9 +192,7 @@ def test_distributed_forward_packs_unequal_replica_rows_once(monkeypatch, phase)
             plan, _context(groups, phase, sizes, plan)
         ).token_ids.tolist() == ([4, 6] if rank == 0 else [9])
         assert runner.calls == [("batch", len(plan.token_ids), plan.positions.tolist())]
-        assert runner.tensorized == [
-            "prefill.0" if phase == BatchPhase.PREFILL else "decode"
-        ]
+        assert runner.tensorized == [phase]
         assert groups.broadcasts == []
         assert runner.lowered == [plan]
 
@@ -241,7 +230,7 @@ def test_worker_prepared_attention_is_reused_for_every_execution_path(
         raise AssertionError("worker-prepared host metadata must be reused")
 
     monkeypatch.setattr(runner, "validate_distributed", repeated)
-    monkeypatch.setattr(runner, "_attention_batches", repeated)
+    monkeypatch.setattr(implementation, "build_attention_batch", repeated)
     replayed = []
     if captured:
         monkeypatch.setattr(
@@ -249,7 +238,7 @@ def test_worker_prepared_attention_is_reused_for_every_execution_path(
         )
 
         def replay(plan_arg, host, *, shape):
-            assert plan_arg is plan and host is prepared[1]
+            assert plan_arg is plan and host is prepared
             replayed.append(shape)
             return token_output([9])
 
@@ -272,11 +261,7 @@ def test_worker_prepared_attention_is_reused_for_every_execution_path(
         assert output.token_ids.tolist() == [9]
     assert runner.lowered == ([] if idle else [plan])
     assert replayed == ([(2, 1)] if captured else [])
-    assert runner.tensorized == (
-        []
-        if idle or captured
-        else ["prefill.0" if phase == BatchPhase.PREFILL else "decode"]
-    )
+    assert runner.tensorized == ([] if idle or captured else [phase])
 
 
 def test_distributed_prefill_scores_all_predecessors_from_one_forward(monkeypatch):
@@ -446,7 +431,6 @@ def test_unsupported_distributed_preparation_fails_before_cuda(
     ],
 )
 def test_distributed_graph_policies_pass_topology_preparation(monkeypatch, parallelism):
-    import resin_models_cuda.gpt_oss.cuda as implementation
 
     class CudaEntry(Exception):
         pass
@@ -556,8 +540,6 @@ def _decode_host(runner, plan):
     rows = plan.num_sequences
     return AttentionBatch(
         phase=BatchPhase.DECODE,
-        token_indices=np.arange(rows, dtype=np.int64),
-        sequence_indices=tuple(range(rows)),
         query_lengths=(1,) * rows,
         groups=tuple(
             AttentionGroup(
@@ -642,7 +624,6 @@ def test_decode_capture_wraps_experts_and_replica_sampling_broadcast(monkeypatch
     step = runner._new_decode_graph_step((2, 1))
     step.inputs["token_ids"].copy_(torch.tensor([4, 6]))
     step.inputs["positions"].copy_(torch.tensor([3, 5]))
-    step.inputs["sequence_indices"].copy_(torch.arange(2))
     step.inputs["ep_valid_rows"].fill_(1)
 
     step.launch()

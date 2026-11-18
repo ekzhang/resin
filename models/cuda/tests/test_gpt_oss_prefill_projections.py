@@ -66,9 +66,6 @@ def _batch(slots, lengths):
     )
     return DeviceAttentionBatch(
         phase=BatchPhase.PREFILL,
-        token_indices=torch.arange(len(slots)),
-        sequence_indices=torch.tensor([0]),
-        last_token_indices=torch.tensor([len(slots) - 1]),
         cu_seqlens_q=torch.tensor([0, len(slots)], dtype=torch.int32),
         max_seqlen_q=len(slots),
         groups=(("full", group),),

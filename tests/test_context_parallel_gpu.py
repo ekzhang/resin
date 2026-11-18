@@ -119,9 +119,6 @@ def _rank(rank, rendezvous):
             cache_lengths = tuple(a + b for a, b in zip(lengths, prefixes, strict=True))
             batch = DeviceAttentionBatch(
                 BatchPhase.PREFILL,
-                torch.arange(total, device=device),
-                torch.arange(rows, device=device),
-                torch.tensor([end - 1 for end in offsets[1:]], device=device),
                 torch.tensor(offsets, device=device, dtype=torch.int32),
                 max(lengths),
                 (

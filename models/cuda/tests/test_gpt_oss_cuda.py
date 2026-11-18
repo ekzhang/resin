@@ -22,7 +22,6 @@ from resin.backend.cuda.graphs import default_decode_graph_shapes
 from resin.backend.cuda.runner import CudaRunner
 from resin.backend.cuda.sampling import FusedSampler
 from resin.backend.resources import CachePoolBinding
-from resin.backend.sampling import TorchSampler
 from resin.models.gpt_oss.plan import (
     PAGE_SIZE,
     PREFILL_CHUNK_SIZE,
@@ -31,7 +30,7 @@ from resin.models.gpt_oss.plan import (
     WINDOW_TABLE_WIDTH,
 )
 from resin.models.gpt_oss.plan import (
-    build_attention_batches as _build_attention_batches,
+    build_attention_batch as _build_attention_batch,
 )
 from resin_models_cuda.gpt_oss import cuda as gpt_oss_runtime
 from resin_models_cuda.gpt_oss.cuda import (
@@ -45,7 +44,7 @@ from resin_models_cuda.gpt_oss.model import SinkAttention, TopKRouter
 from resin_models_cuda.gpt_oss.paged_kv import paged_attention_host_inputs
 
 
-def build_attention_batches(plan, *, parent_capacity: int = 2048):
+def build_attention_batch(plan, *, parent_capacity: int = 2048):
     layout = CacheLayout(
         parent_capacity=parent_capacity,
         groups=[
@@ -58,7 +57,7 @@ def build_attention_batches(plan, *, parent_capacity: int = 2048):
             ),
         ],
     )
-    return _build_attention_batches(plan, layout)
+    return _build_attention_batch(plan, layout)
 
 
 def _group_plan(group_index, rows, block_table_start_indices, positions, indptr):
@@ -289,8 +288,6 @@ class TestGptOssCudaNativePlan:
     def test_graph_capture_inputs_use_only_the_reserved_null_page(self) -> None:
         inputs = GptOssCudaRunner._graph_capture_inputs((2, 4))
 
-        assert inputs["token_indices"] == (0, 1)
-        assert inputs["sequence_indices"] == (0, 1)
         assert inputs["full_page_table"] == (0,) * 8
         assert inputs["sliding_page_table"] == (0,) * (2 * WINDOW_TABLE_WIDTH)
         assert inputs["full_append_slots"] == (0, 1)
@@ -309,7 +306,7 @@ class TestGptOssCudaNativePlan:
                 for row in range(rows)
             ],
         )
-        _, batch = build_attention_batches(plan)
+        batch = build_attention_batch(plan)
         runner = object.__new__(GptOssCudaRunner)
         runner.parallel_groups = None
         runner.vocab_size = 16
@@ -346,8 +343,6 @@ class TestGptOssCudaNativePlan:
         for name in ("token_ids", "positions"):
             np.testing.assert_array_equal(inputs[name][:rows], getattr(plan, name))
             np.testing.assert_array_equal(inputs[name][rows:], 0)
-        for name in ("token_indices", "sequence_indices"):
-            np.testing.assert_array_equal(inputs[name], np.arange(expected_bucket))
         for name, width in (("full", 4), ("sliding", WINDOW_TABLE_WIDTH)):
             np.testing.assert_array_equal(
                 inputs[f"{name}_page_table"][rows * width :], 0
@@ -368,7 +363,7 @@ class TestGptOssCudaNativePlan:
         self, monkeypatch, phase
     ) -> None:
         plan = _flat_plan([130, 260], [1, 1], phase=phase)
-        batches = build_attention_batches(plan)
+        batches = build_attention_batch(plan)
         runner = object.__new__(GptOssCudaRunner)
         setattr(runner, "device", "cpu")
         runner.hidden_size = 2
@@ -381,12 +376,8 @@ class TestGptOssCudaNativePlan:
         setattr(runner, "_graph_forward", lambda *_: None)
         setattr(runner, "_model", SimpleNamespace(lm_head=lambda hidden: hidden))
         setattr(runner, "_sampler", lambda logits, _: logits.argmax(dim=-1))
-        setattr(
-            runner,
-            "_tensorize",
-            lambda host, *_: SimpleNamespace(
-                sequence_indices=torch.tensor(host.sequence_indices)
-            ),
+        monkeypatch.setattr(
+            gpt_oss_runtime, "stage_paged_attention_batch", lambda host, _: host
         )
         events = []
 
@@ -396,7 +387,7 @@ class TestGptOssCudaNativePlan:
 
         setattr(runner, "_forward_batch", forward)
         monkeypatch.setattr(
-            gpt_oss_runtime, "build_attention_batches", lambda *_: batches
+            gpt_oss_runtime, "build_attention_batch", lambda *_: batches
         )
         monkeypatch.setattr(
             gpt_oss_runtime,
@@ -456,16 +447,9 @@ class TestGptOssCudaNativePlan:
                 fresh.bind_resources(self._resources(fresh, pool_id=invalid))
 
     def test_prefill_tables_are_derived_from_history_and_window_csr(self) -> None:
-        batches, decode = build_attention_batches(_prefill_plan())
-
-        assert decode is None
-        assert len(batches) == 1
-        batch = batches[0]
+        batch = build_attention_batch(_prefill_plan())
         assert batch.phase == BatchPhase.PREFILL
-        assert batch.sequence_indices == (0, 1)
         assert batch.query_lengths == (128, 5)
-        assert batch.token_indices[:3].tolist() == [0, 1, 2]
-        assert batch.token_indices[-3:].tolist() == [130, 131, 132]
         assert batch.group("full").width == 2
         assert batch.group("full").page_table.tolist() == [1, 1, 129, 130]
         assert batch.group("full").lengths == (128, 135)
@@ -484,20 +468,17 @@ class TestGptOssCudaNativePlan:
 
     def test_one_token_continuation_remains_explicit_prefill(self) -> None:
         plan = _flat_plan([260], [1])
-        prefill, decode = build_attention_batches(plan)
+        batch = build_attention_batch(plan)
 
-        assert decode is None
-        assert len(prefill) == 1
-        batch = prefill[0]
+        assert batch.phase == BatchPhase.PREFILL
         assert batch.query_lengths == (1,)
-        assert batch.token_indices.tolist() == [0]
         assert batch.group("full").page_table.tolist() == [1, 2, 3]
         assert batch.group("full").lengths == (261,)
         assert batch.group("sliding").page_table[:3].tolist() == [1025, 1026, 1027]
         assert batch.group("sliding").lengths == (261,)
 
     def test_graph_padding_repeats_only_pages_owned_by_each_row(self) -> None:
-        _, batch = build_attention_batches(_decode_plan())
+        batch = build_attention_batch(_decode_plan())
         assert batch is not None
         inputs = paged_attention_host_inputs(
             batch, {"full": 4, "sliding": WINDOW_TABLE_WIDTH}
@@ -514,11 +495,10 @@ class TestGptOssCudaNativePlan:
         ]
 
     def test_decode_tables_and_append_slots_come_from_sparse_groups(self) -> None:
-        _, batch = build_attention_batches(_decode_plan())
+        batch = build_attention_batch(_decode_plan())
 
         assert batch is not None
         assert batch is not None
-        assert batch.sequence_indices == (0, 1)
         assert batch.query_lengths == (1, 1)
         assert batch.group("full").width == 3
         assert batch.group("full").page_table.tolist() == [1, 2, 1, 129, 130, 131]
@@ -539,7 +519,7 @@ class TestGptOssCudaNativePlan:
         append = plan.cache_groups[1].append_slab_ids.copy()
         append[0] += 1
         with pytest.raises(ValueError, match="append target"):
-            build_attention_batches(_replace_group(plan, 1, append_slab_ids=append))
+            build_attention_batch(_replace_group(plan, 1, append_slab_ids=append))
 
     def test_group_order_suffix_and_parent_ownership_fail_closed(self) -> None:
         with pytest.raises(ValueError, match="ordered"):
@@ -547,30 +527,29 @@ class TestGptOssCudaNativePlan:
 
         plan = _flat_plan([9000], [1])
         with pytest.raises(ValueError, match="active range"):
-            build_attention_batches(
+            build_attention_batch(
                 _replace_group(plan, 1, block_table_start_indices=[0])
             )
 
         plan = _flat_plan([0], [1])
         with pytest.raises(ValueError, match="cannot address"):
-            build_attention_batches(
+            build_attention_batch(
                 _replace_group(plan, 1, block_slab_ids=[1], append_slab_ids=[1])
             )
 
         with pytest.raises(ValueError, match="outside"):
-            build_attention_batches(plan, parent_capacity=128)
+            build_attention_batch(plan, parent_capacity=128)
 
     def test_multi_page_prefill_is_validated_before_device_work(self) -> None:
-        prefill, decode = build_attention_batches(_flat_plan([0], [PREFILL_CHUNK_SIZE]))
+        batch = build_attention_batch(_flat_plan([0], [PREFILL_CHUNK_SIZE]))
 
-        assert decode is None
-        assert prefill[0].query_lengths == (PREFILL_CHUNK_SIZE,)
-        assert prefill[0].group("full").width == PREFILL_CHUNK_SIZE // 128
-        assert prefill[0].group("sliding").width == WINDOW_TABLE_WIDTH
-        assert len(set(prefill[0].group("sliding").append_slots)) == PREFILL_CHUNK_SIZE
+        assert batch.query_lengths == (PREFILL_CHUNK_SIZE,)
+        assert batch.group("full").width == PREFILL_CHUNK_SIZE // 128
+        assert batch.group("sliding").width == WINDOW_TABLE_WIDTH
+        assert len(set(batch.group("sliding").append_slots)) == PREFILL_CHUNK_SIZE
 
         with pytest.raises(ValueError, match="exceeds 8192"):
-            build_attention_batches(_flat_plan([0], [PREFILL_CHUNK_SIZE + 1]))
+            build_attention_batch(_flat_plan([0], [PREFILL_CHUNK_SIZE + 1]))
 
     def test_zeroed_kv_storage_shares_both_group_views(self) -> None:
         from resin_models_cuda.gpt_oss.paged_kv import PagedKvArena
@@ -810,33 +789,6 @@ class TestGptOssCudaTinyOracle:
         torch.testing.assert_close(cuda_indices, indices)
         torch.testing.assert_close(cuda_weights, weights)
         torch.testing.assert_close(weights, logits.gather(1, indices).softmax(-1))
-
-    def test_static_decode_step_restores_rust_sequence_order_before_sampling(
-        self,
-    ) -> None:
-        import torch
-
-        runner = GptOssCudaRunner.__new__(GptOssCudaRunner)
-        setattr(runner, "_sampler", TorchSampler())
-        runner.parallel_groups = None
-        setattr(runner, "device", "cpu")
-        runner.hidden_size = 3
-        runner.vocab_size = 3
-        runner._graph_logits = {}
-        setattr(runner, "_model", SimpleNamespace(lm_head=lambda hidden: hidden))
-        setattr(
-            runner,
-            "_forward_batch",
-            lambda *_args: torch.tensor(
-                [[0.0, 5.0, 1.0], [4.0, 0.0, 1.0]], dtype=torch.bfloat16
-            ),
-        )
-        step = runner._new_decode_graph_step((2, 1))
-        step.inputs["sequence_indices"].copy_(torch.tensor([1, 0]))
-
-        step.launch()
-
-        assert step.output.tolist() == [0, 1]
 
     def test_rotary_adapter_passes_packed_rows_in_place_and_skips_empty(
         self, monkeypatch

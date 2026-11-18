@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from contextlib import nullcontext
 from dataclasses import replace
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -59,7 +60,7 @@ from resin.models.gpt_oss.plan import (
     WINDOW_RETENTION_TOKENS,
     WINDOW_TABLE_WIDTH,
     AttentionBatch,
-    build_attention_batches,
+    build_attention_batch,
 )
 from resin_models_cuda.gpt_oss.checkpoint import (
     DEFAULT_MODEL,
@@ -85,7 +86,6 @@ if TYPE_CHECKING:
 
 _BF16_BYTES = 2
 _TINYGEMM_MAX_TOKENS = 128
-_AttentionBatches = tuple[tuple[AttentionBatch, ...], AttentionBatch | None]
 
 
 class _EmptyFa4AuxData:
@@ -490,8 +490,6 @@ class GptOssCudaRunner(CudaRunner):
         return {
             "token_ids": zeros,
             "positions": zeros,
-            "token_indices": rows,
-            "sequence_indices": rows,
             "full_page_table": (0,) * (batch_size * full_width),
             "full_seqused_k": (1,) * batch_size,
             "sliding_page_table": (0,) * (batch_size * cls.window_table_width),
@@ -513,11 +511,6 @@ class GptOssCudaRunner(CudaRunner):
         if self.parallel_groups is not None:
             inputs["ep_valid_rows"] = shape[0]
         return inputs
-
-    def _tensorize(
-        self, batch: AttentionBatch, staging: TensorStager, prefix: str
-    ) -> DeviceAttentionBatch:
-        return stage_paged_attention_batch(batch, staging, prefix)
 
     def _apply_yarn_rotary(self, hidden, cos, sin):
         """Apply the model's already-materialized YaRN cos/sin tensors."""
@@ -747,18 +740,15 @@ class GptOssCudaRunner(CudaRunner):
         batch: DeviceAttentionBatch,
         *,
         context_parallel: ContextParallelTokens | None = None,
-        full_hidden: bool = False,
     ):
-        selected_tokens = token_ids.index_select(0, batch.token_indices)
-        selected_positions = positions.index_select(0, batch.token_indices)
         query_batch = None
         if context_parallel is not None:
-            selected_tokens = context_parallel.select(selected_tokens)
-            selected_positions = context_parallel.select(selected_positions)
+            token_ids = context_parallel.select(token_ids)
+            positions = context_parallel.select(positions)
             query_batch = context_parallel_query_batch(batch, context_parallel)
-        hidden = self._model.model.embed_tokens(selected_tokens).unsqueeze(0)
+        hidden = self._model.model.embed_tokens(token_ids).unsqueeze(0)
         position_embeddings = self._model.model.rotary_emb(
-            selected_positions.unsqueeze(0), hidden.dtype
+            positions.unsqueeze(0), hidden.dtype
         )
         layers = self._model.model.layers
         normalized = (
@@ -804,11 +794,7 @@ class GptOssCudaRunner(CudaRunner):
         final_hidden = normalized.squeeze(0)
         if context_parallel is not None:
             final_hidden = context_parallel.gather(final_hidden)
-        return (
-            final_hidden
-            if full_hidden
-            else final_hidden.index_select(0, batch.last_token_indices)
-        )
+        return final_hidden
 
     def _new_decode_graph_step(self, shape: GraphShape) -> CudaGraphStep:
         batch_size, full_width = shape
@@ -826,7 +812,6 @@ class GptOssCudaRunner(CudaRunner):
         )
         token_ids = empty(torch.long, batch_size)
         positions = empty(torch.long, batch_size)
-        final_hidden = empty(torch.bfloat16, batch_size, self.hidden_size)
         output_ids = empty(torch.long, batch_size)
         valid_rows = (
             torch.empty((), dtype=torch.int32, device=self.device)
@@ -842,8 +827,7 @@ class GptOssCudaRunner(CudaRunner):
         def launch() -> None:
             with self._parallel_graph_capacity(batch_size, valid_rows=valid_rows):
                 hidden = self._forward_batch(token_ids, positions, batch)
-                final_hidden.index_copy_(0, batch.sequence_indices, hidden)
-                logits = self._model.lm_head(final_hidden)
+                logits = self._model.lm_head(hidden)
                 self._graph_logits[shape] = logits
                 if sampling is None:
                     self._sampler(logits, out=output_ids)
@@ -914,8 +898,6 @@ class GptOssCudaRunner(CudaRunner):
             for name in ("token_ids", "positions"):
                 inputs[name] = np.pad(inputs[name], (0, padding))
             inactive_rows = np.arange(rows, shape[0], dtype=np.int64)
-            for name in ("token_indices", "sequence_indices"):
-                inputs[name] = np.concatenate((inputs[name], inactive_rows))
             for name, width in (
                 ("full", shape[1]),
                 ("sliding", self.window_table_width),
@@ -948,94 +930,56 @@ class GptOssCudaRunner(CudaRunner):
             raise RuntimeError("explicit rank groups require forward_distributed")
         return self._forward_plan(plan)
 
-    def _attention_batches(self, plan: BatchPlan) -> _AttentionBatches:
-        prefill_batches, decode_batch = build_attention_batches(plan, self.cache_layout)
-        host_batches = prefill_batches + (
-            () if decode_batch is None else (decode_batch,)
-        )
-        covered = {index for batch in host_batches for index in batch.sequence_indices}
-        if covered != set(range(len(plan.sequence_ids))):
-            raise ValueError(
-                "native attention batches do not cover every plan sequence"
-            )
-        return prefill_batches, decode_batch
-
     def _forward_plan(
         self,
         plan: BatchPlan,
         *,
         use_graph=True,
-        prepared: _AttentionBatches | None = None,
+        prepared: AttentionBatch | None = None,
     ) -> ForwardOutput:
         self._check_cuda_graphs(plan.phase)
-        host_positions = plan.positions
-
-        prefill_batches, decode_batch = (
-            self._attention_batches(plan) if prepared is None else prepared
+        host = (
+            build_attention_batch(plan, self.cache_layout)
+            if prepared is None
+            else prepared
         )
+        prefill = plan.phase == BatchPhase.PREFILL
 
         with self._cuda_failure:
-            if use_graph and not prefill_batches and decode_batch is not None:
-                graph_output = self._graph_forward(plan, decode_batch)
+            if use_graph and not prefill:
+                graph_output = self._graph_forward(plan, host)
                 if graph_output is not None:
                     return graph_output
 
             staging = TensorStager(self.device)
             token_ids = staging.device("token_ids", plan.token_ids, torch.long)
-            positions = staging.device("positions", host_positions, torch.long)
-            final_hidden = torch.empty(
-                len(plan.sequence_ids),
-                self.hidden_size,
-                dtype=torch.bfloat16,
-                device=self.device,
-            )
-            prompt_hidden = (
-                torch.empty(
-                    (len(plan.token_ids), self.hidden_size),
-                    dtype=torch.bfloat16,
-                    device=self.device,
-                )
-                if plan.needs_prompt_logprobs
-                else None
-            )
+            positions = staging.device("positions", plan.positions, torch.long)
+            batch = stage_paged_attention_batch(host, staging)
             with torch.inference_mode():
-                with self._prefill_graphs():
-                    for index, host_batch in enumerate(prefill_batches):
-                        batch = self._tensorize(host_batch, staging, f"prefill.{index}")
-                        groups = self.parallel_groups
-                        context_parallel = None
-                        if groups is not None and groups.cp.size > 1:
-                            context_parallel = ContextParallelTokens(
-                                host_batch.query_lengths,
-                                groups.cp,
-                                device=self.device,
-                                distributed=groups.distributed,
-                            )
-                        last_hidden = self._forward_batch(
-                            token_ids,
-                            positions,
-                            batch,
-                            context_parallel=context_parallel,
-                            full_hidden=prompt_hidden is not None,
-                        )
-                        if prompt_hidden is not None:
-                            prompt_hidden.index_copy_(
-                                0, batch.token_indices, last_hidden
-                            )
-                            last_hidden = last_hidden.index_select(
-                                0, batch.last_token_indices
-                            )
-                        final_hidden.index_copy_(0, batch.sequence_indices, last_hidden)
-                if decode_batch is not None:
-                    batch = self._tensorize(decode_batch, staging, "decode")
-                    last_hidden = self._forward_batch(token_ids, positions, batch)
-                    final_hidden.index_copy_(0, batch.sequence_indices, last_hidden)
-                logits = self._model.lm_head(final_hidden)
+                groups = self.parallel_groups
+                context_parallel = None
+                if prefill and groups is not None and groups.cp.size > 1:
+                    context_parallel = ContextParallelTokens(
+                        host.query_lengths,
+                        groups.cp,
+                        device=self.device,
+                        distributed=groups.distributed,
+                    )
+                with self._prefill_graphs() if prefill else nullcontext():
+                    hidden = self._forward_batch(
+                        token_ids, positions, batch, context_parallel=context_parallel
+                    )
                 scores = (
-                    prompt_scores(plan, prompt_hidden, self._model.lm_head)
-                    if prompt_hidden is not None
+                    prompt_scores(plan, hidden, self._model.lm_head)
+                    if plan.needs_prompt_logprobs
                     else None
                 )
+                if prefill:
+                    last = staging.device(
+                        "last_token_indices", plan.token_indptr[1:] - 1, torch.long
+                    )
+                    hidden = hidden.index_select(0, last)
+                logits = self._model.lm_head(hidden)
 
             tokens = self._sampler(logits, plan)
             groups = getattr(self, "parallel_groups", None)
@@ -1049,17 +993,17 @@ class GptOssCudaRunner(CudaRunner):
 
     def validate_distributed(
         self, plan: BatchPlan | None, context: StepContext
-    ) -> _AttentionBatches:
+    ) -> AttentionBatch:
         """Prepare rank-local attention metadata before the readiness vote."""
 
         if self.parallel_groups is None or context.groups is not self.parallel_groups:
             raise ValueError("distributed step groups do not match this runner")
         if context.phase not in (BatchPhase.PREFILL, BatchPhase.DECODE):
             raise ValueError("GPT-OSS plan phase must be prefill or decode")
-        prepared: _AttentionBatches = ((), None)
         if plan is None:
             if context.num_sequences or context.num_tokens:
                 raise ValueError("a nonempty replica requires a batch plan")
+            prepared = AttentionBatch(context.phase, (), ())
         else:
             if (
                 plan.phase != context.phase
@@ -1067,12 +1011,7 @@ class GptOssCudaRunner(CudaRunner):
                 or len(plan.token_ids) != context.num_tokens
             ):
                 raise ValueError("distributed step metadata does not match the plan")
-            prepared = self._attention_batches(plan)
-            prefills, decode = prepared
-            if len(prefills) + (decode is not None) != 1:
-                raise ValueError(
-                    "distributed GPT-OSS requires one packed attention batch"
-                )
+            prepared = build_attention_batch(plan, self.cache_layout)
         # Worker readiness votes on validation errors before any rank enters
         # a graph-selection collective or launches captured expert exchanges.
         self._check_cuda_graphs(context.phase)
@@ -1086,7 +1025,7 @@ class GptOssCudaRunner(CudaRunner):
         plan: BatchPlan | None,
         context: StepContext,
         *,
-        prepared: _AttentionBatches | None = None,
+        prepared: AttentionBatch | None = None,
     ) -> ForwardOutput | None:
         """Run one packed batch, or join its expert layers without KV work."""
 
@@ -1095,19 +1034,17 @@ class GptOssCudaRunner(CudaRunner):
         )
         with self._cuda_failure:
             if context.phase == BatchPhase.DECODE:
-                host = prepared[1]
                 shape = self._select_distributed_cuda_graph(
                     "decode",
                     context,
                     required_shape=(
                         context.num_sequences,
-                        0 if host is None else host.group("full").width,
+                        0 if plan is None else prepared.group("full").width,
                     ),
                 )
                 if shape is not None:
                     if plan is not None:
-                        assert host is not None
-                        return self._graph_forward(plan, host, shape=shape)
+                        return self._graph_forward(plan, prepared, shape=shape)
                     inputs = self._decode_graph_capture_inputs(shape)
                     inputs["ep_valid_rows"] = 0
                     self._run_cuda_graph("decode", shape, inputs)
