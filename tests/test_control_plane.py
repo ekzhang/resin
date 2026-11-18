@@ -94,37 +94,28 @@ def _control_worker(rank, rendezvous, output):
     assert saved == [(0, -1, 2**40), (3, -2, 2**40 + 1)]
     assert len(control._buffers) == 1
 
-    # Exercise actual driver codecs and their opaque HTTP fallback on the same
-    # group. Every successful step vote uses only fixed tensor collectives.
+    # Exercise driver votes and opaque setup exchanges on the same group.
     worker = object.__new__(DistributedWorker)
     worker._metrics = None
     worker.groups = SimpleNamespace(drivers=group, distributed=transport)
     worker._control, worker.failure = control, None
-    assert worker._drivers("work", (rank == 0, None)) == [
-        (True, None),
-        (False, None),
-    ]
-    assert worker._drivers(
-        "phase", ("decode" if rank == 0 else "prefill", None, rank == 0, True)
-    ) == [("decode", None, True, True), ("prefill", None, False, True)]
-    assert worker._drivers("prepare", (rank + 1, rank + 5, None, True, False)) == [
-        (1, 5, None, True, False),
-        (2, 6, None, True, False),
-    ]
+    assert worker.driver_vote("prepare", (rank + 1, rank + 5, True, False)) == (
+        [(1, 5, 1, 0), (2, 6, 1, 0)],
+        [None, None],
+    )
     assert transport.objects == 1
-    assert worker._drivers("commit", "failed after enqueue" if rank else None) == [
-        None,
-        "failed after enqueue",
-    ]
-    assert worker._drivers("http configuration", {"rank": rank}) == [
+    assert worker.driver_vote(
+        "commit", error="failed after enqueue" if rank else None
+    ) == ([(), ()], [None, "failed after enqueue"])
+    assert worker._gather_drivers("http configuration", {"rank": rank}) == [
         {"rank": 0},
         {"rank": 1},
     ]
     with pytest.raises(DistributedExecutionError, match="different orders"):
         if rank == 0:
-            worker._drivers("phase", ("decode", None, True, True))
+            worker.driver_vote("phase", (2, True, True))
         else:
-            worker._drivers("http output", {"rank": rank})
+            worker._gather_drivers("phase", {"rank": rank})
     assert transport.objects == 3  # No opaque payload exchange after mismatch.
     (output / f"rank{rank}.json").write_text(
         json.dumps(
@@ -146,7 +137,7 @@ def test_control_votes_preserve_rank_records_failure_diagnostics_and_order(tmp_p
         join=True,
     )
     records = [json.loads(path.read_text()) for path in tmp_path.glob("rank*.json")]
-    assert records == [{"gathers": 15, "broadcasts": 15, "objects": 3}] * 2
+    assert records == [{"gathers": 13, "broadcasts": 13, "objects": 3}] * 2
 
 
 def _inference_mode_worker(rank, rendezvous):

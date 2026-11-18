@@ -125,7 +125,7 @@ class HttpServer:
                     engine.local.max_top_logprobs,
                 )
             )
-            states = engine.worker._drivers(
+            states = engine.worker._gather_drivers(
                 "http configuration", (config, None if error is None else str(error))
             )
             group = engine.worker._driver_group

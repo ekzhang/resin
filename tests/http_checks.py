@@ -46,7 +46,7 @@ def check_loaded_server(
         with socket.socket() as probe:
             probe.bind(("127.0.0.1", 0))
             port = probe.getsockname()[1]
-    port = worker._drivers("HTTP qualification port", port)[0]
+    port = worker._gather_drivers("HTTP qualification port", port)[0]
     base = f"http://127.0.0.1:{port}"
     server = HttpServer(engine, recipe=recipe, model=model)
     stopped = threading.Event()
@@ -106,7 +106,7 @@ def check_loaded_server(
             thread.join(timeout=timeout + 5)
             if thread.is_alive():
                 error = error or "HTTP checker did not stop after server shutdown"
-    results = worker._drivers("HTTP qualification result", (error, report))
+    results = worker._gather_drivers("HTTP qualification result", (error, report))
     failures = [message for message, _ in results if message is not None]
     report = results[0][1]
     assert not failures and report.get("ok"), (
