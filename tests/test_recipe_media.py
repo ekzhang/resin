@@ -40,10 +40,13 @@ MODELS = (
 @pytest.fixture(scope="module", params=MODELS, ids=lambda model: model[0])
 def model_processor(request):
     from transformers import AutoProcessor, PreTrainedTokenizerBase
+    from transformers.models.qwen3_vl.processing_qwen3_vl import Qwen3VLProcessor
 
     model, repo, revision = request.param
+    # MLX VLM registers its own Qwen processor with AutoProcessor on import.
+    processor_type = Qwen3VLProcessor if model == "qwen3_5" else AutoProcessor
     try:
-        processor = AutoProcessor.from_pretrained(
+        processor = processor_type.from_pretrained(
             repo, revision=revision, local_files_only=True, trust_remote_code=False
         )
     except OSError:
