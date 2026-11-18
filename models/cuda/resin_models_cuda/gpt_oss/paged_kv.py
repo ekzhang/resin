@@ -93,9 +93,6 @@ class DeviceAttentionBatch:
     """Dense named attention tables and token metadata staged for CUDA."""
 
     phase: BatchPhase
-    token_indices: torch.Tensor
-    sequence_indices: torch.Tensor
-    last_token_indices: torch.Tensor
     cu_seqlens_q: torch.Tensor
     max_seqlen_q: int
     groups: tuple[tuple[str, PagedKvTable], ...]
@@ -110,17 +107,14 @@ class DeviceAttentionBatch:
 
 
 def stage_paged_attention_batch(
-    batch: AttentionBatch, staging: TensorStager, prefix: str
+    batch: AttentionBatch, staging: TensorStager
 ) -> DeviceAttentionBatch:
     """Copy one semantic paged-attention batch to CUDA tensors."""
-
-    def device(name: str, values: object, dtype: torch.dtype) -> torch.Tensor:
-        return staging.device(f"{prefix}.{name}", values, dtype)
 
     cu_seqlens_q = [0]
     for length in batch.query_lengths:
         cu_seqlens_q.append(cu_seqlens_q[-1] + length)
-    row_count = len(batch.sequence_indices)
+    row_count = len(batch.query_lengths)
     groups = []
     for group in batch.groups:
         if (
@@ -132,11 +126,13 @@ def stage_paged_attention_batch(
             (
                 group.name,
                 PagedKvTable(
-                    page_table=device(
+                    page_table=staging.device(
                         f"{group.name}.pages", group.page_table, torch.int32
                     ).view(row_count, group.width),
-                    lengths=device(f"{group.name}.lengths", group.lengths, torch.int32),
-                    append_slots=device(
+                    lengths=staging.device(
+                        f"{group.name}.lengths", group.lengths, torch.int32
+                    ),
+                    append_slots=staging.device(
                         f"{group.name}.append", group.append_slots, torch.long
                     ),
                     min_length=min(group.lengths),
@@ -146,14 +142,7 @@ def stage_paged_attention_batch(
         )
     return DeviceAttentionBatch(
         phase=batch.phase,
-        token_indices=device("token_indices", batch.token_indices, torch.long),
-        sequence_indices=device("sequence_indices", batch.sequence_indices, torch.long),
-        last_token_indices=device(
-            "last_token_indices",
-            tuple(end - 1 for end in cu_seqlens_q[1:]),
-            torch.long,
-        ),
-        cu_seqlens_q=device("cu_seqlens_q", cu_seqlens_q, torch.int32),
+        cu_seqlens_q=staging.device("cu_seqlens_q", cu_seqlens_q, torch.int32),
         max_seqlen_q=max(batch.query_lengths),
         groups=tuple(groups),
     )
@@ -205,9 +194,6 @@ def empty_decode_paged_attention_batch(
     )
     return DeviceAttentionBatch(
         phase=BatchPhase.DECODE,
-        token_indices=empty(torch.long, batch_size),
-        sequence_indices=empty(torch.long, batch_size),
-        last_token_indices=torch.arange(batch_size, dtype=torch.long, device=device),
         cu_seqlens_q=torch.arange(batch_size + 1, dtype=torch.int32, device=device),
         max_seqlen_q=1,
         groups=groups,
@@ -219,10 +205,7 @@ def paged_attention_graph_inputs(
 ) -> dict[str, torch.Tensor]:
     """Expose stable graph input names for one device batch."""
 
-    inputs = {
-        "token_indices": batch.token_indices,
-        "sequence_indices": batch.sequence_indices,
-    }
+    inputs = {}
     for name, group in batch.groups:
         inputs[f"{name}_page_table"] = group.page_table
         inputs[f"{name}_seqused_k"] = group.lengths
@@ -250,10 +233,7 @@ def paged_attention_host_inputs(
 ) -> dict[str, Any]:
     """Build named host values matching :func:`paged_attention_graph_inputs`."""
 
-    inputs = {
-        "token_indices": batch.token_indices,
-        "sequence_indices": batch.sequence_indices,
-    }
+    inputs = {}
     if set(group_widths) != {group.name for group in batch.groups}:
         raise ValueError("CUDA graph group widths do not match attention groups")
     for group in batch.groups:
@@ -279,7 +259,7 @@ def context_parallel_query_batch(
 
     if batch.phase != BatchPhase.PREFILL:
         raise ValueError("context-parallel query sharding is only used for prefill")
-    if batch.token_indices.shape[0] != tokens.plan.total_tokens:
+    if batch.groups[0][1].append_slots.numel() != tokens.plan.total_tokens:
         raise ValueError("attention batch does not match its context token plan")
     groups = tuple(
         (
@@ -297,8 +277,6 @@ def context_parallel_query_batch(
     )
     return replace(
         batch,
-        token_indices=tokens.select(batch.token_indices),
-        sequence_indices=batch.sequence_indices.index_select(0, tokens.active_rows),
         cu_seqlens_q=tokens.cu_seqlens_q,
         max_seqlen_q=tokens.max_seqlen_q,
         groups=groups,

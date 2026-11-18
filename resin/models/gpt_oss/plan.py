@@ -32,8 +32,6 @@ class AttentionGroup:
 @dataclass(frozen=True, slots=True)
 class AttentionBatch:
     phase: BatchPhase
-    token_indices: npt.NDArray[np.int64]
-    sequence_indices: tuple[int, ...]
     query_lengths: tuple[int, ...]
     groups: tuple[AttentionGroup, ...]
 
@@ -44,9 +42,7 @@ class AttentionBatch:
             raise KeyError(f"unknown attention group: {name!r}") from error
 
 
-def build_attention_batches(
-    plan, cache_layout
-) -> tuple[tuple[AttentionBatch, ...], AttentionBatch | None]:
+def build_attention_batch(plan, cache_layout) -> AttentionBatch:
     """Lower a homogeneous native plan to GPT-OSS's two dense page tables."""
 
     cache = PagedCachePlan.from_plan(plan, cache_layout)
@@ -65,7 +61,7 @@ def build_attention_batches(
     ).size:
         raise ValueError("attention cache groups cannot address one parent")
 
-    rows = tuple(range(native.num_sequences))
+    rows = range(native.num_sequences)
     post_lengths = native.post_lengths
     groups = []
     for name, group, minimum_width in zip(
@@ -96,16 +92,11 @@ def build_attention_batches(
                 append_slots=append_slots,
             )
         )
-    batch = AttentionBatch(
+    return AttentionBatch(
         phase=native.phase,
-        token_indices=np.arange(native.num_tokens, dtype=np.int64),
-        sequence_indices=rows,
         query_lengths=query_lengths,
         groups=tuple(groups),
     )
-    if batch.phase == BatchPhase.PREFILL:
-        return (batch,), None
-    return (), batch
 
 
 __all__ = [
@@ -116,5 +107,5 @@ __all__ = [
     "SLIDING_WINDOW",
     "WINDOW_RETENTION_TOKENS",
     "WINDOW_TABLE_WIDTH",
-    "build_attention_batches",
+    "build_attention_batch",
 ]

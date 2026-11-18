@@ -69,9 +69,6 @@ def _batch(lengths, prefixes):
     )
     return DeviceAttentionBatch(
         BatchPhase.PREFILL,
-        torch.arange(sum(lengths)),
-        torch.arange(len(lengths)),
-        torch.tensor([end - 1 for end in offsets[1:]]),
         torch.tensor(offsets, dtype=torch.int32),
         max(lengths),
         (("full", group),),
@@ -88,10 +85,9 @@ def test_local_query_metadata_preserves_full_and_sliding_causal_coordinates():
         )
         local = context_parallel_query_batch(batch, tokens)
         assert local.group("full").append_slots is batch.group("full").append_slots
-        assert local.last_token_indices is batch.last_token_indices
         assert local.cu_seqlens_q[-1] == tokens.plan.local_tokens
         assert torch.diff(local.cu_seqlens_q).gt(0).all()
-        for active, sequence in enumerate(local.sequence_indices.tolist()):
+        for active, sequence in enumerate(tokens.active_rows.tolist()):
             count = int(local.cu_seqlens_q[active + 1] - local.cu_seqlens_q[active])
             key_length = int(local.group("full").lengths[active])
             global_start = max(tokens.plan.start, offsets[sequence]) - offsets[sequence]

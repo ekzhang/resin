@@ -201,6 +201,17 @@ class _DevicePagedPlan:
     append_pages: Tensor
     append_offsets: Tensor
 
+    def graph_inputs(self, prefix: str) -> dict[str, Tensor]:
+        inputs = {
+            f"{prefix}_kv_indptr": self.kv_indptr,
+            f"{prefix}_page_indices": self.page_indices,
+            f"{prefix}_last_page_lengths": self.last_page_lengths,
+        }
+        if self.append_pages.numel():
+            inputs[f"{prefix}_append_pages"] = self.append_pages
+            inputs[f"{prefix}_append_offsets"] = self.append_offsets
+        return inputs
+
 
 @dataclass(frozen=True, slots=True)
 class _MediaFeatures:
@@ -542,70 +553,51 @@ class Gemma4CudaRunner(CudaRunner):
         global_: _DevicePagedPlan,
         custom_mask: Tensor | None,
     ) -> tuple[Any, Any]:
-        if batch.phase == BatchPhase.PREFILL:
-            self._local_prefill.plan(
-                local.qo_indptr,
-                local.kv_indptr,
-                local.page_indices,
-                local.last_page_lengths,
-                self.attention_config.num_attention_heads,
-                self.attention_config.num_key_value_heads,
-                self.config.head_dim,
-                PAGE_SIZE,
-                custom_mask=custom_mask,
-                causal=custom_mask is None,
-                sm_scale=1.0,
-                window_left=self.sliding_window - 1,
-                q_data_type=torch.bfloat16,
-                kv_data_type=self._cache.dtype,
-                o_data_type=torch.bfloat16,
-            )
-            self._global_prefill.plan(
-                global_.qo_indptr,
-                global_.kv_indptr,
-                global_.page_indices,
-                global_.last_page_lengths,
-                self.attention_config.num_attention_heads,
-                self.attention_config.num_global_key_value_heads,
-                self.config.global_head_dim,
-                PAGE_SIZE,
-                causal=True,
-                sm_scale=1.0,
-                q_data_type=torch.bfloat16,
-                kv_data_type=self._cache.dtype,
-                o_data_type=torch.bfloat16,
-            )
-            return self._local_prefill, self._global_prefill
+        prefill = batch.phase == BatchPhase.PREFILL
+        wrappers = (
+            (self._local_prefill, self._global_prefill)
+            if prefill
+            else (self._local_decode, self._global_decode)
+        )
+        return self._plan_page_pair(
+            wrappers,
+            local,
+            global_,
+            self.attention_config.num_attention_heads,
+            queries=(local.qo_indptr, global_.qo_indptr) if prefill else (None, None),
+            local_mask=custom_mask,
+        )
 
-        common = {
-            "pos_encoding_mode": "NONE",
-            "q_data_type": torch.bfloat16,
-            "kv_data_type": self._cache.dtype,
-            "o_data_type": torch.bfloat16,
-            "sm_scale": 1.0,
-        }
-        self._local_decode.plan(
-            local.kv_indptr,
-            local.page_indices,
-            local.last_page_lengths,
-            self.attention_config.num_attention_heads,
-            self.attention_config.num_key_value_heads,
-            self.config.head_dim,
-            PAGE_SIZE,
-            window_left=self.sliding_window - 1,
-            **common,
-        )
-        self._global_decode.plan(
-            global_.kv_indptr,
-            global_.page_indices,
-            global_.last_page_lengths,
-            self.attention_config.num_attention_heads,
-            self.attention_config.num_global_key_value_heads,
-            self.config.global_head_dim,
-            PAGE_SIZE,
-            **common,
-        )
-        return self._local_decode, self._global_decode
+    def _plan_page_pair(
+        self, wrappers, local, global_, heads, *, queries=(None, None), local_mask=None
+    ):
+        config = self.attention_config
+        for is_local, wrapper, plan, query in zip(
+            (True, False), wrappers, (local, global_), queries, strict=True
+        ):
+            kv = (plan.kv_indptr, plan.page_indices, plan.last_page_lengths)
+            mask = local_mask if is_local else None
+            wrapper.plan(
+                *((query, *kv) if query is not None else kv),
+                heads,
+                config.num_key_value_heads
+                if is_local
+                else config.num_global_key_value_heads,
+                self.config.head_dim if is_local else self.config.global_head_dim,
+                PAGE_SIZE,
+                window_left=self.sliding_window - 1 if is_local else -1,
+                q_data_type=torch.bfloat16,
+                kv_data_type=self._cache.dtype,
+                o_data_type=torch.bfloat16,
+                sm_scale=1.0,
+                pos_encoding_mode="NONE",
+                **(
+                    {"causal": mask is None, "custom_mask": mask}
+                    if query is not None
+                    else {}
+                ),
+            )
+        return wrappers
 
     def _features_for(
         self, sequence_id: int, media: tuple[Media, ...]
@@ -939,61 +931,84 @@ class Gemma4CudaRunner(CudaRunner):
             **({"causal": True} if qo_indptr is not None else {}),
         )
 
+    def _capture_page_attention(
+        self, shape, *, local: bool, query_width: int = 1, assistant: bool = False
+    ):
+        """Allocate fixed graph buffers and prime the FlashInfer wrapper on page zero."""
+        rows, history_width = shape
+        page_width = self.local_graph_page_capacity if local else history_width
+        workspace = self._graph_attention_workspaces[0 if local else 1]
+        row_indptr = torch.arange(rows + 1, dtype=torch.int32, device=self.device)
+        verify = query_width > 1
+
+        def int_buffer(length):
+            return torch.empty(length, dtype=torch.int32, device=self.device)
+
+        writes = 0 if assistant else rows * query_width
+        plan = _DevicePagedPlan(
+            qo_indptr=int_buffer(rows + 1) if verify else row_indptr,
+            kv_indptr=int_buffer(rows + 1),
+            page_indices=int_buffer(rows * page_width),
+            last_page_lengths=int_buffer(rows),
+            append_pages=torch.empty(writes, dtype=torch.int64, device=self.device),
+            append_offsets=torch.empty(writes, dtype=torch.int64, device=self.device),
+        )
+        if verify:
+            wrapper = self._new_verify_attention_wrapper(
+                workspace,
+                "NHD",
+                use_cuda_graph=True,
+                backend="auto",
+                qo_indptr_buf=plan.qo_indptr,
+                paged_kv_indptr_buf=plan.kv_indptr,
+                paged_kv_indices_buf=plan.page_indices,
+                paged_kv_last_page_len_buf=plan.last_page_lengths,
+            )
+        else:
+            from flashinfer import BatchDecodeWithPagedKVCacheWrapper
+
+            constructor = (
+                self._new_assistant_graph_attention_wrapper
+                if assistant
+                else BatchDecodeWithPagedKVCacheWrapper
+            )
+            wrapper = constructor(
+                workspace,
+                "NHD",
+                use_cuda_graph=True,
+                paged_kv_indptr_buffer=plan.kv_indptr,
+                paged_kv_indices_buffer=plan.page_indices,
+                paged_kv_last_page_len_buffer=plan.last_page_lengths,
+                backend="auto" if assistant else "fa2",
+                use_tensor_cores=not assistant,
+            )
+        self._plan_graph_attention(
+            wrapper,
+            row_indptr,
+            torch.zeros(rows, dtype=torch.int32, device=self.device),
+            torch.full(
+                (rows,),
+                query_width + 1 if verify else 1,
+                dtype=torch.int32,
+                device=self.device,
+            ),
+            local=local,
+            assistant=assistant,
+            qo_indptr=row_indptr * query_width if verify else None,
+        )
+        return wrapper, plan
+
     def _new_decode_graph_step(self, shape: GraphShape) -> CudaGraphStep:
         if self.speculative_draft_tokens:
             return self._new_speculative_graph_step(shape)
-        from flashinfer import BatchDecodeWithPagedKVCacheWrapper
 
-        batch_size, history_width = shape
+        batch_size = shape[0]
 
         def empty(dtype, *dimensions):
             return torch.empty(dimensions, dtype=dtype, device=self.device)
 
-        def attention(width: int, *, local: bool):
-            workspace = self._graph_attention_workspaces[0 if local else 1]
-            kv_indptr = empty(torch.int32, batch_size + 1)
-            page_indices = empty(torch.int32, batch_size * width)
-            last_page_lengths = empty(torch.int32, batch_size)
-            append_pages = empty(torch.int64, batch_size)
-            append_offsets = empty(torch.int64, batch_size)
-            wrapper = BatchDecodeWithPagedKVCacheWrapper(
-                workspace,
-                "NHD",
-                use_cuda_graph=True,
-                use_tensor_cores=True,
-                paged_kv_indptr_buffer=kv_indptr,
-                paged_kv_indices_buffer=page_indices,
-                paged_kv_last_page_len_buffer=last_page_lengths,
-                backend="fa2",
-            )
-            initial_indptr = torch.arange(
-                batch_size + 1, dtype=torch.int32, device=self.device
-            )
-            initial_indices = torch.zeros(
-                batch_size, dtype=torch.int32, device=self.device
-            )
-            initial_last = torch.ones(batch_size, dtype=torch.int32, device=self.device)
-            self._plan_graph_attention(
-                wrapper,
-                initial_indptr,
-                initial_indices,
-                initial_last,
-                local=local,
-            )
-            plan = _DevicePagedPlan(
-                qo_indptr=torch.arange(
-                    batch_size + 1, dtype=torch.int32, device=self.device
-                ),
-                kv_indptr=kv_indptr,
-                page_indices=page_indices,
-                last_page_lengths=last_page_lengths,
-                append_pages=append_pages,
-                append_offsets=append_offsets,
-            )
-            return wrapper, plan
-
-        local_wrapper, local = attention(self.local_graph_page_capacity, local=True)
-        global_wrapper, global_ = attention(history_width, local=False)
+        local_wrapper, local = self._capture_page_attention(shape, local=True)
+        global_wrapper, global_ = self._capture_page_attention(shape, local=False)
         self._graph_attention[shape] = (local_wrapper, global_wrapper)
         token_ids = empty(torch.int64, batch_size)
         positions = empty(torch.int64, batch_size)
@@ -1018,16 +1033,8 @@ class Gemma4CudaRunner(CudaRunner):
         inputs = {
             "token_ids": token_ids,
             "positions": positions,
-            "local_kv_indptr": local.kv_indptr,
-            "local_page_indices": local.page_indices,
-            "local_last_page_lengths": local.last_page_lengths,
-            "local_append_pages": local.append_pages,
-            "local_append_offsets": local.append_offsets,
-            "global_kv_indptr": global_.kv_indptr,
-            "global_page_indices": global_.page_indices,
-            "global_last_page_lengths": global_.last_page_lengths,
-            "global_append_pages": global_.append_pages,
-            "global_append_offsets": global_.append_offsets,
+            **local.graph_inputs("local"),
+            **global_.graph_inputs("global"),
         }
         inputs.update(self._sampler.graph_inputs(sampling))
         return CudaGraphStep(inputs=inputs, output=output_ids, launch=launch)
@@ -1046,109 +1053,24 @@ class Gemma4CudaRunner(CudaRunner):
         assistant = self._assistant
         if assistant is None:
             raise RuntimeError("speculative graph requires the Gemma 4 assistant")
-        batch_size, history_width = shape
+        batch_size = shape[0]
         width = self.speculative_draft_tokens + 1
 
         def empty(dtype, *dimensions):
             return torch.empty(dimensions, dtype=dtype, device=self.device)
 
-        def attention(page_width: int, *, local: bool):
-            workspace = self._graph_attention_workspaces[0 if local else 1]
-            assistant_kv_indptr = empty(torch.int32, batch_size + 1)
-            assistant_page_indices = empty(torch.int32, batch_size * page_width)
-            assistant_last = empty(torch.int32, batch_size)
-            assistant_wrapper = self._new_assistant_graph_attention_wrapper(
-                workspace,
-                "NHD",
-                use_cuda_graph=True,
-                paged_kv_indptr_buffer=assistant_kv_indptr,
-                paged_kv_indices_buffer=assistant_page_indices,
-                paged_kv_last_page_len_buffer=assistant_last,
-                backend="auto",
-            )
-            verify_qo_indptr = empty(torch.int32, batch_size + 1)
-            verify_kv_indptr = empty(torch.int32, batch_size + 1)
-            verify_page_indices = empty(torch.int32, batch_size * page_width)
-            verify_last = empty(torch.int32, batch_size)
-            verify_append_pages = empty(torch.int64, batch_size * width)
-            verify_append_offsets = empty(torch.int64, batch_size * width)
-            verify_wrapper = self._new_verify_attention_wrapper(
-                workspace,
-                "NHD",
-                use_cuda_graph=True,
-                qo_indptr_buf=verify_qo_indptr,
-                paged_kv_indptr_buf=verify_kv_indptr,
-                paged_kv_indices_buf=verify_page_indices,
-                paged_kv_last_page_len_buf=verify_last,
-                backend="auto",
-            )
-            initial_kv_indptr = torch.arange(
-                batch_size + 1, dtype=torch.int32, device=self.device
-            )
-            initial_indices = torch.zeros(
-                batch_size, dtype=torch.int32, device=self.device
-            )
-            initial_assistant_last = torch.ones(
-                batch_size, dtype=torch.int32, device=self.device
-            )
-            initial_verify_qo = torch.arange(
-                0,
-                (batch_size + 1) * width,
-                width,
-                dtype=torch.int32,
-                device=self.device,
-            )
-            initial_verify_last = torch.full(
-                (batch_size,), width + 1, dtype=torch.int32, device=self.device
-            )
-            self._plan_graph_attention(
-                assistant_wrapper,
-                initial_kv_indptr,
-                initial_indices,
-                initial_assistant_last,
-                local=local,
-                assistant=True,
-            )
-            self._plan_graph_attention(
-                verify_wrapper,
-                initial_kv_indptr,
-                initial_indices,
-                initial_verify_last,
-                local=local,
-                qo_indptr=initial_verify_qo,
-            )
-            assistant_plan = _DevicePagedPlan(
-                qo_indptr=torch.arange(
-                    batch_size + 1, dtype=torch.int32, device=self.device
-                ),
-                kv_indptr=assistant_kv_indptr,
-                page_indices=assistant_page_indices,
-                last_page_lengths=assistant_last,
-                append_pages=empty(torch.int64, 0),
-                append_offsets=empty(torch.int64, 0),
-            )
-            verify_plan = _DevicePagedPlan(
-                qo_indptr=verify_qo_indptr,
-                kv_indptr=verify_kv_indptr,
-                page_indices=verify_page_indices,
-                last_page_lengths=verify_last,
-                append_pages=verify_append_pages,
-                append_offsets=verify_append_offsets,
-            )
-            return assistant_wrapper, assistant_plan, verify_wrapper, verify_plan
-
-        (
-            assistant_local_wrapper,
-            assistant_local,
-            verify_local_wrapper,
-            verify_local,
-        ) = attention(self.local_graph_page_capacity, local=True)
-        (
-            assistant_global_wrapper,
-            assistant_global,
-            verify_global_wrapper,
-            verify_global,
-        ) = attention(history_width, local=False)
+        assistant_local_wrapper, assistant_local = self._capture_page_attention(
+            shape, local=True, assistant=True
+        )
+        verify_local_wrapper, verify_local = self._capture_page_attention(
+            shape, local=True, query_width=width
+        )
+        assistant_global_wrapper, assistant_global = self._capture_page_attention(
+            shape, local=False, assistant=True
+        )
+        verify_global_wrapper, verify_global = self._capture_page_attention(
+            shape, local=False, query_width=width
+        )
         self._graph_spec_attention[shape] = (
             assistant_local_wrapper,
             assistant_global_wrapper,
@@ -1235,23 +1157,11 @@ class Gemma4CudaRunner(CudaRunner):
             "token_ids": token_ids,
             "positions": positions,
             "target_hidden": target_hidden,
-            "assistant_local_kv_indptr": assistant_local.kv_indptr,
-            "assistant_local_page_indices": assistant_local.page_indices,
-            "assistant_local_last_page_lengths": assistant_local.last_page_lengths,
-            "assistant_global_kv_indptr": assistant_global.kv_indptr,
-            "assistant_global_page_indices": assistant_global.page_indices,
-            "assistant_global_last_page_lengths": assistant_global.last_page_lengths,
             "verify_qo_indptr": verify_local.qo_indptr,
-            "verify_local_kv_indptr": verify_local.kv_indptr,
-            "verify_local_page_indices": verify_local.page_indices,
-            "verify_local_last_page_lengths": verify_local.last_page_lengths,
-            "verify_local_append_pages": verify_local.append_pages,
-            "verify_local_append_offsets": verify_local.append_offsets,
-            "verify_global_kv_indptr": verify_global.kv_indptr,
-            "verify_global_page_indices": verify_global.page_indices,
-            "verify_global_last_page_lengths": verify_global.last_page_lengths,
-            "verify_global_append_pages": verify_global.append_pages,
-            "verify_global_append_offsets": verify_global.append_offsets,
+            **assistant_local.graph_inputs("assistant_local"),
+            **assistant_global.graph_inputs("assistant_global"),
+            **verify_local.graph_inputs("verify_local"),
+            **verify_global.graph_inputs("verify_global"),
         }
         inputs.update(self._sampler.graph_inputs(sampling))
         # At non-power-of-two row counts the captured NVFP4 path can cross an
@@ -1266,22 +1176,22 @@ class Gemma4CudaRunner(CudaRunner):
             validate_eager_output=False,
         )
 
-    def _prepare_graph_attention(
-        self, shape: GraphShape, inputs: dict[str, object]
-    ) -> None:
+    def _graph_attention_stages(self, shape, inputs):
         if self.speculative_draft_tokens:
             wrappers = self._graph_spec_attention[shape]
-            stages = (
+            return (
                 ("assistant_", wrappers[:2], None),
                 ("verify_", wrappers[2:], inputs["verify_qo_indptr"]),
             )
-        else:
-            stages = (("", self._graph_attention[shape], None),)
+        return (("", self._graph_attention[shape], None),)
 
+    def _prepare_graph_attention(
+        self, shape: GraphShape, inputs: dict[str, object]
+    ) -> None:
         def tensor(values):
             return torch.as_tensor(values, dtype=torch.int32, device=self.device)
 
-        for prefix, wrappers, queries in stages:
+        for prefix, wrappers, queries in self._graph_attention_stages(shape, inputs):
             for local, wrapper in zip((True, False), wrappers, strict=True):
                 name = prefix + ("local" if local else "global")
                 indptr = inputs[f"{name}_kv_indptr"]
@@ -1298,21 +1208,20 @@ class Gemma4CudaRunner(CudaRunner):
 
     @staticmethod
     def _pack_graph_pages(name, plan, active_rows, graph_rows, width, padding_last=1):
-        row_widths = np.diff(plan.kv_indptr)
-        if len(row_widths) != active_rows or np.any(row_widths > width):
+        if len(plan.kv_indptr) != active_rows + 1 or (
+            plan.kv_indptr[-1] > width and np.any(np.diff(plan.kv_indptr) > width)
+        ):
             raise GraphInputError(f"{name} page table exceeds CUDA graph shape")
         indices = np.zeros(graph_rows * width, dtype=np.int32)
-        indptr = np.zeros(graph_rows + 1, dtype=np.int32)
-        cursor = 0
-        for row in range(graph_rows):
-            if row < active_rows:
-                start, end = map(int, plan.kv_indptr[row : row + 2])
-                count = end - start
-                indices[cursor : cursor + count] = plan.page_indices[start:end]
-            else:
-                count = 1
-            cursor += count
-            indptr[row + 1] = cursor
+        indptr = np.empty(graph_rows + 1, dtype=np.int32)
+        # The active rows already form a contiguous CSR. Each padded row reads page zero.
+        count = int(plan.kv_indptr[-1])
+        indices[:count] = plan.page_indices[:count]
+        indptr[: active_rows + 1] = plan.kv_indptr
+        if graph_rows > active_rows:
+            indptr[active_rows + 1 :] = np.arange(
+                count + 1, count + 1 + graph_rows - active_rows
+            )
         last = np.full(graph_rows, padding_last, dtype=np.int32)
         last[:active_rows] = plan.last_page_lengths
         return {
@@ -1365,22 +1274,90 @@ class Gemma4CudaRunner(CudaRunner):
                 query_width + 1,
             )
         )
+        if len(verify.qo_indptr) != active_rows + 1 or np.any(
+            np.diff(verify.qo_indptr) != query_width
+        ):
+            raise GraphInputError("verify append rows do not match graph width")
+        size = active_rows * query_width
+        slots = verify.append_slots
         append_pages = np.zeros(graph_rows * query_width, dtype=np.int64)
-        append_offsets = np.zeros(graph_rows * query_width, dtype=np.int64)
-        for row in range(graph_rows):
-            start = row * query_width
-            end = start + query_width
-            if row < active_rows:
-                query_start, query_end = map(int, verify.qo_indptr[row : row + 2])
-                slots = verify.append_slots[query_start:query_end]
-                if len(slots) != query_width:
-                    raise GraphInputError("verify append rows do not match graph width")
-                append_pages[start:end] = slots // PAGE_SIZE
-                append_offsets[start:end] = slots % PAGE_SIZE
-            else:
-                append_offsets[start:end] = np.arange(1, query_width + 1)
+        append_offsets = np.empty((graph_rows, query_width), dtype=np.int64)
+        append_pages[:size] = slots // PAGE_SIZE
+        append_offsets[:active_rows] = (slots % PAGE_SIZE).reshape(
+            active_rows, query_width
+        )
+        if graph_rows > active_rows:
+            append_offsets[active_rows:] = np.arange(1, query_width + 1)
         inputs[f"verify_{name}_append_pages"] = append_pages
-        inputs[f"verify_{name}_append_offsets"] = append_offsets
+        inputs[f"verify_{name}_append_offsets"] = append_offsets.reshape(-1)
+        return inputs
+
+    def _decode_page_shape(self, active_rows, local, history):
+        history_width = int(np.diff(history.kv_indptr).max())
+        local_width = int(np.diff(local.kv_indptr).max())
+        if local_width > self.local_graph_page_capacity:
+            raise GraphInputError("local page table exceeds CUDA graph shape")
+        return self._select_cuda_graph(
+            "decode",
+            match=lambda candidate: (
+                candidate[0] >= active_rows and candidate[1] >= history_width
+            ),
+        )
+
+    def _decode_page_inputs(self, native, batch, shape, hidden, *, padding_position):
+        graph_rows, graph_history_width = shape
+        active_rows = native.num_sequences
+        padding_rows = graph_rows - active_rows
+        token_ids = np.zeros(graph_rows, dtype=batch.token_ids.dtype)
+        positions = np.full(graph_rows, padding_position, dtype=batch.positions.dtype)
+        token_ids[:active_rows] = batch.token_ids
+        positions[:active_rows] = batch.positions
+        inputs: dict[str, object] = {"token_ids": token_ids, "positions": positions}
+        if hidden is not None:
+            width = self.speculative_draft_tokens + 1
+            assistant = gemma4_assistant_context(
+                batch, local_window_tokens=self.sliding_window
+            )
+            verify = expand_gemma4_decode_batch(
+                batch,
+                np.zeros((active_rows, self.speculative_draft_tokens), dtype=np.int64),
+            )
+            inputs.update(
+                {
+                    "target_hidden": hidden,
+                    "verify_qo_indptr": np.arange(
+                        0, (graph_rows + 1) * width, width, dtype=np.int32
+                    ),
+                }
+            )
+        for name, page_width in (
+            ("local", self.local_graph_page_capacity),
+            ("global", graph_history_width),
+        ):
+            if hidden is not None:
+                pages = self._spec_graph_page_inputs(
+                    name,
+                    assistant.local if name == "local" else assistant.global_,
+                    verify.local if name == "local" else verify.global_,
+                    active_rows=active_rows,
+                    graph_rows=graph_rows,
+                    page_width=page_width,
+                    query_width=width,
+                )
+            else:
+                pages = self._graph_page_inputs(
+                    name,
+                    batch.local if name == "local" else batch.global_,
+                    active_rows=active_rows,
+                    graph_rows=graph_rows,
+                    width=page_width,
+                )
+            inputs.update(pages)
+        inputs.update(
+            pad_sampling_inputs(
+                self._sampler, native, self.config.vocab_size, padding_rows
+            )
+        )
         return inputs
 
     def _graph_forward(
@@ -1404,71 +1381,14 @@ class Gemma4CudaRunner(CudaRunner):
                 self._cuda_graph_fallback("decode", "target_hidden")
                 return None
         active_rows = native.num_sequences
-        history_width = int(np.diff(batch.global_.kv_indptr).max())
-        local_width = int(np.diff(batch.local.kv_indptr).max())
-        if local_width > self.local_graph_page_capacity:
-            raise GraphInputError("local page table exceeds CUDA graph shape")
-        shape = self._select_cuda_graph(
-            "decode",
-            match=lambda candidate: (
-                candidate[0] >= active_rows and candidate[1] >= history_width
-            ),
-        )
+        shape = self._decode_page_shape(active_rows, batch.local, batch.global_)
         if shape is None:
             return None
-        graph_rows, graph_history_width = shape
-        padding_rows = graph_rows - active_rows
-        token_ids = np.zeros(graph_rows, dtype=batch.token_ids.dtype)
-        positions = np.full(graph_rows, int(speculative), dtype=batch.positions.dtype)
-        token_ids[:active_rows] = batch.token_ids
-        positions[:active_rows] = batch.positions
-        inputs: dict[str, object] = {"token_ids": token_ids, "positions": positions}
-        if speculative:
-            width = self.speculative_draft_tokens + 1
-            assistant = gemma4_assistant_context(
-                batch, local_window_tokens=self.sliding_window
-            )
-            verify = expand_gemma4_decode_batch(
-                batch,
-                np.zeros((active_rows, self.speculative_draft_tokens), dtype=np.int64),
-            )
-            inputs.update(
-                {
-                    "target_hidden": self._gather_target_hidden(
-                        sequence_ids, graph_rows
-                    ),
-                    "verify_qo_indptr": np.arange(
-                        0, (graph_rows + 1) * width, width, dtype=np.int32
-                    ),
-                }
-            )
-        for name, page_width in (
-            ("local", self.local_graph_page_capacity),
-            ("global", graph_history_width),
-        ):
-            if speculative:
-                pages = self._spec_graph_page_inputs(
-                    name,
-                    assistant.local if name == "local" else assistant.global_,
-                    verify.local if name == "local" else verify.global_,
-                    active_rows=active_rows,
-                    graph_rows=graph_rows,
-                    page_width=page_width,
-                    query_width=width,
-                )
-            else:
-                pages = self._graph_page_inputs(
-                    name,
-                    batch.local if name == "local" else batch.global_,
-                    active_rows=active_rows,
-                    graph_rows=graph_rows,
-                    width=page_width,
-                )
-            inputs.update(pages)
-        inputs.update(
-            pad_sampling_inputs(
-                self._sampler, native, self.config.vocab_size, padding_rows
-            )
+        hidden = (
+            self._gather_target_hidden(sequence_ids, shape[0]) if speculative else None
+        )
+        inputs = self._decode_page_inputs(
+            native, batch, shape, hidden, padding_position=int(speculative)
         )
         self._prepare_graph_attention(shape, inputs)
         output = self._run_cuda_graph("decode", shape, inputs)
