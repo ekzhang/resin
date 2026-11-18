@@ -334,9 +334,13 @@ def test_qwen_and_inkling2_native_bitmap_geometry_and_token_counts() -> None:
         Tokenizer(),
         media_config={"size": {"height": 2, "width": 2}, "do_normalize": False},
     )
+    pixels = np.linspace(0, 1, 3 * 5 * 3, dtype=np.float32).reshape(3, 5, 3)
     (media,) = render_media(inkling2, [resin.recipe.Image.from_rgb(pixels)])
-    assert media.span.length == 8 and not media.atomic
-    np.testing.assert_array_equal(media.image, pixels)
+    assert media.span.length == 6 and not media.atomic
+    expected = np.pad(pixels, ((0, 1), (0, 1), (0, 0)), constant_values=-1 / 255)
+    np.testing.assert_allclose(
+        media.image, expected, rtol=float(np.finfo(np.float32).eps), atol=0
+    )
 
 
 def test_deepseek_geometry_positions_and_cache_identity() -> None:

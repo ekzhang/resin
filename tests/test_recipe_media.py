@@ -8,12 +8,20 @@ from __future__ import annotations
 
 import numpy as np
 import pytest
-import torch
 from recipe_fuzz.inputs import native_inputs
 
 import resin
+from resin.models.vision import packed_images, padded_patches
 from resin.recipe import get_native_recipe
 
+GEMMA = (
+    "gemma4",
+    "nvidia/Gemma-4-31B-IT-NVFP4",
+    "4135a98a9b728a548947683219633b25682223ac",
+)
+GEMMA_ONLY = pytest.mark.parametrize(
+    "model_processor", [GEMMA], indirect=True, ids=["gemma4"]
+)
 MODELS = (
     (
         "inkling2",
@@ -25,17 +33,13 @@ MODELS = (
         "RadixArk/Qwen3.8-27B-NVFP4",
         "554ebba9b5f1b79dc11246341960360e6ef05ef4",
     ),
-    (
-        "gemma4",
-        "nvidia/Gemma-4-31B-IT-NVFP4",
-        "4135a98a9b728a548947683219633b25682223ac",
-    ),
+    GEMMA,
 )
 
 
 @pytest.fixture(scope="module", params=MODELS, ids=lambda model: model[0])
 def model_processor(request):
-    from transformers import AutoProcessor
+    from transformers import AutoProcessor, PreTrainedTokenizerBase
 
     model, repo, revision = request.param
     try:
@@ -44,6 +48,8 @@ def model_processor(request):
         )
     except OSError:
         pytest.skip(f"pinned processor {repo}@{revision} is not cached")  # ty: ignore[too-many-positional-arguments]
+    if model == "inkling2" and isinstance(processor, PreTrainedTokenizerBase):
+        pytest.skip("installed Transformers has no Inkling 2 image processor")  # ty: ignore[too-many-positional-arguments]
     recipe_name = "qwen3_8" if model == "qwen3_5" else model
     image_config = processor.image_processor.to_dict()
     config = (
@@ -69,9 +75,60 @@ def video():
     return np.linspace(0, 1, 32 * 64 * 64 * 3, dtype=np.float32).reshape(32, 64, 64, 3)
 
 
-def assert_reference_tensors(
-    processor, recipe, messages, *, tools=None, resized_pixels=False
-):
+def assert_pixels(model, processor, media, expected, *, atol):
+    assert media
+    config = processor.image_processor
+    if model == "gemma4":
+        # HF pads to a fixed budget. The runner pads to the longest item.
+        for field, position_field, items in (
+            (
+                "pixel_values",
+                "image_position_ids",
+                [m.image for m in media if m.image is not None],
+            ),
+            (
+                "pixel_values_videos",
+                "video_position_ids",
+                [f for m in media for f in m.video or ()],
+            ),
+        ):
+            if field not in expected:
+                assert not items
+                continue
+            values, positions = padded_patches(
+                items,
+                config.patch_size
+                if field == "pixel_values"
+                else processor.video_processor.patch_size,
+            )
+            ref_values, ref_positions = expected[field], expected[position_field]
+            if field == "pixel_values_videos":
+                ref_values, ref_positions = (
+                    ref_values.flatten(0, 1),
+                    ref_positions.flatten(0, 1),
+                )
+            count = values.shape[1]
+            np.testing.assert_array_equal(positions, ref_positions[:, :count])
+            assert (ref_positions[:, count:] == -1).all()
+            np.testing.assert_allclose(values, ref_values[:, :count], atol=atol, rtol=0)
+    else:
+        if model == "inkling2":
+            values, grid = packed_images(
+                media, config.size["height"], channels_last=True
+            )
+        else:
+            values, grid = packed_images(
+                media,
+                config.patch_size,
+                merge=config.merge_size,
+                temporal=config.temporal_patch_size,
+            )
+        np.testing.assert_array_equal(grid, expected["image_grid_thw"])
+        np.testing.assert_allclose(values, expected["pixel_values"], atol=atol, rtol=0)
+
+
+def assert_reference_tensors(model_processor, messages, *, tools=None):
+    model, processor, recipe = model_processor
     request = {"messages": messages, "tools": tools}
     expected = processor.apply_chat_template(
         messages,
@@ -84,31 +141,17 @@ def assert_reference_tensors(
     )
     actual = recipe.render(**native_inputs(request))
     assert actual.token_ids.tolist() == expected["input_ids"][0].tolist()
-    assert actual.media is not None
-    for key, value in expected.items():
-        # The engine stores the prepared payload, without HF's batch/mask shell.
-        if isinstance(value, torch.Tensor) and hasattr(actual.media, key):
-            prepared = getattr(actual.media, key)
-            if key == "mm_token_type_ids":
-                assert tuple(value[0].tolist()) == prepared
-            else:
-                reference = value.numpy()
-                assert reference.shape == prepared.shape, key
-                assert reference.dtype == prepared.dtype, key
-                if resized_pixels and key.startswith("pixel_values"):
-                    # The Rust resize filter need not match Torchvision's pixel
-                    # arithmetic. Placement and padding geometry remain exact;
-                    # no-resize pixel parity is checked independently below.
-                    np.testing.assert_allclose(
-                        reference, prepared, atol=0.01, rtol=0, err_msg=key
-                    )
-                else:
-                    assert np.array_equal(reference, prepared), key
-    return actual
+    # Resize filters can differ slightly. Geometry and unresized pixels match exactly.
+    assert_pixels(
+        model,
+        processor,
+        actual.media,
+        expected,
+        atol=0 if model == "inkling2" else 0.01,
+    )
 
 
 def test_native_recipe_preserves_real_image_geometry_and_tools(model_processor):
-    model, processor, recipe = model_processor
     messages = [
         {
             "role": "user",
@@ -134,9 +177,7 @@ def test_native_recipe_preserves_real_image_geometry_and_tools(model_processor):
             },
         }
     ]
-    assert_reference_tensors(
-        processor, recipe, messages, tools=tools, resized_pixels=model != "inkling2"
-    )
+    assert_reference_tensors(model_processor, messages, tools=tools)
 
 
 def test_native_recipe_matches_unresized_reference_pixels(model_processor):
@@ -169,10 +210,7 @@ def test_native_recipe_matches_unresized_reference_pixels(model_processor):
             )
         ]
     ).media
-    assert actual is not None
-    for key, value in expected.items():
-        if isinstance(value, torch.Tensor) and hasattr(actual, key):
-            assert np.array_equal(value.numpy(), getattr(actual, key)), key
+    assert_pixels(model, processor, actual, expected, atol=0)
 
 
 def test_literal_media_marker_does_not_acquire_a_pixel_slot(model_processor):
@@ -210,12 +248,10 @@ def test_literal_media_marker_does_not_acquire_a_pixel_slot(model_processor):
     ],
     ids=["digits", "colon", "space"],
 )
+@GEMMA_ONLY
 def test_native_recipe_preserves_gemma_video_timestamps_and_geometry(
     model_processor, prefix, suffix
 ):
-    model, processor, recipe = model_processor
-    if model != "gemma4":
-        pytest.skip("only the Gemma runner implements video inputs")  # ty: ignore[too-many-positional-arguments]
     messages = [
         {
             "role": "user",
@@ -226,13 +262,11 @@ def test_native_recipe_preserves_gemma_video_timestamps_and_geometry(
             ],
         }
     ]
-    assert_reference_tensors(processor, recipe, messages, resized_pixels=True)
+    assert_reference_tensors(model_processor, messages)
 
 
+@GEMMA_ONLY
 def test_native_recipe_preserves_gemma_mixed_media_order(model_processor):
-    model, processor, recipe = model_processor
-    if model != "gemma4":
-        pytest.skip("only the Gemma runner implements mixed image/video inputs")  # ty: ignore[too-many-positional-arguments]
     messages = [
         {
             "role": "user",
@@ -247,4 +281,4 @@ def test_native_recipe_preserves_gemma_mixed_media_order(model_processor):
             ],
         }
     ]
-    assert_reference_tensors(processor, recipe, messages, resized_pixels=True)
+    assert_reference_tensors(model_processor, messages)
