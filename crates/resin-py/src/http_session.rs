@@ -14,8 +14,7 @@ use pyo3::{
 };
 use pythonize::pythonize;
 use resin_http::{
-    ConversationRequest, EVENT_QUEUE_CAPACITY, FinishReason, GeneratedTokenLogprob,
-    GenerationEvent, GenerationJob,
+    ConversationRequest, EVENT_QUEUE_CAPACITY, FinishReason, GeneratedTokenLogprob, GenerationEvent,
 };
 use resin_recipe::{AttributedEvent, Event as ParsedEvent, FinishReason as ParserFinishReason};
 use std::{collections::HashMap, sync::Mutex, time::Instant};
@@ -154,8 +153,7 @@ struct ActiveRequest {
     parser: Parser,
     stops: StopFilter,
     scores: Option<OutputScores>,
-    prompt_logprobs: bool,
-    prompt_ids: Vec<u32>,
+    prompt_score_ids: Option<Vec<u32>>,
     events: mpsc::Sender<GenerationEvent>,
     started: Instant,
     first_token_at: Option<Instant>,
@@ -257,24 +255,17 @@ impl Session {
     pub fn active_count(&self) -> usize {
         self.active.len()
     }
-    pub fn admit(&mut self, job: GenerationJob) {
+    pub fn admit_rendered(
+        &mut self,
+        request: &ConversationRequest,
+        events: mpsc::Sender<GenerationEvent>,
+        enqueued_at: Instant,
+        rendered: RenderedJob,
+    ) {
         if let Some(metrics) = &self.metrics {
-            metrics.observe_queue_time(job.enqueued_at.elapsed().as_secs_f64());
+            metrics.observe_queue_time(enqueued_at.elapsed().as_secs_f64());
         }
-        if !job.events.is_closed() {
-            let rendered = render_job(&self.recipe, &job);
-            self.insert_rendered(job, rendered);
-        }
-    }
-    /// Submit a request whose prompt was rendered on another thread.
-    pub fn admit_rendered(&mut self, job: GenerationJob, rendered: RenderedJob) {
-        if let Some(metrics) = &self.metrics {
-            metrics.observe_queue_time(job.enqueued_at.elapsed().as_secs_f64());
-        }
-        self.insert_rendered(job, rendered);
-    }
-    fn insert_rendered(&mut self, job: GenerationJob, rendered: RenderedJob) {
-        if job.events.is_closed() {
+        if events.is_closed() {
             return;
         }
         let result = Python::attach(|py| {
@@ -285,14 +276,14 @@ impl Session {
                 ));
             }
             let parser = Parser::new(py, parser)?;
-            let scores = job.request.logprobs.then(OutputScores::default);
-            let extra = pythonize(py, &job.request.extra)?.unbind();
-            let stops = StopFilter::new(job.request.stop.clone())?;
-            let prompt_ids = token_ids.clone();
+            let scores = request.logprobs.then(OutputScores::default);
+            let extra = pythonize(py, &request.extra)?.unbind();
+            let stops = StopFilter::new(request.stop.clone())?;
+            let prompt_score_ids = request.prompt_logprobs.then(|| token_ids.clone());
             let sampling_params = Py::new(
                 py,
                 SamplingParams::new(
-                    job.request
+                    request
                         .max_output_tokens
                         .map(u32::try_from)
                         .transpose()
@@ -300,13 +291,13 @@ impl Session {
                             PyValueError::new_err("max_output_tokens must fit in a uint32")
                         })?,
                     self.stop_token_ids.to_vec(),
-                    job.request.temperature,
-                    job.request.top_p,
-                    job.request.top_k,
-                    job.request.seed,
-                    job.request.logprobs,
-                    job.request.top_logprobs,
-                    job.request.prompt_logprobs,
+                    request.temperature,
+                    request.top_p,
+                    request.top_k,
+                    request.seed,
+                    request.logprobs,
+                    request.top_logprobs,
+                    request.prompt_logprobs,
                     0,
                     Some(extra),
                 )?,
@@ -315,12 +306,12 @@ impl Session {
             let lease = self.engine.bind(py).borrow_mut().submit(
                 py,
                 token_ids,
-                job.request.priority.unwrap_or_default(),
+                request.priority.unwrap_or_default(),
                 None,
                 Some(sampling_params),
                 media,
                 None,
-                job.request.cache_salt.clone(),
+                request.cache_salt.clone(),
             )?;
             let lease_ref = lease.bind(py).borrow();
             let request_id = lease_ref.request_id();
@@ -328,52 +319,33 @@ impl Session {
             drop(lease_ref);
             Ok::<_, PyErr>((
                 request_id,
-                lease,
-                parser,
-                scores,
-                stops,
-                prompt_ids,
-                input_tokens,
-                cached_tokens,
+                ActiveRequest {
+                    http_id: request.id.clone(),
+                    lease,
+                    parser,
+                    stops,
+                    scores,
+                    prompt_score_ids,
+                    events: events.clone(),
+                    started: enqueued_at,
+                    first_token_at: None,
+                    input_tokens,
+                    cached_tokens,
+                    output_tokens: 0,
+                    last_source: 0,
+                    stream: StreamOutput::default(),
+                },
             ))
         });
         match result {
-            Ok((
-                request_id,
-                lease,
-                parser,
-                scores,
-                stops,
-                prompt_ids,
-                input_tokens,
-                cached_tokens,
-            )) => {
-                let _ = job
-                    .events
-                    .try_send(GenerationEvent::Started { input_tokens });
-                self.active.insert(
-                    request_id,
-                    ActiveRequest {
-                        http_id: job.request.id.clone(),
-                        lease,
-                        parser,
-                        stops,
-                        scores,
-                        prompt_logprobs: job.request.prompt_logprobs,
-                        prompt_ids,
-                        events: job.events,
-                        started: job.enqueued_at,
-                        first_token_at: None,
-                        input_tokens,
-                        cached_tokens,
-                        output_tokens: 0,
-                        last_source: 0,
-                        stream: StreamOutput::default(),
-                    },
-                );
+            Ok((id, active)) => {
+                let _ = events.try_send(GenerationEvent::Started {
+                    input_tokens: active.input_tokens,
+                });
+                self.active.insert(id, active);
             }
             Err(error) => {
-                let _ = job.events.try_send(GenerationEvent::Error {
+                let _ = events.try_send(GenerationEvent::Error {
                     message: format_python_error("request admission failed", error),
                 });
             }
@@ -522,12 +494,12 @@ impl Session {
                         .events
                         .try_send(GenerationEvent::StopSequence(sequence.to_owned()));
                 }
-                if request.prompt_logprobs {
+                if let Some(prompt_ids) = &request.prompt_score_ids {
                     let scores =
                         Python::attach(|py| request.lease.bind(py).borrow().prompt_logprobs())
                             .unwrap_or_default()
                             .into_iter()
-                            .zip(&request.prompt_ids)
+                            .zip(prompt_ids)
                             .map(|(score, &id)| {
                                 score.map(|score| self.vocabulary.token(id, score.inner.logprob))
                             })
@@ -641,9 +613,9 @@ fn render_custom<'py>(
 }
 
 /// Render prompt/media and create its parser off the engine thread.
-pub(crate) fn render_job(recipe: &Py<PyAny>, job: &GenerationJob) -> RenderedJob {
+pub(crate) fn render_job(recipe: &Py<PyAny>, request: &ConversationRequest) -> RenderedJob {
     Python::attach(|py| {
-        let input = render_input(py, recipe, &job.request)?;
+        let input = render_input(py, recipe, request)?;
         if let Ok(native) = recipe.bind(py).cast::<NativeRecipe>() {
             let native = native.borrow();
             let rendered = native.render(py, input.messages, input.tools, Some(&input.options))?;
@@ -724,11 +696,9 @@ impl NativeHttpSession {
             }
             let (events, receiver) = mpsc::channel(EVENT_QUEUE_CAPACITY);
             outputs.insert(request.id.clone(), receiver);
-            session.admit(GenerationJob {
-                request: request.clone(),
-                events,
-                enqueued_at: Instant::now(),
-            });
+            let started = Instant::now();
+            let rendered = render_job(session.recipe(), request);
+            session.admit_rendered(request, events, started, rendered);
         }
         session.cancel(&ingress.canceled)?;
         for id in &ingress.canceled {

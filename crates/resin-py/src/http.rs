@@ -398,7 +398,7 @@ fn schedule_render(
             if *shutdown.borrow() || job.events.is_closed() {
                 return Err(PyRuntimeError::new_err("prompt rendering was cancelled"));
             }
-            render_job(&recipe, &job)
+            render_job(&recipe, &job.request)
         }))
         .unwrap_or_else(|_| Err(PyRuntimeError::new_err("prompt rendering panicked")));
         let _ = completed.send((job, rendered));
@@ -467,7 +467,7 @@ fn engine_actor(
             match rendered_queue.try_recv() {
                 Ok((job, rendered)) => {
                     rendering -= 1;
-                    session.admit_rendered(job, rendered);
+                    session.admit_rendered(&job.request, job.events, job.enqueued_at, rendered);
                 }
                 Err(_) => break,
             }
