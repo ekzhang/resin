@@ -1,29 +1,11 @@
 """Cache readers must survive MLX event/command-encoder boundaries."""
 
-import types
-
 import mlx.core as mx
 import numpy as np
 import pytest
 
-from resin_models_mlx import paged_attention
 from resin_models_mlx._native import CacheStorage
-
-
-def _attention_partials(*args):
-    # Retain all three independently fenced outputs of the real reader.
-    # A generic slice/cast/reduction does not reproduce the encoder boundary.
-    function = paged_attention.paged_decode_attention
-    core = types.FunctionType(
-        function.__code__,
-        dict(
-            function.__globals__,
-            _merge_output=lambda *arrays, **_kwargs: arrays,
-        ),
-        "attention_partials",
-        function.__defaults__,
-    )
-    return core(*args)
+from resin_models_mlx._native_cache import _paged_attention_partials
 
 
 def _assert_bits(actual, expected):
@@ -34,7 +16,7 @@ def _assert_bits(actual, expected):
 
 
 @pytest.mark.parametrize("write", ["rows", "slice"])
-def test_cross_stream_readers_and_lazy_snapshots_precede_mutation(write):
+def test_cross_stream_attention_readers_precede_mutation(write):
     rng = np.random.default_rng(9937)
     initial = mx.array(rng.normal(size=(10, 2, 128, 512)).astype(np.float32)).astype(
         mx.bfloat16
@@ -50,7 +32,7 @@ def test_cross_stream_readers_and_lazy_snapshots_precede_mutation(write):
     changed = mx.array(changed_bits).view(mx.bfloat16)
 
     def read(units):
-        return _attention_partials(q, k, v, units, pages, lengths, 1, 256**-0.5)
+        return _paged_attention_partials(q, k, v, units, pages, lengths, 1, 256**-0.5)
 
     expected_before, expected_after = read(initial), read(changed)
     mx.eval(expected_before, expected_after)
@@ -58,7 +40,6 @@ def test_cross_stream_readers_and_lazy_snapshots_precede_mutation(write):
     a, b = mx.new_stream(mx.gpu), mx.new_stream(mx.gpu)
     with mx.stream(a):
         epoch = owner.write_slice(owner.initial_epoch(), 0, initial)
-        before = owner.snapshot(epoch)
         units = owner.read_epoch(epoch).reshape(initial.shape)
         old_a = read(units)
     with mx.stream(b):
@@ -84,11 +65,9 @@ def test_cross_stream_readers_and_lazy_snapshots_precede_mutation(write):
         new_a = read(current)
     with mx.stream(b):
         new_b = read(current)
-        after = owner.snapshot(mx.depends(epoch, [*new_a, *new_b]))
-    # Pre-evaluating the old snapshot or partials would hide the regression.
-    mx.eval(old_a, old_b, new_a, new_b, after, before)
-    _assert_bits(before.reshape(initial.shape), initial)
-    _assert_bits(after.reshape(initial.shape), changed)
+    # Evaluating the old partials before the write would hide the regression.
+    mx.eval(old_a, old_b, new_a, new_b)
+    _assert_bits(current, changed)
     for actual, expected in (
         (old_a, expected_before),
         (old_b, expected_before),
@@ -97,4 +76,3 @@ def test_cross_stream_readers_and_lazy_snapshots_precede_mutation(write):
     ):
         for array, reference in zip(actual, expected, strict=True):
             _assert_bits(array, reference)
-    assert owner.allocation_count == 1

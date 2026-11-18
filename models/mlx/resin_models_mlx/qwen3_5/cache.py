@@ -182,18 +182,18 @@ class CacheArena:
     def buffer_identity(self) -> int:
         return self._storage.buffer_identity
 
-    @property
-    def allocation_count(self) -> int:
-        return self._storage.allocation_count
-
     def order_after(self, reads: Sequence[mx.array]) -> None:
         """Queue later mutation after every consumer of the preceding view."""
-        if reads:
-            self._readers.extend(reads)
+        self._readers.extend(reads)
 
     def snapshot(self) -> mx.array:
         """Return an independent, immutable copy, ordered before later writes."""
-        return self._storage.snapshot(self._epoch)
+        # Copy raw words so NaNs retain their payloads. The copy is a reader
+        # of the arena, just like attention, until the next ordered write.
+        words = self._read().view(mx.uint16)
+        result = mx.full(words.shape, words, dtype=mx.uint16).view(mx.bfloat16)
+        self._readers.append(result)
+        return result
 
     def _read(self) -> mx.array:
         return self._storage.read_epoch(self._epoch)

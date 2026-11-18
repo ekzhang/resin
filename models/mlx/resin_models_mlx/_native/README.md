@@ -24,14 +24,9 @@ precede mutation. Old read views must never escape as immutable values or be
 reused after advancing the epoch. The Engine retains its writer lease across
 continuations and drains writes before releasing or reassigning cache ownership.
 
-`snapshot(epoch)` returns an independent, immutable copy of the entire arena.
-The native wrapper copies raw integer words with MLX, records the copy as a
-pending reader, and passes it to the next writer through `after=`. The pending
-list clears after successful write construction. A snapshot created
-before a write therefore preserves the earlier contents even if it has not
-yet been evaluated. Calling `snapshot` with an old epoch after later writes have
-already been issued cannot recover historical contents. Snapshots are explicit
-debug or inspection operations; metadata queries do not allocate copies.
+`CacheArena.snapshot()` makes an immutable copy for inspection. The arena
+copies raw integer words to preserve NaN payloads and adds the copy to the
+same reader list as attention. Subsequent writes wait for pending reads.
 
 `scatter_rows` treats the arena as rows of `shape[-1]` elements. Indices must be
 rank-one `int32` or `int64`, and valid target rows must be unique. Negative and
@@ -57,7 +52,7 @@ Each submitted cache operation also retains the arena's `Data` in a Metal
 command-buffer completion handler. This keeps the allocation alive while GPU
 commands use it, even if Python objects or graph nodes have been released.
 `buffer_identity` reports the actual Metal buffer identity without evaluating an
-array; `allocation_count` counts arena allocations, excluding tokens and copies.
+array.
 
 The cache constructor evaluates both the arena and initial epoch before handing
 them to a serving actor. Subsequent operations select the calling thread's

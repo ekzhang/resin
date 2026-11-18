@@ -84,6 +84,17 @@ class TestLfm2Torch:
         self.args = _tiny_args()
         self.model = Lfm2ForCausalLM(self.args).eval()
 
+    def _runner(self):
+        from unittest.mock import patch
+
+        from resin_models_torch.lfm2 import Lfm2TorchRunner
+
+        with patch(
+            "resin_models_torch.lfm2.reference.load_model",
+            return_value=(self.model, {"vocab_size": self.args.vocab_size}),
+        ):
+            return Lfm2TorchRunner(Path(__file__).parent, device="cpu")
+
     def test_fp32_logits_match_transformers_reference(self) -> None:
         from transformers.models.lfm2.configuration_lfm2 import (
             Lfm2Config as ReferenceConfig,
@@ -141,12 +152,19 @@ class TestLfm2Torch:
         torch.testing.assert_close(actual, expected, rtol=1e-5, atol=1e-5)
 
     def test_cached_chunks_match_full_forward(self) -> None:
+        from resin_models_torch.lfm2.model import RecurrentState
+
         tokens = torch.tensor([[1, 2, 3, 4]])
         with torch.inference_mode():
             full = self.model(tokens, self.model.make_cache())
             for split in (1, 2, 3):
                 cache = self.model.make_cache()
                 self.model(tokens[:, :split], cache)
+                if split > 1:
+                    state = cache.layers[0]
+                    assert isinstance(state, RecurrentState) and state.value is not None
+                    tail = state.value
+                    assert tail.untyped_storage().nbytes() == tail.nbytes
                 cached = self.model(tokens[:, split:], cache)
                 torch.testing.assert_close(
                     full[:, split:], cached, rtol=1e-5, atol=1e-5
@@ -192,14 +210,8 @@ class TestLfm2Torch:
 
     def test_engine_scores_match_full_context_model_logits(self) -> None:
         from resin import Engine, SamplingParams
-        from resin_models_torch.lfm2 import Lfm2TorchRunner
 
-        runner = Lfm2TorchRunner.__new__(Lfm2TorchRunner)
-        runner.device = torch.device("cpu")
-        runner._model = self.model
-        runner.vocab_size = self.args.vocab_size
-        runner._cache = {}
-        runner.forward_calls = 0
+        runner = self._runner()
         engine = Engine(runner)
         tokens = [1, 2, 3]
         request = engine.submit(
@@ -229,14 +241,8 @@ class TestLfm2Torch:
     @pytest.mark.parametrize("chunk", [1, 2, 8])
     def test_prompt_scores_match_full_context_without_extra_forwards(self, chunk):
         from resin import Engine, SamplingParams, SchedulerConfig
-        from resin_models_torch.lfm2 import Lfm2TorchRunner
 
-        runner = Lfm2TorchRunner.__new__(Lfm2TorchRunner)
-        runner.device = torch.device("cpu")
-        runner._model = self.model
-        runner.vocab_size = self.args.vocab_size
-        runner._cache = {}
-        runner.forward_calls = 0
+        runner = self._runner()
         tokens = [1, 2, 3, 4, 5]
         with torch.inference_mode():
             logits = self.model(torch.tensor([tokens]), self.model.make_cache())[0]
@@ -285,14 +291,8 @@ class TestLfm2Torch:
         self, context, token, message
     ) -> None:
         from resin import BatchPlan
-        from resin_models_torch.lfm2 import Lfm2TorchRunner
 
-        runner = Lfm2TorchRunner.__new__(Lfm2TorchRunner)
-        runner.device = torch.device("cpu")
-        runner._model = self.model
-        runner.vocab_size = self.args.vocab_size
-        runner._cache = {}
-        runner.forward_calls = 0
+        runner = self._runner()
         runner.forward(
             BatchPlan(
                 sequence_ids=[11],
@@ -315,16 +315,8 @@ class TestLfm2Torch:
 
     def test_runner_consumes_batch_plan_and_releases_per_request_cache(self) -> None:
         from resin import BatchPhase, BatchPlan
-        from resin_models_torch.lfm2 import Lfm2TorchRunner
 
-        runner = Lfm2TorchRunner.__new__(Lfm2TorchRunner)
-        runner.device = torch.device("cpu")
-        runner._model = self.model
-        runner.config = {"vocab_size": self.args.vocab_size}
-        runner.eos_token_id = None
-        runner.vocab_size = self.args.vocab_size
-        runner._cache = {}
-        runner.forward_calls = 0
+        runner = self._runner()
 
         prefill = BatchPlan(
             sequence_ids=[17, 23],
