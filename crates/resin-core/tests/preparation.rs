@@ -51,7 +51,7 @@ impl From<&ExecutionPlan<Payload>> for Work {
 #[derive(Default)]
 struct Model {
     work: Vec<Work>,
-    tables: Vec<Vec<KvGroupPlan>>,
+    tables: Vec<Vec<std::sync::Arc<KvGroupPlan>>>,
     reject: bool,
 }
 impl Runner<Payload> for Model {

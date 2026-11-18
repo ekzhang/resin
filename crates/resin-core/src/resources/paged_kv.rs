@@ -1,6 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::num::{NonZeroU32, NonZeroUsize};
+use std::sync::Arc;
 
 use crate::{RequestId, SequenceStep};
 
@@ -1231,7 +1232,7 @@ impl PagedKvResources {
                 state: state_plan,
             };
             plan.validate()?;
-            groups.push(plan);
+            groups.push(Arc::new(plan));
         }
 
         let lease = self.pool.acquire_writer_access(claims)?;
@@ -1390,7 +1391,7 @@ pub struct RequestResourceRef<'a> {
 #[derive(Debug)]
 #[must_use = "KV batch access must be released or quarantined"]
 pub struct PagedKvBatch {
-    pub groups: Vec<KvGroupPlan>,
+    pub groups: Vec<Arc<KvGroupPlan>>,
     pub lease: WriterAccessLease,
 }
 

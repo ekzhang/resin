@@ -14,8 +14,8 @@ use crate::resources::paged_kv::{
     PrefixStoragePolicy, RequestResourceRef,
 };
 use crate::{
-    Phase, PlanningConfig, PlanningError, RequestId, RequestProgress, Schedulable, Scheduler,
-    Selection, SequenceStep, TokenRange, schedule_ready_prefix,
+    BatchPlan, Phase, PlanningConfig, PlanningError, RequestId, RequestProgress, Schedulable,
+    Scheduler, Selection, SequenceStep, TokenRange, schedule_ready_prefix,
 };
 use std::cmp::Reverse;
 use std::num::{NonZeroU32, NonZeroU64, NonZeroUsize};
@@ -313,29 +313,25 @@ impl<P> Submission<P> {
     }
 }
 
-/// Owned numeric plan; the runner may move its arrays into a language adapter.
+/// Owned execution plan plus opaque per-request frontend payloads.
 #[derive(Clone, Debug)]
 pub struct ExecutionPlan<P> {
-    /// Flattened predecessor rows and their next prompt tokens, partitioned by sequence.
-    pub prompt_score_indices: Vec<u32>,
-    pub prompt_score_token_ids: Vec<u32>,
-    pub prompt_score_indptr: Vec<u32>,
-    pub prompt_score_top_counts: Vec<u32>,
-    pub prompt_target_indptr: Vec<u32>,
-    pub prompt_target_token_ids: Vec<u32>,
-    pub batch_id: u64,
-    pub batch_key: Option<u64>,
-    pub phase: Phase,
-    pub sequence_ids: Vec<u64>,
-    pub context_lengths: Vec<u32>,
-    /// Final prefill-history endpoints, including generated inputs on retraction.
-    /// Only meaningful for prefill; constant across that history's chunks.
-    pub prefill_lengths: Vec<u32>,
-    pub token_ids: Vec<u32>,
-    pub token_indptr: Vec<u32>,
-    pub sampling_mask: Vec<bool>,
-    pub cache_groups: Vec<KvGroupPlan>,
+    pub batch: BatchPlan,
     pub payloads: Vec<P>,
+}
+
+impl<P> std::ops::Deref for ExecutionPlan<P> {
+    type Target = BatchPlan;
+
+    fn deref(&self) -> &BatchPlan {
+        &self.batch
+    }
+}
+
+impl<P> std::ops::DerefMut for ExecutionPlan<P> {
+    fn deref_mut(&mut self) -> &mut BatchPlan {
+        &mut self.batch
+    }
 }
 
 // Foreign/user callbacks can unwind as well as return errors. Once a callback
@@ -1267,14 +1263,16 @@ impl<P: Clone> EngineCore<P> {
         for context in &mut plan.context_lengths {
             *context += maximum;
         }
-        for (group, layout) in plan.cache_groups.iter_mut().zip(
+        let contexts = &plan.batch.context_lengths;
+        for (group, layout) in plan.batch.cache_groups.iter_mut().zip(
             self.runner_config
                 .cache_layout
                 .as_ref()
                 .expect("continuation keeps resources")
                 .groups(),
         ) {
-            for (row, &position) in plan.context_lengths.iter().enumerate() {
+            let group = Arc::make_mut(group);
+            for (row, &position) in contexts.iter().enumerate() {
                 if layout.is_recurrent() {
                     group.append_block_offsets[row] = 0;
                     continue;
@@ -2424,7 +2422,7 @@ fn build_plan<P: Clone>(
     batch_id: u64,
     requests: &[Request<P>],
     scheduled_rows: &[SequenceStep],
-    kv_groups: Option<&mut Vec<KvGroupPlan>>,
+    kv_groups: Option<&mut Vec<Arc<KvGroupPlan>>>,
 ) -> Result<ExecutionPlan<P>> {
     if requests.len() != scheduled_rows.len() {
         return Err(Error::internal(
@@ -2515,22 +2513,24 @@ fn build_plan<P: Clone>(
     // payload clone. The batch keeps the independent lease through execution.
     let cache_groups = kv_groups.map_or_else(Vec::new, std::mem::take);
     Ok(ExecutionPlan {
-        prompt_score_indices,
-        prompt_score_token_ids,
-        prompt_score_indptr,
-        prompt_score_top_counts,
-        prompt_target_indptr,
-        prompt_target_token_ids,
-        sequence_ids,
-        context_lengths,
-        prefill_lengths,
-        token_ids,
-        token_indptr,
-        phase,
-        batch_id,
-        batch_key,
-        cache_groups,
-        sampling_mask,
+        batch: BatchPlan {
+            prompt_score_indices,
+            prompt_score_token_ids,
+            prompt_score_indptr,
+            prompt_score_top_counts,
+            prompt_target_indptr,
+            prompt_target_token_ids,
+            sequence_ids,
+            context_lengths,
+            prefill_lengths,
+            token_ids,
+            token_indptr,
+            phase,
+            batch_id,
+            batch_key,
+            cache_groups,
+            sampling_mask,
+        },
         payloads,
     })
 }

@@ -850,7 +850,7 @@ fn a_panicking_payload_clone_restores_the_cohort_and_releases_its_cache_access()
     impl Runner<Payload> for NativeModel {
         fn forward(&mut self, plan: ExecutionPlan<Payload>) -> Result<OwnedTokenRows, Error> {
             self.calls += 1;
-            self.ids = plan.sequence_ids;
+            self.ids = plan.batch.sequence_ids;
             let indptr = (0..=plan.payloads.len() as u32).collect();
             OwnedTokenRows::new(
                 plan.payloads

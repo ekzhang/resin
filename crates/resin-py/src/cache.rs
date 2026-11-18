@@ -424,9 +424,9 @@ impl CacheStatePlan {
 /// - `append_slotnums`: Destination block slot for each token.
 /// - `append_block_offsets`: Token offset within each destination block.
 #[pyclass(frozen, module = "resin._resin", skip_from_py_object)]
-#[derive(Clone, Debug, Eq, PartialEq, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct CacheGroupPlan {
-    inner: Arc<KvGroupPlan>,
+    pub(crate) inner: Arc<KvGroupPlan>,
 }
 
 impl CacheGroupPlan {
@@ -434,14 +434,6 @@ impl CacheGroupPlan {
         Self {
             inner: Arc::new(inner),
         }
-    }
-
-    pub(crate) fn validate_local(&self) -> PyResult<()> {
-        self.inner.validate().map_err(plan_error)
-    }
-
-    pub(crate) fn inner_native(&self) -> &KvGroupPlan {
-        self.inner.as_ref()
     }
 
     fn repr_string(&self) -> String {

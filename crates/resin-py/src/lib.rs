@@ -28,7 +28,6 @@ mod metrics;
 mod numa;
 mod output;
 mod parallelism;
-mod planning;
 mod recipe;
 mod recipe_events;
 mod recipe_types;
@@ -42,6 +41,7 @@ use parallelism::Parallelism;
 use resin_core::engine::{self as core, CompletionReason};
 use resin_core::logprobs::DEFAULT_MAX_TOP_LOGPROBS;
 use resin_core::resources::paged_kv::PrefixStoragePolicy;
+use resin_core::{BatchPlan as NativeBatchPlan, Phase};
 use runner::{
     ResourceBinding, RunnerConfig, bind_runner_resources, optional_runner_callable,
     resolve_runner_config, resolve_runner_contract, runner_error_is_post_accept,
@@ -139,9 +139,7 @@ impl SchedulerConfig {
     from_py_object,
     module = "resin._resin"
 )]
-#[derive(
-    Clone, Copy, Debug, Eq, Hash, PartialEq, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize,
-)]
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 enum BatchPhase {
     Prefill,
     Decode,
@@ -159,6 +157,13 @@ impl BatchPhase {
         match self {
             Self::Prefill => resin_core::Phase::Prefill,
             Self::Decode => resin_core::Phase::Decode,
+        }
+    }
+
+    const fn from_core(phase: Phase) -> Self {
+        match phase {
+            Phase::Prefill => Self::Prefill,
+            Phase::Decode => Self::Decode,
         }
     }
 }
@@ -311,324 +316,109 @@ impl SamplingParams {
 /// - `cache_groups`: One placement plan per `CacheLayout` group, covering
 ///   every sequence.
 #[pyclass(frozen, module = "resin._resin", skip_from_py_object)]
-#[derive(Clone, Debug, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
+#[derive(Debug)]
 struct BatchPlan {
-    prompt_score_indices: Vec<u32>,
-    prompt_score_token_ids: Vec<u32>,
-    prompt_score_indptr: Vec<u32>,
-    prompt_score_top_counts: Vec<u32>,
-    prompt_target_indptr: Vec<u32>,
-    prompt_target_token_ids: Vec<u32>,
-    sequence_ids: Vec<u64>,
-    context_lengths: Vec<u32>,
-    prefill_lengths: Vec<u32>,
-    token_ids: Vec<u32>,
-    token_indptr: Vec<u32>,
-    /// Whether this is a prefill or decode batch. Mixed-chunk is not supported.
-    #[pyo3(get)]
-    phase: BatchPhase,
-    /// Monotonic identifier for tracing and correlating runner steps.
-    #[pyo3(get)]
-    batch_id: u64,
-    /// Optional key that prevents incompatible requests from sharing a batch.
-    #[pyo3(get)]
-    batch_key: Option<u64>,
-    cache_groups: Vec<CacheGroupPlan>,
-    sampling_mask: Vec<bool>,
-    #[rkyv(with = rkyv::with::Skip)]
-    sampling_params: Vec<SamplingParams>,
-    #[rkyv(with = rkyv::with::Skip)]
-    media: Vec<Option<Arc<Py<PyTuple>>>>,
-    #[rkyv(with = rkyv::with::Skip)]
+    batch: NativeBatchPlan,
+    payloads: Vec<RequestPayload>,
     positions: OnceLock<Vec<u32>>,
 }
 
-const PLAN_WIRE_MAGIC: &[u8; 8] = b"RSNPLAN\0";
-// Private same-build protocol: bump when the archived BatchPlan, BatchPhase,
-// CacheGroupPlan or KvGroupPlan schema, or rkyv format flags, change.
-const PLAN_WIRE_VERSION: u32 = 1;
-const PLAN_WIRE_HEADER: usize = 20;
+impl std::ops::Deref for BatchPlan {
+    type Target = NativeBatchPlan;
+
+    fn deref(&self) -> &NativeBatchPlan {
+        &self.batch
+    }
+}
+
+impl From<core::ExecutionPlan<RequestPayload>> for BatchPlan {
+    fn from(plan: core::ExecutionPlan<RequestPayload>) -> Self {
+        Self {
+            batch: plan.batch,
+            payloads: plan.payloads,
+            positions: OnceLock::new(),
+        }
+    }
+}
 
 impl BatchPlan {
-    fn encode_wire(&self) -> PyResult<Vec<u8>> {
-        // Serialize directly into the eventual NumPy owner. The envelope is
-        // separate from the derived schema and rejects version/length mistakes.
-        let mut bytes =
-            rkyv::api::high::to_bytes_in::<_, rkyv::rancor::Error>(self, vec![0; PLAN_WIRE_HEADER])
-                .map_err(|error| PyValueError::new_err(format!("cannot encode plan: {error}")))?;
-        let length = (bytes.len() - PLAN_WIRE_HEADER) as u64;
-        bytes[..8].copy_from_slice(PLAN_WIRE_MAGIC);
-        bytes[8..12].copy_from_slice(&PLAN_WIRE_VERSION.to_le_bytes());
-        bytes[12..PLAN_WIRE_HEADER].copy_from_slice(&length.to_le_bytes());
-        Ok(bytes)
-    }
-
-    fn decode_wire(bytes: &[u8]) -> PyResult<Self> {
-        if bytes.len() < PLAN_WIRE_HEADER || &bytes[..8] != PLAN_WIRE_MAGIC {
-            return Err(PyValueError::new_err("invalid plan wire format"));
-        }
-        if u32::from_le_bytes(bytes[8..12].try_into().unwrap()) != PLAN_WIRE_VERSION {
-            return Err(PyValueError::new_err("unsupported plan wire version"));
-        }
-        let length = u64::from_le_bytes(bytes[12..PLAN_WIRE_HEADER].try_into().unwrap());
-        if length != (bytes.len() - PLAN_WIRE_HEADER) as u64 {
-            return Err(PyValueError::new_err("plan wire length mismatch"));
-        }
-        rkyv::from_bytes::<Self, rkyv::rancor::Error>(&bytes[PLAN_WIRE_HEADER..])
-            .map_err(|error| PyValueError::new_err(format!("invalid plan archive: {error}")))
-    }
-
     fn restore_requests(
-        mut self,
+        batch: NativeBatchPlan,
         requests: &Bound<'_, PyDict>,
         pending: &Bound<'_, PyDict>,
     ) -> PyResult<Self> {
-        self.sampling_params.reserve(self.sequence_ids.len());
-        self.media.reserve(self.sequence_ids.len());
-        for &id in &self.sequence_ids {
+        let mut payloads = Vec::with_capacity(batch.sequence_ids.len());
+        for &id in &batch.sequence_ids {
             let request = match pending.get_item(id)? {
                 Some(request) => request,
                 None => requests.get_item(id)?.ok_or_else(|| {
                     PyValueError::new_err(format!("request {id} has not been registered"))
                 })?,
             };
-            self.sampling_params.push(
-                request
-                    .getattr("sampling_params")?
-                    .extract::<PyRef<'_, SamplingParams>>()?
-                    .clone(),
-            );
+            let sampling_params = request
+                .getattr("sampling_params")?
+                .extract::<PyRef<'_, SamplingParams>>()?
+                .clone();
             let media = request.getattr("media")?;
-            self.media.push(if media.is_none() {
+            let media = if media.is_none() {
                 None
             } else {
                 Some(Arc::new(media.cast_into::<PyTuple>()?.unbind()))
+            };
+            payloads.push(RequestPayload {
+                sampling_params,
+                media,
             });
         }
-        Self::checked(self)
+        Self::checked(Self {
+            batch,
+            payloads,
+            positions: OnceLock::new(),
+        })
     }
 
     fn checked(plan: Self) -> PyResult<Self> {
-        let Self {
-            token_ids,
-            sequence_ids,
-            token_indptr,
-            context_lengths,
-            prefill_lengths,
-            sampling_params,
-            sampling_mask,
-            media,
-            ..
-        } = &plan;
-        if token_ids.is_empty() {
-            return Err(PyValueError::new_err(
-                "a batch must contain at least one token",
-            ));
-        }
-        if token_ids.len() > u32::MAX as usize {
-            return Err(PyValueError::new_err(
-                "batch token count exceeds the u32 metadata range",
-            ));
-        }
-        if sequence_ids.is_empty() {
-            return Err(PyValueError::new_err(
-                "a batch must contain at least one sequence",
-            ));
-        }
-        if token_indptr.len() != sequence_ids.len() + 1 {
-            return Err(PyValueError::new_err(
-                "token_indptr must contain one more item than sequence_ids",
-            ));
-        }
-        if context_lengths.len() != sequence_ids.len() {
-            return Err(PyValueError::new_err(
-                "context_lengths must contain one item per sequence",
-            ));
-        }
-        if prefill_lengths.len() != sequence_ids.len() {
-            return Err(PyValueError::new_err(
-                "prefill_lengths must contain one item per sequence",
-            ));
-        }
-        if sampling_params.len() != sequence_ids.len() {
-            return Err(PyValueError::new_err(
-                "sampling_params must contain one item per sequence",
-            ));
-        }
-        if sampling_params.iter().any(|params| params.seed.is_none()) {
+        plan.batch.validate().map_err(core_error)?;
+        if plan
+            .payloads
+            .iter()
+            .any(|payload| payload.sampling_params.seed.is_none())
+        {
             return Err(PyValueError::new_err(
                 "sampling_params must contain an effective seed for every sequence",
             ));
         }
-        if sampling_mask.len() != sequence_ids.len() {
-            return Err(PyValueError::new_err(
-                "sampling_mask must contain one item per sequence",
-            ));
-        }
-        if media.len() != sequence_ids.len() {
-            return Err(PyValueError::new_err(
-                "media must contain one item per sequence",
-            ));
-        }
-        if token_indptr.first() != Some(&0) {
-            return Err(PyValueError::new_err("token_indptr must start at zero"));
-        }
-        if token_indptr.last().copied() != Some(token_ids.len() as u32) {
-            return Err(PyValueError::new_err(
-                "token_indptr must end at the token count",
-            ));
-        }
-        if token_indptr.windows(2).any(|pair| pair[0] >= pair[1]) {
-            return Err(PyValueError::new_err(
-                "each sequence must contain at least one token",
-            ));
-        }
-        if context_lengths
-            .iter()
-            .zip(token_indptr.windows(2))
-            .any(|(context, range)| context.checked_add(range[1] - range[0]).is_none())
-        {
-            return Err(PyValueError::new_err(
-                "scheduled positions exceed the u32 metadata range",
-            ));
-        }
-        if plan.phase == BatchPhase::Prefill
-            && context_lengths
-                .iter()
-                .zip(token_indptr.windows(2))
-                .zip(prefill_lengths)
-                .any(|((context, range), length)| *context + (range[1] - range[0]) > *length)
-        {
-            return Err(PyValueError::new_err(
-                "prefill_lengths must cover every scheduled prefill row",
-            ));
-        }
-        let mut sorted_ids = sequence_ids.clone();
-        sorted_ids.sort_unstable();
-        if sorted_ids.windows(2).any(|pair| pair[0] == pair[1]) {
-            return Err(PyValueError::new_err(
-                "sequence ids must be unique within a batch",
-            ));
-        }
-
-        plan.validate_cache()?;
-        resin_core::logprobs::validate_indptr(
-            &plan.prompt_score_indptr,
-            sequence_ids.len(),
-            plan.prompt_score_indices.len(),
-        )
-        .map_err(core_error)?;
-        if !plan.prompt_score_indices.is_empty()
-            || !plan.prompt_target_indptr.is_empty()
-            || !plan.prompt_target_token_ids.is_empty()
-        {
-            resin_core::logprobs::validate_indptr(
-                &plan.prompt_target_indptr,
-                plan.prompt_score_indices.len(),
-                plan.prompt_target_token_ids.len(),
-            )
-            .map_err(core_error)?;
-        }
-        if plan.prompt_score_token_ids.len() != plan.prompt_score_indices.len()
-            || plan.prompt_score_top_counts.len() != plan.prompt_score_indices.len()
-            || plan
-                .prompt_score_indptr
-                .windows(2)
-                .enumerate()
-                .any(|(row, range)| {
-                    plan.prompt_score_indices[range[0] as usize..range[1] as usize]
-                        .iter()
-                        .any(|&index| index < token_indptr[row] || index >= token_indptr[row + 1])
-                })
-            || plan.phase != BatchPhase::Prefill && !plan.prompt_score_indices.is_empty()
-        {
-            return Err(PyValueError::new_err(
-                "prompt score indices and targets must align with their prefill sequence",
-            ));
-        }
-
         Ok(plan)
-    }
-
-    fn validate_cache(&self) -> PyResult<()> {
-        if self.cache_groups.is_empty() {
-            return Ok(());
-        }
-
-        for (group_index, group) in self.cache_groups.iter().enumerate() {
-            group.validate_local()?;
-            let group = group.inner_native();
-            if group.group_index != group_index as u32 {
-                return Err(PyValueError::new_err(
-                    "cache_groups must be ordered by contiguous group_index",
-                ));
-            }
-            if group.block_table_start_indices.len() != self.sequence_ids.len() {
-                return Err(PyValueError::new_err(
-                    "each cache group must contain one block-table segment per sequence",
-                ));
-            }
-            if group.append_slab_ids.len() != self.token_ids.len()
-                || group.append_slotnums.len() != self.token_ids.len()
-            {
-                return Err(PyValueError::new_err(
-                    "each cache group must contain one append target per batch token",
-                ));
-            }
-            for sequence_index in 0..self.sequence_ids.len() {
-                let block_start = group.block_indptr[sequence_index] as usize;
-                let block_end = group.block_indptr[sequence_index + 1] as usize;
-                let row_slabs = &group.block_slab_ids[block_start..block_end];
-                let row_slotnums = &group.block_slotnums[block_start..block_end];
-                let token_start = self.token_indptr[sequence_index] as usize;
-                let token_end = self.token_indptr[sequence_index + 1] as usize;
-                if group.append_slab_ids[token_start..token_end]
-                    .iter()
-                    .zip(&group.append_slotnums[token_start..token_end])
-                    .any(|(append_slab, append_slotnum)| {
-                        !row_slabs
-                            .iter()
-                            .zip(row_slotnums)
-                            .any(|(slab, slotnum)| slab == append_slab && slotnum == append_slotnum)
-                    })
-                {
-                    return Err(PyValueError::new_err(
-                        "cache append targets must belong to their sequence's block table",
-                    ));
-                }
-            }
-        }
-        Ok(())
     }
 }
 crate::arrays::array_methods! {
     impl BatchPlan {
         arrays {
             /// Stable request identifier for each sequence.
-            sequence_ids: u64 => sequence_ids;
+            sequence_ids: u64 => batch.sequence_ids;
             /// Number of tokens already processed for each sequence.
-            context_lengths: u32 => context_lengths;
+            context_lengths: u32 => batch.context_lengths;
             /// Final history endpoint for each prefill, including retracted generated inputs.
             /// Only meaningful during prefill; constant across that history's chunks.
-            prefill_lengths: u32 => prefill_lengths;
+            prefill_lengths: u32 => batch.prefill_lengths;
             /// Flattened scheduled token IDs, grouped by sequence.
-            token_ids: u32 => token_ids;
+            token_ids: u32 => batch.token_ids;
             /// Offsets into `token_ids` for each sequence.
-            token_indptr: u32 => token_indptr;
+            token_indptr: u32 => batch.token_indptr;
             /// Which sequences should generate a sampled token. Used for chunked
             /// prefill, when some sequences only advance the cache.
-            sampling_mask: bool => sampling_mask;
-            prompt_score_indices: u32 => prompt_score_indices;
-            prompt_score_token_ids: u32 => prompt_score_token_ids;
-            prompt_score_indptr: u32 => prompt_score_indptr;
-            prompt_score_top_counts: u32 => prompt_score_top_counts;
-            prompt_target_indptr: u32 => prompt_target_indptr;
-            prompt_target_token_ids: u32 => prompt_target_token_ids;
+            sampling_mask: bool => batch.sampling_mask;
+            prompt_score_indices: u32 => batch.prompt_score_indices;
+            prompt_score_token_ids: u32 => batch.prompt_score_token_ids;
+            prompt_score_indptr: u32 => batch.prompt_score_indptr;
+            prompt_score_top_counts: u32 => batch.prompt_score_top_counts;
+            prompt_target_indptr: u32 => batch.prompt_target_indptr;
+            prompt_target_token_ids: u32 => batch.prompt_target_token_ids;
         }
 
         #[pyo3(signature = () -> "npt.NDArray[np.uint8]")]
         fn _to_wire<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyArray1<u8>>> {
-            Ok(PyArray1::from_vec(py, self.encode_wire()?))
+            Ok(PyArray1::from_vec(py, self.batch.encode_wire().map_err(core_error)?))
         }
 
         #[staticmethod]
@@ -645,11 +435,11 @@ crate::arrays::array_methods! {
             let bytes = data.as_slice().map_err(|_| {
                 PyValueError::new_err("plan wire data must be a contiguous uint8 array")
             })?;
-            Self::decode_wire(bytes)?.restore_requests(requests, pending)
+            Self::restore_requests(NativeBatchPlan::decode_wire(bytes).map_err(core_error)?, requests, pending)
         }
 
         fn _validate_cache_layout(&self, layout: &CacheLayout, decode_lookahead: u64) -> PyResult<()> {
-            planning::validate_cache_layout(self, layout.inner_native(), decode_lookahead)
+            self.batch.validate_cache_layout(layout.inner_native(), decode_lookahead).map_err(core_error)
         }
 
         #[new]
@@ -713,7 +503,7 @@ crate::arrays::array_methods! {
             let cache_groups = cache_groups
                 .unwrap_or_default()
                 .into_iter()
-                .map(|group| group.borrow(py).clone())
+                .map(|group| group.get().inner.clone())
                 .collect();
             let sampling_mask = sampling_mask
                 .map(arrays::owned_vec)
@@ -731,50 +521,59 @@ crate::arrays::array_methods! {
                     .seed
                     .get_or_insert_with(|| default_sampling_seed(0, *sequence_id));
             }
+            if sampling_params.len() != sequence_count {
+                return Err(PyValueError::new_err("sampling_params must contain one item per sequence"));
+            }
+            if media.as_ref().is_some_and(|media| media.len() != sequence_count) {
+                return Err(PyValueError::new_err("media must contain one item per sequence"));
+            }
             let media = media
                 .unwrap_or_else(|| (0..sequence_count).map(|_| None).collect())
                 .into_iter()
-                .map(|items| items.filter(|v| !v.bind(py).is_empty()).map(Arc::new))
+                .map(|items| items.filter(|v| !v.bind(py).is_empty()).map(Arc::new));
+            let payloads = sampling_params.into_iter().zip(media)
+                .map(|(sampling_params, media)| RequestPayload { sampling_params, media })
                 .collect();
             let prompt_score_indices = prompt_score_indices
                 .map(arrays::owned_vec)
                 .unwrap_or_default();
             let predecessor_count = prompt_score_indices.len();
             Self::checked(Self {
-                prompt_score_indices,
-                prompt_score_top_counts: prompt_score_top_counts
-                    .map(arrays::owned_vec)
-                    .unwrap_or_else(|| vec![0; predecessor_count]),
-                prompt_target_indptr: prompt_target_indptr.map(arrays::owned_vec).unwrap_or_else(
-                    || {
-                        if predecessor_count == 0 {
-                            Vec::new()
-                        } else {
-                            vec![0; predecessor_count + 1]
-                        }
-                    },
-                ),
-                prompt_target_token_ids: prompt_target_token_ids
-                    .map(arrays::owned_vec)
-                    .unwrap_or_default(),
-                prompt_score_token_ids: prompt_score_token_ids
-                    .map(arrays::owned_vec)
-                    .unwrap_or_default(),
-                prompt_score_indptr: prompt_score_indptr
-                    .map(arrays::owned_vec)
-                    .unwrap_or_else(|| vec![0; sequence_count + 1]),
-                sequence_ids,
-                context_lengths,
-                prefill_lengths,
-                token_ids,
-                token_indptr,
-                phase,
-                batch_id,
-                batch_key,
-                cache_groups,
-                sampling_mask,
-                sampling_params,
-                media,
+                batch: NativeBatchPlan {
+                    prompt_score_indices,
+                    prompt_score_top_counts: prompt_score_top_counts
+                        .map(arrays::owned_vec)
+                        .unwrap_or_else(|| vec![0; predecessor_count]),
+                    prompt_target_indptr: prompt_target_indptr.map(arrays::owned_vec).unwrap_or_else(
+                        || {
+                            if predecessor_count == 0 {
+                                Vec::new()
+                            } else {
+                                vec![0; predecessor_count + 1]
+                            }
+                        },
+                    ),
+                    prompt_target_token_ids: prompt_target_token_ids
+                        .map(arrays::owned_vec)
+                        .unwrap_or_default(),
+                    prompt_score_token_ids: prompt_score_token_ids
+                        .map(arrays::owned_vec)
+                        .unwrap_or_default(),
+                    prompt_score_indptr: prompt_score_indptr
+                        .map(arrays::owned_vec)
+                        .unwrap_or_else(|| vec![0; sequence_count + 1]),
+                    sequence_ids,
+                    context_lengths,
+                    prefill_lengths,
+                    token_ids,
+                    token_indptr,
+                    phase: phase.core(),
+                    batch_id,
+                    batch_key,
+                    cache_groups,
+                    sampling_mask,
+                },
+                payloads,
                 positions: OnceLock::new(),
             })
         }
@@ -795,7 +594,7 @@ crate::arrays::array_methods! {
                     .iter()
                     .zip(plan.token_indptr.windows(2))
                 {
-                    positions.extend(*context..*context + range[1] - range[0]);
+                    positions.extend(*context..*context + (range[1] - range[0]));
                 }
                 positions
             });
@@ -807,7 +606,8 @@ crate::arrays::array_methods! {
         /// contains one block-table row for every sequence in this batch.
         #[getter]
         fn cache_groups(&self, py: Python<'_>) -> PyResult<Py<PyTuple>> {
-            Ok(PyTuple::new(py, self.cache_groups.iter().cloned())?.unbind())
+            let groups = self.cache_groups.iter().map(|inner| CacheGroupPlan { inner: inner.clone() });
+            Ok(PyTuple::new(py, groups)?.unbind())
         }
 
 
@@ -816,8 +616,8 @@ crate::arrays::array_methods! {
         fn needs_logprobs(&self) -> bool {
             self.sampling_mask
                 .iter()
-                .zip(&self.sampling_params)
-                .any(|(sample, params)| *sample && params.logprobs)
+                .zip(&self.payloads)
+                .any(|(sample, payload)| *sample && payload.sampling_params.logprobs)
         }
         #[getter]
         fn needs_prompt_logprobs(&self) -> bool {
@@ -827,23 +627,35 @@ crate::arrays::array_methods! {
         /// Effective sampling parameters, one per sequence.
         #[getter]
         fn sampling_params(&self, py: Python<'_>) -> PyResult<Py<PyTuple>> {
-            Ok(PyTuple::new(py, self.sampling_params.iter().cloned())?.unbind())
+            Ok(PyTuple::new(py, self.payloads.iter().map(|row| row.sampling_params.clone()))?.unbind())
         }
 
         /// Opaque runner inputs, one per sequence. The scheduler never inspects them.
         #[getter]
         fn media(&self, py: Python<'_>) -> PyResult<Py<PyTuple>> {
             let payloads = self
-                .media
+                .payloads
                 .iter()
                 .map(|payload| {
-                    payload
+                    payload.media
                         .as_ref()
                         .map_or_else(|| py.None(), |payload| payload.clone_ref(py).into_any())
                 })
                 .collect::<Vec<_>>();
             Ok(PyTuple::new(py, payloads)?.unbind())
         }
+
+        /// Whether this is a prefill or decode batch.
+        #[getter]
+        fn phase(&self) -> BatchPhase { BatchPhase::from_core(self.batch.phase) }
+
+        /// Monotonic identifier for tracing and correlating runner steps.
+        #[getter]
+        fn batch_id(&self) -> u64 { self.batch.batch_id }
+
+        /// Optional key that prevents incompatible requests from sharing a batch.
+        #[getter]
+        fn batch_key(&self) -> Option<u64> { self.batch.batch_key }
 
         /// Number of sequences (batch size).
         #[getter]
@@ -872,7 +684,7 @@ crate::arrays::array_methods! {
             format!(
                 "BatchPlan(batch_id={}, phase=BatchPhase.{}, sequences={}, tokens={}, cache_groups={})",
                 self.batch_id,
-                self.phase.as_str(),
+                self.phase().as_str(),
                 self.sequence_ids.len(),
                 self.token_ids.len(),
                 self.cache_groups.len()
@@ -1157,7 +969,7 @@ impl Engine {
             if let Some(feedback) = feedback
                 && let Some(next) = self.core.continuation_plan().map_err(core_error)?
             {
-                let plan = Py::new(py, planning::from_core(next))?;
+                let plan = Py::new(py, BatchPlan::from(next))?;
                 return self.enqueue(py, plan, Some(feedback));
             }
             return self.harvest(py, false);
@@ -1179,7 +991,7 @@ impl Engine {
         let can_enqueue = overlap_admission
             && plan.phase == resin_core::Phase::Decode
             && self.core.retain_continuation(&plan);
-        let plan = match Py::new(py, planning::from_core(plan)) {
+        let plan = match Py::new(py, BatchPlan::from(plan)) {
             Ok(plan) => plan,
             Err(error) => return Err(self.fail_output(py, error, false)),
         };
@@ -1855,7 +1667,8 @@ fn validate_requested_logprobs(
             plan.sequence_ids.len()
         )));
     }
-    for (row, params) in plan.sampling_params.iter().enumerate() {
+    for (row, payload) in plan.payloads.iter().enumerate() {
+        let params = &payload.sampling_params;
         if !params.logprobs || !plan.sampling_mask[row] {
             continue;
         }
@@ -1945,7 +1758,7 @@ mod tests {
     use super::*;
 
     fn wire_plan(group_index: u32) -> BatchPlan {
-        let group = CacheGroupPlan::from_inner(
+        let group = Arc::new(
             resin_core::resources::kv::KvGroupPlan::new(
                 group_index,
                 vec![0, 1],
@@ -1960,27 +1773,31 @@ mod tests {
             .unwrap(),
         );
         BatchPlan {
-            prompt_score_indices: Vec::new(),
-            prompt_score_token_ids: Vec::new(),
-            prompt_score_indptr: vec![0, 0],
-            prompt_score_top_counts: Vec::new(),
-            prompt_target_indptr: vec![0],
-            prompt_target_token_ids: Vec::new(),
-            sequence_ids: vec![1],
-            context_lengths: vec![0],
-            prefill_lengths: vec![2],
-            token_ids: vec![1, 2],
-            token_indptr: vec![0, 2],
-            phase: BatchPhase::Prefill,
-            batch_id: 1,
-            batch_key: None,
-            cache_groups: vec![group],
-            sampling_mask: vec![true],
-            sampling_params: vec![SamplingParams {
-                seed: Some(1),
-                ..SamplingParams::default()
+            batch: NativeBatchPlan {
+                prompt_score_indices: Vec::new(),
+                prompt_score_token_ids: Vec::new(),
+                prompt_score_indptr: vec![0, 0],
+                prompt_score_top_counts: Vec::new(),
+                prompt_target_indptr: vec![0],
+                prompt_target_token_ids: Vec::new(),
+                sequence_ids: vec![1],
+                context_lengths: vec![0],
+                prefill_lengths: vec![2],
+                token_ids: vec![1, 2],
+                token_indptr: vec![0, 2],
+                phase: Phase::Prefill,
+                batch_id: 1,
+                batch_key: None,
+                cache_groups: vec![group],
+                sampling_mask: vec![true],
+            },
+            payloads: vec![RequestPayload {
+                sampling_params: SamplingParams {
+                    seed: Some(1),
+                    ..SamplingParams::default()
+                },
+                media: None,
             }],
-            media: vec![None],
             positions: OnceLock::new(),
         }
     }
@@ -1993,16 +1810,13 @@ mod tests {
     #[test]
     fn plan_archive_skips_request_objects_and_derived_positions() {
         let plan = wire_plan(0);
-        let bytes = plan.encode_wire().unwrap();
+        let bytes = plan.batch.encode_wire().unwrap();
         plan.positions.set(vec![0, 1]).unwrap();
-        assert_eq!(bytes, plan.encode_wire().unwrap());
-        let restored = BatchPlan::decode_wire(&bytes).unwrap();
+        assert_eq!(bytes, plan.batch.encode_wire().unwrap());
+        let restored = NativeBatchPlan::decode_wire(&bytes).unwrap();
         assert_eq!(restored.sequence_ids, plan.sequence_ids);
         assert_eq!(restored.token_ids, plan.token_ids);
         assert_eq!(restored.cache_groups, plan.cache_groups);
-        assert!(restored.sampling_params.is_empty());
-        assert!(restored.media.is_empty());
-        assert!(restored.positions.get().is_none());
     }
 
     #[test]
@@ -2034,8 +1848,9 @@ mod tests {
                 .call((), Some(&kwargs))
                 .unwrap();
             pending.set_item(1, request).unwrap();
-            let valid = BatchPlan::decode_wire(&wire_plan(0).encode_wire().unwrap()).unwrap();
-            assert!(valid.restore_requests(&requests, &pending).is_ok());
+            let valid =
+                NativeBatchPlan::decode_wire(&wire_plan(0).batch.encode_wire().unwrap()).unwrap();
+            assert!(BatchPlan::restore_requests(valid, &requests, &pending).is_ok());
 
             for (case, expected) in [
                 (0, "token_indptr must start at zero"),
@@ -2044,24 +1859,23 @@ mod tests {
                 (3, "block_indptr must end"),
                 (4, "contiguous group_index"),
             ] {
-                let mut plan = wire_plan(0);
+                let mut plan = wire_plan(0).batch;
                 match case {
                     0 => plan.token_indptr[0] = 1,
                     1 => plan.prefill_lengths[0] = 1,
                     _ => {
-                        let mut group = plan.cache_groups[0].inner_native().clone();
+                        let group = Arc::make_mut(&mut plan.cache_groups[0]);
                         match case {
                             2 => group.blocks_per_slab = 0,
                             3 => group.block_indptr[1] = 0,
                             _ => group.group_index = 1,
                         }
-                        plan.cache_groups[0] = CacheGroupPlan::from_inner(group);
                     }
                 }
                 // These bytes pass rkyv's memory/representation checks. Only
                 // BatchPlan::checked can reject their inconsistent semantics.
-                let decoded = BatchPlan::decode_wire(&plan.encode_wire().unwrap()).unwrap();
-                let error = decoded.restore_requests(&requests, &pending).unwrap_err();
+                let decoded = NativeBatchPlan::decode_wire(&plan.encode_wire().unwrap()).unwrap();
+                let error = BatchPlan::restore_requests(decoded, &requests, &pending).unwrap_err();
                 assert!(error.to_string().contains(expected), "{error}");
             }
         });
