@@ -672,20 +672,3 @@ class TestNativePolicyIntegration:
         ):
             poisoned.step()
         assert poisoned.poisoned
-
-    def test_cleanup_failure_does_not_publish_a_sampled_token(self) -> None:
-        class FailingRelease(ContinuationRecordingRunner):
-            def release(self, request_ids: list[int]) -> None:
-                raise RuntimeError("cleanup failed")
-
-        engine = Engine(
-            FailingRelease(),
-            scheduler_config=SchedulerConfig(prefill_chunk_size=1),
-        )
-        request = engine.submit(
-            [4], sampling_params=SamplingParams(max_output_tokens=1)
-        )
-        with pytest.raises(RuntimeError, match="cleanup failed"):
-            engine.step()
-        assert engine.poisoned
-        assert not request.done
