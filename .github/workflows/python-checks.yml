@@ -57,16 +57,7 @@ jobs:
           PY
       - name: Python runtime contracts
         timeout-minutes: 6
-        run: |
-          .venv/bin/python -m pytest -x -vv -o faulthandler_timeout=60 \
-            tests/test_engine_execution.py tests/test_engine_overlap.py \
-            tests/test_backend_plans.py tests/test_plan_metadata.py tests/test_plan_transport.py \
-            tests/test_cache_storage.py \
-            tests/test_http_lifecycle.py tests/test_http_session.py tests/test_http_token_counts.py \
-            tests/test_recipe.py tests/test_recipe_media_preparation.py \
-            tests/test_control_plane.py tests/test_distributed_transport.py \
-            'tests/test_distributed_http.py::test_distributed_http_routes_real_replica_engines[normal-4]' \
-            'tests/test_distributed_http.py::test_distributed_http_routes_real_replica_engines[ingress_decode-2]'
+        run: .venv/bin/python -m pytest -x -v -o faulthandler_timeout=60 tests/runtime
 
   lint-and-types:
     # Match local development without installing the Linux-only CUDA runtime.
