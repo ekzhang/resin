@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from contextlib import nullcontext
-from dataclasses import dataclass, replace
+from dataclasses import replace
 from pathlib import Path
 
 import numpy as np
@@ -12,30 +12,22 @@ import torch
 from resin import BatchPhase, BatchPlan, RunnerConfig
 from resin.backend.capacity import plan_cache_capacity
 from resin.backend.cuda.completion import (
-    CudaContinuation,
     DeviceAcceptance,
     DeviceCompletion,
-    GraphDeviceFeedback,
 )
 from resin.backend.cuda.graphs import (
     CudaGraphMode,
     CudaGraphStep,
     resolve_decode_graph_shapes,
 )
-from resin.backend.cuda.metrics import observe_execution
 from resin.backend.cuda.runner import (
-    CudaRunner,
-    capture_sampling_inputs,
-    pad_sampling_inputs,
     validate_hybrid_plan,
 )
 from resin.backend.cuda.scoring import format_output, prompt_scores, score_completion
 from resin.backend.cuda.slab import graph_scratch_parent_count
 from resin.backend.cuda.staging import TensorStager
-from resin.backend.cuda.state import execute_state
 from resin.backend.cuda.vision_cache import VisionFeatureCache
 from resin.backend.plans import PagedCachePlan
-from resin.backend.speculative import SpeculativeStats
 from resin.backend.topology import ParallelismCapabilities
 from resin.backend.torch import use_default_dtype
 from resin.models.vision import (
@@ -47,14 +39,11 @@ from resin.models.vision import (
 )
 from resin_models_cuda.glm5_3_flash.cache import CacheArena, CacheGeometry
 from resin_models_cuda.glm5_3_flash.checkpoint import load_model, resolve_model_path
+from resin_models_cuda.speculative_runner import SpeculativeCudaRunner
 
 
-@dataclass(frozen=True)
-class PreparedBatch:
-    cache_plan: PagedCachePlan | None
-
-
-class Glm53FlashCudaRunner(CudaRunner):
+class Glm53FlashCudaRunner(SpeculativeCudaRunner):
+    _cache: CacheArena
     parallelism_capabilities = ParallelismCapabilities(
         attn_dp=True, ep=True, expert_tp=True
     )
@@ -98,6 +87,7 @@ class Glm53FlashCudaRunner(CudaRunner):
             if mesh.attn_dp != mesh.world_size:
                 raise ValueError("GLM requires attention-DP=world size")
         super().__init__(
+            speculative_draft_tokens=speculative_draft_tokens,
             device=device,
             label="GLM-5.3-Flash",
             kv_cache_dtype="fp8",
@@ -109,13 +99,9 @@ class Glm53FlashCudaRunner(CudaRunner):
         # Compatibility floor, not the capacity of every executing batch.
         # The selected graph bucket supplies the target projection row count.
         self.target_projection_rows = 64
-        self.prefill_chunk_size, self.speculative_draft_tokens = (
-            prefill_chunk_size,
-            speculative_draft_tokens,
-        )
+        self.prefill_chunk_size = prefill_chunk_size
         self._media_features = {}
         self._vision_feature_cache = VisionFeatureCache()
-        self._speculation = SpeculativeStats(speculative_draft_tokens)
         if profile_graph_phases:
             self.configure_metrics(enabled=True)
         self.model_path = resolve_model_path(model)
@@ -175,10 +161,6 @@ class Glm53FlashCudaRunner(CudaRunner):
             max_accepted_per_step=speculative_draft_tokens + 1,
             cache_layout=self.cache_layout,
         )
-        self._graph_device_caches, self._graph_logits = {}, {}
-        self._graph_acceptance = {}
-        self._graph_inputs = {}
-        self._continuation = CudaContinuation()
         shapes = resolve_decode_graph_shapes(
             cuda_graph_decode_shapes,
             policy=cuda_graph_decode,
@@ -214,25 +196,14 @@ class Glm53FlashCudaRunner(CudaRunner):
         for layer, callback in zip(layers, callbacks, strict=True):
             layer.prefill_ffn = callback
 
-    def speculative_stats(self):
-        return self._speculation.snapshot(include_draft_tokens=True)
+    def release(self, sequence_ids):
+        self._continuation.drain()
+        for sequence_id in sequence_ids:
+            self._media_features.pop(int(sequence_id), None)
 
     def _after_cuda_graph_capture(self):
         self._cache.reset_null()
         torch.cuda.synchronize(self.device)
-
-    def _decode_graph_capture_inputs(self, shape):
-        inputs = {
-            "token_ids": (0,) * shape[0],
-            "positions": (1,) * shape[0],
-            **capture_sampling_inputs(shape[0], self.vocab_size, unique_seeds=True),
-            **self._cache.graph_shape_capture_inputs(
-                shape[0], shape[1] + self.speculative_draft_tokens
-            ),
-        }
-        if self.parallel_groups is not None:
-            inputs["ep_valid_rows"] = shape[0]
-        return inputs
 
     def _projection_rows_for_bucket(self, batch_bucket):
         """Keep one arithmetic profile per physical batch bucket for K0..K7."""
@@ -387,78 +358,6 @@ class Glm53FlashCudaRunner(CudaRunner):
             ),
         )
 
-    def _graph_forward(
-        self, plan, cache_plan, *, shape=None, enqueue=False, feedback=None
-    ):
-        batch_size = plan.num_sequences
-        if shape is None:
-            shape = self._decode_graph_shape(plan, cache_plan)
-        if shape is None:
-            return None
-        padding = shape[0] - batch_size
-        inputs = {
-            "token_ids": np.pad(plan.token_ids, (0, padding)),
-            "positions": np.pad(plan.positions, (0, padding), constant_values=1),
-            **self._cache.graph_plan_inputs(
-                self._graph_device_caches[shape], cache_plan
-            ),
-            **pad_sampling_inputs(self._sampler, plan, self.vocab_size, padding),
-        }
-        if self.parallel_groups is not None:
-            inputs["ep_valid_rows"] = batch_size
-        if enqueue:
-            return self._enqueue_graph_output(plan, shape, inputs, feedback)
-        self._run_cuda_graph("decode", shape, inputs)
-        acceptance = self._graph_acceptance[shape]
-        completion = DeviceCompletion.from_acceptance(
-            acceptance,
-            rows=batch_size,
-            device=self.device,
-            stats=self._speculation if self.speculative_draft_tokens else None,
-            plan=plan,
-            scores=score_completion(self._graph_logits[shape], acceptance, plan),
-        )
-        return completion.result()
-
-    def _enqueue_graph_output(self, plan, shape, inputs, feedback):
-        ids = () if plan is None else tuple(map(int, plan.sequence_ids))
-        continuation = (
-            feedback.continuation
-            if feedback is not None
-            else self._continuation.begin(ids, shape, self._graph_inputs[shape])
-        )
-        if feedback is not None:
-            inputs.update(feedback.inputs())
-        self._run_cuda_graph("decode", shape, inputs)
-        acceptance = self._graph_acceptance[shape]
-        next_inputs = acceptance.feedback()
-        completion = DeviceCompletion.from_acceptance(
-            acceptance,
-            feedback=GraphDeviceFeedback(
-                next_inputs.token_ids, next_inputs.positions, continuation
-            ),
-            rows=0 if plan is None else plan.num_sequences,
-            device=self.device,
-            stats=self._speculation
-            if self.speculative_draft_tokens and plan is not None
-            else None,
-            plan=plan,
-            scores=score_completion(self._graph_logits[shape], acceptance, plan),
-        )
-        maximum = self.runner_config.max_accepted_per_step
-        writes = maximum + self.cache_layout.decode_write_extra_tokens
-        capacity = (
-            shape[1]
-            + self.speculative_draft_tokens
-            + self.cache_layout.decode_write_extra_tokens
-        )
-        if plan is not None and np.any(
-            np.asarray(plan.positions, dtype=np.int64) + maximum + writes > capacity
-        ):
-            completion.feedback = None
-            self._continuation.drain(continuation)
-        return completion
-
     def _eager(self, plan, cache_plan, *, decode_batch_size=None):
         projection_rows = 0
         if plan.phase == BatchPhase.DECODE:
@@ -597,79 +496,7 @@ class Glm53FlashCudaRunner(CudaRunner):
                 embeddings[begin:end][destination].copy_(stored[1][source])
         return embeddings
 
-    def release(self, sequence_ids):
-        self._continuation.drain()
-        for sequence_id in sequence_ids:
-            self._media_features.pop(int(sequence_id), None)
-
-    @observe_execution
-    @execute_state
-    def forward(self, plan):
-        self._check_cuda_graphs(plan.phase)
-        self._continuation.drain()
-        cache_plan = self._prepare(plan)
-        with (
-            self._cuda_failure,
-            torch.inference_mode(),
-            use_default_dtype(torch.bfloat16),
-            torch.device(self.device),
-        ):
-            if plan.phase == BatchPhase.DECODE:
-                result = self._graph_forward(plan, cache_plan)
-                if result is not None:
-                    return result
-            with (
-                self._prefill_graphs()
-                if plan.phase == BatchPhase.PREFILL
-                else nullcontext()
-            ):
-                return self._eager(plan, cache_plan)
-
-    @observe_execution
-    @execute_state
-    def enqueue(self, plan, *, feedback=None):
-        if feedback is not None:
-            if not isinstance(feedback, GraphDeviceFeedback):
-                raise ValueError("GLM continuation requires owned graph feedback")
-            inputs = self._continuation.resume(plan.sequence_ids, feedback.continuation)
-            with self._cuda_failure, torch.inference_mode():
-                return self._enqueue_graph_output(
-                    plan, feedback.continuation.shape, inputs, feedback
-                )
-        self._continuation.drain()
-        if plan.phase != BatchPhase.DECODE or plan.needs_prompt_logprobs:
-            return self.forward(plan)
-        self._check_cuda_graphs(plan.phase)
-        cache_plan = self._prepare(plan)
-        with self._cuda_failure, torch.inference_mode():
-            result = self._graph_forward(
-                plan, cache_plan, enqueue=True, feedback=feedback
-            )
-        if result is None and feedback is not None:
-            raise RuntimeError("a device continuation requires a captured graph")
-        return self.forward(plan) if result is None else result
-
-    def validate_distributed(self, plan, context):
-        if self.parallel_groups is None or context.groups is not self.parallel_groups:
-            raise ValueError("distributed groups do not match GLM runner")
-        if plan is None:
-            if context.num_sequences or context.num_tokens:
-                raise ValueError("nonempty distributed replica needs a plan")
-            cache_plan = None
-        else:
-            if (
-                plan.phase != context.phase
-                or plan.num_tokens != context.num_tokens
-                or plan.num_sequences != context.num_sequences
-            ):
-                raise ValueError("distributed metadata does not match plan")
-            cache_plan = self._prepare(plan)
-        self._check_cuda_graphs(context.phase)
-        return PreparedBatch(cache_plan)
-
-    def _distributed_graph(
-        self, plan, context, prepared, *, enqueue=False, feedback=None
-    ):
+    def _distributed_decode_shape(self, plan, context, prepared, *, enqueue, feedback):
         local_shape = (
             feedback.continuation.shape
             if feedback is not None
@@ -677,7 +504,7 @@ class Glm53FlashCudaRunner(CudaRunner):
             if enqueue and plan is not None
             else None
         )
-        shape = self._select_distributed_cuda_graph(
+        return self._select_distributed_cuda_graph(
             "decode",
             context,
             required_shape=local_shape
@@ -688,93 +515,29 @@ class Glm53FlashCudaRunner(CudaRunner):
             ),
             eligible=not enqueue or plan is None or local_shape is not None,
         )
-        if shape is None:
-            return False, None
-        if feedback is not None:
-            inputs = self._continuation.resume(
-                () if plan is None else plan.sequence_ids,
-                feedback.continuation,
-                shape=shape,
-            )
-            return True, self._enqueue_graph_output(plan, shape, inputs, feedback)
-        if plan is not None:
-            return True, self._graph_forward(
-                plan,
-                prepared.cache_plan,
-                shape=shape,
-                enqueue=enqueue,
-                feedback=feedback,
-            )
-        inputs = self._decode_graph_capture_inputs(shape)
-        inputs["ep_valid_rows"] = 0
-        if enqueue:
-            return True, self._enqueue_graph_output(None, shape, inputs, None)
-        self._run_cuda_graph("decode", shape, inputs)
-        return True, None
 
-    @observe_execution
-    @execute_state
-    def forward_distributed(self, plan, context, *, prepared=None):
-        self._continuation.drain()
-        prepared = (
-            self.validate_distributed(plan, context) if prepared is None else prepared
+    def _eager_distributed(self, plan, context, cache_plan):
+        scope = (
+            self._distributed_prefill_graphs(context)
+            if context.phase == BatchPhase.PREFILL
+            else nullcontext()
         )
-        with (
-            self._cuda_failure,
-            torch.inference_mode(),
-            use_default_dtype(torch.bfloat16),
-            torch.device(self.device),
-        ):
-            if context.phase == BatchPhase.DECODE:
-                used, result = self._distributed_graph(plan, context, prepared)
-                if used:
-                    return result
-            scope = (
-                self._distributed_prefill_graphs(context)
-                if context.phase == BatchPhase.PREFILL
-                else nullcontext()
-            )
-            with scope:
-                if plan is not None:
-                    return self._eager(
-                        plan,
-                        prepared.cache_plan,
-                        decode_batch_size=context.max_num_sequences
-                        if context.phase == BatchPhase.DECODE
-                        else None,
-                    )
-                if self._prefill_graph_active:
-                    self._empty_prefill_regions()
-                else:
-                    if context.phase == BatchPhase.DECODE:
-                        for _ in range(self.speculative_draft_tokens):
-                            self._model.forward_mtp_experts_empty()
-                    self._model.forward_experts_empty()
-                    if self.speculative_draft_tokens:
+        with scope:
+            if plan is not None:
+                return self._eager(
+                    plan,
+                    cache_plan,
+                    decode_batch_size=context.max_num_sequences
+                    if context.phase == BatchPhase.DECODE
+                    else None,
+                )
+            if self._prefill_graph_active:
+                self._empty_prefill_regions()
+            else:
+                if context.phase == BatchPhase.DECODE:
+                    for _ in range(self.speculative_draft_tokens):
                         self._model.forward_mtp_experts_empty()
-                return None
-
-    @observe_execution
-    @execute_state
-    def enqueue_distributed(self, plan, context, *, prepared=None, feedback=None):
-        if feedback is not None:
-            if not isinstance(feedback, GraphDeviceFeedback):
-                raise ValueError("GLM continuation requires owned graph feedback")
-        else:
-            self._continuation.drain()
-        if context.phase != BatchPhase.DECODE or (
-            plan is not None and plan.needs_prompt_logprobs
-        ):
-            return self.forward_distributed(plan, context, prepared=prepared)
-        prepared = (
-            self.validate_distributed(plan, context) if prepared is None else prepared
-        )
-        with self._cuda_failure, torch.inference_mode():
-            used, result = self._distributed_graph(
-                plan, context, prepared, enqueue=True, feedback=feedback
-            )
-        if used:
-            return result
-        if feedback is not None:
-            raise RuntimeError("a device continuation requires a captured graph")
-        return self.forward_distributed(plan, context, prepared=prepared)
+                self._model.forward_experts_empty()
+                if self.speculative_draft_tokens:
+                    self._model.forward_mtp_experts_empty()
+            return None

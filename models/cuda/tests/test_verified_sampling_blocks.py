@@ -84,7 +84,9 @@ def _inkling_fixture(monkeypatch, runner, logits, drafts, counts, stored):
     runner.parallel_groups = None
     runner.cache_geometry = SimpleNamespace(state_width=4)
     runner._graph_inputs = {}
-    runner._initial_state = lambda *a: torch.zeros(2, 1, 3, 4)
+    runner._graph_checkpoint_inputs = {}
+    runner._checkpoint_buffers = torch.empty(2, 1, 3, 4), torch.empty(2, 3, 1, 4)
+    runner._initial_state = lambda *a, out: out.zero_()
     runner._draft = SimpleNamespace(
         propose=lambda *a, **kw: drafts,
         inject_target=lambda *a: torch.arange(12).view(2, 3, 2).float(),
