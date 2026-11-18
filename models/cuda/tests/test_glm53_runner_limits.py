@@ -17,6 +17,7 @@ from resin import (
 )
 from resin_models_cuda.glm5_3_flash.cache import CacheGeometry
 from resin_models_cuda.glm5_3_flash.cuda import Glm53FlashCudaRunner
+from resin_models_cuda.speculative_runner import replay_distributed_decode
 
 
 @pytest.fixture
@@ -186,7 +187,7 @@ def test_graph_selection_uses_public_width_and_capture_reserves_verification(dra
         return {}
 
     model._select_distributed_cuda_graph = select
-    assert model._distributed_graph(plan(4095), object(), None) == (False, None)
+    assert replay_distributed_decode(model, plan(4095), object(), None) == (False, None)
     assert required == [(1, 4096)]
     model._cache = SimpleNamespace(graph_shape_capture_inputs=capture_inputs)
     model.vocab_size = 16

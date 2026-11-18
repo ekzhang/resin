@@ -437,19 +437,6 @@ def test_block32_grouped_output_weight_dequantization():
     )
 
 
-def test_runner_owns_its_graph_and_distributed_lifecycle():
-    from resin.backend.cuda.runner import CudaRunner
-
-    assert DeepSeekV41CudaRunner.__bases__ == (CudaRunner,)
-    for name in (
-        "forward_distributed",
-        "_new_decode_graph_step",
-        "_new_dspark_graph_step",
-        "_graph_forward",
-    ):
-        assert name in DeepSeekV41CudaRunner.__dict__
-
-
 def test_token_history_addresses_remain_int64_above_sixteen_gibibytes():
     from dataclasses import replace
 

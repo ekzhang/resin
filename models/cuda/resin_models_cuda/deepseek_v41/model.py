@@ -1036,13 +1036,6 @@ class Transformer(nn.Module):
         hidden, main = self._run(input_ids, positions, graph_seq_len, cache)
         return self.head(hidden, full_logits=True), main
 
-    def clear_rejected_speculative_state(
-        self, positions, processed_counts, block_length, *, cache
-    ):
-        # Future rows can remain physically present: causal lengths hide them,
-        # and corrected token, compressor and n-gram rows overwrite before use.
-        pass
-
     def _project_main(self, hidden, *, prefill=False):
         operation = getattr(self, "prefill_main_projection", None) if prefill else None
         projection = operation if operation is not None else self.mtp[0].main_proj
@@ -1058,6 +1051,7 @@ class Transformer(nn.Module):
     def commit_dspark_main_block(
         self, main_hidden, position, *, cache, valid_tokens=None, prefill=False
     ):
+        # Causal lengths hide rejected rows until the corrected tokens overwrite them.
         hidden = self._project_main(main_hidden, prefill=prefill)
         positions = position[:, None] + torch.arange(
             hidden.shape[1], device=hidden.device

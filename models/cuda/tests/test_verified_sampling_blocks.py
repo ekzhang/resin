@@ -18,6 +18,7 @@ from resin_models_cuda.inkling2.cuda import Inkling2CudaRunner
 
 class _BlockSampler:
     graph_inputs = staticmethod(FusedSampler.graph_inputs)
+    host_inputs = staticmethod(FusedSampler.host_inputs)
 
     def __init__(self, expected, targets):
         self.expected = expected
@@ -114,7 +115,7 @@ def _inkling_fixture(monkeypatch, runner, logits, drafts, counts, stored):
 @pytest.mark.parametrize("runner_type", [DeepSeekV41CudaRunner, Inkling2CudaRunner])
 @pytest.mark.parametrize("scored", [False, True])
 @pytest.mark.parametrize("all_rejected", [False, True])
-def test_eager_verification_routes_scores_and_rolls_back_accepted_state(
+def test_eager_verification_routes_scores_and_commits_accepted_tokens(
     monkeypatch, runner_type, scored, all_rejected
 ):
     runner, plan, logits, drafts, targets = _fixture(runner_type, scored=scored)
@@ -130,9 +131,6 @@ def test_eager_verification_routes_scores_and_rolls_back_accepted_state(
             draft=lambda *a, **kw: drafts,
             forward_verify=lambda *a, **kw: (logits, object()),
             commit_dspark_main_block=lambda *a, **kw: None,
-            clear_rejected_speculative_state=lambda _positions, processed, *a, **kw: (
-                counts.append(processed.tolist())
-            ),
         )
     else:
         runtime = inkling_runtime
@@ -177,8 +175,8 @@ def test_eager_verification_routes_scores_and_rolls_back_accepted_state(
         else runner._eager(plan, object())
     )
     expected = [1, 1] if all_rejected else [2, 3]
-    assert counts == [expected]
-    if stored:
+    if runner_type is Inkling2CudaRunner:
+        assert counts == [expected]
         torch.testing.assert_close(stored[0], positions + torch.tensor(expected) - 1)
     if scored:
         assert output is result
@@ -188,9 +186,8 @@ def test_eager_verification_routes_scores_and_rolls_back_accepted_state(
     assert runner._sampler.calls == [(2, 3, 10)]
 
 
-def test_deepseek_unscored_graph_harvests_directly_and_rolls_back(monkeypatch):
+def test_deepseek_unscored_graph_harvests_accepted_tokens_directly():
     from resin.backend.speculative import _accept_speculative_tokens
-    from resin_models_cuda.deepseek_v41 import cuda as runtime
 
     runner, plan, _logits, drafts, targets = _fixture(DeepSeekV41CudaRunner)
     runner.parallel_groups = None
@@ -198,23 +195,15 @@ def test_deepseek_unscored_graph_harvests_directly_and_rolls_back(monkeypatch):
     runner._dspark_phase_events = {}
     runner._cache = SimpleNamespace(graph_plan_inputs=lambda *_args: {})
     runner._run_cuda_graph = lambda *_args: torch.cat((drafts, targets), dim=1)
-    processed = []
-    runner._model = SimpleNamespace(
-        clear_rejected_speculative_state=lambda _positions, counts, *_args, **_kwargs: (
-            processed.append(counts.tolist())
-        )
-    )
 
     def forbid_completion(*_args):
         raise AssertionError("unscored synchronous graph must harvest directly")
 
     runner._enqueue_graph_output = forbid_completion
-    monkeypatch.setattr(runtime, "pad_sampling_inputs", lambda *_args: {})
     result = runner._graph_forward(plan, object(), shape=(2, 128))
     expected = _accept_speculative_tokens(drafts.tolist(), targets.tolist())
     assert result is not None
     assert result.token_ids.tolist() == sum(expected.token_rows, [])
-    assert processed == [expected.processed_counts]
     assert runner._speculation.blocks == 2
     assert runner._speculation.accepted == sum(expected.accepted_counts)
 

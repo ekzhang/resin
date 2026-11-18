@@ -22,6 +22,7 @@ from resin_models_cuda.gpt_oss.cuda import GptOssCudaRunner
 from resin_models_cuda.inkling2.cache import CacheArena, CacheGeometry
 from resin_models_cuda.inkling2.cuda import Inkling2CudaRunner
 from resin_models_cuda.qwen3_5.cuda import Qwen3_5CudaRunner
+from resin_models_cuda.speculative_runner import replay_distributed_decode
 
 
 def _fail(message: str) -> NoReturn:
@@ -60,8 +61,8 @@ def test_inkling_distributed_graph_selection_covers_the_complete_native_lease(
 
     runner._select_distributed_cuda_graph = vote
     runner._graph_forward = lambda *_args, **options: launched.append(options)
-    used, _ = runner._distributed_graph(
-        plan, object(), SimpleNamespace(cache_plan=cache_plan), enqueue=enqueue
+    used, _ = replay_distributed_decode(
+        runner, plan, object(), SimpleNamespace(cache_plan=cache_plan), enqueue=enqueue
     )
     assert used is larger_graph
     assert votes[0]["eligible"] is larger_graph
