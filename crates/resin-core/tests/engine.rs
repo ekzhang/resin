@@ -850,7 +850,7 @@ fn a_panicking_payload_clone_restores_the_cohort_and_releases_its_cache_access()
     impl Runner<Payload> for NativeModel {
         fn forward(&mut self, plan: ExecutionPlan<Payload>) -> Result<OwnedTokenRows, Error> {
             self.calls += 1;
-            self.ids = plan.batch.sequence_ids;
+            self.ids = plan.sequence_ids.clone();
             let indptr = (0..=plan.payloads.len() as u32).collect();
             OwnedTokenRows::new(
                 plan.payloads
@@ -1193,10 +1193,15 @@ fn cross_page_continuation_reserves_pages_and_updates_physical_append_addresses(
         .unwrap()
         .unwrap();
     assert_eq!(plan.context_lengths, [31, 32]);
-    assert!(engine.retain_continuation(&plan));
+    let mut altered = plan.clone();
+    altered.cache_groups.clear();
+    assert!(engine.retain_continuation(&altered));
     let next = engine.continuation_plan().unwrap().unwrap();
     assert_eq!(next.context_lengths, [35, 36]);
+    assert!(engine.continuation_plan().unwrap().is_none());
+    assert!(std::sync::Arc::ptr_eq(&plan.cohort, &next.cohort));
     for (old, new) in plan.cache_groups.iter().zip(&next.cache_groups) {
+        assert!(std::sync::Arc::ptr_eq(&old.blocks, &new.blocks));
         assert_eq!(old.block_indptr, new.block_indptr);
         assert_eq!(old.block_slab_ids, new.block_slab_ids);
         assert_eq!(old.block_slotnums, new.block_slotnums);

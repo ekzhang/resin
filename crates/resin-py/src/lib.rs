@@ -41,7 +41,7 @@ use parallelism::Parallelism;
 use resin_core::engine::{self as core, CompletionReason};
 use resin_core::logprobs::DEFAULT_MAX_TOP_LOGPROBS;
 use resin_core::resources::paged_kv::PrefixStoragePolicy;
-use resin_core::{BatchPlan as NativeBatchPlan, Phase};
+use resin_core::{BatchCohort, BatchPlan as NativeBatchPlan, Phase};
 use runner::{
     ResourceBinding, RunnerConfig, bind_runner_resources, optional_runner_callable,
     resolve_runner_config, resolve_runner_contract, runner_error_is_post_accept,
@@ -319,7 +319,7 @@ impl SamplingParams {
 #[derive(Debug)]
 struct BatchPlan {
     batch: NativeBatchPlan,
-    payloads: Vec<RequestPayload>,
+    payloads: Arc<Vec<RequestPayload>>,
     positions: OnceLock<Vec<u32>>,
 }
 
@@ -335,7 +335,7 @@ impl From<core::ExecutionPlan<RequestPayload>> for BatchPlan {
     fn from(plan: core::ExecutionPlan<RequestPayload>) -> Self {
         Self {
             batch: plan.batch,
-            payloads: plan.payloads,
+            payloads: Arc::new(plan.payloads),
             positions: OnceLock::new(),
         }
     }
@@ -372,7 +372,7 @@ impl BatchPlan {
         }
         Self::checked(Self {
             batch,
-            payloads,
+            payloads: Arc::new(payloads),
             positions: OnceLock::new(),
         })
     }
@@ -395,25 +395,25 @@ crate::arrays::array_methods! {
     impl BatchPlan {
         arrays {
             /// Stable request identifier for each sequence.
-            sequence_ids: u64 => batch.sequence_ids;
+            sequence_ids: u64 => batch.cohort.sequence_ids;
             /// Number of tokens already processed for each sequence.
             context_lengths: u32 => batch.context_lengths;
             /// Final history endpoint for each prefill, including retracted generated inputs.
             /// Only meaningful during prefill; constant across that history's chunks.
-            prefill_lengths: u32 => batch.prefill_lengths;
+            prefill_lengths: u32 => batch.cohort.prefill_lengths;
             /// Flattened scheduled token IDs, grouped by sequence.
             token_ids: u32 => batch.token_ids;
             /// Offsets into `token_ids` for each sequence.
-            token_indptr: u32 => batch.token_indptr;
+            token_indptr: u32 => batch.cohort.token_indptr;
             /// Which sequences should generate a sampled token. Used for chunked
             /// prefill, when some sequences only advance the cache.
-            sampling_mask: bool => batch.sampling_mask;
-            prompt_score_indices: u32 => batch.prompt_score_indices;
-            prompt_score_token_ids: u32 => batch.prompt_score_token_ids;
-            prompt_score_indptr: u32 => batch.prompt_score_indptr;
-            prompt_score_top_counts: u32 => batch.prompt_score_top_counts;
-            prompt_target_indptr: u32 => batch.prompt_target_indptr;
-            prompt_target_token_ids: u32 => batch.prompt_target_token_ids;
+            sampling_mask: bool => batch.cohort.sampling_mask;
+            prompt_score_indices: u32 => batch.cohort.prompt_score_indices;
+            prompt_score_token_ids: u32 => batch.cohort.prompt_score_token_ids;
+            prompt_score_indptr: u32 => batch.cohort.prompt_score_indptr;
+            prompt_score_top_counts: u32 => batch.cohort.prompt_score_top_counts;
+            prompt_target_indptr: u32 => batch.cohort.prompt_target_indptr;
+            prompt_target_token_ids: u32 => batch.cohort.prompt_target_token_ids;
         }
 
         #[pyo3(signature = () -> "npt.NDArray[np.uint8]")]
@@ -540,40 +540,42 @@ crate::arrays::array_methods! {
             let predecessor_count = prompt_score_indices.len();
             Self::checked(Self {
                 batch: NativeBatchPlan {
-                    prompt_score_indices,
-                    prompt_score_top_counts: prompt_score_top_counts
-                        .map(arrays::owned_vec)
-                        .unwrap_or_else(|| vec![0; predecessor_count]),
-                    prompt_target_indptr: prompt_target_indptr.map(arrays::owned_vec).unwrap_or_else(
-                        || {
-                            if predecessor_count == 0 {
-                                Vec::new()
-                            } else {
-                                vec![0; predecessor_count + 1]
-                            }
-                        },
-                    ),
-                    prompt_target_token_ids: prompt_target_token_ids
-                        .map(arrays::owned_vec)
-                        .unwrap_or_default(),
-                    prompt_score_token_ids: prompt_score_token_ids
-                        .map(arrays::owned_vec)
-                        .unwrap_or_default(),
-                    prompt_score_indptr: prompt_score_indptr
-                        .map(arrays::owned_vec)
-                        .unwrap_or_else(|| vec![0; sequence_count + 1]),
-                    sequence_ids,
+                    cohort: Arc::new(BatchCohort {
+                        prompt_score_indices,
+                        prompt_score_top_counts: prompt_score_top_counts
+                            .map(arrays::owned_vec)
+                            .unwrap_or_else(|| vec![0; predecessor_count]),
+                        prompt_target_indptr: prompt_target_indptr.map(arrays::owned_vec).unwrap_or_else(
+                            || {
+                                if predecessor_count == 0 {
+                                    Vec::new()
+                                } else {
+                                    vec![0; predecessor_count + 1]
+                                }
+                            },
+                        ),
+                        prompt_target_token_ids: prompt_target_token_ids
+                            .map(arrays::owned_vec)
+                            .unwrap_or_default(),
+                        prompt_score_token_ids: prompt_score_token_ids
+                            .map(arrays::owned_vec)
+                            .unwrap_or_default(),
+                        prompt_score_indptr: prompt_score_indptr
+                            .map(arrays::owned_vec)
+                            .unwrap_or_else(|| vec![0; sequence_count + 1]),
+                        sequence_ids,
+                        prefill_lengths,
+                        token_indptr,
+                        phase: phase.core(),
+                        batch_key,
+                        sampling_mask,
+                    }),
                     context_lengths,
-                    prefill_lengths,
                     token_ids,
-                    token_indptr,
-                    phase: phase.core(),
                     batch_id,
-                    batch_key,
                     cache_groups,
-                    sampling_mask,
                 },
-                payloads,
+                payloads: Arc::new(payloads),
                 positions: OnceLock::new(),
             })
         }
@@ -616,7 +618,7 @@ crate::arrays::array_methods! {
         fn needs_logprobs(&self) -> bool {
             self.sampling_mask
                 .iter()
-                .zip(&self.payloads)
+                .zip(self.payloads.iter())
                 .any(|(sample, payload)| *sample && payload.sampling_params.logprobs)
         }
         #[getter]
@@ -967,9 +969,17 @@ impl Engine {
             // small-batch attention plan). Inspect before consuming a batch ID
             // or constructing conservative continuation metadata.
             if let Some(feedback) = feedback
-                && let Some(next) = self.core.continuation_plan().map_err(core_error)?
+                && let Some(batch) = self.core.continuation_batch().map_err(core_error)?
             {
-                let plan = Py::new(py, BatchPlan::from(next))?;
+                let previous = self.pending.as_ref().expect("pending continuation");
+                let plan = Py::new(
+                    py,
+                    BatchPlan {
+                        batch,
+                        payloads: previous.plan.get().payloads.clone(),
+                        positions: OnceLock::new(),
+                    },
+                )?;
                 return self.enqueue(py, plan, Some(feedback));
             }
             return self.harvest(py, false);
@@ -990,7 +1000,7 @@ impl Engine {
         drop(runner);
         let can_enqueue = overlap_admission
             && plan.phase == resin_core::Phase::Decode
-            && self.core.retain_continuation(&plan);
+            && self.core.has_continuation();
         let plan = match Py::new(py, BatchPlan::from(plan)) {
             Ok(plan) => plan,
             Err(error) => return Err(self.fail_output(py, error, false)),
@@ -1774,30 +1784,32 @@ mod tests {
         );
         BatchPlan {
             batch: NativeBatchPlan {
-                prompt_score_indices: Vec::new(),
-                prompt_score_token_ids: Vec::new(),
-                prompt_score_indptr: vec![0, 0],
-                prompt_score_top_counts: Vec::new(),
-                prompt_target_indptr: vec![0],
-                prompt_target_token_ids: Vec::new(),
-                sequence_ids: vec![1],
+                cohort: Arc::new(BatchCohort {
+                    prompt_score_indices: Vec::new(),
+                    prompt_score_token_ids: Vec::new(),
+                    prompt_score_indptr: vec![0, 0],
+                    prompt_score_top_counts: Vec::new(),
+                    prompt_target_indptr: vec![0],
+                    prompt_target_token_ids: Vec::new(),
+                    sequence_ids: vec![1],
+                    prefill_lengths: vec![2],
+                    token_indptr: vec![0, 2],
+                    phase: Phase::Prefill,
+                    batch_key: None,
+                    sampling_mask: vec![true],
+                }),
                 context_lengths: vec![0],
-                prefill_lengths: vec![2],
                 token_ids: vec![1, 2],
-                token_indptr: vec![0, 2],
-                phase: Phase::Prefill,
                 batch_id: 1,
-                batch_key: None,
                 cache_groups: vec![group],
-                sampling_mask: vec![true],
             },
-            payloads: vec![RequestPayload {
+            payloads: Arc::new(vec![RequestPayload {
                 sampling_params: SamplingParams {
                     seed: Some(1),
                     ..SamplingParams::default()
                 },
                 media: None,
-            }],
+            }]),
             positions: OnceLock::new(),
         }
     }
@@ -1861,13 +1873,13 @@ mod tests {
             ] {
                 let mut plan = wire_plan(0).batch;
                 match case {
-                    0 => plan.token_indptr[0] = 1,
-                    1 => plan.prefill_lengths[0] = 1,
+                    0 => Arc::make_mut(&mut plan.cohort).token_indptr[0] = 1,
+                    1 => Arc::make_mut(&mut plan.cohort).prefill_lengths[0] = 1,
                     _ => {
                         let group = Arc::make_mut(&mut plan.cache_groups[0]);
                         match case {
                             2 => group.blocks_per_slab = 0,
-                            3 => group.block_indptr[1] = 0,
+                            3 => Arc::make_mut(&mut group.blocks).block_indptr[1] = 0,
                             _ => group.group_index = 1,
                         }
                     }

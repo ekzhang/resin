@@ -1,5 +1,6 @@
 use std::collections::HashSet;
 use std::num::NonZeroU32;
+use std::sync::Arc;
 
 pub const MAX_KERNEL_VALUE: u32 = i32::MAX as u32;
 
@@ -384,14 +385,28 @@ pub struct StatePlan {
 pub struct KvGroupPlan {
     pub group_index: u32,
     pub blocks_per_slab: u32,
-    pub block_indptr: Vec<u32>,
-    pub block_slab_ids: Vec<u32>,
-    pub block_slotnums: Vec<u32>,
-    pub block_table_start_indices: Vec<u32>,
+    pub blocks: Arc<KvBlockTable>,
     pub append_slab_ids: Vec<u32>,
     pub append_slotnums: Vec<u32>,
     pub append_block_offsets: Vec<u32>,
     pub state: Option<StatePlan>,
+}
+
+/// Immutable physical history addresses shared by every launch of one lease.
+#[derive(Clone, Debug, Eq, PartialEq, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
+pub struct KvBlockTable {
+    pub block_indptr: Vec<u32>,
+    pub block_slab_ids: Vec<u32>,
+    pub block_slotnums: Vec<u32>,
+    pub block_table_start_indices: Vec<u32>,
+}
+
+impl std::ops::Deref for KvGroupPlan {
+    type Target = KvBlockTable;
+
+    fn deref(&self) -> &KvBlockTable {
+        &self.blocks
+    }
 }
 
 impl KvGroupPlan {
@@ -411,10 +426,12 @@ impl KvGroupPlan {
         let plan = Self {
             group_index,
             blocks_per_slab: packing,
-            block_indptr,
-            block_slab_ids,
-            block_slotnums,
-            block_table_start_indices,
+            blocks: Arc::new(KvBlockTable {
+                block_indptr,
+                block_slab_ids,
+                block_slotnums,
+                block_table_start_indices,
+            }),
             append_slab_ids,
             append_slotnums,
             append_block_offsets,
@@ -773,7 +790,7 @@ mod tests {
         let corrupt: [fn(&mut KvGroupPlan); 9] = [
             |plan| plan.append_slab_ids[0] = 8,
             |plan| plan.append_block_offsets[0] = 1,
-            |plan| plan.block_table_start_indices[0] = 1,
+            |plan| Arc::make_mut(&mut plan.blocks).block_table_start_indices[0] = 1,
             |plan| plan.state.as_mut().unwrap().restore_copies[0].row = 1,
             |plan| plan.state.as_mut().unwrap().restore_copies[0].source_slotnum = 1,
             |plan| plan.state.as_mut().unwrap().restore_copies[0].source_slab_id = 7,

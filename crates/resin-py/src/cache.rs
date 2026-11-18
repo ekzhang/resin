@@ -9,7 +9,8 @@ use pyo3::prelude::*;
 use pyo3::types::PyTuple;
 use resin_core::resources::kv as core_kv;
 use resin_core::resources::kv::{
-    KvGroupFamily, KvGroupLayout, KvGroupPlan, KvLayout, KvLayoutError, KvPlanError, KvRetention,
+    KvBlockTable, KvGroupFamily, KvGroupLayout, KvGroupPlan, KvLayout, KvLayoutError, KvPlanError,
+    KvRetention,
 };
 
 fn layout_error(error: KvLayoutError) -> PyErr {
@@ -453,18 +454,18 @@ crate::arrays::array_methods! {
         arrays {
             /// CSR row pointer into the block-address arrays. Its length is one more
             /// than the batch sequence count.
-            block_indptr: u32 => inner.block_indptr;
+            block_indptr: u32 => inner.blocks.block_indptr;
             /// One-based slab ID for each flattened block-table entry. Pair with
             /// `block_slotnums`; slab zero is reserved as null.
-            block_slab_ids: u32 => inner.block_slab_ids;
+            block_slab_ids: u32 => inner.blocks.block_slab_ids;
             /// Zero-based slot number for each flattened block-table entry. Pair with
             /// `block_slab_ids`.
-            block_slotnums: u32 => inner.block_slotnums;
+            block_slotnums: u32 => inner.blocks.block_slotnums;
             /// Absolute logical-block index at which each sequence's table row starts.
             /// This is zero for full-attention history and advances for sliding-window
             /// rows. Private live state always uses zero. It has one entry per sequence and is unrelated to
             /// the physical slab ID.
-            block_table_start_indices: u32 => inner.block_table_start_indices;
+            block_table_start_indices: u32 => inner.blocks.block_table_start_indices;
             /// One-based slab ID of each token's write target. Entry `k`
             /// corresponds to `BatchPlan.token_ids[k]`.
             append_slab_ids: u32 => inner.append_slab_ids;
@@ -508,10 +509,12 @@ crate::arrays::array_methods! {
             let plan = KvGroupPlan {
                 group_index,
                 blocks_per_slab,
-                block_indptr: crate::arrays::owned_vec(block_indptr),
-                block_slab_ids: crate::arrays::owned_vec(block_slab_ids),
-                block_slotnums: crate::arrays::owned_vec(block_slotnums),
-                block_table_start_indices: crate::arrays::owned_vec(block_table_start_indices),
+                blocks: Arc::new(KvBlockTable {
+                    block_indptr: crate::arrays::owned_vec(block_indptr),
+                    block_slab_ids: crate::arrays::owned_vec(block_slab_ids),
+                    block_slotnums: crate::arrays::owned_vec(block_slotnums),
+                    block_table_start_indices: crate::arrays::owned_vec(block_table_start_indices),
+                }),
                 append_slab_ids: crate::arrays::owned_vec(append_slab_ids),
                 append_slotnums: crate::arrays::owned_vec(append_slotnums),
                 append_block_offsets: crate::arrays::owned_vec(append_block_offsets),

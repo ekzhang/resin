@@ -42,6 +42,16 @@ pub struct SequenceStep {
 /// Numeric execution plan shared by native runners and replica transport.
 #[derive(Clone, Debug, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
 pub struct BatchPlan {
+    pub cohort: Arc<BatchCohort>,
+    pub batch_id: u64,
+    pub context_lengths: Vec<u32>,
+    pub token_ids: Vec<u32>,
+    pub cache_groups: Vec<Arc<KvGroupPlan>>,
+}
+
+/// Numerical columns that are fixed for the life of a decode cohort.
+#[derive(Clone, Debug, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
+pub struct BatchCohort {
     /// Flattened predecessor rows and their next prompt tokens, partitioned by sequence.
     pub prompt_score_indices: Vec<u32>,
     pub prompt_score_token_ids: Vec<u32>,
@@ -49,23 +59,27 @@ pub struct BatchPlan {
     pub prompt_score_top_counts: Vec<u32>,
     pub prompt_target_indptr: Vec<u32>,
     pub prompt_target_token_ids: Vec<u32>,
-    pub batch_id: u64,
     pub batch_key: Option<u64>,
     pub phase: Phase,
     pub sequence_ids: Vec<u64>,
-    pub context_lengths: Vec<u32>,
     /// Final prefill-history endpoints, including generated inputs on retraction.
     /// Only meaningful for prefill; constant across that history's chunks.
     pub prefill_lengths: Vec<u32>,
-    pub token_ids: Vec<u32>,
     pub token_indptr: Vec<u32>,
     pub sampling_mask: Vec<bool>,
-    pub cache_groups: Vec<Arc<KvGroupPlan>>,
+}
+
+impl std::ops::Deref for BatchPlan {
+    type Target = BatchCohort;
+
+    fn deref(&self) -> &BatchCohort {
+        &self.cohort
+    }
 }
 
 const PLAN_WIRE_MAGIC: &[u8; 8] = b"RSNPLAN\0";
 // Private same-build protocol. Bump when the archived schema or format changes.
-const PLAN_WIRE_VERSION: u32 = 2;
+const PLAN_WIRE_VERSION: u32 = 3;
 const PLAN_WIRE_HEADER: usize = 20;
 
 impl BatchPlan {
@@ -100,13 +114,16 @@ impl BatchPlan {
     pub fn validate(&self) -> Result<()> {
         let Self {
             token_ids,
+            context_lengths,
+            ..
+        } = self;
+        let BatchCohort {
             sequence_ids,
             token_indptr,
-            context_lengths,
             prefill_lengths,
             sampling_mask,
             ..
-        } = self;
+        } = &*self.cohort;
         if token_ids.is_empty() {
             return Err(Error::invalid("a batch must contain at least one token"));
         }
@@ -123,20 +140,16 @@ impl BatchPlan {
                 "token_indptr must contain one more item than sequence_ids",
             ));
         }
-        if context_lengths.len() != sequence_ids.len() {
-            return Err(Error::invalid(
-                "context_lengths must contain one item per sequence",
-            ));
-        }
-        if prefill_lengths.len() != sequence_ids.len() {
-            return Err(Error::invalid(
-                "prefill_lengths must contain one item per sequence",
-            ));
-        }
-        if sampling_mask.len() != sequence_ids.len() {
-            return Err(Error::invalid(
-                "sampling_mask must contain one item per sequence",
-            ));
+        for (name, count) in [
+            ("context_lengths", context_lengths.len()),
+            ("prefill_lengths", prefill_lengths.len()),
+            ("sampling_mask", sampling_mask.len()),
+        ] {
+            if count != sequence_ids.len() {
+                return Err(Error::invalid(format!(
+                    "{name} must contain one item per sequence"
+                )));
+            }
         }
         if token_indptr.first() != Some(&0) {
             return Err(Error::invalid("token_indptr must start at zero"));

@@ -14,14 +14,14 @@ use crate::resources::paged_kv::{
     PrefixStoragePolicy, RequestResourceRef,
 };
 use crate::{
-    BatchPlan, Phase, PlanningConfig, PlanningError, RequestId, RequestProgress, Schedulable,
-    Scheduler, Selection, SequenceStep, TokenRange, schedule_ready_prefix,
+    BatchCohort, BatchPlan, Phase, PlanningConfig, PlanningError, RequestId, RequestProgress,
+    Schedulable, Scheduler, Selection, SequenceStep, TokenRange, schedule_ready_prefix,
 };
 use std::cmp::Reverse;
 use std::num::{NonZeroU32, NonZeroU64, NonZeroUsize};
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Instant;
 
 pub type Result<T> = std::result::Result<T, Error>;
@@ -515,14 +515,20 @@ struct PreparedProgress<'a> {
 
 struct Batch<P> {
     rows: Vec<BatchRow<P>>,
+    continuation: Option<Continuation>,
     resources: Option<WriterAccessLease>,
     prepared_at: Option<Instant>,
+}
+
+struct Continuation {
+    plan: BatchPlan,
+    issued: Option<u64>,
+    ready: OnceLock<bool>,
 }
 
 pub struct EngineCore<P> {
     metrics: Option<EngineMetricsState>,
     in_flight: Option<Batch<P>>,
-    continuation: Option<ExecutionPlan<P>>,
     quarantined: Option<Batch<P>>,
     runner_config: RunnerConfig,
     scheduler: Scheduler<Request<P>>,
@@ -595,7 +601,6 @@ impl<P: Clone> EngineCore<P> {
         Ok(Self {
             metrics: None,
             in_flight: None,
-            continuation: None,
             quarantined: None,
             runner_config,
             scheduler: Scheduler::new(max_running_requests),
@@ -1112,7 +1117,15 @@ impl<P: Clone> EngineCore<P> {
     }
 
     pub fn has_continuation(&self) -> bool {
-        self.continuation.is_some() && self.scheduler.is_empty()
+        self.scheduler.is_empty()
+            && self.in_flight.as_ref().is_some_and(|batch| {
+                batch.continuation.as_ref().is_some_and(|continuation| {
+                    continuation.issued.is_none()
+                        && *continuation
+                            .ready
+                            .get_or_init(|| self.can_continue(batch, &continuation.plan))
+                })
+            })
     }
 
     /// Harvest an enqueued result using the same atomic commit as synchronous execution.
@@ -1122,8 +1135,27 @@ impl<P: Clone> EngineCore<P> {
         output: Result<TokenRows<'_>>,
         make_event: impl FnMut(TokenEvent) -> Result<E>,
     ) -> Result<Vec<E>> {
+        self.complete_dispatch(runner, output, make_event, false)
+    }
+
+    fn complete_dispatch<E>(
+        &mut self,
+        runner: &mut impl Runner<P>,
+        output: Result<TokenRows<'_>>,
+        make_event: impl FnMut(TokenEvent) -> Result<E>,
+        continuing: bool,
+    ) -> Result<Vec<E>> {
         self.raise_if_open()?;
-        self.continuation = None;
+        if continuing
+            && self
+                .in_flight
+                .as_ref()
+                .and_then(|batch| batch.continuation.as_ref())
+                .and_then(|continuation| continuation.issued)
+                .is_none()
+        {
+            return Err(Error::internal("Engine has no issued decode continuation"));
+        }
         let Some(mut batch) = self.in_flight.take() else {
             return Err(Error::internal("Engine has no in-flight step to complete"));
         };
@@ -1131,7 +1163,8 @@ impl<P: Clone> EngineCore<P> {
         // execution failure keeps the exact requests and writer lease quarantined.
         let output = match output {
             Err(error)
-                if error.kind == ErrorKind::Rejected
+                if !continuing
+                    && error.kind == ErrorKind::Rejected
                     && !batch.rows.iter().any(|row| row.terminal) =>
             {
                 self.release_kv_access(batch.resources.take());
@@ -1140,24 +1173,34 @@ impl<P: Clone> EngineCore<P> {
                 return Err(error);
             }
             Err(error) => {
-                return self.quarantine(batch, "runner forward failed after accepting work", error);
+                // A successor already uses the lease. The prior step cannot return it.
+                let stage = if continuing {
+                    "overlapped execution failed after enqueue"
+                } else {
+                    "runner forward failed after accepting work"
+                };
+                return self.quarantine(batch, stage, error);
             }
             Ok(output) => output,
         };
-        self.complete_batch(runner, batch, output, make_event, None)
+        self.complete_batch(runner, batch, output, make_event, continuing)
     }
 
-    /// Retain a decode view only when another maximum-sized step cannot
-    /// allocate, rotate, replace, or publish any of its leased pages. Stops
-    /// complete logically while physical retirement waits for the next step.
-    /// The caller separately checks that its device runtime supports feedback.
+    /// Check whether the active lease can continue the supplied batch. The
+    /// engine's own frozen table determines the lease, even if a caller edits
+    /// its copy of the plan.
     pub fn retain_continuation(&mut self, plan: &ExecutionPlan<P>) -> bool {
-        let allowed = self.can_continue(plan);
-        self.continuation = allowed.then(|| plan.clone());
-        allowed
+        self.in_flight
+            .as_ref()
+            .and_then(|batch| batch.continuation.as_ref())
+            .is_some_and(|active| {
+                active.plan.batch_id == plan.batch_id
+                    && active.plan.sequence_ids == plan.sequence_ids
+            })
+            && self.has_continuation()
     }
 
-    fn can_continue(&self, plan: &ExecutionPlan<P>) -> bool {
+    fn can_continue(&self, batch: &Batch<P>, plan: &BatchPlan) -> bool {
         let maximum = u64::from(self.runner_config.max_accepted_per_step);
         let two_step_writes = maximum
             + u64::from(
@@ -1165,97 +1208,94 @@ impl<P: Clone> EngineCore<P> {
                     .decode_write_tokens()
                     .expect("validated decode write footprint"),
             );
-        let Some(batch) = &self.in_flight else {
-            return false;
-        };
-        self.scheduler.is_empty()
-            && plan.phase == Phase::Decode
-            && batch.rows.len() == plan.sequence_ids.len()
-            && batch.rows.iter().all(|row| {
-                !row.terminal
-                    && row
-                        .request
-                        .max_output_tokens
-                        .saturating_sub(row.request.generated.len()) as u64
-                        > 2 * maximum
-                    && u64::from(row.scheduled.token_start()) + two_step_writes
-                        <= u64::from(self.context_length.get())
-            })
-            && self
-                .runner_config
-                .cache_layout
-                .as_ref()
-                .is_some_and(|layout| {
-                    layout.groups().iter().enumerate().all(|(index, group)| {
-                        plan.context_lengths
-                            .iter()
-                            .enumerate()
-                            .all(|(row, &start)| {
-                                let block = u64::from(group.block_tokens().get());
-                                if group.is_recurrent() {
-                                    // Live recurrent state has no token-page
-                                    // boundary. Its one private slot is pinned
-                                    // for the entire continuation chain.
-                                    plan.cache_groups[index]
-                                        .state
-                                        .as_ref()
-                                        .is_some_and(|state| {
-                                            self.prefix_alignment().is_none_or(|alignment| {
-                                                let alignment = u64::from(alignment);
-                                                let first =
-                                                    (u64::from(start) / alignment + 1) * alignment;
-                                                let end = u64::from(start) + two_step_writes;
-                                                // A continuation cannot allocate snapshot slots.
-                                                // Drain before crossing an unreserved boundary.
-                                                (first..=end).step_by(alignment as usize).all(
-                                                    |prefix| {
-                                                        state.checkpoint_slots.iter().any(|slot| {
-                                                            slot.row as usize == row
-                                                                && u64::from(slot.prefix_length)
-                                                                    == prefix
-                                                        })
-                                                    },
-                                                )
-                                            })
+        batch.rows.iter().all(|row| {
+            !row.terminal
+                && row
+                    .request
+                    .max_output_tokens
+                    .saturating_sub(row.request.generated.len()) as u64
+                    > 2 * maximum
+                && u64::from(row.scheduled.token_start()) + two_step_writes
+                    <= u64::from(self.context_length.get())
+        }) && self
+            .runner_config
+            .cache_layout
+            .as_ref()
+            .is_some_and(|layout| {
+                layout.groups().iter().enumerate().all(|(index, group)| {
+                    plan.context_lengths
+                        .iter()
+                        .enumerate()
+                        .all(|(row, &start)| {
+                            let block = u64::from(group.block_tokens().get());
+                            if group.is_recurrent() {
+                                // Live recurrent state has no token-page
+                                // boundary. Its one private slot is pinned
+                                // for the entire continuation chain.
+                                plan.cache_groups[index]
+                                    .state
+                                    .as_ref()
+                                    .is_some_and(|state| {
+                                        self.prefix_alignment().is_none_or(|alignment| {
+                                            let alignment = u64::from(alignment);
+                                            let first =
+                                                (u64::from(start) / alignment + 1) * alignment;
+                                            let end = u64::from(start) + two_step_writes;
+                                            // A continuation cannot allocate snapshot slots.
+                                            // Drain before crossing an unreserved boundary.
+                                            (first..=end).step_by(alignment as usize).all(
+                                                |prefix| {
+                                                    state.checkpoint_slots.iter().any(|slot| {
+                                                        slot.row as usize == row
+                                                            && u64::from(slot.prefix_length)
+                                                                == prefix
+                                                    })
+                                                },
+                                            )
                                         })
-                                } else {
-                                    // The page table is the frozen lease envelope,
-                                    // not a promise that new pages may be allocated.
-                                    // Full-page leases permit further continuations
-                                    // only until the last already-pinned page ends.
-                                    let table = &plan.cache_groups[index];
-                                    let first = u64::from(table.block_table_start_indices[row]);
-                                    let count = u64::from(
-                                        table.block_indptr[row + 1] - table.block_indptr[row],
-                                    );
-                                    let earliest_read = group
-                                        .read_window_tokens()
-                                        .map_or(0, |window| start.saturating_sub(window.get() - 1));
-                                    let lease_end = (first + count) * block;
-                                    u64::from(earliest_read) / block >= first
-                                        && u64::from(start) + two_step_writes <= lease_end
-                                        && group.max_write_tokens().is_none_or(|limit| {
-                                            lease_end - u64::from(start) <= u64::from(limit.get())
-                                        })
-                                }
-                            })
-                    })
+                                    })
+                            } else {
+                                // The page table is the frozen lease envelope,
+                                // not a promise that new pages may be allocated.
+                                // Full-page leases permit further continuations
+                                // only until the last already-pinned page ends.
+                                let table = &plan.cache_groups[index];
+                                let first = u64::from(table.block_table_start_indices[row]);
+                                let count = u64::from(
+                                    table.block_indptr[row + 1] - table.block_indptr[row],
+                                );
+                                let earliest_read = group
+                                    .read_window_tokens()
+                                    .map_or(0, |window| start.saturating_sub(window.get() - 1));
+                                let lease_end = (first + count) * block;
+                                u64::from(earliest_read) / block >= first
+                                    && u64::from(start) + two_step_writes <= lease_end
+                                    && group.max_write_tokens().is_none_or(|limit| {
+                                        lease_end - u64::from(start) <= u64::from(limit.get())
+                                    })
+                            }
+                        })
                 })
+            })
     }
 
-    /// A conservative host plan reserves the longest possible previous output;
-    /// the runtime substitutes exact GPU token/position feedback before launch.
-    pub fn continuation_plan(&mut self) -> Result<Option<ExecutionPlan<P>>> {
+    /// Issue one successor from the current writer lease. The host uses the
+    /// maximum accepted length; the device substitutes its exact feedback.
+    pub fn continuation_batch(&mut self) -> Result<Option<BatchPlan>> {
         self.raise_if_open()?;
-        if !self.scheduler.is_empty() {
+        if !self.has_continuation() {
             return Ok(None);
         }
-        let Some(template) = &self.continuation else {
-            return Ok(None);
-        };
-        let mut plan = template.clone();
+        let continuation = self
+            .in_flight
+            .as_mut()
+            .unwrap()
+            .continuation
+            .as_mut()
+            .unwrap();
+        let mut plan = continuation.plan.clone();
         plan.batch_id = self.next_batch_id;
-        self.next_batch_id = self
+        let next_batch_id = self
             .next_batch_id
             .checked_add(1)
             .ok_or_else(|| Error::internal("batch id space is exhausted"))?;
@@ -1263,8 +1303,8 @@ impl<P: Clone> EngineCore<P> {
         for context in &mut plan.context_lengths {
             *context += maximum;
         }
-        let contexts = &plan.batch.context_lengths;
-        for (group, layout) in plan.batch.cache_groups.iter_mut().zip(
+        let contexts = &plan.context_lengths;
+        for (group, layout) in plan.cache_groups.iter_mut().zip(
             self.runner_config
                 .cache_layout
                 .as_ref()
@@ -1295,7 +1335,27 @@ impl<P: Clone> EngineCore<P> {
                 state.restore_copies.clear();
             }
         }
+        continuation.issued = Some(plan.batch_id);
+        self.next_batch_id = next_batch_id;
         Ok(Some(plan))
+    }
+
+    /// Native-runner adapter that includes the original request payloads.
+    pub fn continuation_plan(&mut self) -> Result<Option<ExecutionPlan<P>>> {
+        let Some(batch) = self.continuation_batch()? else {
+            return Ok(None);
+        };
+        let payloads = execution_call("continuation payload cloning", || {
+            Ok(self
+                .in_flight
+                .as_ref()
+                .unwrap()
+                .rows
+                .iter()
+                .map(|row| row.request.payload.clone())
+                .collect())
+        })?;
+        Ok(Some(ExecutionPlan { batch, payloads }))
     }
 
     /// Commit the previous output while the next device step uses the same
@@ -1307,23 +1367,7 @@ impl<P: Clone> EngineCore<P> {
         output: Result<TokenRows<'_>>,
         make_event: impl FnMut(TokenEvent) -> Result<E>,
     ) -> Result<Vec<E>> {
-        self.raise_if_open()?;
-        let Some(template) = self.continuation.take() else {
-            return Err(Error::internal("Engine has no safe decode continuation"));
-        };
-        let batch = self
-            .in_flight
-            .take()
-            .ok_or_else(|| Error::internal("Engine has no in-flight step to continue"))?;
-        let output = match output {
-            // A next forward was already accepted: even a previous-step
-            // rejection cannot justify returning its shared writer lease.
-            Err(error) => {
-                return self.quarantine(batch, "overlapped execution failed after enqueue", error);
-            }
-            Ok(output) => output,
-        };
-        self.complete_batch(runner, batch, output, make_event, Some(template))
+        self.complete_dispatch(runner, output, make_event, true)
     }
 
     fn selected_cohort(&self) -> Result<(Vec<&Request<P>>, Selection)> {
@@ -1590,6 +1634,13 @@ impl<P: Clone> EngineCore<P> {
                 }
             };
             let batch = Batch {
+                continuation: (plan.phase == Phase::Decode && !plan.cache_groups.is_empty()).then(
+                    || Continuation {
+                        plan: plan.batch.clone(),
+                        issued: None,
+                        ready: OnceLock::new(),
+                    },
+                ),
                 prepared_at: self.metrics.as_ref().map(|_| Instant::now()),
                 rows: scheduled
                     .into_iter()
@@ -1613,7 +1664,7 @@ impl<P: Clone> EngineCore<P> {
         mut batch: Batch<P>,
         output_token_ids: TokenRows<'_>,
         mut make_event: impl FnMut(TokenEvent) -> Result<E>,
-        continuation: Option<ExecutionPlan<P>>,
+        continuing: bool,
     ) -> Result<Vec<E>> {
         // Validate the complete execution result before terminal output limits
         // can hide writes beyond the leased capacity or extra prefill tokens.
@@ -1799,7 +1850,7 @@ impl<P: Clone> EngineCore<P> {
         }
 
         let mut survivors = Vec::new();
-        if continuation.is_none() {
+        if !continuing {
             // Validate every physical retirement and reserve all destination
             // storage before asking the runner or any allocator to release state.
             for (row, retire) in batch.rows.iter().zip(&retired) {
@@ -1886,7 +1937,17 @@ impl<P: Clone> EngineCore<P> {
                 *score = update;
             }
         }
-        if let Some(mut template) = continuation {
+        if continuing {
+            let continuation = batch
+                .continuation
+                .as_mut()
+                .expect("issued continuation owns a plan");
+            continuation.ready.take();
+            let template = &mut continuation.plan;
+            template.batch_id = continuation
+                .issued
+                .take()
+                .expect("successor consumes one lease issue");
             for (slot, (row, retire)) in batch.rows.iter_mut().zip(retired).enumerate() {
                 if retire {
                     complete_request_lease(
@@ -1910,7 +1971,6 @@ impl<P: Clone> EngineCore<P> {
                 }
             }
             self.in_flight = Some(batch);
-            self.continuation = self.can_continue(&template).then_some(template);
         } else {
             for (row, retire) in batch.rows.drain(..).zip(retired) {
                 let request = row.request;
@@ -2514,22 +2574,24 @@ fn build_plan<P: Clone>(
     let cache_groups = kv_groups.map_or_else(Vec::new, std::mem::take);
     Ok(ExecutionPlan {
         batch: BatchPlan {
-            prompt_score_indices,
-            prompt_score_token_ids,
-            prompt_score_indptr,
-            prompt_score_top_counts,
-            prompt_target_indptr,
-            prompt_target_token_ids,
-            sequence_ids,
+            cohort: Arc::new(BatchCohort {
+                prompt_score_indices,
+                prompt_score_token_ids,
+                prompt_score_indptr,
+                prompt_score_top_counts,
+                prompt_target_indptr,
+                prompt_target_token_ids,
+                sequence_ids,
+                prefill_lengths,
+                token_indptr,
+                phase,
+                batch_key,
+                sampling_mask,
+            }),
             context_lengths,
-            prefill_lengths,
             token_ids,
-            token_indptr,
-            phase,
             batch_id,
-            batch_key,
             cache_groups,
-            sampling_mask,
         },
         payloads,
     })
