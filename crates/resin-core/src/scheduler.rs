@@ -1,7 +1,7 @@
 use std::cmp::Reverse;
 use std::num::NonZeroUsize;
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
 pub enum Phase {
     Prefill,
     Decode,

@@ -1,5 +1,6 @@
 use std::collections::HashSet;
 use std::num::NonZeroU32;
+use std::sync::Arc;
 
 pub const MAX_KERNEL_VALUE: u32 = i32::MAX as u32;
 
@@ -379,22 +380,86 @@ pub struct StatePlan {
     pub checkpoint_slots: Vec<StateCheckpointSlot>,
 }
 
+impl StatePlan {
+    /// A continuation can only publish snapshots reserved by its writer lease.
+    fn covers_checkpoints(&self, row: usize, start: u64, end: u64, alignment: u64) -> bool {
+        let first = (start / alignment + 1) * alignment;
+        (first..=end).step_by(alignment as usize).all(|prefix| {
+            self.checkpoint_slots
+                .iter()
+                .any(|slot| slot.row as usize == row && u64::from(slot.prefix_length) == prefix)
+        })
+    }
+}
+
 /// Executor-facing block table and append locations for one cache group.
 #[derive(Clone, Debug, Eq, PartialEq, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
 pub struct KvGroupPlan {
     pub group_index: u32,
     pub blocks_per_slab: u32,
-    pub block_indptr: Vec<u32>,
-    pub block_slab_ids: Vec<u32>,
-    pub block_slotnums: Vec<u32>,
-    pub block_table_start_indices: Vec<u32>,
+    pub blocks: Arc<KvBlockTable>,
     pub append_slab_ids: Vec<u32>,
     pub append_slotnums: Vec<u32>,
     pub append_block_offsets: Vec<u32>,
     pub state: Option<StatePlan>,
 }
 
+/// Immutable physical history addresses shared by every launch of one lease.
+#[derive(Clone, Debug, Eq, PartialEq, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
+pub struct KvBlockTable {
+    pub block_indptr: Vec<u32>,
+    pub block_slab_ids: Vec<u32>,
+    pub block_slotnums: Vec<u32>,
+    pub block_table_start_indices: Vec<u32>,
+}
+
+impl std::ops::Deref for KvGroupPlan {
+    type Target = KvBlockTable;
+
+    fn deref(&self) -> &KvBlockTable {
+        &self.blocks
+    }
+}
+
 impl KvGroupPlan {
+    pub(crate) fn covers_continuation(
+        &self,
+        layout: &KvGroupLayout,
+        starts: &[u32],
+        write_tokens: u64,
+        checkpoint_alignment: Option<u32>,
+    ) -> bool {
+        if layout.is_recurrent() {
+            // The private live slot stays pinned for the entire lease.
+            let Some(state) = &self.state else {
+                return false;
+            };
+            let Some(alignment) = checkpoint_alignment.map(u64::from) else {
+                return true;
+            };
+            return starts.iter().enumerate().all(|(row, &start)| {
+                let start = u64::from(start);
+                state.covers_checkpoints(row, start, start + write_tokens, alignment)
+            });
+        }
+
+        let block_tokens = u64::from(layout.block_tokens().get());
+        let read_window = layout.read_window_tokens();
+        let write_limit = layout.max_write_tokens();
+        starts.iter().enumerate().all(|(row, &start)| {
+            let first = u64::from(self.block_table_start_indices[row]);
+            let blocks = u64::from(self.block_indptr[row + 1] - self.block_indptr[row]);
+            let earliest_read =
+                read_window.map_or(0, |window| start.saturating_sub(window.get() - 1));
+            let lease_end = (first + blocks) * block_tokens;
+            let start = u64::from(start);
+            // Both steps must fit inside the history pages already pinned by the lease.
+            u64::from(earliest_read) / block_tokens >= first
+                && start + write_tokens <= lease_end
+                && write_limit.is_none_or(|limit| lease_end - start <= u64::from(limit.get()))
+        })
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         group_index: u32,
@@ -411,10 +476,12 @@ impl KvGroupPlan {
         let plan = Self {
             group_index,
             blocks_per_slab: packing,
-            block_indptr,
-            block_slab_ids,
-            block_slotnums,
-            block_table_start_indices,
+            blocks: Arc::new(KvBlockTable {
+                block_indptr,
+                block_slab_ids,
+                block_slotnums,
+                block_table_start_indices,
+            }),
             append_slab_ids,
             append_slotnums,
             append_block_offsets,
@@ -773,7 +840,7 @@ mod tests {
         let corrupt: [fn(&mut KvGroupPlan); 9] = [
             |plan| plan.append_slab_ids[0] = 8,
             |plan| plan.append_block_offsets[0] = 1,
-            |plan| plan.block_table_start_indices[0] = 1,
+            |plan| Arc::make_mut(&mut plan.blocks).block_table_start_indices[0] = 1,
             |plan| plan.state.as_mut().unwrap().restore_copies[0].row = 1,
             |plan| plan.state.as_mut().unwrap().restore_copies[0].source_slotnum = 1,
             |plan| plan.state.as_mut().unwrap().restore_copies[0].source_slab_id = 7,

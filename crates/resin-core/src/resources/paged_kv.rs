@@ -1,12 +1,13 @@
 use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::num::{NonZeroU32, NonZeroUsize};
+use std::sync::Arc;
 
 use crate::{RequestId, SequenceStep};
 
 use super::kv::{
-    KvGroupLayout, KvGroupPlan, KvLayout, KvPlanError, KvRetention, StateCheckpointSlot, StateCopy,
-    StatePlan,
+    KvBlockTable, KvGroupLayout, KvGroupPlan, KvLayout, KvPlanError, KvRetention,
+    StateCheckpointSlot, StateCopy, StatePlan,
 };
 use super::paged::{
     CachePool, CachePoolError, CachedPages, GroupDemand, GroupId, PageAccessClaim, PageHandle,
@@ -1221,10 +1222,12 @@ impl PagedKvResources {
             let plan = KvGroupPlan {
                 group_index: group_index as u32,
                 blocks_per_slab: group.blocks_per_slab().get(),
-                block_indptr: indptr,
-                block_slab_ids,
-                block_slotnums,
-                block_table_start_indices: first_blocks,
+                blocks: Arc::new(KvBlockTable {
+                    block_indptr: indptr,
+                    block_slab_ids,
+                    block_slotnums,
+                    block_table_start_indices: first_blocks,
+                }),
                 append_slab_ids,
                 append_slotnums,
                 append_block_offsets: append_offsets,

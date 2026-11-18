@@ -184,137 +184,19 @@ class PagedCachePlan:
         device position. Prefill tables describe the exact active range.
         """
 
-        from resin._resin import CacheGroupFamily
-
         if decode_lookahead < 0:
             raise ValueError("decode_lookahead cannot be negative")
         if not isinstance(layout, CacheLayout):
             raise TypeError("paged cache plans require a native CacheLayout")
         batch = BatchView.from_plan(plan)
-        if len(batch.cache_groups) != len(layout.groups):
-            raise ValueError("BatchPlan cache groups do not match CacheLayout")
-
-        query_lengths = batch.query_lengths.astype(np.int64)
-        row_ids = np.repeat(np.arange(batch.num_sequences), query_lengths)
-        positions = batch.positions.astype(np.int64)
-        lookahead = decode_lookahead if batch.phase == BatchPhase.DECODE else 0
-        # Native fields are u32, but a leased decode span can extend beyond u32.
-        # Keep even oversized caller-supplied lookahead from wrapping arithmetic.
-        post_lengths = batch.context_lengths.astype(np.int64) + query_lengths
-        arithmetic = (
-            object
-            if lookahead > np.iinfo(np.int64).max - int(post_lengths.max())
-            else np.int64
+        # Cache tables and block widths cannot cover a u64-sized write span.
+        # Clamp larger Python integers without allowing their arithmetic to wrap.
+        plan._validate_cache_layout(layout, min(decode_lookahead, 2**64 - 1))
+        groups = tuple(
+            CacheGroupView.from_plan(batch, group_index=index)
+            for index in range(len(batch.cache_groups))
         )
-        write_tokens = query_lengths.astype(arithmetic) + lookahead
-        leased = batch.context_lengths.astype(arithmetic) + write_tokens
-
-        groups = []
-        for index, descriptor in enumerate(layout.groups):
-            block_tokens = descriptor.block_tokens
-            group = CacheGroupView.from_plan(
-                batch,
-                group_index=index,
-                blocks_per_slab=descriptor.blocks_per_slab,
-                parent_capacity=layout.parent_capacity,
-                block_tokens=block_tokens,
-            )
-            window_blocks = descriptor.window_resident_block_count
-            if descriptor.family == CacheGroupFamily.STATE:
-                if group.state is None:
-                    raise ValueError(f"cache group {index} requires private live state")
-                if (
-                    np.any(np.diff(group.block_indptr) != 1)
-                    or np.any(group.block_table_start_indices != 0)
-                    or not np.array_equal(
-                        group.append_slab_ids, group.block_slab_ids[row_ids]
-                    )
-                    or not np.array_equal(
-                        group.append_slotnums, group.block_slotnums[row_ids]
-                    )
-                ):
-                    raise ValueError(
-                        f"cache group {index} must address its private live state"
-                    )
-                groups.append(group)
-                continue
-            if group.state is not None:
-                raise ValueError(f"cache group {index} is not a STATE group")
-            invalid_span = np.zeros(batch.num_sequences, dtype=np.bool_)
-            maximum = 0
-            if window_blocks is not None:
-                assert descriptor.window_tokens is not None
-                assert descriptor.read_window_tokens is not None
-                maximum = descriptor.window_tokens - descriptor.read_window_tokens + 1
-                invalid_span = write_tokens > maximum
-            last_blocks = (leased - 1) // block_tokens
-            if window_blocks is not None:
-                expected_first = np.maximum(0, last_blocks + 1 - window_blocks)
-            else:
-                expected_first = np.zeros(batch.num_sequences, dtype=np.int64)
-            invalid_range = (group.block_table_start_indices != expected_first) | (
-                np.diff(group.block_indptr) != last_blocks - expected_first + 1
-            )
-            if batch.phase == BatchPhase.DECODE:
-                # The native table is the lease authority, including any tail
-                # reserved for queued steps. Validate coverage without requiring
-                # the runner to reproduce the Engine's reservation policy.
-                expected_first = group.block_table_start_indices.astype(np.int64)
-                count = np.diff(group.block_indptr).astype(np.int64)
-                table_end = expected_first + count
-                invalid_range = table_end <= last_blocks
-                if window_blocks is None:
-                    invalid_range |= expected_first != 0
-                else:
-                    assert descriptor.read_window_tokens is not None
-                    earliest_read = np.maximum(
-                        0,
-                        batch.context_lengths.astype(np.int64)
-                        - (descriptor.read_window_tokens - 1),
-                    )
-                    invalid_range |= (
-                        expected_first != np.maximum(0, table_end - window_blocks)
-                    ) | (expected_first > earliest_read // block_tokens)
-
-            logical_blocks = positions // block_tokens
-            # Layout-inconsistent extents must be rejected before indexing.
-            retained = (logical_blocks >= expected_first[row_ids]) & ~invalid_range[
-                row_ids
-            ]
-            retained_rows = row_ids[retained]
-            columns = (logical_blocks[retained] - expected_first[retained_rows]).astype(
-                np.intp
-            )
-            addresses = group.block_indptr[:-1][retained_rows] + columns
-            invalid_append = (
-                group.append_slab_ids[retained] != group.block_slab_ids[addresses]
-            ) | (group.append_slotnums[retained] != group.block_slotnums[addresses])
-            invalid_append |= (
-                group.append_block_offsets[retained]
-                != positions[retained] % block_tokens
-            )
-            invalid_append_rows = np.zeros(batch.num_sequences, dtype=np.bool_)
-            invalid_append_rows[retained_rows[invalid_append]] = True
-            # Keep the original row-first failure order across all three checks.
-            invalid_rows = np.flatnonzero(
-                invalid_span | invalid_range | invalid_append_rows
-            )
-            if len(invalid_rows):
-                row = int(invalid_rows[0])
-                if invalid_span[row]:
-                    raise ValueError(
-                        f"cache group {index} row {row} write span {write_tokens[row]} "
-                        f"exceeds {maximum}-token Window read/write capacity"
-                    )
-                if invalid_range[row]:
-                    raise ValueError(
-                        f"cache group {index} row {row} has an invalid active range"
-                    )
-                raise ValueError(
-                    f"cache group {index} row {row} append target is not row-owned"
-                )
-            groups.append(group)
-        return cls(batch, layout, tuple(groups))
+        return cls(batch, layout, groups)
 
     @property
     def phase(self) -> BatchPhase:

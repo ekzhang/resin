@@ -1630,7 +1630,6 @@ dependencies = [
  "resin-core",
  "resin-http",
  "resin-recipe",
- "rkyv",
  "serde",
  "serde_json",
  "serde_path_to_error",

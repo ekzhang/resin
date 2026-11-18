@@ -9,7 +9,8 @@ use pyo3::prelude::*;
 use pyo3::types::PyTuple;
 use resin_core::resources::kv as core_kv;
 use resin_core::resources::kv::{
-    KvGroupFamily, KvGroupLayout, KvGroupPlan, KvLayout, KvLayoutError, KvPlanError, KvRetention,
+    KvBlockTable, KvGroupFamily, KvGroupLayout, KvGroupPlan, KvLayout, KvLayoutError, KvPlanError,
+    KvRetention,
 };
 
 fn layout_error(error: KvLayoutError) -> PyErr {
@@ -424,34 +425,29 @@ impl CacheStatePlan {
 /// - `append_slotnums`: Destination block slot for each token.
 /// - `append_block_offsets`: Token offset within each destination block.
 #[pyclass(frozen, module = "resin._resin", skip_from_py_object)]
-#[derive(Clone, Debug, Eq, PartialEq, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
+#[derive(Debug)]
 pub(crate) struct CacheGroupPlan {
-    inner: Arc<KvGroupPlan>,
+    pub(crate) groups: Arc<[KvGroupPlan]>,
+    pub(crate) index: usize,
+}
+
+impl std::ops::Deref for CacheGroupPlan {
+    type Target = KvGroupPlan;
+
+    fn deref(&self) -> &KvGroupPlan {
+        &self.groups[self.index]
+    }
 }
 
 impl CacheGroupPlan {
-    pub(crate) fn from_inner(inner: KvGroupPlan) -> Self {
-        Self {
-            inner: Arc::new(inner),
-        }
-    }
-
-    pub(crate) fn validate_local(&self) -> PyResult<()> {
-        self.inner.validate().map_err(plan_error)
-    }
-
-    pub(crate) fn inner_native(&self) -> &KvGroupPlan {
-        self.inner.as_ref()
-    }
-
     fn repr_string(&self) -> String {
         format!(
             "CacheGroupPlan(group_index={}, blocks_per_slab={}, sequences={}, blocks={}, appends={})",
-            self.inner.group_index,
-            self.inner.blocks_per_slab,
-            self.inner.block_table_start_indices.len(),
-            self.inner.block_slab_ids.len(),
-            self.inner.append_slab_ids.len()
+            self.group_index,
+            self.blocks_per_slab,
+            self.block_table_start_indices.len(),
+            self.block_slab_ids.len(),
+            self.append_slab_ids.len()
         )
     }
 }
@@ -461,28 +457,28 @@ crate::arrays::array_methods! {
         arrays {
             /// CSR row pointer into the block-address arrays. Its length is one more
             /// than the batch sequence count.
-            block_indptr: u32 => inner.block_indptr;
+            block_indptr: u32 => blocks.block_indptr;
             /// One-based slab ID for each flattened block-table entry. Pair with
             /// `block_slotnums`; slab zero is reserved as null.
-            block_slab_ids: u32 => inner.block_slab_ids;
+            block_slab_ids: u32 => blocks.block_slab_ids;
             /// Zero-based slot number for each flattened block-table entry. Pair with
             /// `block_slab_ids`.
-            block_slotnums: u32 => inner.block_slotnums;
+            block_slotnums: u32 => blocks.block_slotnums;
             /// Absolute logical-block index at which each sequence's table row starts.
             /// This is zero for full-attention history and advances for sliding-window
             /// rows. Private live state always uses zero. It has one entry per sequence and is unrelated to
             /// the physical slab ID.
-            block_table_start_indices: u32 => inner.block_table_start_indices;
+            block_table_start_indices: u32 => blocks.block_table_start_indices;
             /// One-based slab ID of each token's write target. Entry `k`
             /// corresponds to `BatchPlan.token_ids[k]`.
-            append_slab_ids: u32 => inner.append_slab_ids;
+            append_slab_ids: u32 => append_slab_ids;
             /// Zero-based slot number of each token's write target. Entry `k`
             /// corresponds to `BatchPlan.token_ids[k]`.
-            append_slotnums: u32 => inner.append_slotnums;
+            append_slotnums: u32 => append_slotnums;
             /// Token offset within each token's destination block. Entry `k`
             /// corresponds to `BatchPlan.token_ids[k]` and is less than the matching
             /// `CacheGroupLayout.block_tokens`.
-            append_block_offsets: u32 => inner.append_block_offsets;
+            append_block_offsets: u32 => append_block_offsets;
         }
 
         #[new]
@@ -516,37 +512,38 @@ crate::arrays::array_methods! {
             let plan = KvGroupPlan {
                 group_index,
                 blocks_per_slab,
-                block_indptr: crate::arrays::owned_vec(block_indptr),
-                block_slab_ids: crate::arrays::owned_vec(block_slab_ids),
-                block_slotnums: crate::arrays::owned_vec(block_slotnums),
-                block_table_start_indices: crate::arrays::owned_vec(block_table_start_indices),
+                blocks: Arc::new(KvBlockTable {
+                    block_indptr: crate::arrays::owned_vec(block_indptr),
+                    block_slab_ids: crate::arrays::owned_vec(block_slab_ids),
+                    block_slotnums: crate::arrays::owned_vec(block_slotnums),
+                    block_table_start_indices: crate::arrays::owned_vec(block_table_start_indices),
+                }),
                 append_slab_ids: crate::arrays::owned_vec(append_slab_ids),
                 append_slotnums: crate::arrays::owned_vec(append_slotnums),
                 append_block_offsets: crate::arrays::owned_vec(append_block_offsets),
                 state: state.as_ref().map(|state| state.borrow(py).inner.clone()),
             };
             plan.validate().map_err(plan_error)?;
-            Ok(Self::from_inner(plan))
+            Ok(Self { groups: Arc::new([plan]), index: 0 })
         }
 
         /// Zero-based index of this plan's matching CacheGroupLayout. BatchPlan
         /// orders group plans by this index and rejects gaps or reordering.
         #[getter]
         fn group_index(&self) -> u32 {
-            self.inner.group_index
+            self.group_index
         }
 
         /// Number of this group's blocks packed into one slab. Valid slot numbers
         /// are `0 <= slotnum < blocks_per_slab`.
         #[getter]
         fn blocks_per_slab(&self) -> u32 {
-            self.inner.blocks_per_slab
+            self.blocks_per_slab
         }
 
         #[getter]
         fn state(&self) -> Option<CacheStatePlan> {
-            self.inner
-                .state
+            self.state
                 .clone()
                 .map(|inner| CacheStatePlan { inner })
         }

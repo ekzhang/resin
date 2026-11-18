@@ -28,7 +28,7 @@ impl Runner<&'static str> for Model {
         if self.report_checkpoints
             && let Ok(rows) = &output
         {
-            for group in &plan.cache_groups {
+            for group in plan.cache_groups.iter() {
                 if let Some(state) = &group.state {
                     for slot in &state.checkpoint_slots {
                         let row = slot.row as usize;
@@ -850,7 +850,7 @@ fn a_panicking_payload_clone_restores_the_cohort_and_releases_its_cache_access()
     impl Runner<Payload> for NativeModel {
         fn forward(&mut self, plan: ExecutionPlan<Payload>) -> Result<OwnedTokenRows, Error> {
             self.calls += 1;
-            self.ids = plan.sequence_ids;
+            self.ids = plan.sequence_ids.clone();
             let indptr = (0..=plan.payloads.len() as u32).collect();
             OwnedTokenRows::new(
                 plan.payloads
@@ -1193,10 +1193,16 @@ fn cross_page_continuation_reserves_pages_and_updates_physical_append_addresses(
         .unwrap()
         .unwrap();
     assert_eq!(plan.context_lengths, [31, 32]);
-    assert!(engine.retain_continuation(&plan));
+    let mut altered = plan.clone();
+    altered.batch.cache_groups = Default::default();
+    assert!(engine.retain_continuation(&altered));
     let next = engine.continuation_plan().unwrap().unwrap();
     assert_eq!(next.context_lengths, [35, 36]);
-    for (old, new) in plan.cache_groups.iter().zip(&next.cache_groups) {
+    assert!(engine.continuation_plan().unwrap().is_none());
+    assert_eq!(plan.sequence_ids, next.sequence_ids);
+    assert_eq!(plan.token_indptr, next.token_indptr);
+    for (old, new) in plan.cache_groups.iter().zip(next.cache_groups.iter()) {
+        assert!(std::sync::Arc::ptr_eq(&old.blocks, &new.blocks));
         assert_eq!(old.block_indptr, new.block_indptr);
         assert_eq!(old.block_slab_ids, new.block_slab_ids);
         assert_eq!(old.block_slotnums, new.block_slotnums);
@@ -1576,7 +1582,12 @@ fn hybrid_reservation_crosses_history_and_window_pages_without_rotating_state() 
     assert!(engine.retain_continuation(&plan));
     let next = engine.continuation_plan().unwrap().unwrap();
     assert_eq!(next.context_lengths, [130]);
-    for (index, (old, new)) in plan.cache_groups.iter().zip(&next.cache_groups).enumerate() {
+    for (index, (old, new)) in plan
+        .cache_groups
+        .iter()
+        .zip(next.cache_groups.iter())
+        .enumerate()
+    {
         assert_eq!(old.block_indptr, new.block_indptr);
         assert_eq!(old.block_slab_ids, new.block_slab_ids);
         assert_eq!(old.block_slotnums, new.block_slotnums);

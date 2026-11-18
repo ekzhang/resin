@@ -74,6 +74,9 @@ class BatchPlan:
         pending: "dict[int, Any]",
     ) -> BatchPlan: ...
     def _to_wire(self, /) -> "npt.NDArray[np.uint8]": ...
+    def _validate_cache_layout(
+        self, /, layout: CacheLayout, decode_lookahead: int
+    ) -> None: ...
     @property
     def batch_id(self, /) -> int:
         """
