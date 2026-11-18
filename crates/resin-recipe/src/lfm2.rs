@@ -167,24 +167,18 @@ impl Grammar for Lfm2Grammar {
 
 #[derive(Clone, Debug, Default, serde::Deserialize, serde::Serialize)]
 #[serde(default, deny_unknown_fields)]
-pub struct Lfm2RecipeParams {
+pub struct Lfm2Recipe {
     pub add_generation_prompt: Option<bool>,
     pub preserve_thinking: Option<bool>,
 }
 
-#[derive(Clone, Debug, Default)]
-pub struct Lfm2Recipe {
-    params: Lfm2RecipeParams,
-}
-
-impl Lfm2Recipe {
-    pub fn new(params: Lfm2RecipeParams) -> Self {
-        Self { params }
-    }
-}
 impl crate::Recipe for Lfm2Recipe {
+    fn from_config(params: Value, _defaults: &crate::RecipeDefaults<'_>) -> Result<Self, Error> {
+        crate::recipe::params(params)
+    }
+
     fn render(&self, request: &Value) -> Result<crate::Prompt, crate::Error> {
-        let options = crate::recipe::options("lfm2", &self.params, request)?;
+        let options = crate::recipe::options("lfm2", self, request)?;
         let messages = messages(request, "LFM2")?;
         let mut prompt = Prompt::new();
         prompt.special(BOS);

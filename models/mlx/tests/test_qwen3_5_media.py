@@ -9,7 +9,7 @@ import pytest
 mx = pytest.importorskip("mlx.core")
 
 from resin import BatchPlan  # noqa: E402
-from resin.recipe import Qwen35Media  # noqa: E402
+from resin.recipe import Media  # noqa: E402
 from resin_models_mlx.qwen3_5.media import MediaEncoder, apply_mrope  # noqa: E402
 
 
@@ -57,14 +57,7 @@ def test_multimodal_rotary_matches_transformers(dtype):
 
 
 def _media(value=1.0):
-    return Qwen35Media(
-        token_ids=(2, 8, 8, 8, 8, 3),
-        image_positions=(1, 2, 3, 4),
-        pixel_values=np.full((16, 12), value, dtype=np.float32),
-        image_grid_thw=np.array([[1, 4, 4]], dtype=np.int64),
-        spatial_merge_size=2,
-        image_token_id=8,
-    )
+    return (Media(span=(1, 4), image=np.full((8, 8, 3), value, dtype=np.float32)),)
 
 
 def test_media_chunks_merge_features_and_keep_decode_rotary_delta():
@@ -74,7 +67,7 @@ def test_media_chunks_merge_features_and_keep_decode_rotary_delta():
         calls.append(grid.copy())
         return mx.arange(4 * 8).reshape(4, 8).astype(mx.bfloat16)
 
-    encoder = MediaEncoder(visual, 8)
+    encoder = MediaEncoder(visual, 8, patch_size=2, merge_size=2, temporal_patch_size=1)
     media = _media()
     plan = cast(BatchPlan, SimpleNamespace(media=(media, None)))
     rows = np.array([0])
@@ -83,14 +76,18 @@ def test_media_chunks_merge_features_and_keep_decode_rotary_delta():
     )
     np.testing.assert_array_equal(np.array(first[0, 0]), np.zeros(8))
     np.testing.assert_array_equal(np.array(first[0, 1:]), np.arange(16).reshape(2, 8))
-    np.testing.assert_array_equal(np.array(positions)[:, 0], media.position_ids[:, :3])
+    np.testing.assert_array_equal(
+        np.array(positions)[:, 0], [[0, 1, 1], [0, 1, 1], [0, 1, 2]]
+    )
     second, positions = encoder.prepare(
         plan, rows, np.array([[8, 8, 3]]), np.array([3]), mx.zeros((1, 3, 8))
     )
     np.testing.assert_array_equal(
         np.array(second[0, :2]), np.arange(16, 32).reshape(2, 8)
     )
-    np.testing.assert_array_equal(np.array(positions)[:, 0], media.position_ids[:, 3:])
+    np.testing.assert_array_equal(
+        np.array(positions)[:, 0], [[1, 1, 3], [2, 2, 3], [1, 2, 3]]
+    )
     assert len(calls) == 1
 
     _, positions = encoder.prepare(
@@ -101,7 +98,7 @@ def test_media_chunks_merge_features_and_keep_decode_rotary_delta():
         mx.zeros((2, 1, 8)),
     )
     np.testing.assert_array_equal(np.array(positions)[:, :, 0], [[5, 7]] * 3)
-    with pytest.raises(ValueError, match="scheduled token"):
-        encoder.prepare(
-            plan, rows, np.array([[99]]), np.array([1]), mx.zeros((1, 1, 8))
-        )
+
+    malformed = (Media(span=(1, 3), image=media[0].image),)
+    with pytest.raises(ValueError, match="geometry"):
+        encoder.features(malformed)

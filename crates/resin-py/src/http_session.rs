@@ -10,7 +10,7 @@ use crate::{CompletionReason, Engine, RequestLease, SamplingParams, TokenEvent};
 use pyo3::{
     exceptions::{PyAttributeError, PyRuntimeError, PyValueError},
     prelude::*,
-    types::PyDict,
+    types::{PyDict, PyTuple},
 };
 use pythonize::pythonize;
 use resin_http::{
@@ -314,7 +314,7 @@ impl Session {
             let input_tokens = token_ids.len();
             let lease = self.engine.bind(py).borrow_mut().submit(
                 py,
-                Some(token_ids),
+                token_ids,
                 job.request.priority.unwrap_or_default(),
                 None,
                 Some(sampling_params),
@@ -586,7 +586,7 @@ impl Session {
     }
 }
 /// Generation input always includes its response parser.
-pub(crate) type RenderedJob = PyResult<(Vec<u32>, Option<Py<PyAny>>, Py<PyAny>)>;
+pub(crate) type RenderedJob = PyResult<(Vec<u32>, Option<Py<PyTuple>>, Py<PyAny>)>;
 
 struct RenderInput {
     messages: Vec<Py<Message>>,

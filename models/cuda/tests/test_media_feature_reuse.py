@@ -11,14 +11,7 @@ import torch
 from resin import BatchPhase, BatchPlan
 from resin.backend.cuda.completion import CudaContinuation
 from resin.backend.cuda.vision_cache import VisionFeatureCache
-from resin.recipe import (
-    DeepSeekV41Image,
-    DeepSeekV41Media,
-    Gemma4Media,
-    Glm53FlashMedia,
-    Inkling2Media,
-    Qwen35Media,
-)
+from resin.recipe import Media
 
 
 @pytest.fixture(params=["deepseek", "glm", "qwen", "gemma", "inkling2"])
@@ -44,6 +37,11 @@ def _case(name):
     runner: Any = object.__new__(cls)
     runner.device = torch.device("cpu")
     runner.config = SimpleNamespace(hidden_size=3, image_token_id=8, video_token_id=9)
+    (
+        runner.vision_patch_size,
+        runner.spatial_merge_size,
+        runner.vision_temporal_patch_size,
+    ) = 2, 2, 1
     runner._media_features = {}
     runner._target_hidden = {}
     if name in ("deepseek", "glm", "qwen", "inkling2"):
@@ -69,7 +67,12 @@ def _case(name):
         embed=lambda ids: ids.float()[..., None].expand(-1, -1, 3).clone(),
         embedding=torch.zeros(10, 3),
         vision=(
-            SimpleNamespace(encode=lambda pixels, grid: encode(pixels, 4))
+            SimpleNamespace(
+                encode=lambda pixels, grid: encode(pixels, 4),
+                config=SimpleNamespace(
+                    patch_size=2, spatial_merge_size=2, temporal_patch_size=1
+                ),
+            )
             if name == "glm"
             else lambda pixels, *args: encode(pixels, 1 if name == "deepseek" else 2)
         ),
@@ -83,55 +86,42 @@ def _case(name):
     )
 
     runner._vision = runner._model.vision
+    if name == "inkling2":
+        runner._vision.patch_size, runner._vision.merge_size = 2, 1
+    runner._model.transformers_config = SimpleNamespace(
+        vision_config=SimpleNamespace(patch_size=1, pooling_kernel_size=1)
+    )
 
     def media(value=0.25, *, followup=False, geometry=False, shift=0):
-        prefix = (7,) * (1 + shift)
-        suffix = (6, 5) if followup else (6,)
+        start = 1 + shift
         if name == "deepseek":
-            h, w = (2, 1) if geometry else (1, 2)
-            types = (0, 1, 2, 3)
-            image = DeepSeekV41Image(
-                start=len(prefix),
-                patches=np.full((2, 3, 14, 14), value, dtype=np.float32),
-                n_vit_h=h,
-                n_vit_w=w,
-                types=types,
-            )
-            return DeepSeekV41Media(
-                token_ids=prefix + (129264,) * len(types) + suffix, images=(image,)
-            )
+            shape = (28, 14, 3) if geometry else (14, 28, 3)
+            return (Media(span=(start, 4), image=np.full(shape, value, np.float32)),)
         if name in ("qwen", "glm"):
-            return (Qwen35Media if name == "qwen" else Glm53FlashMedia)(
-                token_ids=prefix + (8,) * 4 + suffix,
-                image_positions=tuple(range(len(prefix), len(prefix) + 4)),
-                pixel_values=np.full((16, 12), value, dtype=np.float32),
-                image_grid_thw=np.array(
-                    [[1, 2, 8] if geometry else [1, 4, 4]], dtype=np.int64
-                ),
-                spatial_merge_size=2,
-                image_token_id=8,
-            )
+            shape = (4, 16, 3) if geometry else (8, 8, 3)
+            return (Media(span=(start, 4), image=np.full(shape, value, np.float32)),)
         if name == "inkling2":
-            return Inkling2Media(
-                token_ids=prefix + (8, 8) + suffix,
-                image_token_id=8,
-                image_grid_thw=np.array(
-                    [[1, 2, 1] if geometry else [1, 1, 2]], dtype=np.int64
-                ),
-                pixel_values=np.full(
-                    (2, 4, 2, 3) if geometry else (2, 2, 4, 3),
-                    value,
-                    dtype=np.float32,
-                ),
-            )
-        return Gemma4Media(
-            token_ids=prefix + (8, 8, 9, 9) + suffix,
-            mm_token_type_ids=(0,) * len(prefix) + (1, 1, 2, 2) + (0,) * len(suffix),
-            pixel_values=np.full((1, 4, 3), value, dtype=np.float32),
-            image_position_ids=np.full((1, 4, 2), int(geometry), dtype=np.int64),
-            pixel_values_videos=np.full((1, 1, 4, 3), value + 1, dtype=np.float32),
-            video_position_ids=np.zeros((1, 1, 4, 2), dtype=np.int64),
+            shape = (4, 2, 3) if geometry else (2, 4, 3)
+            return (Media(span=(start, 2), image=np.full(shape, value, np.float32)),)
+        shape = (2, 1, 3) if geometry else (1, 2, 3)
+        return (
+            Media(span=(start, 2), image=np.full(shape, value, np.float32)),
+            Media(
+                span=(start + 2, 2),
+                video=(np.full(shape, value + 1, np.float32),),
+                video_frame_spans=((start + 2, 2),),
+                video_fps=1.0,
+            ),
         )
+
+    def tokens(payload):
+        ids = [7] * (max(sum(item.span) for item in payload) + 1)
+        for item in payload:
+            for start, length in item.video_frame_spans or (item.span,):
+                ids[start : start + length] = [
+                    129264 if name == "deepseek" else 9 if item.video is not None else 8
+                ] * length
+        return tuple(ids)
 
     def features(sequence_id, payload, *, start=0):
         if name in ("qwen", "inkling2"):
@@ -142,20 +132,25 @@ def _case(name):
         plan = BatchPlan(
             sequence_ids=[sequence_id],
             context_lengths=[start],
-            token_ids=payload.token_ids[start:],
-            token_indptr=[0, len(payload.token_ids) - start],
+            token_ids=tokens(payload)[start:],
+            token_indptr=[0, len(tokens(payload)) - start],
             phase=BatchPhase.PREFILL,
             media=[payload],
         )
         if name == "deepseek":
             runner._validate_plan(plan)
-            runner._media_embeddings(plan, 0, torch.tensor([payload.token_ids[start:]]))
+            runner._media_embeddings(plan, 0, torch.tensor([tokens(payload)[start:]]))
             return (runner._media_features[sequence_id][1][0],)
-        runner._media_embeddings(plan, torch.tensor(payload.token_ids[start:]))
+        runner._media_embeddings(plan, torch.tensor(tokens(payload)[start:]))
         return (runner._media_features[sequence_id][1],)
 
     return SimpleNamespace(
-        name=name, runner=runner, state=state, media=media, features=features
+        name=name,
+        runner=runner,
+        state=state,
+        media=media,
+        features=features,
+        tokens=tokens,
     )
 
 
@@ -210,13 +205,13 @@ def test_inkling2_only_encodes_chunks_with_image_positions():
         plan = BatchPlan(
             sequence_ids=[sequence_id],
             context_lengths=[start],
-            token_ids=payload.token_ids[start:stop],
+            token_ids=case.tokens(payload)[start:stop],
             token_indptr=[0, stop - start],
             phase=BatchPhase.PREFILL,
             media=[payload],
         )
         return case.runner._media_embeddings(
-            plan, 0, torch.tensor([payload.token_ids[start:stop]])
+            plan, 0, torch.tensor([case.tokens(payload)[start:stop]])
         )
 
     assert chunk(1, 0, 1) is None
@@ -239,31 +234,38 @@ def test_gemma_rebuilds_current_request_positions():
     assert all(a is b for a, b in zip(first, second, strict=True))
     record = case.runner._media_features[2]
     assert record.media is shifted
-    assert record.positions == {
-        4: ("image", 0),
-        5: ("image", 1),
-        6: ("video", 0),
-        7: ("video", 1),
-    }
+    tokens = case.tokens(shifted)
+    hidden = torch.full((len(tokens), 3), 99.0)
+    batch = SimpleNamespace(
+        token_indptr=np.array([0, len(tokens)]), positions=np.arange(len(tokens))
+    )
+    native = SimpleNamespace(sequence_ids=(2,), media=(shifted,))
+    case.runner._merge_media_embeddings(native, batch, hidden)
+    torch.testing.assert_close(hidden[4:6], torch.full((2, 3), 0.25))
+    torch.testing.assert_close(hidden[6:8], torch.full((2, 3), 1.25))
+    assert (hidden[:4] == 99).all()
+    batch.phase = BatchPhase.PREFILL
+    batch.local = SimpleNamespace(first_token_positions=[0], kv_lengths=[len(tokens)])
+    case.runner.sliding_window = 16
+    mask = case.runner._local_custom_mask(batch, {0: record}).reshape(
+        len(tokens), len(tokens)
+    )
+    expected = torch.ones_like(mask).tril()
+    expected[4:6, 4:6] = True
+    expected[6:8, 6:8] = True
+    torch.testing.assert_close(mask, expected)
+    with pytest.raises(ValueError, match="prefill chunk boundary"):
+        case.runner._validate_unsplit_vision_blocks(shifted, 5, len(tokens))
 
 
 def test_deepseek_keeps_image_indices_distinct():
     case = _case("deepseek")
     case.runner._vision_feature_cache = VisionFeatureCache(max_entries=2)
-    first_image = case.media().images[0]
-    second_image = DeepSeekV41Image(
-        start=6,
-        patches=np.full((2, 3, 14, 14), 0.75, dtype=np.float32),
-        n_vit_h=1,
-        n_vit_w=2,
-        types=first_image.types,
-    )
+    first_image = case.media()[0]
+    second_image = Media(span=(6, 4), image=np.full((14, 28, 3), 0.75, np.float32))
 
     def payload():
-        return DeepSeekV41Media(
-            token_ids=(7,) + (129264,) * 4 + (6,) + (129264,) * 4 + (6,),
-            images=(first_image, second_image),
-        )
+        return (first_image, second_image)
 
     case.features(1, payload())
     features = case.runner._media_features[1][1]
@@ -274,3 +276,16 @@ def test_deepseek_keeps_image_indices_distinct():
     assert case.state.calls == 2
     assert case.runner._media_features[2][1][0] is features[0]
     assert case.runner._media_features[2][1][1] is features[1]
+
+
+def test_cached_features_reject_wrong_placeholder_lengths(case):
+    media = case.media()
+    case.features(1, media)
+    item = media[0]
+    changed = (
+        Media(span=(item.span[0], item.span[1] - 1), image=item.image),
+        *media[1:],
+    )
+    assert changed[0].digest == item.digest
+    with pytest.raises(ValueError, match="geometry"):
+        case.features(2, changed)

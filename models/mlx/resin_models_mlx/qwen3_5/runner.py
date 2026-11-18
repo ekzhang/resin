@@ -151,7 +151,13 @@ class Qwen35MlxRunner:
                 visual = load_vision_model(
                     self.model_path, raw_config, compiled=compile_vision
                 )
-                self._media = MediaEncoder(visual, self.config.hidden_size)
+                self._media = MediaEncoder(
+                    visual,
+                    self.config.hidden_size,
+                    patch_size=visual.config.patch_size,
+                    merge_size=visual.config.spatial_merge_size,
+                    temporal_patch_size=visual.config.temporal_patch_size,
+                )
                 if compile_vision:
                     side = visual.config.spatial_merge_size * 8
                     mx.eval(

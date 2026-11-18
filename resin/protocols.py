@@ -9,7 +9,6 @@ from typing import (
     Literal,
     NamedTuple,
     Protocol,
-    runtime_checkable,
 )
 
 if TYPE_CHECKING:
@@ -29,33 +28,6 @@ class MediaTokenSpan(NamedTuple):
 
     position: int
     length: int
-
-
-@runtime_checkable
-class MediaInput(Protocol):
-    """Model-owned prompt payload understood by the generic Engine.
-
-    ``cache_key`` is a token-aligned, hashable identity. It normally equals
-    ``token_ids`` outside media spans and is digest-salted inside them, allowing
-    the Engine's ordinary prefix tree to distinguish equal placeholders backed
-    by different media. ``token_spans`` marks ranges that must remain intact in
-    one prefill row when a model uses bidirectional attention within media.
-    Both properties are required at admission; use an empty tuple for spans
-    when all prompt positions may be split across prefill chunks.
-
-    The payload must remain consistent with its content identity. Native media
-    owns immutable snapshots and exposes read-only arrays; construct a new
-    payload to change pixels or geometry instead of mutating an existing one.
-    """
-
-    @property
-    def token_ids(self) -> Sequence[int]: ...
-
-    @property
-    def cache_key(self) -> tuple[int, ...]: ...
-
-    @property
-    def token_spans(self) -> tuple[MediaTokenSpan, ...]: ...
 
 
 # (generated token index, source byte start/end, event text byte start/end).
@@ -153,7 +125,6 @@ __all__ = [
     "FinalizingResponseParser",
     "ManagedRunner",
     "CacheExporter",
-    "MediaInput",
     "MediaTokenSpan",
     "MetricsRunner",
     "ResponseParser",

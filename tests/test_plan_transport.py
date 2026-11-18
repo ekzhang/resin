@@ -14,16 +14,11 @@ from resin import (
     SamplingParams,
 )
 from resin.backend.plan_transport import PlanTransport, RequestRegistration
-from resin.recipe import Inkling2Media
+from resin.recipe import Media
 
 
 def media(value=0.5):
-    return Inkling2Media(
-        token_ids=[7, 200054, 9],
-        image_token_id=200054,
-        pixel_values=np.full((1, 2, 2, 3), value, dtype=np.float32),
-        image_grid_thw=np.array([[1, 1, 1]], dtype=np.int64),
-    )
+    return (Media((1, 1), image=np.full((2, 2, 3), value, dtype=np.float32)),)
 
 
 def rich_plan(batch_key):
@@ -234,9 +229,9 @@ def test_restore_owns_step_arrays_and_registration_buffers():
     assert restored.sequence_ids.tolist() == [9]
     assert restored.token_ids.tolist() == [7, 200054, 9]
     received = restored.media[0]
-    assert isinstance(received, Inkling2Media)
-    assert received.token_ids == (7, 200054, 9)
-    np.testing.assert_array_equal(received.pixel_values, 0.5)
+    assert isinstance(received, tuple) and isinstance(received[0], Media)
+    assert received[0].span == (1, 1)
+    np.testing.assert_array_equal(received[0].image, 0.5)
 
 
 def test_release_allows_new_request_with_same_id_without_invalidating_old_plan():
@@ -269,20 +264,14 @@ def test_release_allows_new_request_with_same_id_without_invalidating_old_plan()
     second_packet = sender.prepare(second_plan)
     assert len(second_packet.registrations) == 1
     second = receiver.restore(second_packet)
+    assert first.media[0] is not None and second.media[0] is not None
     assert first.media[0] is not second.media[0]
-    assert isinstance(first.media[0], Inkling2Media)
-    assert isinstance(second.media[0], Inkling2Media)
-    np.testing.assert_array_equal(first.media[0].pixel_values, 0.25)
-    np.testing.assert_array_equal(second.media[0].pixel_values, 0.75)
+    np.testing.assert_array_equal(first.media[0][0].image, 0.25)
+    np.testing.assert_array_equal(second.media[0][0].image, 0.75)
     assert second.sampling_params[0].temperature == 0
 
 
-def test_prepare_is_atomic_when_later_request_has_unsupported_media():
-    class CustomMedia:
-        token_ids = (8,)
-        cache_key = (8,)
-        token_spans = ()
-
+def test_prepare_is_atomic_when_later_request_has_overlapping_media():
     sender = PlanTransport()
     payload = media()
     invalid = BatchPlan(
@@ -290,9 +279,9 @@ def test_prepare_is_atomic_when_later_request_has_unsupported_media():
         context_lengths=[0, 0],
         token_ids=[7, 8],
         token_indptr=[0, 1, 2],
-        media=[payload, CustomMedia()],
+        media=[payload, (payload[0], payload[0])],
     )
-    with pytest.raises(TypeError, match="media"):
+    with pytest.raises(ValueError, match="media spans"):
         sender.prepare(invalid)
     valid = BatchPlan(
         sequence_ids=[1, 2],

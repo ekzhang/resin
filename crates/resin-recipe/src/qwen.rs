@@ -1,5 +1,6 @@
 //! Qwen3.5, Qwen3.8 and Ornith conversation formats.
 
+mod media;
 mod parser;
 pub use parser::{QwenParser, QwenTokens};
 
@@ -91,8 +92,8 @@ pub struct QwenRecipeParams {
     /// Rejects media for runners that serve only the language model.
     #[serde(skip_serializing)]
     pub text_only: bool,
-    #[serde(skip_serializing)]
-    pub media_config: Option<crate::media::qwen::Config>,
+    #[serde(skip_serializing, deserialize_with = "crate::recipe::default_if_null")]
+    pub media_config: media::Config,
 }
 
 /// Checkpoint template variants rendered by [`QwenRecipe`].
@@ -117,6 +118,11 @@ impl<const FORMAT: u8> QwenRecipe<FORMAT> {
     }
 }
 impl<const FORMAT: u8> crate::Recipe for QwenRecipe<FORMAT> {
+    fn from_config(mut params: Value, defaults: &crate::RecipeDefaults<'_>) -> Result<Self, Error> {
+        crate::recipe::default(&mut params, "media_config", || defaults("image_processor"))?;
+        Ok(Self::new(crate::recipe::params(params)?))
+    }
+
     fn render(&self, request: &Value) -> Result<Prompt, Error> {
         let options = crate::recipe::options("Qwen", &self.params, request)?;
         let messages = messages(request, "Qwen")?;
@@ -337,8 +343,21 @@ impl<const FORMAT: u8> crate::Recipe for QwenRecipe<FORMAT> {
             encoder.special_id("<|endoftext|>")?,
         ])
     }
-    fn media_config(&self) -> Option<crate::MediaConfig> {
-        (!self.params.text_only)
-            .then(|| crate::MediaConfig::Qwen(self.params.media_config.clone().unwrap_or_default()))
+    fn input_modalities(&self) -> &'static [&'static str] {
+        if self.params.text_only {
+            &["text"]
+        } else {
+            &["text", "image"]
+        }
+    }
+    fn prepare_media(
+        &self,
+        sources: Vec<crate::media::Source>,
+        encoder: &dyn crate::Encoder,
+    ) -> Result<crate::media::Prepared, Error> {
+        if self.params.text_only {
+            return Err(Error::new("this recipe does not support media"));
+        }
+        self.params.media_config.prepare(sources, encoder)
     }
 }

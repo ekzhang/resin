@@ -2,27 +2,27 @@
 
 use std::collections::{HashMap, VecDeque};
 
-use resin_recipe::{Encoder, Error, Prompt, PromptSpan};
+use crate::{Encoder, Error, Prompt, PromptSpan};
 
 /// Explicit media IDs replacing one trusted template placeholder.
 ///
 /// Prefix and suffix are ordinary text and share BPE boundaries with nearby text.
 #[derive(Clone)]
-pub(crate) struct MediaTokens {
-    placeholder: String,
-    token_ids: Vec<u32>,
-    prefix: String,
-    suffix: String,
+pub struct MediaTokens {
+    pub(crate) placeholder: String,
+    pub(crate) token_ids: Vec<u32>,
+    pub(crate) prefix: String,
+    pub(crate) suffix: String,
 }
 impl MediaTokens {
-    pub(crate) fn heap_bytes(&self) -> usize {
+    pub fn heap_bytes(&self) -> usize {
         self.placeholder.capacity()
             + self.token_ids.capacity() * std::mem::size_of::<u32>()
             + self.prefix.capacity()
             + self.suffix.capacity()
     }
 
-    pub(crate) fn from_parts(
+    pub fn from_parts(
         placeholder: &str,
         token_ids: Vec<u32>,
         prefix: String,
@@ -41,7 +41,7 @@ type EncodedMedia = (Vec<u32>, Vec<(usize, usize)>);
 
 /// Encode trusted media slots and return their absolute (position, length) in input order.
 /// Literal marker spellings in ordinary message text never become media slots.
-pub(crate) fn encode(
+pub fn encode(
     prompt: Prompt,
     media: &[MediaTokens],
     encoder: &dyn Encoder,

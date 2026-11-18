@@ -6,7 +6,6 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import timedelta
 from pathlib import Path
-from types import SimpleNamespace
 
 import numpy as np
 import pytest
@@ -32,6 +31,7 @@ from resin.backend.distributed import (
     DistributedWorker,
 )
 from resin.backend.topology import ParallelGroups, ParallelismCapabilities
+from resin.recipe import Media
 
 
 @dataclass
@@ -226,19 +226,11 @@ def _run_case(groups, case):
                     )
                 ]
             if case == "serialize_failure" and dp == 0:
-                engine.cancel(requests.pop())
-                requests.append(
-                    engine.submit(
-                        [7],
-                        sampling_params=SamplingParams(max_output_tokens=1),
-                        media=SimpleNamespace(
-                            token_ids=(7,),
-                            cache_key=(1,),
-                            token_spans=(),
-                            injected=lambda: None,
-                        ),
-                    )
-                )
+
+                def fail_serialization(plan):
+                    raise TypeError("injected serialization failure")
+
+                setattr(worker._plans, "prepare", fail_serialization)
             steps = 0
             try:
                 while engine.has_work():
@@ -610,6 +602,8 @@ def test_single_rank_replica_keeps_preparation_local_and_skips_serialization(
         implementation.PlanTransport, "prepare", unexpected_serialization
     )
 
+    media = (Media((0, 1), image=np.ones((1, 1, 3), dtype=np.float32)),)
+
     class PreparedRunner:
         runner_config = RunnerConfig()
         calls = 0
@@ -622,7 +616,7 @@ def test_single_rank_replica_keeps_preparation_local_and_skips_serialization(
         def forward_distributed(self, plan, context, *, prepared=None):
             assert prepared is not None
             assert prepared[0] == context.step_id and prepared[1] is plan
-            assert plan.media[0].callback() == 19
+            assert plan.media[0] is media
             self.calls += 1
             return forward_output([3])
 
@@ -631,9 +625,7 @@ def test_single_rank_replica_keeps_preparation_local_and_skips_serialization(
     request = engine.submit(
         [1],
         sampling_params=SamplingParams(max_output_tokens=1),
-        media=SimpleNamespace(
-            token_ids=(1,), cache_key=(1,), token_spans=(), callback=lambda: 19
-        ),
+        media=media,
     )
     engine.step()
     assert request.take_result() == [3]

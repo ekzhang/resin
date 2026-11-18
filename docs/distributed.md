@@ -370,8 +370,9 @@ Successful step commands do not use pickle or object collectives. Media buffers
 and JSON request descriptors are sent only on registration, never on repeated
 decode steps. Request policy and media stay unchanged until release. Distributed
 sampling `extra` values must be JSON data, and distributed media must use Resin's
-native payloads. Local execution accepts custom Python `MediaInput`
-implementations with the same required cache identity and token-span fields.
+native `Media` objects. Each object carries immutable image, video or audio
+buffers, prompt spans and content identity. Local and distributed submission use
+the same `token_ids=rendered.token_ids, media=rendered.media` arguments.
 
 ## Model callback
 

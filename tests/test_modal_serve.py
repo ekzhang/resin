@@ -3,6 +3,7 @@
 from inspect import signature
 from types import SimpleNamespace
 
+import numpy as np
 import pytest
 import torch
 import torch.distributed as dist
@@ -12,6 +13,7 @@ from deploy.models import get_model
 from resin import Engine
 from resin.backend import distributed
 from resin.backend.topology import ParallelGroups
+from resin.recipe import Media
 from resin.server import HttpServer
 
 
@@ -42,10 +44,12 @@ def test_rank_warms_then_serves_and_closes_on_failure(monkeypatch, name, rank, f
             max_batch_tokens=spec.max_batch_size * spec.prefill_chunk_size
         ),
     )
-    media = object()
+    media = (Media((1, 1), image=np.zeros((1, 1, 3), dtype=np.float32)),)
     recipe = SimpleNamespace(
         stop_token_ids=[7, 8],
-        render=lambda messages: SimpleNamespace(token_ids=[4, 5], media=media),
+        render=lambda messages: SimpleNamespace(
+            token_ids=[4, 5], media=media if len(messages[0].content) > 1 else None
+        ),
     )
 
     def initialize(backend, **options):
@@ -94,12 +98,12 @@ def test_rank_warms_then_serves_and_closes_on_failure(monkeypatch, name, rank, f
             signature(Engine.submit).bind(self, **options)
             assert options["sampling_params"].stop_token_ids == (7, 8)
             assert options["sampling_params"].temperature == 0
-            assert rank == 0 or (spec.image_warmup and "media" in options)
-            if "media" in options:
+            assert options["token_ids"] == [4, 5]
+            assert rank == 0 or (spec.image_warmup and options["media"] is media)
+            if options["media"] is not None:
                 assert options["media"] is media and spec.image_warmup
                 calls.append("media")
             else:
-                assert options["token_ids"] == [4, 5]
                 calls.append("text")
             self.remaining = 2
             return SimpleNamespace(take_result=lambda: calls.append("warmup_done"))

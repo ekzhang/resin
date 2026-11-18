@@ -280,9 +280,8 @@ fn null_http_reasoning_effort_preserves_the_codec_default() {
         .unwrap()
         .rendered_text();
     assert!(prompt.contains("Reasoning: high"));
-    let recipe = GptOssRecipe::new(
-        serde_json::from_value(serde_json::json!({"reasoning_effort": "low"})).unwrap(),
-    );
+    let recipe: GptOssRecipe =
+        serde_json::from_value(serde_json::json!({"reasoning_effort": "low"})).unwrap();
     let inherited = recipe.render(&serde_json::json!({"messages": request["messages"], "extra": {"reasoning_effort": null}})).unwrap();
     assert!(inherited.rendered_text().contains("Reasoning: low"));
 }

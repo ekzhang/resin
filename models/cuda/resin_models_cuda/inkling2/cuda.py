@@ -11,7 +11,7 @@ from typing import cast
 import numpy as np
 import torch
 
-from resin import BatchPhase, RunnerConfig
+from resin import BatchPhase, BatchPlan, RunnerConfig
 from resin.backend.capacity import plan_cache_capacity
 from resin.backend.cuda.completion import (
     CudaContinuation,
@@ -49,6 +49,14 @@ from resin.backend.topology import ParallelismCapabilities
 from resin.backend.torch import use_default_dtype
 from resin.models.inkling2.config import Inkling2Config
 from resin.models.inkling2.dspark import Inkling2DSparkConfig
+from resin.models.vision import (
+    image_grid,
+    media_identity,
+    media_key,
+    packed_images,
+    span_slices,
+)
+from resin.recipe import Media
 from resin_models_cuda.inkling2.cache import (
     PREFILL_CHUNK_SIZE,
     CacheArena,
@@ -519,14 +527,7 @@ class Inkling2CudaRunner(CudaRunner):
             phase_timing=phase_timing,
         )
 
-    def _validate_plan(self, plan):
-        from resin.recipe import Inkling2Media
-
-        if any(
-            media is not None and not isinstance(media, Inkling2Media)
-            for media in plan.media
-        ):
-            raise TypeError("Inkling 2 requires its native prepared image payload")
+    def _validate_plan(self, plan: BatchPlan) -> tuple[tuple[int, int], ...]:
         return validate_hybrid_plan(
             plan,
             label="Inkling 2",
@@ -606,54 +607,50 @@ class Inkling2CudaRunner(CudaRunner):
             prompt_logprobs=PromptScores.concat(scores),
         )
 
-    def _features_for(self, sequence_id, media):
+    def _features_for(self, sequence_id: int, media: tuple[Media, ...]) -> torch.Tensor:
         existing = self._media_features.get(sequence_id)
-        if existing is not None and existing[0] != media.digest:
+        if existing is not None and existing[0] != media_identity(media):
             raise ValueError("Inkling 2 image payload changed during a request")
         if existing is None:
-            cached = self._vision_feature_cache.get(media.digest)
+            side = self._vision.patch_size * self._vision.merge_size
+            image_grid(media, side)
+            cached = self._vision_feature_cache.get(media_key(media))
             if cached is None:
-                if media.pixel_values is None or media.image_grid_thw is None:
-                    raise ValueError(
-                        "Inkling 2 image placeholders require pixels and grids"
-                    )
+                pixels, grid = packed_images(media, side, channels_last=True)
                 pixels = torch.as_tensor(
-                    np.array(media.pixel_values),
-                    device=self.device,
-                    dtype=torch.bfloat16,
+                    pixels, device=self.device, dtype=torch.bfloat16
                 )
-                features = self._vision(
-                    pixels, torch.from_numpy(media.image_grid_thw.copy())
-                )
+                features = self._vision(pixels, torch.from_numpy(grid))
                 if features.shape != (
-                    len(media.image_positions),
+                    sum(item.span[1] for item in media),
                     self.config.hidden_size,
                 ):
                     raise ValueError(
                         "Inkling 2 vision features do not match image placeholders"
                     )
-                cached = self._vision_feature_cache.put(media.digest, (features,))
+                cached = self._vision_feature_cache.put(media_key(media), (features,))
             (features,) = cached
-            existing = (media.digest, features)
+            assert features is not None
+            existing = (media_identity(media), features)
             self._media_features[sequence_id] = existing
         return existing[1]
 
-    def _media_embeddings(self, plan, row, ids):
+    def _media_embeddings(
+        self, plan: BatchPlan, row: int, ids: torch.Tensor
+    ) -> torch.Tensor | None:
         media = plan.media[row]
         if media is None:
             return None
         start = int(plan.context_lengths[row])
-        positions = np.asarray(media.image_positions)
-        selected = np.flatnonzero(
-            (positions >= start) & (positions < start + ids.shape[1])
+        slices = tuple(
+            span_slices((item.span for item in media), start, start + ids.shape[1])
         )
-        if not selected.size:
+        if not slices:
             return None
         features = self._features_for(int(plan.sequence_ids[row]), media)
         embeddings = self._model.embed_norm(self._model.embed_tokens(ids))
-        destination = torch.as_tensor(positions[selected] - start, device=self.device)
-        source = torch.as_tensor(selected, device=self.device)
-        embeddings[0].index_copy_(0, destination, features[source])
+        for destination, source in slices:
+            embeddings[0, destination].copy_(features[source])
         return embeddings
 
     def _eager(self, plan, cache_plan):

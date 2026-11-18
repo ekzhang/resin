@@ -31,7 +31,6 @@ mod parallelism;
 mod planning;
 mod recipe;
 mod recipe_events;
-mod recipe_media;
 mod recipe_types;
 mod runner;
 
@@ -339,7 +338,7 @@ struct BatchPlan {
     #[rkyv(with = rkyv::with::Skip)]
     sampling_params: Vec<SamplingParams>,
     #[rkyv(with = rkyv::with::Skip)]
-    media: Vec<Option<Arc<Py<PyAny>>>>,
+    media: Vec<Option<Arc<Py<PyTuple>>>>,
     #[rkyv(with = rkyv::with::Skip)]
     positions: OnceLock<Vec<u32>>,
 }
@@ -403,7 +402,7 @@ impl BatchPlan {
             self.media.push(if media.is_none() {
                 None
             } else {
-                Some(Arc::new(media.unbind()))
+                Some(Arc::new(media.cast_into::<PyTuple>()?.unbind()))
             });
         }
         Self::checked(self)
@@ -663,7 +662,7 @@ crate::arrays::array_methods! {
             cache_groups = None,
             sampling_mask: "Sequence[bool] | npt.NDArray[np.bool_] | None" = None,
             sampling_params = None,
-            media: "Sequence[MediaInput | None] | None" = None,
+            media: "Sequence[tuple[Media, ...] | None] | None" = None,
             prompt_score_indices: "Sequence[int] | npt.NDArray[np.uint32] | None" = None,
             prompt_score_token_ids: "Sequence[int] | npt.NDArray[np.uint32] | None" = None,
             prompt_score_indptr: "Sequence[int] | npt.NDArray[np.uint32] | None" = None,
@@ -685,7 +684,7 @@ crate::arrays::array_methods! {
             cache_groups: Option<Vec<Py<CacheGroupPlan>>>,
             sampling_mask: Option<PyArrayLike1<'_, bool>>,
             sampling_params: Option<Vec<Py<SamplingParams>>>,
-            media: Option<Vec<Option<Py<PyAny>>>>,
+            media: Option<Vec<Option<Py<PyTuple>>>>,
             prompt_score_indices: Option<PyArrayLike1<'_, u32>>,
             prompt_score_token_ids: Option<PyArrayLike1<'_, u32>>,
             prompt_score_indptr: Option<PyArrayLike1<'_, u32>>,
@@ -731,7 +730,7 @@ crate::arrays::array_methods! {
             let media = media
                 .unwrap_or_else(|| (0..sequence_count).map(|_| None).collect())
                 .into_iter()
-                .map(|payload| payload.map(Arc::new))
+                .map(|items| items.filter(|v| !v.bind(py).is_empty()).map(Arc::new))
                 .collect();
             let prompt_score_indices = prompt_score_indices
                 .map(arrays::owned_vec)
@@ -836,7 +835,7 @@ crate::arrays::array_methods! {
                 .map(|payload| {
                     payload
                         .as_ref()
-                        .map_or_else(|| py.None(), |payload| payload.clone_ref(py))
+                        .map_or_else(|| py.None(), |payload| payload.clone_ref(py).into_any())
                 })
                 .collect::<Vec<_>>();
             Ok(PyTuple::new(py, payloads)?.unbind())
@@ -1022,7 +1021,7 @@ impl RequestLease {
 #[derive(Clone, Debug)]
 struct RequestPayload {
     sampling_params: SamplingParams,
-    media: Option<Arc<Py<PyAny>>>,
+    media: Option<Arc<Py<PyTuple>>>,
 }
 
 fn core_error(error: core::Error) -> PyErr {
@@ -1478,12 +1477,12 @@ impl Engine {
         })
     }
     #[pyo3(signature = (
-        token_ids: "Sequence[int] | npt.NDArray[np.uint32] | None" = None,
+        token_ids: "Sequence[int] | npt.NDArray[np.uint32]",
         *,
         priority = 0,
         batch_key = None,
         sampling_params = None,
-        media: "MediaInput | None" = None,
+        media: "tuple[Media, ...] | None" = None,
         prompt_target_logprobs = None,
         cache_salt = None
     ))]
@@ -1491,50 +1490,25 @@ impl Engine {
     fn submit(
         &mut self,
         py: Python<'_>,
-        token_ids: Option<Vec<u32>>,
+        token_ids: Vec<u32>,
         priority: i32,
         batch_key: Option<u64>,
         sampling_params: Option<Py<SamplingParams>>,
-        media: Option<Py<PyAny>>,
+        media: Option<Py<PyTuple>>,
         prompt_target_logprobs: Option<Vec<Vec<u32>>>,
         cache_salt: Option<String>,
     ) -> PyResult<Py<RequestLease>> {
         self.core.raise_if_open().map_err(core_error)?;
-        let token_ids = match token_ids {
-            Some(token_ids) => token_ids,
-            None => media
-                .as_ref()
-                .ok_or_else(|| {
-                    PyValueError::new_err(
-                        "token_ids may be omitted only when media supplies token_ids",
-                    )
-                })?
-                .getattr(py, "token_ids")?
-                .extract(py)?,
-        };
         if token_ids.is_empty() {
             return Err(PyValueError::new_err("token_ids must be non-empty"));
         }
-        let cache_prompt: Option<Vec<u32>> = match media.as_ref() {
-            Some(media) => Some(media.getattr(py, "cache_key")?.extract::<Vec<u32>>(py)?),
-            None => None,
-        };
-        if cache_prompt
-            .as_ref()
-            .is_some_and(|identity| identity.len() != token_ids.len())
-        {
-            return Err(PyValueError::new_err(
-                "media cache_key must match token_ids length",
-            ));
-        }
-        let atomic_prefill_spans = match media.as_ref() {
-            Some(media) => media
-                .getattr(py, "token_spans")?
-                .extract::<Vec<(u32, u32)>>(py)?
-                .into_iter()
-                .map(|(position, length)| (position, position.saturating_add(length)))
-                .collect(),
-            None => Vec::new(),
+        let media = media.filter(|items| !items.bind(py).is_empty());
+        let (cache_prompt, atomic_prefill_spans) = match media.as_ref() {
+            Some(items) => {
+                let (identity, spans) = media_payload::admission(items.bind(py), &token_ids)?;
+                (Some(identity), spans)
+            }
+            None => (None, Vec::new()),
         };
         let mut sampling_params = sampling_params
             .map(|params| params.borrow(py).clone())
@@ -1966,10 +1940,7 @@ mod _resin {
     };
 
     #[pymodule_export]
-    use crate::media_payload::{
-        _media_from_buffers, _media_to_buffers, DeepSeekV41Image, DeepSeekV41Media, Gemma4Media,
-        Glm53FlashMedia, Inkling2Media, Qwen35Media,
-    };
+    use crate::media_payload::{_media_from_buffers, _media_to_buffers, Media};
 
     #[pymodule_export]
     use crate::recipe_types::{

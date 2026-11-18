@@ -9,6 +9,7 @@ from typing import TYPE_CHECKING, cast
 
 import numpy as np
 import torch
+from numpy.typing import NDArray
 
 from resin import BatchPhase, RunnerConfig
 from resin.backend.capacity import plan_cache_capacity
@@ -50,7 +51,16 @@ from resin.backend.sampling import (
 )
 from resin.backend.speculative import SpeculativeStats
 from resin.backend.topology import ParallelGroups, ParallelismCapabilities
-from resin.recipe import Qwen35Media
+from resin.models.vision import (
+    image_grid,
+    media_identity,
+    media_key,
+    mrope_delta,
+    mrope_positions,
+    packed_images,
+    span_slices,
+)
+from resin.recipe import Media
 from resin_models_cuda.nvfp4 import select_nvfp4_backend
 from resin_models_cuda.qwen3_5.attention import (
     GraphAttentionSpec,
@@ -241,8 +251,12 @@ class Qwen3_5CudaRunner(CudaRunner):
         self._configure_parallel_graphs(self._model, parallel_groups)
         self.image_token_id = self.raw_config.get("image_token_id")
         vision_config = self.raw_config.get("vision_config") or {}
-        self.spatial_merge_size = int(vision_config.get("spatial_merge_size", 1))
-        self._media_features: dict[int, tuple[Qwen35Media, torch.Tensor]] = {}
+        self.spatial_merge_size = int(vision_config.get("spatial_merge_size", 2))
+        self.vision_patch_size = int(vision_config.get("patch_size", 16))
+        self.vision_temporal_patch_size = int(
+            vision_config.get("temporal_patch_size", 2)
+        )
+        self._media_features: dict[int, tuple[tuple[Media, ...], torch.Tensor]] = {}
         self._vision_feature_cache = VisionFeatureCache()
         self.weight_quantization = (
             "modelopt-fp8-nvfp4" if is_modelopt_nvfp4(self.raw_config) else "bfloat16"
@@ -400,19 +414,12 @@ class Qwen3_5CudaRunner(CudaRunner):
             "host.attention_plans": getattr(self, "_host_attention_plans", 0),
         }
 
-    @staticmethod
-    def _media_at(plan: BatchPlan, row: int) -> Qwen35Media | None:
-        media = plan.media[row]
-        if media is None:
-            return None
-        if not isinstance(media, Qwen35Media):
-            raise TypeError("Qwen3_5CudaRunner media must be Qwen35Media")
-        return media
-
-    def _host_rope_deltas(self, plan: BatchPlan) -> np.ndarray:
+    def _host_rope_deltas(self, plan: BatchPlan) -> NDArray[np.int64]:
         return np.asarray(
             [
-                media.rope_delta if (media := self._media_at(plan, row)) else 0
+                mrope_delta(media, self.vision_patch_size, self.spatial_merge_size)
+                if (media := plan.media[row])
+                else 0
                 for row in range(plan.num_sequences)
             ],
             dtype=np.int64,
@@ -429,44 +436,53 @@ class Qwen3_5CudaRunner(CudaRunner):
 
     def _prefill_rotary_positions(
         self,
-        media: Qwen35Media | None,
+        media: tuple[Media, ...] | None,
         positions: torch.Tensor,
     ) -> torch.Tensor:
         if media is None:
             return positions[None].expand(3, -1, -1)
         absolute = positions[0].cpu().numpy()
-        columns = np.broadcast_to(
-            absolute + media.rope_delta, (3, len(absolute))
-        ).copy()
-        prompt = absolute < len(media.token_ids)
-        columns[:, prompt] = media.position_ids[:, absolute[prompt]]
+        columns = mrope_positions(
+            media, absolute, self.vision_patch_size, self.spatial_merge_size
+        )
         return torch.from_numpy(columns).to(self.device)[:, None]
 
-    def _features_for(self, sequence_id: int, media: Qwen35Media) -> torch.Tensor:
+    def _features_for(self, sequence_id: int, media: tuple[Media, ...]) -> torch.Tensor:
         existing = self._media_features.get(sequence_id)
         if existing is not None:
-            if existing[0] is not media:
+            if media_identity(existing[0]) != media_identity(media):
                 raise ValueError("a live Qwen sequence changed its media object")
             return existing[1]
-        cached = self._vision_feature_cache.get(media.digest)
+        image_grid(media, self.vision_patch_size, self.spatial_merge_size)
+        cached = self._vision_feature_cache.get(media_key(media))
         if cached is None:
             visual = self._model.visual
             if visual is None:
                 raise RuntimeError("Qwen checkpoint did not load a visual tower")
+            pixels, grid = packed_images(
+                media,
+                self.vision_patch_size,
+                merge=self.spatial_merge_size,
+                temporal=self.vision_temporal_patch_size,
+            )
             with torch.inference_mode():
                 output = visual(
-                    torch.from_numpy(media.pixel_values).to(
-                        self.device, dtype=torch.bfloat16
-                    ),
-                    torch.from_numpy(media.image_grid_thw).to(self.device),
+                    torch.from_numpy(pixels).to(self.device, dtype=torch.bfloat16),
+                    torch.from_numpy(grid).to(self.device),
                 )
                 features = output.pooler_output.detach()
-            if features.shape != (len(media.image_positions), self.config.hidden_size):
+            if features.shape != (
+                sum(item.span[1] for item in media),
+                self.config.hidden_size,
+            ):
                 raise ValueError("Qwen vision features do not match image placeholders")
-            cached = self._vision_feature_cache.put(media.digest, (features,))
+            cached = self._vision_feature_cache.put(media_key(media), (features,))
         (features,) = cached
         assert features is not None
-        if features.shape != (len(media.image_positions), self.config.hidden_size):
+        if features.shape != (
+            sum(item.span[1] for item in media),
+            self.config.hidden_size,
+        ):
             raise ValueError("Qwen vision features do not match image placeholders")
         self._media_features[sequence_id] = (media, features)
         return features
@@ -476,29 +492,21 @@ class Qwen3_5CudaRunner(CudaRunner):
         plan: BatchPlan,
         row: int,
         token_ids: torch.Tensor,
-        positions: torch.Tensor,
         embeddings: torch.Tensor,
-    ) -> Qwen35Media | None:
-        media = self._media_at(plan, row)
+    ) -> tuple[Media, ...] | None:
+        media = plan.media[row]
         if media is None:
             return None
-        position_list = [int(position) for position in positions[0].tolist()]
-        prompt_ids = media.token_ids
-        for token_id, position in zip(
-            token_ids[0].tolist(), position_list, strict=True
-        ):
-            if position < len(prompt_ids) and int(token_id) != prompt_ids[position]:
-                raise ValueError("scheduled token does not match Qwen35Media prompt")
-        feature_indices = {
-            position: index for index, position in enumerate(media.image_positions)
-        }
-        if not any(position in feature_indices for position in position_list):
-            return media
-        features = self._features_for(int(plan.sequence_ids[row]), media)
-        for query_index, position in enumerate(position_list):
-            feature_index = feature_indices.get(position)
-            if feature_index is not None:
-                embeddings[0, query_index].copy_(features[feature_index])
+        start = int(plan.context_lengths[row])
+        slices = tuple(
+            span_slices(
+                (item.span for item in media), start, start + token_ids.shape[1]
+            )
+        )
+        if slices:
+            features = self._features_for(int(plan.sequence_ids[row]), media)
+            for destination, source in slices:
+                embeddings[0, destination].copy_(features[source])
         return media
 
     @staticmethod
@@ -1100,7 +1108,7 @@ class Qwen3_5CudaRunner(CudaRunner):
         target_hidden: torch.Tensor,
         previous_hidden: torch.Tensor,
         context: int,
-        media: Qwen35Media | None,
+        media: tuple[Media, ...] | None,
     ) -> None:
         if self._model.mtp is None:
             return
@@ -1146,9 +1154,7 @@ class Qwen3_5CudaRunner(CudaRunner):
                 row_cache, contexts
             )
             embeddings = self._model.language_model.embed_tokens(row_ids)
-            media = self._merge_media_embeddings(
-                plan, row, row_ids, row_positions, embeddings
-            )
+            media = self._merge_media_embeddings(plan, row, row_ids, embeddings)
             hidden, recurrent, convolution = self._target_forward(
                 row_cache,
                 row_ids,
@@ -1191,7 +1197,7 @@ class Qwen3_5CudaRunner(CudaRunner):
                 previous_hidden,
                 context,
             ) = state
-            media = self._media_at(plan, row)
+            media = plan.media[row]
             self._prefill_mtp(
                 row_cache,
                 row_ids,

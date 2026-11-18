@@ -29,7 +29,7 @@ pub use lfm2::{Lfm2Parser, Lfm2Tokens};
 pub use prompt::{Encoder, Prompt, PromptSpan, TokenizerEncoder};
 pub use provenance::{AttributedEvent, AttributedText, TokenSpan};
 pub use qwen::{QwenParser, QwenTokens};
-pub use recipe::{BlockKind, MediaConfig, MessagePolicy, ReasoningEffort, Recipe, ToolScope};
+pub use recipe::{BlockKind, MessagePolicy, ReasoningEffort, Recipe, RecipeDefaults, ToolScope};
 pub use tokenizer::{TokenBytes, Tokenizer, TokenizerDecoder};
 
 /// A semantic response event, shared by streaming and complete responses.

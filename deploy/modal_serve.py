@@ -88,13 +88,9 @@ def _warmup(engine, recipe, spec, rank: int) -> None:
                 ).copy()
                 parts = [Image(source=pixels), Text("Name one visible color.")]
             prompt = recipe.render([Message(Role.USER, parts)])
-            inputs = (
-                {"media": prompt.media}
-                if image_input
-                else {"token_ids": prompt.token_ids}
-            )
             lease = engine.submit(
-                **inputs,
+                token_ids=prompt.token_ids,
+                media=prompt.media,
                 sampling_params=SamplingParams(
                     max_output_tokens=64,
                     stop_token_ids=recipe.stop_token_ids,

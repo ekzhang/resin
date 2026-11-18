@@ -1,5 +1,6 @@
 //! Gemma 4's turn, thought-channel, and structured tool-call format.
 
+mod media;
 mod values;
 
 use serde_json::Value;
@@ -223,27 +224,27 @@ impl Grammar for Gemma4Grammar {
 
 #[derive(Clone, Debug, Default, serde::Deserialize, serde::Serialize)]
 #[serde(default, deny_unknown_fields)]
-pub struct Gemma4RecipeParams {
+pub struct Gemma4Recipe {
     pub add_generation_prompt: Option<bool>,
     pub enable_thinking: Option<bool>,
     /// Older 31B templates close an empty thought channel in the generation
     /// prefix. The original Edge checkpoints instead end at the model header.
     pub empty_thought_prefix: Option<bool>,
-    #[serde(skip_serializing)]
-    pub media_config: Option<crate::media::gemma::Config>,
+    #[serde(skip_serializing, deserialize_with = "crate::recipe::default_if_null")]
+    pub media_config: media::Config,
 }
 
-#[derive(Clone, Debug, Default)]
-pub struct Gemma4Recipe {
-    params: Gemma4RecipeParams,
-}
-
-impl Gemma4Recipe {
-    pub fn new(params: Gemma4RecipeParams) -> Self {
-        Self { params }
-    }
-}
 impl crate::Recipe for Gemma4Recipe {
+    fn from_config(mut params: Value, defaults: &crate::RecipeDefaults<'_>) -> Result<Self, Error> {
+        crate::recipe::default(&mut params, "media_config", || {
+            Ok(serde_json::json!({
+                "image_processor": defaults("image_processor")?,
+                "video_processor": defaults("video_processor")?,
+            }))
+        })?;
+        crate::recipe::params(params)
+    }
+
     fn message_policy(&self) -> crate::MessagePolicy {
         crate::MessagePolicy {
             assistant_order: &[
@@ -257,7 +258,7 @@ impl crate::Recipe for Gemma4Recipe {
         }
     }
     fn render(&self, request: &Value) -> Result<crate::Prompt, crate::Error> {
-        let options = crate::recipe::options("gemma4", &self.params, request)?;
+        let options = crate::recipe::options("gemma4", self, request)?;
         let messages = messages(request, "Gemma 4")?;
         let tools = array(&request["tools"]);
         let enable_thinking = options.enable_thinking.unwrap_or(false);
@@ -448,9 +449,14 @@ impl crate::Recipe for Gemma4Recipe {
             encoder.special_id("<eos>")?,
         ])
     }
-    fn media_config(&self) -> Option<crate::MediaConfig> {
-        Some(crate::MediaConfig::Gemma(
-            self.params.media_config.clone().unwrap_or_default(),
-        ))
+    fn input_modalities(&self) -> &'static [&'static str] {
+        &["text", "image", "video"]
+    }
+    fn prepare_media(
+        &self,
+        sources: Vec<crate::media::Source>,
+        encoder: &dyn crate::Encoder,
+    ) -> Result<crate::media::Prepared, Error> {
+        self.media_config.prepare(sources, encoder)
     }
 }

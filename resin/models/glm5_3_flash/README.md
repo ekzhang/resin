@@ -163,10 +163,10 @@ parsing directly from `tokenizer.json`. The template always opens `<think>` and
 has no `enable_thinking=False` mode. Stop IDs are `[154820, 154827, 154829]`.
 
 Still images use aspect-preserving bicubic resize, an aligned black-padded
-canvas, CLIP normalization, and merge-block-major temporal patch packing. The
-pinned defaults allow 16–8000 image tokens. `Glm53FlashMedia` carries pixels,
-grids, absolute slots, and pixel-dependent cache identity across ranks. The
-runner encodes each image once, inserts features into the applicable prefill
+canvas and CLIP normalization. The pinned defaults allow 16–8000 image tokens.
+Generic `Media` objects carry immutable RGB bitmaps, prompt spans and content
+identities across ranks. The runner packs merge-block-major temporal patches,
+encodes each image once, inserts features into the applicable prefill
 chunks, and releases them with the request. Vision uses axial RoPE; language
 positions remain one-dimensional. Video and audio are unsupported. Image encoding
 is not separately captured by the runner, and its compilation is outside the

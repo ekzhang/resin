@@ -1,4 +1,4 @@
-"""Image recipe equivalence, cache identity and scheduler-neutral ownership."""
+"""Image recipe equivalence, runner packing, and scheduler-neutral ownership."""
 
 import base64
 import io
@@ -15,15 +15,12 @@ from recipe_fuzz.deepseek import DeepSeekV41Adapter
 from tokenizers import Tokenizer
 
 import resin
-from resin import Engine, MediaInput, RunnerConfig, SamplingParams, SchedulerConfig
-from resin.recipe import (
-    DeepSeekV41Image,
-    DeepSeekV41Media,
-    get_native_recipe,
-)
+import resin._resin as native
+from resin import Engine, RunnerConfig, SamplingParams, SchedulerConfig
+from resin.models.vision import image_patches
+from resin.recipe import get_native_recipe
 
 IMAGE_TOKEN = "<｜deepseek_image｜>"
-
 FIXTURE = json.loads(
     (Path(__file__).parent / "fixtures/deepseek_v41_images.json").read_text()
 )
@@ -54,42 +51,47 @@ def test_native_pixels_preserve_published_geometry(case, recipe):
         recipe.tokenizer,
         vision_config={"max_wh_ratio": case["max_wh_ratio"]},
     )
-    rgb = _pattern(case["width"], case["height"])
     media = recipe.render(
         [
             resin.recipe.Message(
                 resin.recipe.Role.USER,
-                [resin.recipe.Image(source=rgb.astype(np.float32) / 255)],
+                [
+                    resin.recipe.Image(
+                        source=_pattern(case["width"], case["height"]).astype(
+                            np.float32
+                        )
+                        / 255
+                    )
+                ],
             )
         ]
     ).media
-    assert isinstance(media, DeepSeekV41Media)
-    image = media.images[0]
-    assert (image.n_vit_h, image.n_vit_w) == tuple(case["grid"])
+    assert media and len(media) == 1 and isinstance(media[0], native.Media)
+    image = media[0].image
+    assert image is not None
+    assert tuple(size // 14 for size in image.shape[:2]) == tuple(case["grid"])
     height, width = case["llm_grid"]
-    assert image.types == (0, *((1,) * width + (2,)) * height, 3)
+    assert media[0].span.length == height * (width + 1) + 2
     if case["max_wh_ratio"] is None:
-        expected_tokens = (
+        expected = (
             MultiModalData(
                 [ImageInfo(b"", case["width"], case["height"])]
             ).image_token_adjustment()
             + 1
         )
-        assert len(image.types) == expected_tokens
-    assert len(image.types) <= 1024
-    assert image.patches.dtype == np.float32
-    assert image.patches.flags.c_contiguous
-    assert np.isfinite(image.patches).all()
-    assert np.all(image.patches >= -1) and np.all(image.patches <= 1)
-    # Native resize need not reproduce Pillow pixels, but the tower still sees
-    # exactly BF16-rounded values with the checkpoint's geometry and packing.
-    expected = torch.from_numpy(image.patches).to(torch.bfloat16).float().numpy()
-    np.testing.assert_array_equal(image.patches, expected)
+        assert media[0].span.length == expected
+    assert media[0].span.length <= 1024
+    patches = image_patches(image, 14).reshape(-1, 3, 14, 14)
+    assert patches.dtype == np.float32 and patches.flags.c_contiguous
+    assert np.isfinite(patches).all()
+    assert np.all(patches >= -1) and np.all(patches <= 1)
+    # Resizing can differ from Pillow; packed values remain exactly BF16-rounded.
+    expected = torch.from_numpy(patches).to(torch.bfloat16).float().numpy()
+    np.testing.assert_array_equal(patches, expected)
 
 
 def test_native_patch_order_and_normalization_are_exact_without_resizing(recipe):
-    rgb = _pattern(28, 14)
-    source = rgb.astype(np.float32) / 255
+    source = _pattern(28, 14).astype(np.float32) / 255
     recipe = get_native_recipe(
         "deepseek_v41", recipe.tokenizer, vision_config={"min_pixels": 0}
     )
@@ -100,61 +102,49 @@ def test_native_patch_order_and_normalization_are_exact_without_resizing(recipe)
             )
         ]
     ).media
-    assert isinstance(media, DeepSeekV41Media)
-    image = media.images[0]
+    assert media is not None
+    image = media[0].image
+    assert image is not None
+    patches = image_patches(image, 14).reshape(-1, 3, 14, 14)
     expected = torch.from_numpy(source).permute(2, 0, 1)
     expected = ((expected - 0.5) / 0.5).to(torch.bfloat16).float()
     expected = expected.reshape(3, 1, 14, 2, 14).permute(1, 3, 0, 2, 4)
-    np.testing.assert_array_equal(image.patches, expected.reshape(2, 3, 14, 14).numpy())
-    before = image.patches.copy()
+    np.testing.assert_array_equal(patches, expected.reshape(2, 3, 14, 14).numpy())
+    before = image.copy()
     source.fill(0)
-    np.testing.assert_array_equal(image.patches, before)
+    np.testing.assert_array_equal(media[0].image, before)
 
 
 def test_media_recipe_expands_only_explicit_images_and_owns_inputs(recipe):
-    rgb = _pattern(17, 31)
     second = np.zeros((2, 4, 3), dtype=np.float32)
-    messages = [
-        resin.recipe.Message(
-            resin.recipe.Role.USER,
-            [
-                resin.recipe.Text("literal " + IMAGE_TOKEN),
-                resin.recipe.Image(source=_data_url(rgb)),
-                resin.recipe.Text("compare"),
-                resin.recipe.Image(source=second),
-            ],
-        )
-    ]
     rendered = recipe.render(
-        messages,
+        [
+            resin.recipe.Message(
+                resin.recipe.Role.USER,
+                [
+                    resin.recipe.Text("literal " + IMAGE_TOKEN),
+                    resin.recipe.Image(source=_data_url(_pattern(17, 31))),
+                    resin.recipe.Text("compare"),
+                    resin.recipe.Image(source=second),
+                ],
+            )
+        ],
         options=resin.recipe.RenderOptions(
             thinking_mode="thinking", reasoning_effort=37
         ),
     )
     media = rendered.media
-    assert isinstance(media, MediaInput)
-    assert isinstance(media, DeepSeekV41Media)
-    assert len(media.images) == 2
-    assert media.token_ids == tuple(rendered.token_ids)
-    assert recipe.stop_token_ids
-    assert media.token_spans == ()
-    positions = {
-        position
-        for image in media.images
-        for position in range(image.start, image.start + len(image.types))
-    }
-    assert rendered.token_ids.tolist().count(media.image_token_id) == len(positions)
-    assert all(
-        (token != key) == (index in positions)
-        for index, (token, key) in enumerate(
-            zip(media.token_ids, media.cache_key, strict=True)
-        )
-    )
+    assert media and len(media) == 2
+    assert recipe.stop_token_ids and not any(item.atomic for item in media)
+    positions = [p for item in media for p in range(item.span.position, sum(item.span))]
+    image_token_id = rendered.token_ids[positions[0]]
+    assert rendered.token_ids.tolist().count(image_token_id) == len(positions)
     assert IMAGE_TOKEN in recipe.tokenizer.decode(
-        rendered.token_ids[: media.images[0].start], skip_special_tokens=False
+        rendered.token_ids[: media[0].span.position], skip_special_tokens=False
     )
     second.fill(1)
-    assert np.all(media.images[1].patches < 0)
+    image = media[1].image
+    assert image is not None and np.all(image < 0)
 
 
 def test_image_identity_changes_only_its_media_cache_identity(recipe):
@@ -171,35 +161,30 @@ def test_image_identity_changes_only_its_media_cache_identity(recipe):
                     ],
                 )
             ]
-        ).media
+        )
 
     black, white, black_again = render(0), render(1), render(0)
-    assert black.token_ids == white.token_ids
-    assert black.cache_key != white.cache_key
-    assert black.digest == black_again.digest
-    assert black.cache_key == black_again.cache_key
+    np.testing.assert_array_equal(black.token_ids, white.token_ids)
+    assert black.media and white.media and black_again.media
+    assert black.media[0].span == white.media[0].span
+    assert black.media[0].digest != white.media[0].digest
+    assert black.media[0].digest == black_again.media[0].digest
 
 
-def test_prepared_media_rejects_bad_layout_and_owns_patch_storage():
-    patches = np.ones((1, 3, 14, 14), dtype=np.float32)
-    image = DeepSeekV41Image(
-        start=1, patches=patches, n_vit_h=1, n_vit_w=1, types=(0, 1, 2, 3)
-    )
-    patches.fill(0)
-    assert np.all(image.patches == 1)
-    media = DeepSeekV41Media(
-        token_ids=(7, 129264, 129264, 129264, 129264), images=(image,)
-    )
-    with pytest.raises(ValueError, match="different placeholder"):
-        DeepSeekV41Media(token_ids=(7, 129264, 129264, 129264, 8), images=(image,))
-    with pytest.raises(ValueError, match="outside an image span"):
-        DeepSeekV41Media(token_ids=(*media.token_ids, 129264), images=(image,))
-    with pytest.raises(ValueError, match="3x3 aligner"):
-        DeepSeekV41Image(
-            start=1, patches=image.patches, n_vit_h=1, n_vit_w=1, types=(0, 1, 3)
-        )
-    with pytest.raises(ValueError, match="ordered, disjoint"):
-        DeepSeekV41Media(token_ids=media.token_ids, images=(image, image))
+def test_prepared_media_rejects_bad_layout_and_owns_bitmap_storage():
+    pixels = np.ones((14, 14, 3), dtype=np.float32)
+    media = native.Media((1, 4), image=pixels)
+    pixels.fill(0)
+    image = media.image
+    assert image is not None
+    assert np.all(image == 1) and not image.flags.writeable
+    assert image_patches(image, 14).shape == (1, 588)
+    with pytest.raises(ValueError, match="HWC"):
+        native.Media((1, 4), image=np.ones((1, 3, 14, 14), np.float32))
+    with pytest.raises(ValueError, match="align"):
+        image_patches(np.ones((14, 15, 3), np.float32), 14)
+    with pytest.raises(ValueError, match="non-overlapping"):
+        native._media_to_buffers((media, media))
 
 
 def test_engine_slices_causal_image_spans_across_prefill_chunks(recipe):
@@ -225,7 +210,9 @@ def test_engine_slices_causal_image_spans_across_prefill_chunks(recipe):
     )
     engine = Engine(Runner(), scheduler_config=SchedulerConfig(prefill_chunk_size=32))
     engine.submit(
-        media=rendered.media, sampling_params=SamplingParams(max_output_tokens=1)
+        token_ids=rendered.token_ids,
+        media=rendered.media,
+        sampling_params=SamplingParams(max_output_tokens=1),
     )
     while engine.has_work():
         engine.step()

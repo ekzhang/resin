@@ -1,9 +1,9 @@
-//! GLM-5.3-Flash image geometry and packing. Unlike Qwen, GLM preserves aspect
+//! GLM-5.3-Flash image sizing and normalization. GLM preserves aspect
 //! ratio inside a ceil-aligned, black-padded canvas. Input pixels are RGB [0,1].
 use serde::{Deserialize, Serialize};
 
-use super::{RgbImage, Tensor, append_patches, qwen::Prepared};
-use crate::Error;
+use crate::media::{Input, Prepared, RgbImage, Source, bitmap, image_tokens, images};
+use crate::{Encoder, Error};
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(default)]
@@ -20,6 +20,63 @@ pub struct Config {
     pub image_std: [f32; 3],
     pub resample: u8,
 }
+impl Config {
+    pub(super) fn prepare(
+        &self,
+        sources: Vec<Source>,
+        encoder: &dyn Encoder,
+    ) -> Result<Prepared, Error> {
+        let marker = "<|image|>";
+        let image_token_id = encoder.special_id(marker)?;
+        self.factor()?;
+        let mut expansions = Vec::new();
+        let mut items = Vec::new();
+        for image in images(sources)? {
+            let image = image.into_rgb()?;
+            let [height, width, content_height, content_width] =
+                self.resize_shape(image.height, image.width)?;
+            let resized = if (content_height, content_width) == (image.height, image.width) {
+                image.data
+            } else {
+                resize_bicubic(&image, content_height, content_width)
+            };
+            let data = if (height, width) == (content_height, content_width) {
+                resized
+            } else {
+                let len = height
+                    .checked_mul(width)
+                    .and_then(|v| v.checked_mul(3))
+                    .ok_or_else(|| Error::new("GLM image canvas overflows"))?;
+                let mut canvas = vec![0.0; len];
+                for y in 0..content_height {
+                    canvas[y * width * 3..y * width * 3 + content_width * 3].copy_from_slice(
+                        &resized[y * content_width * 3..(y + 1) * content_width * 3],
+                    );
+                }
+                canvas
+            };
+            let count = height / self.patch_size / self.merge_size
+                * (width / self.patch_size / self.merge_size);
+            expansions.push(image_tokens(marker, image_token_id, count));
+            items.push(Input::Image {
+                pixels: bitmap(
+                    RgbImage {
+                        width,
+                        height,
+                        data,
+                    },
+                    self.do_normalize,
+                    self.image_mean,
+                    self.image_std,
+                )?,
+                span: (0, count),
+                atomic: false,
+            });
+        }
+        Ok(Prepared::new(expansions, items))
+    }
+}
+
 impl Default for Config {
     fn default() -> Self {
         Self {
@@ -116,50 +173,6 @@ impl Config {
         let ch = (height as f64 * scale).floor().max(1.0).min(h as f64) as usize;
         let cw = (width as f64 * scale).floor().max(1.0).min(w as f64) as usize;
         Ok([h, w, ch, cw])
-    }
-
-    pub fn process(&self, images: &[RgbImage]) -> Result<Prepared, Error> {
-        self.factor()?;
-        let mut pixels = Vec::new();
-        let mut grids = Vec::new();
-        let mut counts = Vec::new();
-        for image in images {
-            let [h, w, ch, cw] = self.resize_shape(image.height, image.width)?;
-            let resized = resize_bicubic(image, ch, cw);
-            let (gh, gw, p, m) = (
-                h / self.patch_size,
-                w / self.patch_size,
-                self.patch_size,
-                self.merge_size,
-            );
-            append_patches(
-                &mut pixels,
-                [gh, gw],
-                p,
-                m,
-                self.temporal_patch_size,
-                |y, x, c| {
-                    let value = if y < ch && x < cw {
-                        resized[(y * cw + x) * 3 + c]
-                    } else {
-                        0.0
-                    };
-                    if self.do_normalize {
-                        (value - self.image_mean[c]) / self.image_std[c]
-                    } else {
-                        value
-                    }
-                },
-            );
-            grids.extend([1, gh as i64, gw as i64]);
-            counts.push(gh / m * (gw / m));
-        }
-        let row = 3 * self.temporal_patch_size * self.patch_size * self.patch_size;
-        Ok(Prepared {
-            pixel_values: Tensor::new(vec![pixels.len() / row, row], pixels)?,
-            image_grid_thw: Tensor::new(vec![images.len(), 3], grids)?,
-            token_counts: counts,
-        })
     }
 }
 

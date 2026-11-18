@@ -6,13 +6,7 @@ from resin.recipe import Recipe
 from resin.recipe import ContentBlock
 import numpy as np
 import numpy.typing as npt
-from resin.protocols import (
-    FinalizingResponseParser,
-    MediaInput,
-    MediaTokenSpan,
-    Runner,
-    TokenSpan,
-)
+from resin.protocols import FinalizingResponseParser, MediaTokenSpan, Runner, TokenSpan
 
 __version__: Final[str]
 
@@ -64,7 +58,7 @@ class BatchPlan:
         cache_groups: Sequence[CacheGroupPlan] | None = None,
         sampling_mask: "Sequence[bool] | npt.NDArray[np.bool_] | None" = None,
         sampling_params: Sequence[SamplingParams] | None = None,
-        media: "Sequence[MediaInput | None] | None" = None,
+        media: "Sequence[tuple[Media, ...] | None] | None" = None,
         prompt_score_indices: "Sequence[int] | npt.NDArray[np.uint32] | None" = None,
         prompt_score_token_ids: "Sequence[int] | npt.NDArray[np.uint32] | None" = None,
         prompt_score_indptr: "Sequence[int] | npt.NDArray[np.uint32] | None" = None,
@@ -103,7 +97,7 @@ class BatchPlan:
         Number of tokens already processed for each sequence.
         """
     @property
-    def media(self, /) -> tuple[MediaInput | None, ...]:
+    def media(self, /) -> tuple[tuple[Media, ...] | None, ...]:
         """
         Opaque runner inputs, one per sequence. The scheduler never inspects them.
         """
@@ -445,52 +439,6 @@ class CacheStatePlan:
     def restore_copies(self, /) -> tuple: ...
 
 @final
-class DeepSeekV41Image:
-    def __new__(
-        cls,
-        /,
-        *,
-        start: int,
-        patches: Any,
-        n_vit_h: int,
-        n_vit_w: int,
-        types: Sequence[int],
-    ) -> DeepSeekV41Image: ...
-    @property
-    def n_vit_h(self, /) -> int: ...
-    @property
-    def n_vit_w(self, /) -> int: ...
-    @property
-    def patches(self, /) -> npt.NDArray[np.float32]: ...
-    @property
-    def start(self, /) -> int: ...
-    @property
-    def types(self, /) -> tuple[int, ...]: ...
-
-@final
-class DeepSeekV41Media:
-    def __new__(
-        cls,
-        /,
-        *,
-        token_ids: Sequence[int],
-        images: Sequence[DeepSeekV41Image],
-        image_token_id: int = 129264,
-    ) -> DeepSeekV41Media: ...
-    @property
-    def cache_key(self, /) -> tuple[int, ...]: ...
-    @property
-    def digest(self, /) -> str: ...
-    @property
-    def image_token_id(self, /) -> int: ...
-    @property
-    def images(self, /) -> tuple[DeepSeekV41Image, ...]: ...
-    @property
-    def token_ids(self, /) -> tuple[int, ...]: ...
-    @property
-    def token_spans(self, /) -> tuple[MediaTokenSpan, ...]: ...
-
-@final
 class Engine:
     def __enter__(self, /) -> Engine: ...
     def __exit__(self, /, _exc_type: Any, _exc_value: Any, _traceback: Any) -> bool: ...
@@ -501,7 +449,7 @@ class Engine:
         *,
         max_running_requests: int = 32,
         context_length: int = 32768,
-        max_top_logprobs: int = 32,
+        max_top_logprobs: int = ...,
         scheduler_config: SchedulerConfig | None = None,
         prefix_cache: bool = False,
         state_tracking_interval: int = 256,
@@ -599,12 +547,12 @@ class Engine:
     def submit(
         self,
         /,
-        token_ids: "Sequence[int] | npt.NDArray[np.uint32] | None" = None,
+        token_ids: "Sequence[int] | npt.NDArray[np.uint32]",
         *,
         priority: int = 0,
         batch_key: int | None = None,
         sampling_params: SamplingParams | None = None,
-        media: "MediaInput | None" = None,
+        media: "tuple[Media, ...] | None" = None,
         prompt_target_logprobs: Sequence[Sequence[int]] | None = None,
         cache_salt: str | None = None,
     ) -> RequestLease: ...
@@ -691,84 +639,6 @@ class ForwardOutput:
     def with_state_checkpoints(self, /, records: Sequence[int]) -> ForwardOutput: ...
 
 @final
-class Gemma4Media:
-    def __new__(
-        cls,
-        /,
-        *,
-        token_ids: Sequence[int],
-        mm_token_type_ids: Sequence[int],
-        pixel_values: Any | None = None,
-        image_position_ids: Any | None = None,
-        pixel_values_videos: Any | None = None,
-        video_position_ids: Any | None = None,
-    ) -> Gemma4Media: ...
-    @property
-    def block_ids(self, /) -> tuple[int, ...]: ...
-    @property
-    def cache_key(self, /) -> tuple[int, ...]: ...
-    @property
-    def digest(self, /) -> str: ...
-    @property
-    def image_position_ids(self, /) -> npt.NDArray[np.int64] | None: ...
-    @property
-    def image_positions(self, /) -> tuple[int, ...]: ...
-    @property
-    def mm_token_type_ids(self, /) -> tuple[int, ...]: ...
-    @property
-    def pixel_values(self, /) -> npt.NDArray[np.float32] | None: ...
-    @property
-    def pixel_values_videos(self, /) -> npt.NDArray[np.float32] | None: ...
-    @property
-    def token_ids(self, /) -> tuple[int, ...]: ...
-    @property
-    def token_spans(self, /) -> tuple[MediaTokenSpan, ...]: ...
-    def validate_placeholder_tokens(
-        self, /, *, image_token_id: int, video_token_id: int
-    ) -> None: ...
-    @property
-    def video_position_ids(self, /) -> npt.NDArray[np.int64] | None: ...
-    @property
-    def video_positions(self, /) -> tuple[int, ...]: ...
-    @property
-    def vision_digest(self, /) -> str:
-        """
-        Image/video tensor identity, independent of conversational text positions.
-        """
-
-@final
-class Glm53FlashMedia:
-    def __new__(
-        cls,
-        /,
-        *,
-        token_ids: Sequence[int],
-        image_positions: Sequence[int],
-        pixel_values: Any,
-        image_grid_thw: Any,
-        spatial_merge_size: int,
-        image_token_id: int,
-    ) -> Glm53FlashMedia: ...
-    @property
-    def cache_key(self, /) -> tuple[int, ...]: ...
-    @property
-    def digest(self, /) -> str: ...
-    @property
-    def image_grid_thw(self, /) -> npt.NDArray[np.int64]: ...
-    @property
-    def image_positions(self, /) -> tuple[int, ...]: ...
-    @property
-    def image_token_id(self, /) -> int: ...
-    @property
-    def pixel_values(self, /) -> npt.NDArray[np.float32]: ...
-    @property
-    def spatial_merge_size(self, /) -> int: ...
-    @property
-    def token_ids(self, /) -> tuple[int, ...]: ...
-    @property
-    def token_spans(self, /) -> tuple[MediaTokenSpan, ...]: ...
-
-@final
 class Image:
     def __new__(cls, /, *, source: Any) -> Image: ...
     @staticmethod
@@ -779,32 +649,44 @@ class Image:
     def source(self, /) -> Any: ...
 
 @final
-class Inkling2Media:
+class Media:
+    """
+    One image, video, or audio source and its token range in a prompt.
+    """
     def __new__(
         cls,
         /,
+        span: tuple[int, int],
         *,
-        token_ids: Sequence[int],
-        image_token_id: int,
-        pixel_values: Any | None = None,
-        image_grid_thw: Any | None = None,
-    ) -> Inkling2Media: ...
+        image: "npt.NDArray[np.float32] | None" = None,
+        video: "tuple[npt.NDArray[np.float32], ...] | None" = None,
+        audio: "npt.NDArray[np.float32] | None" = None,
+        audio_sample_rate: int | None = None,
+        video_fps: float | None = None,
+        video_frame_indices: Sequence[int] | None = None,
+        video_frame_spans: Sequence[tuple[int, int]] | None = None,
+        atomic: bool = False,
+    ) -> Media: ...
     @property
-    def cache_key(self, /) -> tuple[int, ...]: ...
+    def atomic(self, /) -> bool: ...
+    @property
+    def audio(self, /) -> npt.NDArray[np.float32] | None: ...
+    @property
+    def audio_sample_rate(self, /) -> int | None: ...
     @property
     def digest(self, /) -> str: ...
     @property
-    def image_positions(self, /) -> tuple[int, ...]: ...
+    def image(self, /) -> npt.NDArray[np.float32] | None: ...
     @property
-    def image_token_id(self, /) -> int: ...
+    def span(self, /) -> MediaTokenSpan: ...
     @property
-    def pixel_values(self, /) -> npt.NDArray[np.float32] | None: ...
+    def video(self, /) -> tuple[npt.NDArray[np.float32], ...] | None: ...
     @property
-    def image_grid_thw(self, /) -> npt.NDArray[np.int64] | None: ...
+    def video_fps(self, /) -> float | None: ...
     @property
-    def token_ids(self, /) -> tuple[int, ...]: ...
+    def video_frame_indices(self, /) -> tuple[int, ...]: ...
     @property
-    def token_spans(self, /) -> tuple[MediaTokenSpan, ...]: ...
+    def video_frame_spans(self, /) -> tuple[MediaTokenSpan, ...]: ...
 
 @final
 class Message:
@@ -837,8 +719,6 @@ class NativeRecipe(Recipe):
     """
     A native model recipe constructed by get_native_recipe.
     """
-    @property
-    def input_modalities(self, /) -> list[str]: ...
     def _media_preparation_cache_info(self, /) -> dict[str, int]: ...
     def create_parser(self, /, prompt: RenderedPrompt) -> _NativeResponseParser: ...
     def debug_render_text(
@@ -852,6 +732,8 @@ class NativeRecipe(Recipe):
         """
         Inspect the template before tokenization and media expansion.
         """
+    @property
+    def input_modalities(self, /) -> list[str]: ...
     def parse_response(
         self,
         /,
@@ -932,42 +814,6 @@ class ParserEvent:
     def token_spans(self, /) -> tuple[TokenSpan, ...]: ...
     @property
     def type(self, /) -> str: ...
-
-@final
-class Qwen35Media:
-    def __new__(
-        cls,
-        /,
-        *,
-        token_ids: Sequence[int],
-        image_positions: Sequence[int],
-        pixel_values: Any,
-        image_grid_thw: Any,
-        spatial_merge_size: int,
-        image_token_id: int,
-    ) -> Qwen35Media: ...
-    @property
-    def cache_key(self, /) -> tuple[int, ...]: ...
-    @property
-    def digest(self, /) -> str: ...
-    @property
-    def image_grid_thw(self, /) -> npt.NDArray[np.int64]: ...
-    @property
-    def image_positions(self, /) -> tuple[int, ...]: ...
-    @property
-    def image_token_id(self, /) -> int: ...
-    @property
-    def pixel_values(self, /) -> npt.NDArray[np.float32]: ...
-    @property
-    def position_ids(self, /) -> npt.NDArray[np.int64]: ...
-    @property
-    def rope_delta(self, /) -> int: ...
-    @property
-    def spatial_merge_size(self, /) -> int: ...
-    @property
-    def token_ids(self, /) -> tuple[int, ...]: ...
-    @property
-    def token_spans(self, /) -> tuple[MediaTokenSpan, ...]: ...
 
 @final
 class ReasoningDelta(ParserEvent):
@@ -1072,10 +918,10 @@ class RenderedPrompt:
         /,
         token_ids: "Sequence[int] | npt.NDArray[np.uint32]",
         *,
-        media: "MediaInput | None" = None,
+        media: "tuple[Media, ...] | None" = None,
     ) -> RenderedPrompt: ...
     @property
-    def media(self, /) -> MediaInput | None: ...
+    def media(self, /) -> tuple[Media, ...] | None: ...
     @property
     def token_ids(self, /) -> npt.NDArray[np.uint32]: ...
 
@@ -1540,9 +1386,9 @@ class _NativeResponseParser(FinalizingResponseParser):
 
 def _media_from_buffers(
     metadata: bytes, buffers: "Sequence[npt.NDArray[Any]]"
-) -> "MediaInput": ...
+) -> "tuple[Media, ...]": ...
 def _media_to_buffers(
-    media: "MediaInput",
+    media: "tuple[Media, ...]",
 ) -> "tuple[bytes, tuple[npt.NDArray[Any], ...]]": ...
 def _numa_get_policy() -> tuple[int, list[int]]:
     """

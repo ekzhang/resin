@@ -15,9 +15,8 @@ from test_recipe_media_preparation import GEMMA_CONFIG, Tokenizer
 
 import resin
 from resin.recipe import (
-    Gemma4Media,
     Image,
-    Inkling2Media,
+    Media,
     Message,
     RenderedPrompt,
     Role,
@@ -111,20 +110,15 @@ def messages(*images, lead="Describe: "):
     return [Message(Role.USER, [Text(lead), *images])]
 
 
-def inkling2_pixels(prompt: RenderedPrompt):
-    media = prompt.media
-    assert isinstance(media, Inkling2Media)
-    pixels = media.pixel_values
-    assert pixels is not None
-    return pixels
+def image_pixels(prompt: RenderedPrompt):
+    assert isinstance(prompt.media, tuple) and isinstance(prompt.media[0], Media)
+    assert prompt.media[0].image is not None
+    return prompt.media[0].image
 
 
-def gemma_video_pixels(prompt: RenderedPrompt):
-    media = prompt.media
-    assert isinstance(media, Gemma4Media)
-    pixels = media.pixel_values_videos
-    assert pixels is not None
-    return pixels
+def video_pixels(prompt: RenderedPrompt):
+    assert isinstance(prompt.media, tuple)
+    return np.stack(next(item.video for item in prompt.media if item.video is not None))
 
 
 def assert_readonly_buffers(buffers):
@@ -180,9 +174,15 @@ def test_cached_images_rebind_changed_history_without_sharing_arrays(
 
     # A longer prefix changes absolute positions, but not source preprocessing.
     moved = messages(first, second, lead="A longer instruction before both images: ")
+    moved_prompt = recipe.render(moved)
     assert_same_preparation(
-        recipe.render(moved), get_native_recipe(name, backend, **config).render(moved)
+        moved_prompt, get_native_recipe(name, backend, **config).render(moved)
     )
+    assert moved_prompt.media is not None
+    assert moved_prompt.media[0].span.position > initial.media[0].span.position
+    assert [item.digest for item in moved_prompt.media] == [
+        item.digest for item in initial.media
+    ]
     assert recipe._media_preparation_cache_info()["hits"] == 2
 
     # Order, changed pixels at the same geometry, and changed geometry are misses.
@@ -208,8 +208,7 @@ def test_image_transport_roundtrip_preserves_immutable_digest(name, config, shap
     mutable_buffers = tuple(buffer.copy() for buffer in original_buffers)
     restored = resin._resin._media_from_buffers(metadata, mutable_buffers)
     assert type(restored) is type(prompt.media)
-    assert restored.cache_key == prompt.media.cache_key
-    assert getattr(restored, "digest") == getattr(prompt.media, "digest")
+    assert [item.digest for item in restored] == [item.digest for item in prompt.media]
     restored_meta, restored_buffers = resin._resin._media_to_buffers(restored)
     assert restored_meta == metadata
     assert_readonly_buffers(restored_buffers)
@@ -219,7 +218,7 @@ def test_image_transport_roundtrip_preserves_immutable_digest(name, config, shap
         assert not np.shares_memory(source, received)
         source.fill(0)
         np.testing.assert_array_equal(received, original)
-    assert getattr(restored, "digest") == getattr(prompt.media, "digest")
+    assert [item.digest for item in restored] == [item.digest for item in prompt.media]
 
 
 def test_recipe_image_cache_is_bounded_and_recipe_configuration_is_local():
@@ -242,8 +241,8 @@ def test_recipe_image_cache_is_bounded_and_recipe_configuration_is_local():
     other = get_native_recipe(
         "inkling2", backend, media_config={**config, "do_normalize": False}
     )
-    normalized = inkling2_pixels(recipe.render(messages(images[0])))
-    unnormalized = inkling2_pixels(other.render(messages(images[0])))
+    normalized = image_pixels(recipe.render(messages(images[0])))
+    unnormalized = image_pixels(other.render(messages(images[0])))
     assert not np.array_equal(normalized, unnormalized)
     assert other._media_preparation_cache_info()["misses"] == 1
 
@@ -253,9 +252,9 @@ def test_mutable_arrays_and_python_tokenizers_bypass_image_cache():
     native = get_native_recipe("inkling2", tokenizer(), media_config=config)
     pixels = np.full((4, 8, 3), 0.25, dtype=np.float32)
     request = messages(Image.from_rgb(pixels))
-    first = inkling2_pixels(native.render(request)).copy()
+    first = image_pixels(native.render(request)).copy()
     pixels.fill(0.75)
-    second = inkling2_pixels(native.render(request))
+    second = image_pixels(native.render(request))
     assert not np.array_equal(first, second)
     assert native._media_preparation_cache_info() == {
         "entries": 0,
@@ -265,9 +264,9 @@ def test_mutable_arrays_and_python_tokenizers_bypass_image_cache():
     }
     encoded = bytearray(encoded_image().source[0])
     request = messages(Image(source=(encoded, "image/png")))
-    first = inkling2_pixels(native.render(request)).copy()
+    first = image_pixels(native.render(request)).copy()
     encoded[:] = encoded_image(color=(10, 30, 220)).source[0]
-    second = inkling2_pixels(native.render(request))
+    second = image_pixels(native.render(request))
     assert not np.array_equal(first, second)
     assert native._media_preparation_cache_info()["entries"] == 0
     custom = get_native_recipe("inkling2", Tokenizer(), media_config=config)
@@ -280,9 +279,9 @@ def test_mixed_video_requests_bypass_image_cache_and_keep_frame_updates():
     native = get_native_recipe("gemma4", tokenizer(), media_config=GEMMA_CONFIG)
     frames = np.zeros((2, 4, 8, 3), dtype=np.float32)
     request = [Message(Role.USER, [encoded_image(), Video(source=frames)])]
-    first = gemma_video_pixels(native.render(request)).copy()
+    first = video_pixels(native.render(request)).copy()
     frames.fill(0.75)
-    second = gemma_video_pixels(native.render(request))
+    second = video_pixels(native.render(request))
     assert not np.array_equal(first, second)
     assert native._media_preparation_cache_info()["entries"] == 0
 
@@ -298,7 +297,7 @@ def test_image_cache_retains_neither_python_sources_nor_bound_buffers():
     source_ref = weakref.ref(source)
     request = messages(Image(source=source))
     prompt = native.render(request)
-    pixels_ref = weakref.ref(inkling2_pixels(prompt))
+    pixels_ref = weakref.ref(image_pixels(prompt))
     del source, request, prompt
     gc.collect()
     assert native._media_preparation_cache_info()["entries"] == 1

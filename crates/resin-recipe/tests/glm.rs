@@ -1,7 +1,4 @@
-use resin_recipe::{
-    Event, FinishReason, GlmParser, GlmTokens, Recipe,
-    glm::{Glm53FlashRecipe, Glm53FlashRecipeParams},
-};
+use resin_recipe::{Event, FinishReason, GlmParser, GlmTokens, Recipe, glm::Glm53FlashRecipe};
 use serde_json::{Value, json};
 mod common;
 use common::{ByteDecoder, SemanticParser, bytes, coalesce};
@@ -54,10 +51,10 @@ fn pinned_hf_template_matches_reasoning_tools_and_media_slots() {
 
 #[test]
 fn defaults_and_request_options_are_consistent_and_unknown_options_fail() {
-    let recipe = Glm53FlashRecipe::new(Glm53FlashRecipeParams {
+    let recipe = Glm53FlashRecipe {
         reasoning_effort: Some("low".into()),
         ..Default::default()
-    });
+    };
     let request = json!({"messages":[{"role":"user","content":"hi"}]});
     assert!(
         recipe

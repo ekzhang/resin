@@ -9,7 +9,7 @@ from PIL import Image
 from recipe_fuzz.gemma import GemmaAdapter
 
 import resin
-from resin.recipe import Gemma4Media, get_native_recipe
+from resin.recipe import Media, get_native_recipe
 
 
 def _data_url() -> str:
@@ -56,17 +56,17 @@ def test_recipe_attaches_media_and_preserves_token_controls(source_kind) -> None
         ],
         options=resin.recipe.RenderOptions(enable_thinking=True),
     )
-    assert isinstance(rendered.media, Gemma4Media)
+    assert rendered.media is not None
+    assert isinstance(rendered.media[0], Media)
     assert rendered.token_ids.tolist().count(image_id) == 2
     assert model_recipe.stop_token_ids == [1, 106]
-    pixels = rendered.media.pixel_values
+    pixels = rendered.media[0].image
     assert pixels is not None
     assert pixels.dtype == np.float32
-    assert pixels.shape == (1, 70, 3)
+    assert pixels.shape == (1, 2, 3)
     np.testing.assert_array_equal(
         pixels[0, :2], np.array([[1.0, 128 / 255, 0.0]] * 2, dtype=np.float32)
     )
-    assert not np.any(pixels[0, 2:])
     assert model_recipe.create_parser(rendered) is not model_recipe.create_parser(
         rendered
     )

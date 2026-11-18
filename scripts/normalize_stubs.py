@@ -30,58 +30,16 @@ PROPERTY_TYPES = {
     ("EngineMetrics", "cache"): "dict[str, Any] | None",
     ("RunnerMetrics", "dp_attention_sync_wait_seconds"): "dict[str, Any] | None",
     ("SamplingParams", "stop_token_ids"): "tuple[int, ...]",
-    ("DeepSeekV41Image", "types"): "tuple[int, ...]",
-    ("DeepSeekV41Image", "patches"): "npt.NDArray[np.float32]",
-    ("DeepSeekV41Media", "images"): "tuple[DeepSeekV41Image, ...]",
-    **{
-        (owner, name): "tuple[int, ...]"
-        for owner, extra in (
-            ("DeepSeekV41Media", ()),
-            (
-                "Gemma4Media",
-                (
-                    "image_positions",
-                    "video_positions",
-                    "block_ids",
-                    "mm_token_type_ids",
-                ),
-            ),
-            ("Inkling2Media", ("image_positions",)),
-            ("Qwen35Media", ("image_positions",)),
-            ("Glm53FlashMedia", ("image_positions",)),
-        )
-        for name in ("token_ids", "cache_key", *extra)
-    },
-    **{
-        (owner, "token_spans"): "tuple[MediaTokenSpan, ...]"
-        for owner in (
-            "DeepSeekV41Media",
-            "Gemma4Media",
-            "Inkling2Media",
-            "Qwen35Media",
-            "Glm53FlashMedia",
-        )
-    },
-    **{
-        (owner, name): f"npt.NDArray[np.{dtype}]" + (" | None" if optional else "")
-        for owner, name, dtype, optional in (
-            ("Inkling2Media", "pixel_values", "float32", True),
-            ("Inkling2Media", "image_grid_thw", "int64", True),
-            ("Qwen35Media", "pixel_values", "float32", False),
-            ("Glm53FlashMedia", "pixel_values", "float32", False),
-            ("Glm53FlashMedia", "image_grid_thw", "int64", False),
-            ("Qwen35Media", "image_grid_thw", "int64", False),
-            ("Qwen35Media", "position_ids", "int64", False),
-            ("Gemma4Media", "pixel_values", "float32", True),
-            ("Gemma4Media", "image_position_ids", "int64", True),
-            ("Gemma4Media", "pixel_values_videos", "float32", True),
-            ("Gemma4Media", "video_position_ids", "int64", True),
-        )
-    },
+    ("Media", "span"): "MediaTokenSpan",
+    ("Media", "video_frame_spans"): "tuple[MediaTokenSpan, ...]",
+    ("Media", "video_frame_indices"): "tuple[int, ...]",
+    ("Media", "image"): "npt.NDArray[np.float32] | None",
+    ("Media", "audio"): "npt.NDArray[np.float32] | None",
+    ("Media", "video"): "tuple[npt.NDArray[np.float32], ...] | None",
     ("ParserEvent", "token_spans"): "tuple[TokenSpan, ...]",
     ("Message", "content"): "tuple[ContentBlock, ...]",
     ("RenderOptions", "reasoning_effort"): "str | int | float | None",
-    ("RenderedPrompt", "media"): "MediaInput | None",
+    ("RenderedPrompt", "media"): "tuple[Media, ...] | None",
     ("RenderedPrompt", "token_ids"): "npt.NDArray[np.uint32]",
     ("NativeRecipe", "stop_token_ids"): "Sequence[int]",
     ("BatchPlan", "sequence_ids"): "npt.NDArray[np.uint64]",
@@ -122,7 +80,7 @@ PROPERTY_TYPES = {
     ("BatchPlan", "sampling_mask"): "npt.NDArray[np.bool_]",
     ("BatchPlan", "cache_groups"): "tuple[CacheGroupPlan, ...]",
     ("BatchPlan", "sampling_params"): "tuple[SamplingParams, ...]",
-    ("BatchPlan", "media"): "tuple[MediaInput | None, ...]",
+    ("BatchPlan", "media"): "tuple[tuple[Media, ...] | None, ...]",
     ("CacheLayout", "groups"): "tuple[CacheGroupLayout, ...]",
     **{
         ("ForwardOutput", name): annotation
@@ -270,7 +228,6 @@ def import_edits(
         additions.append("import numpy.typing as npt")
     missing_protocols = {
         "FinalizingResponseParser",
-        "MediaInput",
         "MediaTokenSpan",
         "TokenSpan",
         "Runner",

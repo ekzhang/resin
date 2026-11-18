@@ -8,9 +8,17 @@ from functools import cache
 
 import mlx.core as mx
 import numpy as np
+from numpy.typing import NDArray
 
 from resin import BatchPlan
-from resin.recipe import Qwen35Media
+from resin.models.vision import (
+    image_grid,
+    media_key,
+    mrope_positions,
+    packed_images,
+    span_slices,
+)
+from resin.recipe import Media
 
 
 @cache
@@ -63,9 +71,12 @@ class MediaEncoder:
 
     def __init__(
         self,
-        visual: Callable[[mx.array, np.ndarray], mx.array],
+        visual: Callable[[mx.array, NDArray[np.int64]], mx.array],
         hidden_size: int,
         *,
+        patch_size: int = 16,
+        merge_size: int = 2,
+        temporal_patch_size: int = 2,
         max_entries: int = 64,
         max_bytes: int = 256 << 20,
     ) -> None:
@@ -73,20 +84,30 @@ class MediaEncoder:
             raise ValueError("vision cache limits must be nonnegative")
         self.visual = visual
         self.hidden_size = hidden_size
+        self.patch_size, self.merge_size, self.temporal_patch_size = (
+            patch_size,
+            merge_size,
+            temporal_patch_size,
+        )
         self.max_entries = max_entries
         self.max_bytes = max_bytes
         self._features: OrderedDict[str, mx.array] = OrderedDict()
         self.size_bytes = 0
 
-    def features(self, media: Qwen35Media) -> mx.array:
-        cached = self._features.get(media.digest)
+    def features(self, media: tuple[Media, ...]) -> mx.array:
+        image_grid(media, self.patch_size, self.merge_size)
+        cached = self._features.get(media_key(media))
         if cached is not None:
-            self._features.move_to_end(media.digest)
+            self._features.move_to_end(media_key(media))
             return cached
-        features = self.visual(
-            mx.array(media.pixel_values).astype(mx.bfloat16), media.image_grid_thw
+        pixels, grid = packed_images(
+            media,
+            self.patch_size,
+            merge=self.merge_size,
+            temporal=self.temporal_patch_size,
         )
-        if features.shape != (len(media.image_positions), self.hidden_size):
+        features = self.visual(mx.array(pixels).astype(mx.bfloat16), grid)
+        if features.shape != (sum(item.span[1] for item in media), self.hidden_size):
             raise ValueError("Qwen vision features do not match image placeholders")
         mx.eval(features)
         size = features.nbytes
@@ -97,16 +118,16 @@ class MediaEncoder:
             ):
                 _, previous = self._features.popitem(last=False)
                 self.size_bytes -= previous.nbytes
-            self._features[media.digest] = features
+            self._features[media_key(media)] = features
             self.size_bytes += size
         return features
 
     def prepare(
         self,
         plan: BatchPlan,
-        rows: np.ndarray,
-        token_ids: np.ndarray,
-        contexts: np.ndarray,
+        rows: NDArray[np.int64],
+        token_ids: NDArray[np.int64],
+        contexts: NDArray[np.int64],
         embeddings: mx.array,
     ) -> tuple[mx.array, mx.array | None]:
         """Merge a scheduled prompt slice and construct positions for its tokens."""
@@ -118,28 +139,18 @@ class MediaEncoder:
             media = plan.media[int(row)]
             if media is None:
                 continue
-            if not isinstance(media, Qwen35Media):
-                raise TypeError("Qwen35MlxRunner media must be Qwen35Media")
             has_media = True
             columns = absolute[selected]
-            positions[:, selected] = columns + media.rope_delta
-            prompt = (columns >= 0) & (columns < len(media.token_ids))
-            if np.any(prompt):
-                expected = np.asarray(media.token_ids)[columns[prompt]]
-                if not np.array_equal(token_ids[selected, prompt], expected):
-                    raise ValueError(
-                        "scheduled token does not match Qwen35Media prompt"
-                    )
-                positions[:, selected][:, prompt] = media.position_ids[
-                    :, columns[prompt]
-                ]
-            image_positions = np.asarray(media.image_positions)
-            inside = (image_positions >= columns[0]) & (image_positions <= columns[-1])
-            if np.any(inside):
-                feature_indices = np.flatnonzero(inside)
-                query_indices = image_positions[inside] - columns[0]
+            positions[:, selected] = mrope_positions(
+                media, columns, self.patch_size, self.merge_size
+            )
+            slices = tuple(
+                span_slices(
+                    (item.span for item in media), int(columns[0]), int(columns[-1]) + 1
+                )
+            )
+            if slices:
                 features = self.features(media).astype(embeddings.dtype)
-                embeddings[selected, mx.array(query_indices)] = features[
-                    mx.array(feature_indices)
-                ]
+                for destination, source in slices:
+                    embeddings[selected, destination] = features[source]
         return embeddings, mx.array(positions) if has_media else None

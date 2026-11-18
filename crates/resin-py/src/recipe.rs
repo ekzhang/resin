@@ -5,23 +5,21 @@ use std::{
     sync::{Arc, Mutex, OnceLock},
 };
 
-use crate::media_preprocess;
+use crate::media_preprocess::MediaCache;
 use crate::recipe_events::{self, ParserEvent};
-use crate::recipe_media;
 use crate::recipe_types::{MediaSources, Message, RenderOptions, Role, Tool};
 use numpy::PyArray1;
 use pyo3::{
     exceptions::{PyAttributeError, PyValueError},
     prelude::*,
-    types::{PyBool, PyDict},
+    types::{PyBool, PyDict, PyTuple},
 };
 use pythonize::{depythonize, pythonize};
 use resin_recipe::{
-    AttributedEvent, AttributedText, Decoder, Encoder, Error, FinishReason, MediaConfig,
-    ResponseParser, Tokenizer, TokenizerDecoder, TokenizerEncoder, ToolScope,
+    AttributedEvent, AttributedText, Decoder, Encoder, Error, FinishReason, ResponseParser,
+    Tokenizer, TokenizerDecoder, TokenizerEncoder, ToolScope,
 };
-use serde::de::DeserializeOwned;
-use serde_json::{Map, Value, json};
+use serde_json::{Value, json};
 
 #[derive(Clone)]
 enum TokenizerSource {
@@ -373,7 +371,7 @@ impl NativeResponseParser {
 #[pyclass(frozen, module = "resin._resin")]
 pub(crate) struct RenderedPrompt {
     pub(crate) token_ids: Vec<u32>,
-    pub(crate) media: Option<Py<PyAny>>,
+    pub(crate) media: Option<Py<PyTuple>>,
     seed: Option<ParserSeed>,
 }
 struct ParserSeed {
@@ -383,8 +381,8 @@ struct ParserSeed {
 #[pymethods]
 impl RenderedPrompt {
     #[new]
-    #[pyo3(signature=(token_ids: "Sequence[int] | npt.NDArray[np.uint32]", *, media: "MediaInput | None" = None))]
-    fn new(token_ids: Vec<u32>, media: Option<Py<PyAny>>) -> Self {
+    #[pyo3(signature=(token_ids: "Sequence[int] | npt.NDArray[np.uint32]", *, media: "tuple[Media, ...] | None" = None))]
+    fn new(token_ids: Vec<u32>, media: Option<Py<PyTuple>>) -> Self {
         Self {
             token_ids,
             media,
@@ -396,7 +394,7 @@ impl RenderedPrompt {
         crate::arrays::readonly_view(this.clone().into_any(), &this.get().token_ids)
     }
     #[getter]
-    fn media(&self, py: Python<'_>) -> Option<Py<PyAny>> {
+    fn media(&self, py: Python<'_>) -> Option<Py<PyTuple>> {
         self.media.as_ref().map(|m| m.clone_ref(py))
     }
 }
@@ -409,8 +407,7 @@ pub(crate) struct NativeRecipe {
     recipe: Box<dyn resin_recipe::Recipe>,
     id: u64,
     stop_token_ids: OnceLock<Vec<u32>>,
-    media_config: Option<MediaConfig>,
-    media_preparation_cache: Mutex<media_preprocess::PreparationCache>,
+    media_cache: MediaCache,
 }
 impl NativeRecipe {
     pub(crate) fn resolved_stop_token_ids(&self) -> PyResult<&[u32]> {
@@ -488,65 +485,30 @@ impl NativeRecipe {
         request: Value,
         sources: MediaSources,
     ) -> PyResult<RenderedPrompt> {
-        // Native tokenizer/processor configurations are immutable snapshots.
-        // Python fallback tokenizers may change their special IDs between calls.
-        let key = if self.tokenizer.is_native() {
-            media_preprocess::cache_key(py, &sources)?
+        let (token_ids, media) = if sources.is_empty() {
+            (
+                py.detach(|| self.recipe.render(&request)?.encode(self.encoder.as_ref()))
+                    .map_err(recipe_error)?,
+                None,
+            )
         } else {
-            None
-        };
-        let cached = key.and_then(|key| {
-            self.media_preparation_cache
-                .lock()
-                .unwrap_or_else(|poison| poison.into_inner())
-                .get(key)
-        });
-        // This lookup precedes image decoding as well as resizing/patchifying.
-        let sources = if cached.is_some() {
-            Vec::new()
-        } else {
-            media_preprocess::sources(
+            let modalities = self.recipe.input_modalities();
+            if let Some((kind, _)) = sources.iter().find(|(kind, _)| !modalities.contains(kind)) {
+                return Err(PyValueError::new_err(format!(
+                    "this recipe does not support media of type {kind}"
+                )));
+            }
+            let prompt = py.detach(|| self.recipe.render(&request).map_err(recipe_error))?;
+            let (ids, media) = self.media_cache.render(
                 py,
+                self.recipe.as_ref(),
+                prompt,
                 sources,
-                matches!(self.media_config, Some(MediaConfig::Inkling2(_))),
-            )?
+                self.encoder.as_ref(),
+                self.tokenizer.is_native(),
+            )?;
+            (ids, Some(media))
         };
-        let (token_ids, preparation, placements) = py.detach(|| -> PyResult<_> {
-            let preparation = if let Some(prepared) = cached {
-                Some(prepared)
-            } else if sources.is_empty() {
-                None
-            } else {
-                let config = self
-                    .media_config
-                    .as_ref()
-                    .ok_or_else(|| PyValueError::new_err("this recipe does not support media"))?;
-                let prepared = Arc::new(
-                    media_preprocess::process(config, sources, self.encoder.as_ref())
-                        .map_err(recipe_error)?,
-                );
-                if let Some(key) = key {
-                    self.media_preparation_cache
-                        .lock()
-                        .unwrap_or_else(|poison| poison.into_inner())
-                        .insert(key, prepared.clone());
-                }
-                Some(prepared)
-            };
-            let prompt = self.recipe.render(&request).map_err(recipe_error)?;
-            let expansions = preparation
-                .as_ref()
-                .map(|p| p.expansions.as_slice())
-                .unwrap_or(&[]);
-            let (ids, placements) = recipe_media::encode(prompt, expansions, self.encoder.as_ref())
-                .map_err(recipe_error)?;
-            // Each bound payload owns independent read-only NumPy buffers. Clone
-            // cached tensors outside the GIL; oversized/uncached values move.
-            Ok((ids, preparation.map(Arc::unwrap_or_clone), placements))
-        })?;
-        let media = preparation
-            .map(|p| p.bind(py, &token_ids, &placements))
-            .transpose()?;
         // Parser creation needs controls, schemas and IDs, never images or conversation history.
         let seed = ParserSeed {
             recipe_id: self.id,
@@ -562,12 +524,7 @@ impl NativeRecipe {
 #[pymethods]
 impl NativeRecipe {
     fn _media_preparation_cache_info(&self) -> HashMap<&'static str, usize> {
-        self.media_preparation_cache
-            .lock()
-            .unwrap_or_else(|poison| poison.into_inner())
-            .info()
-            .into_iter()
-            .collect()
+        self.media_cache.info().into_iter().collect()
     }
 
     #[getter]
@@ -577,11 +534,7 @@ impl NativeRecipe {
 
     #[getter]
     fn input_modalities(&self) -> Vec<&'static str> {
-        match &self.media_config {
-            None => vec!["text"],
-            Some(MediaConfig::Gemma(_)) => vec!["text", "image", "video"],
-            Some(_) => vec!["text", "image"],
-        }
+        self.recipe.input_modalities().to_vec()
     }
     #[pyo3(signature=(messages: "Sequence[Message]", *, tools: "Sequence[Tool]" = Vec::new(), options=None))]
     pub(crate) fn render(
@@ -683,108 +636,84 @@ impl NativeRecipe {
     }
 }
 
-fn recipe_params<T: DeserializeOwned>(params: Map<String, Value>) -> PyResult<T> {
-    serde_json::from_value(Value::Object(params))
-        .map_err(|error| PyValueError::new_err(error.to_string()))
+fn recipe_default(owner: &Bound<'_, PyAny>, key: &str) -> PyResult<Value> {
+    if key == "conversation_start_date" {
+        let date = owner
+            .py()
+            .import("datetime")?
+            .getattr("date")?
+            .call_method0("today")?;
+        return Ok(depythonize(&date.call_method0("isoformat")?)?);
+    }
+    let Some(processor) = optional_attr(owner, key)? else {
+        return Ok(json!({}));
+    };
+    if processor.is_none() || !processor.hasattr("to_dict")? {
+        return Ok(json!({}));
+    }
+    Ok(depythonize(&processor.call_method0("to_dict")?)?)
 }
 
-fn image_processor_params(
+fn native_recipe<R: resin_recipe::Recipe + 'static>(
     owner: &Bound<'_, PyAny>,
-    mut params: Map<String, Value>,
-) -> PyResult<Map<String, Value>> {
-    if params.get("media_config").is_none_or(Value::is_null) {
-        params.insert(
-            "media_config".into(),
-            media_preprocess::config_of(owner, "image_processor")?,
-        );
-    }
-    Ok(params)
+    params: Value,
+    stop_token_ids: Option<Vec<u32>>,
+) -> PyResult<NativeRecipe> {
+    let provider_error = std::cell::Cell::new(None);
+    let recipe = R::from_config(params, &|key| {
+        recipe_default(owner, key).map_err(|error| {
+            let message = error.to_string();
+            provider_error.set(Some(error));
+            Error::new(message)
+        })
+    })
+    .map_err(|error| {
+        provider_error
+            .into_inner()
+            .unwrap_or_else(|| recipe_error(error))
+    })?;
+    static NEXT_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    let original_tokenizer = optional_attr(owner, "tokenizer")?.unwrap_or_else(|| owner.clone());
+    let tokenizer = RecipeTokenizer::new(&original_tokenizer)?;
+    Ok(NativeRecipe {
+        encoder: tokenizer.encoder(),
+        tokenizer,
+        recipe: Box::new(recipe),
+        id: NEXT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+        stop_token_ids: stop_token_ids.map(OnceLock::from).unwrap_or_default(),
+        media_cache: MediaCache::default(),
+    })
 }
 
 /// Construct a native recipe from a canonical name and typed family parameters.
 #[pyfunction]
 #[pyo3(signature = (name, tokenizer, *, stop_token_ids: "Sequence[int] | None" = None, **kwargs))]
 pub(crate) fn get_native_recipe(
-    py: Python<'_>,
     name: &str,
     tokenizer: &Bound<'_, PyAny>,
     stop_token_ids: Option<Vec<u32>>,
     kwargs: Option<&Bound<'_, PyDict>>,
 ) -> PyResult<NativeRecipe> {
-    let mut params = kwargs
-        .map(|kwargs| depythonize::<Map<String, Value>>(kwargs))
+    use resin_recipe::{deepseek, gemma, glm, gpt_oss, inkling2, lfm2, qwen};
+    type Constructor = fn(&Bound<'_, PyAny>, Value, Option<Vec<u32>>) -> PyResult<NativeRecipe>;
+    let constructors: &[(&str, Constructor)] = &[
+        ("gpt_oss", native_recipe::<gpt_oss::GptOssRecipe>),
+        ("deepseek_v41", native_recipe::<deepseek::DeepSeekV41Recipe>),
+        ("glm5_3_flash", native_recipe::<glm::Glm53FlashRecipe>),
+        ("gemma4", native_recipe::<gemma::Gemma4Recipe>),
+        ("inkling2", native_recipe::<inkling2::Inkling2Recipe>),
+        ("lfm2", native_recipe::<lfm2::Lfm2Recipe>),
+        ("qwen3_5", native_recipe::<qwen::Qwen35Recipe>),
+        ("qwen3_8", native_recipe::<qwen::Qwen38Recipe>),
+        ("ornith", native_recipe::<qwen::OrnithRecipe>),
+    ];
+    let (_, construct) = constructors
+        .iter()
+        .find(|(key, _)| *key == name)
+        .ok_or_else(|| PyValueError::new_err(format!("unknown native recipe: {name}")))?;
+    let params = kwargs
+        .map(|kwargs| depythonize::<Value>(kwargs))
         .transpose()?
-        .unwrap_or_default();
-    let recipe: Box<dyn resin_recipe::Recipe> = match name {
-        "gpt_oss" => {
-            if params
-                .get("conversation_start_date")
-                .is_none_or(Value::is_null)
-            {
-                let date: String = py
-                    .import("datetime")?
-                    .getattr("date")?
-                    .call_method0("today")?
-                    .call_method0("isoformat")?
-                    .extract()?;
-                params.insert("conversation_start_date".into(), Value::String(date));
-            }
-            Box::new(resin_recipe::gpt_oss::GptOssRecipe::new(recipe_params(
-                params,
-            )?))
-        }
-        "deepseek_v41" => Box::new(
-            resin_recipe::deepseek::DeepSeekV41Recipe::new(recipe_params(params)?)
-                .map_err(recipe_error)?,
-        ),
-        "glm5_3_flash" => Box::new(resin_recipe::glm::Glm53FlashRecipe::new(recipe_params(
-            image_processor_params(tokenizer, params)?,
-        )?)),
-        "gemma4" => {
-            if params.get("media_config").is_none_or(Value::is_null) {
-                params.insert(
-                    "media_config".into(),
-                    json!({
-                        "image_processor": media_preprocess::config_of(tokenizer, "image_processor")?,
-                        "video_processor": media_preprocess::config_of(tokenizer, "video_processor")?,
-                    }),
-                );
-            }
-            Box::new(resin_recipe::gemma::Gemma4Recipe::new(recipe_params(
-                params,
-            )?))
-        }
-        "inkling2" => Box::new(resin_recipe::inkling2::Inkling2Recipe::new(recipe_params(
-            image_processor_params(tokenizer, params)?,
-        )?)),
-        "lfm2" => Box::new(resin_recipe::lfm2::Lfm2Recipe::new(recipe_params(params)?)),
-        "qwen3_5" => Box::new(resin_recipe::qwen::Qwen35Recipe::new(recipe_params(
-            image_processor_params(tokenizer, params)?,
-        )?)),
-        "qwen3_8" => Box::new(resin_recipe::qwen::Qwen38Recipe::new(recipe_params(
-            image_processor_params(tokenizer, params)?,
-        )?)),
-        "ornith" => Box::new(resin_recipe::qwen::OrnithRecipe::new(recipe_params(
-            image_processor_params(tokenizer, params)?,
-        )?)),
-        _ => {
-            return Err(PyValueError::new_err(format!(
-                "unknown native recipe: {name}"
-            )));
-        }
-    };
-    static NEXT_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
-    let original_tokenizer =
-        optional_attr(tokenizer, "tokenizer")?.unwrap_or_else(|| tokenizer.clone());
-    let tokenizer = RecipeTokenizer::new(&original_tokenizer)?;
-    let media_config = recipe.media_config();
-    Ok(NativeRecipe {
-        encoder: tokenizer.encoder(),
-        tokenizer,
-        recipe,
-        id: NEXT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
-        stop_token_ids: stop_token_ids.map(OnceLock::from).unwrap_or_default(),
-        media_config,
-        media_preparation_cache: Mutex::default(),
-    })
+        .unwrap_or_else(|| json!({}));
+    construct(tokenizer, params, stop_token_ids)
 }

@@ -134,7 +134,7 @@ def test_models_reports_recipe_modalities_and_engine_context(kind, modalities):
     if kind == "custom":
         recipe = Recipe()
         if modalities is not None:
-            recipe.input_modalities = modalities
+            setattr(recipe, "input_modalities", modalities)
     else:
         recipe = get_native_recipe(
             kind,

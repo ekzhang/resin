@@ -77,14 +77,15 @@ DeepSeek-V4-Pro-0813, Copyright (c) 2023 DeepSeek, MIT License.
 The supported V4.1 format follows encoding/encoding.py in
 DeepSeek-V4.1-Flash-1017, revision 1bae0e1088993b9b82de08f59de5be5a34e42170,
 under the same copyright and MIT License.
-The image preprocessing in crates/resin-recipe/src/media/deepseek.rs follows
+The image preprocessing in crates/resin-recipe/src/deepseek/media.rs follows
 inference/image_processor.py from that same V4.1 checkpoint revision.
 The vision tower in models/cuda/resin_models_cuda/deepseek_v41/vision.py
 follows its inference/vision.py, under the same copyright and MIT License.
 The MIT notice is retained at crates/resin-recipe/licenses/deepseek-MIT.txt.
 
-The image/video geometry, normalization, patch layouts and rotary positions in
-crates/resin-recipe/src/media/{gemma,inkling2,qwen}.rs follow Hugging Face
+The image/video geometry and normalization in
+crates/resin-recipe/src/{gemma,inkling2,qwen}/media.rs and the patch layouts
+and rotary positions in resin/models/vision.py follow Hugging Face
 Transformers' model processors (Copyright The HuggingFace Team), Apache License 2.0.
 https://github.com/huggingface/transformers
 The Rust implementations use the image crate's resize filters.
@@ -137,7 +138,7 @@ da920bb0b9f4a06727223a349e55468e38352348, based on zai-org/GLM-5.3-Flash.
 Copyright (c) 2026 Z.AI Co., Ltd, MIT License.
 The notice is retained at crates/resin-recipe/licenses/glm-MIT.txt.
 
-GLM image preprocessing in crates/resin-recipe/src/media/glm.rs and the vision
+GLM image preprocessing in crates/resin-recipe/src/glm/media.rs and the vision
 tower in models/cuda/resin_models_cuda/glm5_3_flash/vision.py are adapted from
 Hugging Face Transformers, revision 50e35cc0ca18ec19b80653690de553e6decf74f5,
 src/transformers/models/glm5_next/{image_processing_glm5_next,modeling_glm5_next}.py.
