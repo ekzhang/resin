@@ -37,9 +37,8 @@ impl GroupId {
     }
 }
 
-/// Stable identity of one live child block. This is a copyable capability, not
-/// ownership; request ownership stays in `PendingRequestPages`, `RequestPages`,
-/// or an active writer lease.
+/// Copyable address of one live child block. Request pages, cached snapshots,
+/// and active leases own its physical lifetime.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct PageHandle {
     pool_id: u64,
@@ -236,38 +235,6 @@ impl Drop for CachedSegment {
     }
 }
 
-/// Provisional ownership returned by one all-or-nothing request reservation.
-#[derive(Debug)]
-#[must_use = "pending request pages must be promoted or aborted"]
-pub struct PendingRequestPages {
-    pool_id: u64,
-    sequence: SequenceId,
-    writer: WriterId,
-    groups: Vec<GroupTable<PageRef>>,
-}
-
-impl PendingRequestPages {
-    #[cfg(test)]
-    pub const fn sequence(&self) -> SequenceId {
-        self.sequence
-    }
-
-    #[cfg(test)]
-    pub fn groups(&self) -> &[GroupTable<PageRef>] {
-        &self.groups
-    }
-
-    #[cfg(test)]
-    pub fn len(&self) -> usize {
-        self.groups.iter().map(|group| group.pages.len()).sum()
-    }
-
-    #[cfg(test)]
-    pub fn is_empty(&self) -> bool {
-        self.len() == 0
-    }
-}
-
 /// Move-only ownership of all physical pages belonging to one live request.
 #[derive(Debug)]
 #[must_use = "request pages must be retired through their issuing pool"]
@@ -307,24 +274,11 @@ pub struct PageAccessClaim {
     write: bool,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct PreparedWriterClaim {
-    claim: PageAccessClaim,
-    expected_write_epoch: u64,
-}
-
-#[derive(Debug)]
-#[must_use = "prepared writer access must be acquired or discarded"]
-pub struct PreparedWriterAccess {
-    pool_id: u64,
-    claims: Vec<PreparedWriterClaim>,
-}
-
 #[derive(Debug)]
 #[must_use = "writer access must be released or retained as quarantine"]
 pub struct WriterAccessLease {
     pool_id: u64,
-    claims: Vec<PreparedWriterClaim>,
+    claims: Vec<PageAccessClaim>,
 }
 
 impl WriterAccessLease {
@@ -386,10 +340,6 @@ pub enum CachePoolError {
     DuplicateAccessClaim,
     #[error("cache page already has an incompatible access lease")]
     AccessConflict,
-    #[error("cache page write completion epoch is exhausted")]
-    WriteEpochExhausted,
-    #[error("cache page write epoch changed from {expected} to {actual} after access preparation")]
-    WriteEpochChanged { expected: u64, actual: u64 },
 }
 
 /// A failed retirement returns the exact move-only request token unchanged.
@@ -401,7 +351,6 @@ pub struct RetireRequestFailure {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum PageMode {
-    Reserved { writer: WriterId },
     Mutable { writer: WriterId },
     Shared,
 }
@@ -416,22 +365,21 @@ struct PageSlot {
     cache_refs: u32,
     reader_leases: u32,
     writer_lease: bool,
-    write_epoch: u64,
 }
 
 impl PageSlot {
     fn is_live(self) -> bool {
-        matches!(self.mode, Some(PageMode::Reserved { .. }))
-            || self.request_refs != 0
+        self.request_refs != 0
             || self.cache_refs != 0
             || self.reader_leases != 0
             || self.writer_lease
     }
 
-    fn reserved_request(generation: u64, writer: WriterId) -> Self {
+    fn request_owned(generation: u64, writer: WriterId) -> Self {
         Self {
             generation,
-            mode: Some(PageMode::Reserved { writer }),
+            mode: Some(PageMode::Mutable { writer }),
+            request_refs: 1,
             ..Self::default()
         }
     }
@@ -443,7 +391,6 @@ impl PageSlot {
         self.cache_refs = 0;
         self.reader_leases = 0;
         self.writer_lease = false;
-        self.write_epoch = 0;
     }
 }
 
@@ -591,14 +538,15 @@ impl PlannedParent {
                 },
             )?;
             self.next_generation = generation;
-            let reserved = PageSlot::reserved_request(generation, writer);
             match &mut self.storage {
                 PlannedStorage::Existing { updates } => updates.push(PlannedSlot {
                     slot: slot_index as u32,
                     generation,
                     writer,
                 }),
-                PlannedStorage::New { slots } => slots[slot_index] = reserved,
+                PlannedStorage::New { slots } => {
+                    slots[slot_index] = PageSlot::request_owned(generation, writer)
+                }
             }
             self.occupied_after += 1;
             allocated += 1;
@@ -632,7 +580,7 @@ struct GroupPlanState {
 struct PlacementPlan {
     parents: Vec<PlannedParent>,
     group_states: Vec<Option<GroupPlanState>>,
-    new_parent_ids: Vec<u32>,
+    new_parent_count: usize,
     block_count: usize,
 }
 
@@ -643,20 +591,12 @@ impl PlacementPlan {
         parent_capacity: usize,
     ) -> Result<Self, CachePoolError> {
         let touched_bound = total_blocks.min(parent_capacity);
-        let mut parents = Vec::new();
-        parents
-            .try_reserve(touched_bound)
-            .map_err(|_| CachePoolError::MetadataAllocation)?;
         let mut group_states = metadata_vec(group_count)?;
         group_states.resize_with(group_count, || None);
-        let mut new_parent_ids = Vec::new();
-        new_parent_ids
-            .try_reserve(touched_bound)
-            .map_err(|_| CachePoolError::MetadataAllocation)?;
         Ok(Self {
-            parents,
+            parents: metadata_vec(touched_bound)?,
             group_states,
-            new_parent_ids,
+            new_parent_count: 0,
             block_count: 0,
         })
     }
@@ -792,22 +732,22 @@ impl CachePool {
             .and_then(|parent| parent.binding)
     }
 
-    /// Reserve every ordered group demand for one request atomically. Logical
+    /// Allocate every ordered group demand for one request atomically. Logical
     /// state is unchanged on every error; output tables preserve input order
     /// and multiplicity.
-    pub fn reserve_request(
+    pub fn allocate_request(
         &mut self,
         sequence: SequenceId,
         demands: &[GroupDemand],
-    ) -> Result<PendingRequestPages, CachePoolError> {
+    ) -> Result<RequestPages, CachePoolError> {
         let writer = WriterId(
             self.last_writer_id
                 .checked_add(1)
                 .ok_or(CachePoolError::WriterIdExhausted)?,
         );
-        let groups = self.reserve_pages(writer, demands)?;
+        let groups = self.allocate_pages(writer, demands)?;
         self.last_writer_id = writer.0;
-        Ok(PendingRequestPages {
+        Ok(RequestPages {
             pool_id: self.id,
             sequence,
             writer,
@@ -815,20 +755,7 @@ impl CachePool {
         })
     }
 
-    /// Make a fully reserved request executable. Private token provenance makes
-    /// this transition infallible.
-    pub fn promote_request(&mut self, pending: PendingRequestPages) -> RequestPages {
-        self.assert_pending_request(&pending);
-        self.promote_pages(pending.writer, &pending.groups);
-        RequestPages {
-            pool_id: pending.pool_id,
-            sequence: pending.sequence,
-            writer: pending.writer,
-            groups: pending.groups,
-        }
-    }
-
-    fn reserve_pages(
+    fn allocate_pages(
         &mut self,
         writer: WriterId,
         demands: &[GroupDemand],
@@ -869,16 +796,6 @@ impl CachePool {
         // Publishing touches only planned parents and performs no allocation.
         self.commit_plan(plan);
         Ok(groups)
-    }
-
-    fn promote_pages(&mut self, writer: WriterId, groups: &[GroupTable<PageRef>]) {
-        for page in groups.iter().flat_map(|group| &group.pages) {
-            let slot = self.slot_mut(page.handle);
-            debug_assert_eq!(slot.mode, Some(PageMode::Reserved { writer }));
-            debug_assert_eq!(slot.request_refs, 0);
-            slot.mode = Some(PageMode::Mutable { writer });
-            slot.request_refs = 1;
-        }
     }
 
     /// Simulate additional cohort pages without changing allocator ownership.
@@ -964,8 +881,7 @@ impl CachePool {
         if growth.iter().all(|demand| demand.blocks == 0) {
             return Ok(());
         }
-        let additions = self.reserve_pages(request.writer, &growth)?;
-        self.promote_pages(request.writer, &additions);
+        let additions = self.allocate_pages(request.writer, &growth)?;
         for (group, mut addition) in request.groups.iter_mut().zip(additions) {
             group.pages.append(&mut addition.pages);
         }
@@ -1279,8 +1195,7 @@ impl CachePool {
                 reuse.iter().filter(|&&exclusive| !exclusive).count(),
             ));
         }
-        let additions = self.reserve_pages(request.writer, &demands)?;
-        self.promote_pages(request.writer, &additions);
+        let additions = self.allocate_pages(request.writer, &demands)?;
         for (((indices, reuse), group), additions) in replacements
             .iter()
             .zip(reusable)
@@ -1356,20 +1271,6 @@ impl CachePool {
         Ok(())
     }
 
-    /// Discard a fresh request reservation. Like promotion, this is infallible
-    /// after successful reservation.
-    pub fn abort_request(&mut self, pending: PendingRequestPages) {
-        self.assert_pending_request(&pending);
-        for group in pending.groups.iter().rev() {
-            for page in group.pages.iter().rev() {
-                let slot = self.slot_mut(page.handle);
-                debug_assert_eq!(slot.request_refs, 0);
-                slot.mode = None;
-                self.retire_slot_if_unused(page.handle);
-            }
-        }
-    }
-
     /// Retire one move-only request owner. Validation completes before the first
     /// mutation; failure returns the exact token unchanged. Active leases keep
     /// their pages physically live until runner completion or quarantine.
@@ -1388,14 +1289,16 @@ impl CachePool {
         Ok(())
     }
 
-    /// Authenticate and canonicalize an exact set of mutable request pages
-    /// before runner acceptance. No lease state changes here.
-    pub fn prepare_writer_access(
-        &self,
+    /// Pin the batch's exact pages atomically. Validate every claim before
+    /// changing lease counts, including duplicate claims for shared reads.
+    pub fn acquire_writer_access(
+        &mut self,
         mut claims: Vec<PageAccessClaim>,
-    ) -> Result<PreparedWriterAccess, CachePoolError> {
-        for claim in &claims {
-            self.validate_writer_claim(*claim)?;
+    ) -> Result<WriterAccessLease, CachePoolError> {
+        let mut busy = false;
+        for &claim in &claims {
+            let slot = self.validate_writer_claim(claim)?;
+            busy |= slot.writer_lease || (claim.write && slot.reader_leases != 0);
         }
         claims.sort_unstable_by_key(|claim| claim.handle);
         if claims
@@ -1404,88 +1307,39 @@ impl CachePool {
         {
             return Err(CachePoolError::DuplicateAccessClaim);
         }
+        if busy {
+            return Err(CachePoolError::AccessConflict);
+        }
         claims.dedup_by_key(|claim| claim.handle);
-
-        let mut prepared_claims = metadata_vec(claims.len())?;
         for claim in &claims {
-            let slot = self.validate_writer_available(*claim)?;
-            prepared_claims.push(PreparedWriterClaim {
-                claim: *claim,
-                expected_write_epoch: slot.write_epoch,
-            });
-        }
-        Ok(PreparedWriterAccess {
-            pool_id: self.id,
-            claims: prepared_claims,
-        })
-    }
-
-    /// Acquire every prepared writer lease atomically. Revalidation catches an
-    /// intervening retirement or competing lease without partially acquiring.
-    pub fn acquire_writer_access(
-        &mut self,
-        prepared: PreparedWriterAccess,
-    ) -> Result<WriterAccessLease, CachePoolError> {
-        if prepared.pool_id != self.id {
-            return Err(CachePoolError::ForeignAccess);
-        }
-        for prepared_claim in &prepared.claims {
-            let claim = prepared_claim.claim;
-            self.validate_writer_claim(claim)?;
-            let slot = self.validate_writer_available(claim)?;
-            if slot.write_epoch != prepared_claim.expected_write_epoch {
-                return Err(CachePoolError::WriteEpochChanged {
-                    expected: prepared_claim.expected_write_epoch,
-                    actual: slot.write_epoch,
-                });
-            }
-        }
-        for prepared_claim in &prepared.claims {
-            let slot = self.slot_mut(prepared_claim.claim.handle);
-            if prepared_claim.claim.write {
+            let slot = self.slot_mut(claim.handle);
+            if claim.write {
                 slot.writer_lease = true;
             } else {
                 slot.reader_leases += 1;
             }
         }
         Ok(WriterAccessLease {
-            pool_id: prepared.pool_id,
-            claims: prepared.claims,
+            pool_id: self.id,
+            claims,
         })
     }
 
-    /// Release a known-live writer lease. This path allocates nothing. A caller
-    /// which cannot prove runner completion retains the lease as quarantine.
+    /// A lease pins its pages even after the owning request retires.
     pub fn release_writer_access(&mut self, lease: WriterAccessLease) {
         assert_eq!(
             lease.pool_id, self.id,
             "writer access can only return to its issuing cache pool"
         );
-        for prepared_claim in &lease.claims {
-            let claim = prepared_claim.claim;
-            let slot = self
-                .validate_live_handle(claim.handle)
-                .expect("writer lease keeps its page live");
+        for claim in lease.claims {
+            let slot = self.slot_mut(claim.handle);
+            assert_eq!(slot.generation, claim.handle.generation);
             if claim.write {
                 assert!(slot.writer_lease);
-            } else {
-                assert_ne!(slot.reader_leases, 0);
-            }
-            assert_eq!(slot.write_epoch, prepared_claim.expected_write_epoch);
-            if claim.write {
-                assert_ne!(slot.write_epoch, u64::MAX);
-            }
-        }
-        for prepared_claim in lease.claims {
-            let claim = prepared_claim.claim;
-            let slot = self.slot_mut(claim.handle);
-            if claim.write {
                 slot.writer_lease = false;
             } else {
+                assert_ne!(slot.reader_leases, 0);
                 slot.reader_leases -= 1;
-            }
-            if claim.write {
-                slot.write_epoch += 1;
             }
             self.retire_slot_if_unused(claim.handle);
         }
@@ -1502,7 +1356,7 @@ impl CachePool {
         let PlacementPlan {
             parents,
             group_states,
-            new_parent_ids,
+            new_parent_count,
             block_count,
         } = plan;
         let state = group_states[demand.group.index() as usize].get_or_insert(GroupPlanState {
@@ -1544,7 +1398,7 @@ impl CachePool {
                 continue;
             }
 
-            let Some(parent_id) = self.free_parents.get(new_parent_ids.len()).copied() else {
+            let Some(parent_id) = self.free_parents.get(*new_parent_count).copied() else {
                 return Err(CachePoolError::InsufficientCapacity {
                     group: demand.group,
                     requested: demand.blocks,
@@ -1555,22 +1409,14 @@ impl CachePool {
             let planned = PlannedParent::new(parent_id, actual, demand.group, packing)?;
             let plan_index = parents.len();
             parents.push(planned);
-            new_parent_ids.push(parent_id);
+            *new_parent_count += 1;
             state.current = Some(plan_index);
         }
         Ok(())
     }
 
     fn commit_plan(&mut self, plan: PlacementPlan) {
-        let PlacementPlan {
-            parents,
-            group_states: _,
-            new_parent_ids,
-            block_count,
-        } = plan;
-        let mut expected_new_parents = new_parent_ids.into_iter();
-
-        for planned in parents {
+        for planned in plan.parents {
             let PlannedParent {
                 parent: parent_id,
                 group,
@@ -1589,7 +1435,7 @@ impl CachePool {
                         for update in updates {
                             let slot = &mut parent.slots[update.slot as usize];
                             debug_assert!(!slot.is_live());
-                            *slot = PageSlot::reserved_request(update.generation, update.writer);
+                            *slot = PageSlot::request_owned(update.generation, update.writer);
                         }
                         parent.occupied_slots = occupied_after;
                         parent.next_generation = next_generation;
@@ -1600,7 +1446,6 @@ impl CachePool {
                     }
                 }
                 PlannedStorage::New { slots } => {
-                    debug_assert_eq!(expected_new_parents.next(), Some(parent_id));
                     assert_eq!(
                         self.free_parents.pop_front(),
                         Some(parent_id),
@@ -1624,8 +1469,7 @@ impl CachePool {
                 }
             }
         }
-        debug_assert_eq!(expected_new_parents.next(), None);
-        self.occupied_blocks += block_count;
+        self.occupied_blocks += plan.block_count;
     }
 
     /// Preflight a request retirement without changing ownership or placement.
@@ -1722,7 +1566,7 @@ impl CachePool {
         Ok(handles.windows(2).any(|pair| pair[0] == pair[1]))
     }
 
-    fn validate_writer_claim(&self, claim: PageAccessClaim) -> Result<(), CachePoolError> {
+    fn validate_writer_claim(&self, claim: PageAccessClaim) -> Result<&PageSlot, CachePoolError> {
         if claim.pool_id != self.id {
             return Err(CachePoolError::ForeignAccess);
         }
@@ -1739,20 +1583,6 @@ impl CachePool {
             }
         } else if slot.mode != Some(PageMode::Shared) || slot.request_refs == 0 {
             return Err(CachePoolError::StaleHandle);
-        }
-        Ok(())
-    }
-
-    fn validate_writer_available(
-        &self,
-        claim: PageAccessClaim,
-    ) -> Result<&PageSlot, CachePoolError> {
-        let slot = self.validate_live_handle(claim.handle)?;
-        if claim.write && slot.write_epoch == u64::MAX {
-            return Err(CachePoolError::WriteEpochExhausted);
-        }
-        if slot.writer_lease || (claim.write && slot.reader_leases != 0) {
-            return Err(CachePoolError::AccessConflict);
         }
         Ok(slot)
     }
@@ -1785,31 +1615,6 @@ impl CachePool {
             return Err(CachePoolError::StaleHandle);
         }
         Ok(slot)
-    }
-
-    fn assert_pending_request(&self, pending: &PendingRequestPages) {
-        assert_eq!(
-            pending.pool_id, self.id,
-            "pending request pages belong to a different cache pool"
-        );
-        for group in &pending.groups {
-            for page in &group.pages {
-                assert_eq!(group.group, page.handle.group);
-                let slot = self
-                    .validate_live_handle(page.handle)
-                    .expect("fresh pending request page remains live");
-                assert_eq!(
-                    slot.mode,
-                    Some(PageMode::Reserved {
-                        writer: pending.writer
-                    })
-                );
-                assert_eq!(slot.request_refs, 0);
-                assert_eq!(slot.reader_leases, 0);
-                assert!(!slot.writer_lease);
-                assert_eq!(slot.write_epoch, 0);
-            }
-        }
     }
 
     fn slot_mut(&mut self, handle: PageHandle) -> &mut PageSlot {
@@ -1910,10 +1715,9 @@ mod tests {
     #[test]
     fn growing_checkpoints_share_linear_metadata_and_reclaim_after_last_owner() {
         let mut pool = CachePool::new(512, &[nz(1)]).unwrap();
-        let pending = pool
-            .reserve_request(sequence(1), &[GroupDemand::new(GroupId::new(0), 0)])
+        let mut request = pool
+            .allocate_request(sequence(1), &[GroupDemand::new(GroupId::new(0), 0)])
             .unwrap();
-        let mut request = pool.promote_request(pending);
         let mut snapshots = Vec::new();
         for count in 1..=512 {
             let demands = [GroupDemand::new(GroupId::new(0), count)];
@@ -1944,10 +1748,9 @@ mod tests {
             assert_eq!(pool.occupied_block_count(), 512);
         }
 
-        let pending = pool
-            .reserve_request(sequence(2), &[GroupDemand::new(GroupId::new(0), 0)])
+        let mut restored = pool
+            .allocate_request(sequence(2), &[GroupDemand::new(GroupId::new(0), 0)])
             .unwrap();
-        let mut restored = pool.promote_request(pending);
         pool.attach_shared_prefix(&mut restored, &last).unwrap();
         assert_eq!(request_handles(&restored), expected);
         pool.retire_cached_prefix(last).unwrap();
@@ -1963,19 +1766,17 @@ mod tests {
     #[test]
     fn branched_checkpoints_keep_shared_ancestors_until_both_branches_retire() {
         let mut pool = CachePool::new(10, &[nz(1)]).unwrap();
-        let pending = pool
-            .reserve_request(sequence(1), &[GroupDemand::new(GroupId::new(0), 2)])
+        let mut base = pool
+            .allocate_request(sequence(1), &[GroupDemand::new(GroupId::new(0), 2)])
             .unwrap();
-        let mut base = pool.promote_request(pending);
         let snapshot = pool
             .share_request_prefix(&mut base, &[GroupDemand::new(GroupId::new(0), 2)])
             .unwrap();
         let mut branches = Vec::new();
         for id in 2..=3 {
-            let pending = pool
-                .reserve_request(sequence(id), &[GroupDemand::new(GroupId::new(0), 0)])
+            let mut request = pool
+                .allocate_request(sequence(id), &[GroupDemand::new(GroupId::new(0), 0)])
                 .unwrap();
-            let mut request = pool.promote_request(pending);
             pool.attach_shared_prefix(&mut request, &snapshot).unwrap();
             pool.grow_request(&mut request, &[GroupDemand::new(GroupId::new(0), 3)])
                 .unwrap();
@@ -2002,13 +1803,11 @@ mod tests {
     fn evicted_shared_pages_regain_exclusive_writes_without_spare_capacity() {
         let mut pool = CachePool::new(1, &[nz(1)]).unwrap();
         let demands = [GroupDemand::new(GroupId::new(0), 1)];
-        let pending = pool.reserve_request(sequence(1), &demands).unwrap();
-        let mut request = pool.promote_request(pending);
+        let mut request = pool.allocate_request(sequence(1), &demands).unwrap();
         let cached = pool.share_request_prefix(&mut request, &demands).unwrap();
-        let pending = pool
-            .reserve_request(sequence(2), &[GroupDemand::new(GroupId::new(0), 0)])
+        let mut peer = pool
+            .allocate_request(sequence(2), &[GroupDemand::new(GroupId::new(0), 0)])
             .unwrap();
-        let mut peer = pool.promote_request(pending);
         pool.attach_shared_prefix(&mut peer, &cached).unwrap();
         pool.retire_cached_prefix(cached).unwrap();
         let handles = request_handles(&request);
@@ -2022,8 +1821,7 @@ mod tests {
         assert_eq!(request_handles(&request), handles);
         assert!(request.groups[0].pages[0].writable);
         assert!(request.groups[0].snapshot.upgrade().is_none());
-        let access = pool.prepare_writer_access(writer_claims(&request)).unwrap();
-        let lease = pool.acquire_writer_access(access).unwrap();
+        let lease = pool.acquire_writer_access(writer_claims(&request)).unwrap();
         pool.release_writer_access(lease);
         pool.retire_request(request).unwrap();
         assert_eq!(pool.free_parent_count(), 1);
@@ -2036,8 +1834,7 @@ mod tests {
             GroupDemand::new(GroupId::new(0), 1),
             GroupDemand::new(GroupId::new(1), 1),
         ];
-        let pending = pool.reserve_request(sequence(1), &demands).unwrap();
-        let mut request = pool.promote_request(pending);
+        let mut request = pool.allocate_request(sequence(1), &demands).unwrap();
         let first = pool
             .share_request_prefix(
                 &mut request,
@@ -2071,8 +1868,7 @@ mod tests {
     fn cyclic_replacement_starts_a_new_snapshot_without_reusing_stale_prefixes() {
         let mut pool = CachePool::new(8, &[nz(1)]).unwrap();
         let demands = [GroupDemand::new(GroupId::new(0), 3)];
-        let pending = pool.reserve_request(sequence(1), &demands).unwrap();
-        let mut request = pool.promote_request(pending);
+        let mut request = pool.allocate_request(sequence(1), &demands).unwrap();
         let old = pool.share_request_prefix(&mut request, &demands).unwrap();
         let old_handles = request_handles(&request);
         pool.replace_shared_pages(&mut request, &[vec![0]]).unwrap();
@@ -2091,8 +1887,7 @@ mod tests {
     fn evicted_snapshot_hint_cannot_resurrect_retired_ownership() {
         let mut pool = CachePool::new(3, &[nz(1)]).unwrap();
         let demands = [GroupDemand::new(GroupId::new(0), 2)];
-        let pending = pool.reserve_request(sequence(1), &demands).unwrap();
-        let mut request = pool.promote_request(pending);
+        let mut request = pool.allocate_request(sequence(1), &demands).unwrap();
         let snapshot = pool.share_request_prefix(&mut request, &demands).unwrap();
         pool.retire_cached_prefix(snapshot).unwrap();
         assert!(request.groups[0].snapshot.upgrade().is_none());
@@ -2110,8 +1905,7 @@ mod tests {
     fn republishing_the_same_checkpoint_reuses_its_segment_ownership() {
         let mut pool = CachePool::new(2, &[nz(1)]).unwrap();
         let demands = [GroupDemand::new(GroupId::new(0), 2)];
-        let pending = pool.reserve_request(sequence(1), &demands).unwrap();
-        let mut request = pool.promote_request(pending);
+        let mut request = pool.allocate_request(sequence(1), &demands).unwrap();
         let first = pool.share_request_prefix(&mut request, &demands).unwrap();
         let second = pool.share_request_prefix(&mut request, &demands).unwrap();
         assert!(Arc::ptr_eq(
@@ -2132,10 +1926,9 @@ mod tests {
     #[test]
     fn dropping_a_long_segment_chain_is_iterative_and_does_not_return_physical_refs() {
         let mut pool = CachePool::new(1, &[nz(1)]).unwrap();
-        let pending = pool
-            .reserve_request(sequence(1), &[GroupDemand::new(GroupId::new(0), 1)])
+        let mut request = pool
+            .allocate_request(sequence(1), &[GroupDemand::new(GroupId::new(0), 1)])
             .unwrap();
-        let mut request = pool.promote_request(pending);
         let snapshot = pool
             .share_request_prefix(&mut request, &[GroupDemand::new(GroupId::new(0), 1)])
             .unwrap();
@@ -2160,32 +1953,32 @@ mod tests {
     fn empty_parent_is_fungible_across_groups_and_generation_survives_rebinding() {
         let mut pool = CachePool::new(1, &[nz(2), nz(1)]).unwrap();
         let first = pool
-            .reserve_request(sequence(1), &[GroupDemand::new(GroupId::new(0), 1)])
+            .allocate_request(sequence(1), &[GroupDemand::new(GroupId::new(0), 1)])
             .unwrap();
         let first_writer = first.writer;
         let first_handle = first.groups()[0].pages()[0].handle();
         assert_eq!(pool.bound_group(1), Some(GroupId::new(0)));
-        pool.abort_request(first);
+        pool.retire_request(first).unwrap();
         assert_eq!(pool.bound_group(1), None);
 
         let second = pool
-            .reserve_request(sequence(2), &[GroupDemand::new(GroupId::new(1), 1)])
+            .allocate_request(sequence(2), &[GroupDemand::new(GroupId::new(1), 1)])
             .unwrap();
         assert!(second.writer > first_writer);
         let second_handle = second.groups()[0].pages()[0].handle();
         assert_eq!(second_handle.parent(), first_handle.parent());
         assert!(second_handle.generation() > first_handle.generation());
         assert_eq!(pool.bound_group(1), Some(GroupId::new(1)));
-        pool.abort_request(second);
+        pool.retire_request(second).unwrap();
     }
 
     #[test]
     fn group_packing_exposes_physical_parent_and_child_slots() {
         let mut pool = CachePool::new(2, &[nz(3)]).unwrap();
-        let pending = pool
-            .reserve_request(sequence(1), &[GroupDemand::new(GroupId::new(0), 4)])
+        let request = pool
+            .allocate_request(sequence(1), &[GroupDemand::new(GroupId::new(0), 4)])
             .unwrap();
-        let addresses = pending.groups()[0]
+        let addresses = request.groups()[0]
             .pages()
             .iter()
             .map(|page| pool.physical_address(page.handle()).unwrap())
@@ -2193,7 +1986,7 @@ mod tests {
         assert_eq!(addresses, vec![(1, 0), (1, 1), (1, 2), (2, 0)]);
         assert_eq!(pool.free_parent_count(), 0);
         assert_eq!(pool.occupied_block_count(), 4);
-        pool.abort_request(pending);
+        pool.retire_request(request).unwrap();
     }
 
     #[test]
@@ -2205,7 +1998,7 @@ mod tests {
         let before_occupied = pool.occupied_blocks;
 
         let error = pool
-            .reserve_request(
+            .allocate_request(
                 sequence(1),
                 &[
                     GroupDemand::new(GroupId::new(0), 3),
@@ -2230,8 +2023,8 @@ mod tests {
     #[test]
     fn duplicate_demands_share_placement_but_preserve_ordered_group_tables() {
         let mut pool = CachePool::new(2, &[nz(2), nz(1)]).unwrap();
-        let pending = pool
-            .reserve_request(
+        let request = pool
+            .allocate_request(
                 sequence(1),
                 &[
                     GroupDemand::new(GroupId::new(0), 1),
@@ -2240,26 +2033,24 @@ mod tests {
                 ],
             )
             .unwrap();
-        assert_eq!(pending.groups().len(), 3);
-        assert_eq!(pending.groups()[0].group(), GroupId::new(0));
-        assert_eq!(pending.groups()[1].group(), GroupId::new(1));
-        assert_eq!(pending.groups()[2].group(), GroupId::new(0));
-        let first = pending.groups()[0].pages()[0].handle();
-        let third = pending.groups()[2].pages()[0].handle();
+        assert_eq!(request.groups().len(), 3);
+        assert_eq!(request.groups()[0].group(), GroupId::new(0));
+        assert_eq!(request.groups()[1].group(), GroupId::new(1));
+        assert_eq!(request.groups()[2].group(), GroupId::new(0));
+        let first = request.groups()[0].pages()[0].handle();
+        let third = request.groups()[2].pages()[0].handle();
         assert_eq!(first.parent(), third.parent());
         assert_ne!(first.slot(), third.slot());
         assert_eq!(pool.free_parent_count(), 0);
-        pool.abort_request(pending);
+        pool.retire_request(request).unwrap();
     }
 
     #[test]
-    fn promotion_installs_exact_request_refs_and_retirement_reclaims_parent() {
+    fn allocated_pages_have_one_request_ref_until_retirement() {
         let mut pool = CachePool::new(1, &[nz(2)]).unwrap();
-        let pending = pool
-            .reserve_request(sequence(7), &[GroupDemand::new(GroupId::new(0), 2)])
+        let request = pool
+            .allocate_request(sequence(7), &[GroupDemand::new(GroupId::new(0), 2)])
             .unwrap();
-        assert_eq!(pending.sequence(), sequence(7));
-        let request = pool.promote_request(pending);
         assert_eq!(request.sequence(), sequence(7));
         let writer = request.writer;
         for handle in request_handles(&request) {
@@ -2276,16 +2067,15 @@ mod tests {
     #[test]
     fn terminal_return_paths_use_pre_reserved_parent_metadata() {
         let mut pool = CachePool::new(4, &[nz(1)]).unwrap();
-        let pending = pool
-            .reserve_request(sequence(1), &[GroupDemand::new(GroupId::new(0), 3)])
+        let request = pool
+            .allocate_request(sequence(1), &[GroupDemand::new(GroupId::new(0), 3)])
             .unwrap();
-        let request = pool.promote_request(pending);
 
         // Admission does not replace or shrink either terminal-path buffer.
         let empty = pool
-            .reserve_request(sequence(2), &[GroupDemand::new(GroupId::new(0), 0)])
+            .allocate_request(sequence(2), &[GroupDemand::new(GroupId::new(0), 0)])
             .unwrap();
-        pool.abort_request(empty);
+        pool.retire_request(empty).unwrap();
         assert!(pool.free_parents.capacity() >= pool.parents.len());
         assert!(pool.partial_parents.capacity() >= pool.parents.len());
         pool.retire_request(request).unwrap();
@@ -2296,17 +2086,14 @@ mod tests {
     fn partial_parent_swap_removal_updates_the_moved_parent_index() {
         let mut pool = CachePool::new(3, &[nz(2), nz(2), nz(2)]).unwrap();
         let first = pool
-            .reserve_request(sequence(1), &[GroupDemand::new(GroupId::new(0), 1)])
+            .allocate_request(sequence(1), &[GroupDemand::new(GroupId::new(0), 1)])
             .unwrap();
-        let first = pool.promote_request(first);
         let middle = pool
-            .reserve_request(sequence(2), &[GroupDemand::new(GroupId::new(1), 1)])
+            .allocate_request(sequence(2), &[GroupDemand::new(GroupId::new(1), 1)])
             .unwrap();
-        let middle = pool.promote_request(middle);
         let last = pool
-            .reserve_request(sequence(3), &[GroupDemand::new(GroupId::new(2), 1)])
+            .allocate_request(sequence(3), &[GroupDemand::new(GroupId::new(2), 1)])
             .unwrap();
-        let last = pool.promote_request(last);
         assert_eq!(pool.partial_parents, vec![1, 2, 3]);
 
         pool.retire_request(middle).unwrap();
@@ -2314,12 +2101,12 @@ mod tests {
         assert_eq!(pool.parents[2].partial_index, Some(1));
 
         let fill_last = pool
-            .reserve_request(sequence(4), &[GroupDemand::new(GroupId::new(2), 1)])
+            .allocate_request(sequence(4), &[GroupDemand::new(GroupId::new(2), 1)])
             .unwrap();
         assert_eq!(fill_last.groups()[0].pages()[0].handle().parent(), 3);
         assert_eq!(pool.partial_parents, vec![1]);
         assert_eq!(pool.parents[2].partial_index, None);
-        pool.abort_request(fill_last);
+        pool.retire_request(fill_last).unwrap();
         pool.retire_request(last).unwrap();
         pool.retire_request(first).unwrap();
         assert!(pool.partial_parents.is_empty());
@@ -2333,7 +2120,7 @@ mod tests {
         let before_free = pool.free_parents.clone();
 
         let error = pool
-            .reserve_request(
+            .allocate_request(
                 sequence(1),
                 &[
                     GroupDemand::new(GroupId::new(0), 1),
@@ -2359,7 +2146,7 @@ mod tests {
         let before_free = pool.free_parents.clone();
 
         assert_eq!(
-            pool.reserve_request(sequence(1), &[GroupDemand::new(GroupId::new(0), 1)])
+            pool.allocate_request(sequence(1), &[GroupDemand::new(GroupId::new(0), 1)])
                 .unwrap_err(),
             CachePoolError::WriterIdExhausted
         );
@@ -2374,16 +2161,15 @@ mod tests {
     fn late_failure_rolls_back_planned_holes_in_an_existing_parent() {
         let mut pool = CachePool::new(2, &[nz(3), nz(1)]).unwrap();
         let seed = pool
-            .reserve_request(sequence(1), &[GroupDemand::new(GroupId::new(0), 1)])
+            .allocate_request(sequence(1), &[GroupDemand::new(GroupId::new(0), 1)])
             .unwrap();
-        let seed = pool.promote_request(seed);
         pool.parents[1].next_generation = u64::MAX;
         let before_parents = pool.parents.clone();
         let before_free = pool.free_parents.clone();
         let before_partial = pool.partial_parents.clone();
 
         let error = pool
-            .reserve_request(
+            .allocate_request(
                 sequence(2),
                 &[
                     GroupDemand::new(GroupId::new(0), 1),
@@ -2406,18 +2192,16 @@ mod tests {
     fn same_slot_reuse_bumps_generation_while_its_parent_stays_bound() {
         let mut pool = CachePool::new(1, &[nz(2)]).unwrap();
         let first = pool
-            .reserve_request(sequence(1), &[GroupDemand::new(GroupId::new(0), 1)])
+            .allocate_request(sequence(1), &[GroupDemand::new(GroupId::new(0), 1)])
             .unwrap();
-        let first = pool.promote_request(first);
         let stale = first.groups()[0].pages()[0].handle();
         let sibling = pool
-            .reserve_request(sequence(2), &[GroupDemand::new(GroupId::new(0), 1)])
+            .allocate_request(sequence(2), &[GroupDemand::new(GroupId::new(0), 1)])
             .unwrap();
-        let sibling = pool.promote_request(sibling);
         pool.retire_request(first).unwrap();
 
         let replacement = pool
-            .reserve_request(sequence(3), &[GroupDemand::new(GroupId::new(0), 1)])
+            .allocate_request(sequence(3), &[GroupDemand::new(GroupId::new(0), 1)])
             .unwrap();
         let fresh = replacement.groups()[0].pages()[0].handle();
         assert_eq!(fresh.parent(), stale.parent());
@@ -2427,48 +2211,40 @@ mod tests {
             pool.physical_address(stale).unwrap_err(),
             CachePoolError::StaleHandle
         );
-        pool.abort_request(replacement);
+        pool.retire_request(replacement).unwrap();
         pool.retire_request(sibling).unwrap();
     }
 
     #[test]
-    fn interleaved_pending_allocations_share_a_parent_in_either_finish_order() {
+    fn two_requests_share_a_parent_until_both_retire_in_either_order() {
         let mut pool = CachePool::new(1, &[nz(2)]).unwrap();
-        let first = pool
-            .reserve_request(sequence(1), &[GroupDemand::new(GroupId::new(0), 1)])
-            .unwrap();
-        let second = pool
-            .reserve_request(sequence(2), &[GroupDemand::new(GroupId::new(0), 1)])
-            .unwrap();
-        assert_eq!(
-            first.groups()[0].pages()[0].handle().parent(),
-            second.groups()[0].pages()[0].handle().parent()
-        );
-        pool.abort_request(first);
-        let second = pool.promote_request(second);
-        pool.retire_request(second).unwrap();
-        assert_eq!(pool.free_parent_count(), 1);
-
-        let first = pool
-            .reserve_request(sequence(3), &[GroupDemand::new(GroupId::new(0), 1)])
-            .unwrap();
-        let second = pool
-            .reserve_request(sequence(4), &[GroupDemand::new(GroupId::new(0), 1)])
-            .unwrap();
-        let first = pool.promote_request(first);
-        pool.abort_request(second);
-        pool.retire_request(first).unwrap();
-        assert_eq!(pool.free_parent_count(), 1);
-        assert!(pool.partial_parents.is_empty());
+        let demand = [GroupDemand::new(GroupId::new(0), 1)];
+        for reverse in [false, true] {
+            let first = pool.allocate_request(sequence(1), &demand).unwrap();
+            let second = pool.allocate_request(sequence(2), &demand).unwrap();
+            assert_eq!(
+                first.groups()[0].pages()[0].handle().parent(),
+                second.groups()[0].pages()[0].handle().parent()
+            );
+            let [earlier, later] = if reverse {
+                [second, first]
+            } else {
+                [first, second]
+            };
+            pool.retire_request(earlier).unwrap();
+            assert_eq!(pool.free_parent_count(), 0);
+            pool.retire_request(later).unwrap();
+            assert_eq!(pool.free_parent_count(), 1);
+            assert!(pool.partial_parents.is_empty());
+        }
     }
 
     #[test]
     fn forged_duplicate_retirement_is_rejected_without_consuming_the_token() {
         let mut pool = CachePool::new(1, &[nz(1)]).unwrap();
-        let pending = pool
-            .reserve_request(sequence(1), &[GroupDemand::new(GroupId::new(0), 1)])
+        let mut request = pool
+            .allocate_request(sequence(1), &[GroupDemand::new(GroupId::new(0), 1)])
             .unwrap();
-        let mut request = pool.promote_request(pending);
         let handle = request.groups[0].pages[0].handle;
         request.groups[0].pages.push(PageRef {
             handle,
@@ -2492,17 +2268,14 @@ mod tests {
     #[test]
     fn idle_validation_keeps_ownership_errors_ahead_of_active_leases() {
         let mut pool = CachePool::new(3, &[nz(1)]).unwrap();
-        let first = pool
-            .reserve_request(sequence(1), &[GroupDemand::new(GroupId::new(0), 2)])
+        let mut first = pool
+            .allocate_request(sequence(1), &[GroupDemand::new(GroupId::new(0), 2)])
             .unwrap();
-        let mut first = pool.promote_request(first);
         let second = pool
-            .reserve_request(sequence(2), &[GroupDemand::new(GroupId::new(0), 1)])
+            .allocate_request(sequence(2), &[GroupDemand::new(GroupId::new(0), 1)])
             .unwrap();
-        let second = pool.promote_request(second);
         let claims = vec![first.access_claim(&first.groups[0].pages[0])];
-        let prepared = pool.prepare_writer_access(claims).unwrap();
-        let lease = pool.acquire_writer_access(prepared).unwrap();
+        let lease = pool.acquire_writer_access(claims).unwrap();
         let original = first.groups[0].pages[1].handle;
         first.groups[0].pages[1].handle = second.groups[0].pages[0].handle;
         let demands = [GroupDemand::new(GroupId::new(0), 2)];
@@ -2525,10 +2298,9 @@ mod tests {
     #[test]
     fn duplicate_validation_uses_preallocated_scratch_for_forged_excess_pages() {
         let mut pool = CachePool::new(1, &[nz(1)]).unwrap();
-        let request = pool
-            .reserve_request(sequence(1), &[GroupDemand::new(GroupId::new(0), 1)])
+        let mut request = pool
+            .allocate_request(sequence(1), &[GroupDemand::new(GroupId::new(0), 1)])
             .unwrap();
-        let mut request = pool.promote_request(request);
         let capacity = pool.validation_handles.lock().unwrap().capacity();
         let handle = request.groups[0].pages[0].handle;
         for _ in 0..=capacity {
@@ -2550,10 +2322,9 @@ mod tests {
     fn failed_retirement_returns_the_unchanged_request_token() {
         let mut owner_pool = CachePool::new(1, &[nz(1)]).unwrap();
         let mut foreign_pool = CachePool::new(1, &[nz(1)]).unwrap();
-        let pending = owner_pool
-            .reserve_request(sequence(1), &[GroupDemand::new(GroupId::new(0), 1)])
+        let request = owner_pool
+            .allocate_request(sequence(1), &[GroupDemand::new(GroupId::new(0), 1)])
             .unwrap();
-        let request = owner_pool.promote_request(pending);
         let expected = request_handles(&request);
         let failure = foreign_pool.retire_request(request).unwrap_err();
         assert_eq!(failure.error, CachePoolError::ForeignPool);
@@ -2565,10 +2336,10 @@ mod tests {
     fn stale_foreign_and_wrong_group_handles_are_rejected() {
         let mut pool = CachePool::new(1, &[nz(1), nz(1)]).unwrap();
         let foreign = CachePool::new(1, &[nz(1), nz(1)]).unwrap();
-        let pending = pool
-            .reserve_request(sequence(1), &[GroupDemand::new(GroupId::new(0), 1)])
+        let request = pool
+            .allocate_request(sequence(1), &[GroupDemand::new(GroupId::new(0), 1)])
             .unwrap();
-        let live = pending.groups()[0].pages()[0].handle();
+        let live = request.groups()[0].pages()[0].handle();
 
         let mut foreign_handle = live;
         foreign_handle.pool_id = foreign.id();
@@ -2590,23 +2361,23 @@ mod tests {
                 bound_group: GroupId::new(0),
             }
         );
-        pool.abort_request(pending);
+        pool.retire_request(request).unwrap();
 
         let replacement = pool
-            .reserve_request(sequence(2), &[GroupDemand::new(GroupId::new(0), 1)])
+            .allocate_request(sequence(2), &[GroupDemand::new(GroupId::new(0), 1)])
             .unwrap();
         assert_eq!(
             pool.physical_address(live).unwrap_err(),
             CachePoolError::StaleHandle
         );
-        pool.abort_request(replacement);
+        pool.retire_request(replacement).unwrap();
     }
 
     #[test]
     fn zero_block_demands_still_preserve_output_order() {
         let mut pool = CachePool::new(1, &[nz(1), nz(2)]).unwrap();
-        let pending = pool
-            .reserve_request(
+        let request = pool
+            .allocate_request(
                 sequence(1),
                 &[
                     GroupDemand::new(GroupId::new(1), 0),
@@ -2614,45 +2385,28 @@ mod tests {
                 ],
             )
             .unwrap();
-        assert_eq!(pending.groups().len(), 2);
-        assert_eq!(pending.groups()[0].group(), GroupId::new(1));
-        assert_eq!(pending.groups()[1].group(), GroupId::new(0));
-        assert!(pending.is_empty());
-        pool.abort_request(pending);
-        assert_eq!(pool.free_parent_count(), 1);
-    }
-
-    #[test]
-    fn pending_request_pages_are_not_writer_accessible_before_promotion() {
-        let mut pool = CachePool::new(1, &[nz(1)]).unwrap();
-        let pending = pool
-            .reserve_request(sequence(9), &[GroupDemand::new(GroupId::new(0), 1)])
-            .unwrap();
-        let page = &pending.groups()[0].pages()[0];
-        let claim = PageAccessClaim {
-            pool_id: pool.id(),
-            writer: pending.writer,
-            handle: page.handle(),
-            write: true,
-        };
-        assert_eq!(
-            pool.prepare_writer_access(vec![claim]).unwrap_err(),
-            CachePoolError::PageNotWritable
+        assert_eq!(request.groups().len(), 2);
+        assert_eq!(request.groups()[0].group(), GroupId::new(1));
+        assert_eq!(request.groups()[1].group(), GroupId::new(0));
+        assert!(
+            request
+                .groups()
+                .iter()
+                .all(|group| group.pages().is_empty())
         );
-        pool.abort_request(pending);
+        pool.retire_request(request).unwrap();
+        assert_eq!(pool.free_parent_count(), 1);
     }
 
     #[test]
     fn duplicate_sequence_id_cannot_substitute_request_writer() {
         let mut pool = CachePool::new(2, &[nz(1), nz(1)]).unwrap();
         let first = pool
-            .reserve_request(sequence(1), &[GroupDemand::new(GroupId::new(0), 1)])
+            .allocate_request(sequence(1), &[GroupDemand::new(GroupId::new(0), 1)])
             .unwrap();
-        let first = pool.promote_request(first);
         let second = pool
-            .reserve_request(sequence(1), &[GroupDemand::new(GroupId::new(1), 1)])
+            .allocate_request(sequence(1), &[GroupDemand::new(GroupId::new(1), 1)])
             .unwrap();
-        let second = pool.promote_request(second);
         assert_eq!(first.sequence(), second.sequence());
         assert_ne!(first.writer, second.writer);
         let claims = vec![
@@ -2660,7 +2414,7 @@ mod tests {
             first.access_claim(&second.groups()[0].pages()[0]),
         ];
         assert_eq!(
-            pool.prepare_writer_access(claims).unwrap_err(),
+            pool.acquire_writer_access(claims).unwrap_err(),
             CachePoolError::WrongWriter
         );
         for handle in request_handles(&first)
@@ -2677,23 +2431,20 @@ mod tests {
     #[test]
     fn duplicate_and_competing_writer_leases_are_rejected_atomically() {
         let mut pool = CachePool::new(1, &[nz(2)]).unwrap();
-        let pending = pool
-            .reserve_request(sequence(1), &[GroupDemand::new(GroupId::new(0), 2)])
+        let request = pool
+            .allocate_request(sequence(1), &[GroupDemand::new(GroupId::new(0), 2)])
             .unwrap();
-        let request = pool.promote_request(pending);
         let first_claim = request.access_claim(&request.groups()[0].pages()[0]);
         assert_eq!(
-            pool.prepare_writer_access(vec![first_claim, first_claim])
+            pool.acquire_writer_access(vec![first_claim, first_claim])
                 .unwrap_err(),
             CachePoolError::DuplicateAccessClaim
         );
 
-        let first = pool
-            .acquire_writer_access(pool.prepare_writer_access(vec![first_claim]).unwrap())
-            .unwrap();
+        let first = pool.acquire_writer_access(vec![first_claim]).unwrap();
         let all = writer_claims(&request);
         assert_eq!(
-            pool.prepare_writer_access(all).unwrap_err(),
+            pool.acquire_writer_access(all).unwrap_err(),
             CachePoolError::AccessConflict
         );
         let second_handle = request.groups()[0].pages()[1].handle();
@@ -2704,26 +2455,22 @@ mod tests {
     }
 
     #[test]
-    fn prepared_multi_page_acquisition_revalidates_without_partial_leasing() {
+    fn stale_claim_rejects_entire_batch_without_partial_leasing() {
         let mut pool = CachePool::new(2, &[nz(1)]).unwrap();
         let first = pool
-            .reserve_request(sequence(1), &[GroupDemand::new(GroupId::new(0), 1)])
+            .allocate_request(sequence(1), &[GroupDemand::new(GroupId::new(0), 1)])
             .unwrap();
-        let first = pool.promote_request(first);
         let second = pool
-            .reserve_request(sequence(2), &[GroupDemand::new(GroupId::new(0), 1)])
+            .allocate_request(sequence(2), &[GroupDemand::new(GroupId::new(0), 1)])
             .unwrap();
-        let second = pool.promote_request(second);
         let first_handle = first.groups()[0].pages()[0].handle();
-        let prepared = pool
-            .prepare_writer_access(vec![
-                first.access_claim(&first.groups()[0].pages()[0]),
-                second.access_claim(&second.groups()[0].pages()[0]),
-            ])
-            .unwrap();
+        let claims = vec![
+            first.access_claim(&first.groups()[0].pages()[0]),
+            second.access_claim(&second.groups()[0].pages()[0]),
+        ];
         pool.retire_request(second).unwrap();
         assert_eq!(
-            pool.acquire_writer_access(prepared).unwrap_err(),
+            pool.acquire_writer_access(claims).unwrap_err(),
             CachePoolError::StaleHandle
         );
         let slot = pool.validate_live_handle(first_handle).unwrap();
@@ -2732,82 +2479,20 @@ mod tests {
     }
 
     #[test]
-    fn writer_release_advances_epoch_and_epoch_exhaustion_is_non_mutating() {
-        let mut pool = CachePool::new(1, &[nz(2)]).unwrap();
-        let pending = pool
-            .reserve_request(sequence(1), &[GroupDemand::new(GroupId::new(0), 2)])
-            .unwrap();
-        let request = pool.promote_request(pending);
-        let claims = writer_claims(&request);
-        let lease = pool
-            .acquire_writer_access(pool.prepare_writer_access(claims).unwrap())
-            .unwrap();
-        assert_eq!(lease.len(), 2);
-        pool.release_writer_access(lease);
-        let handles = request_handles(&request);
-        assert!(
-            handles
-                .iter()
-                .all(|handle| pool.validate_live_handle(*handle).unwrap().write_epoch == 1)
-        );
-
-        pool.slot_mut(handles[1]).write_epoch = u64::MAX;
-        assert_eq!(
-            pool.prepare_writer_access(writer_claims(&request))
-                .unwrap_err(),
-            CachePoolError::WriteEpochExhausted
-        );
-        assert!(handles.iter().all(|handle| {
-            let slot = pool.validate_live_handle(*handle).unwrap();
-            !slot.writer_lease && slot.reader_leases == 0
-        }));
-        pool.slot_mut(handles[1]).write_epoch = 1;
-        pool.retire_request(request).unwrap();
-    }
-
-    #[test]
-    fn prepared_writer_access_rejects_an_intervening_completed_write() {
-        let mut pool = CachePool::new(1, &[nz(1)]).unwrap();
-        let pending = pool
-            .reserve_request(sequence(1), &[GroupDemand::new(GroupId::new(0), 1)])
-            .unwrap();
-        let request = pool.promote_request(pending);
-        let claim = request.access_claim(&request.groups()[0].pages()[0]);
-        let stale = pool.prepare_writer_access(vec![claim]).unwrap();
-        let newer = pool.prepare_writer_access(vec![claim]).unwrap();
-
-        let newer = pool.acquire_writer_access(newer).unwrap();
-        pool.release_writer_access(newer);
-        assert_eq!(
-            pool.acquire_writer_access(stale).unwrap_err(),
-            CachePoolError::WriteEpochChanged {
-                expected: 0,
-                actual: 1,
-            }
-        );
-        let slot = pool.validate_live_handle(claim.handle).unwrap();
-        assert!(!slot.writer_lease && slot.reader_leases == 0);
-        pool.retire_request(request).unwrap();
-    }
-
-    #[test]
     fn active_writer_lease_is_the_quarantine_lifetime_after_request_retirement() {
         let mut pool = CachePool::new(1, &[nz(1)]).unwrap();
-        let pending = pool
-            .reserve_request(sequence(1), &[GroupDemand::new(GroupId::new(0), 1)])
+        let request = pool
+            .allocate_request(sequence(1), &[GroupDemand::new(GroupId::new(0), 1)])
             .unwrap();
-        let request = pool.promote_request(pending);
         let handle = request.groups()[0].pages()[0].handle();
-        let lease = pool
-            .acquire_writer_access(pool.prepare_writer_access(writer_claims(&request)).unwrap())
-            .unwrap();
+        let lease = pool.acquire_writer_access(writer_claims(&request)).unwrap();
         pool.retire_request(request).unwrap();
         let slot = pool.validate_live_handle(handle).unwrap();
         assert_eq!(slot.request_refs, 0);
         assert!(slot.writer_lease);
         assert_eq!(pool.occupied_block_count(), 1);
         assert_eq!(
-            pool.reserve_request(sequence(2), &[GroupDemand::new(GroupId::new(0), 1)],)
+            pool.allocate_request(sequence(2), &[GroupDemand::new(GroupId::new(0), 1)],)
                 .unwrap_err(),
             CachePoolError::InsufficientCapacity {
                 group: GroupId::new(0),
@@ -2819,10 +2504,10 @@ mod tests {
         pool.release_writer_access(lease);
         assert_eq!(pool.occupied_block_count(), 0);
         let replacement = pool
-            .reserve_request(sequence(2), &[GroupDemand::new(GroupId::new(0), 1)])
+            .allocate_request(sequence(2), &[GroupDemand::new(GroupId::new(0), 1)])
             .unwrap();
         let fresh = replacement.groups()[0].pages()[0].handle();
         assert!(fresh.generation() > handle.generation());
-        pool.abort_request(replacement);
+        pool.retire_request(replacement).unwrap();
     }
 }

@@ -311,9 +311,9 @@ impl PagedKvResources {
                 }
                 key.truncate(result as usize);
                 let demands = self.demands(result);
-                let Ok(pending) = self
+                let Ok(pages) = self
                     .pool
-                    .reserve_request(SequenceId::new(request), &demands)
+                    .allocate_request(SequenceId::new(request), &demands)
                 else {
                     if self.evict_one_prefix()? {
                         self.jobs.push((operation, request, key, None));
@@ -322,7 +322,6 @@ impl PagedKvResources {
                     }
                     continue;
                 };
-                let pages = self.pool.promote_request(pending);
                 let tables = pages
                     .groups()
                     .iter()
@@ -375,10 +374,9 @@ impl PagedKvResources {
                 }
                 keep.push(mask);
             }
-            let pending = self
+            let mut source = self
                 .pool
-                .reserve_request(SequenceId::new(u64::MAX), &self.demands(0))?;
-            let mut source = self.pool.promote_request(pending);
+                .allocate_request(SequenceId::new(u64::MAX), &self.demands(0))?;
             if let Err(error) = self
                 .pool
                 .attach_shared_prefix(&mut source, pages)
@@ -495,10 +493,9 @@ impl PagedKvResources {
         maximum_context: u32,
     ) -> Result<RequestPages, CachePoolError> {
         let demands = self.demands(maximum_context);
-        let pending = self
+        let state = self
             .pool
-            .reserve_request(SequenceId::new(request_id.get()), &demands)?;
-        let state = self.pool.promote_request(pending);
+            .allocate_request(SequenceId::new(request_id.get()), &demands)?;
         if !self.state_demands.is_empty() {
             self.state_resources
                 .insert(request_id.get(), StateResources::new(None));
@@ -648,8 +645,8 @@ impl PagedKvResources {
             // Allocate the private destination before attaching any immutable
             // source pages. Capacity pressure is a cache miss, leaving the
             // request empty and eligible for ordinary fresh prefill.
-            match pool.reserve_request(state.sequence(), &self.state_demands) {
-                Ok(pending) => Some(pool.promote_request(pending)),
+            match pool.allocate_request(state.sequence(), &self.state_demands) {
+                Ok(pages) => Some(pages),
                 Err(CachePoolError::InsufficientCapacity { .. }) => return Ok(0),
                 Err(error) => return Err(error),
             }
@@ -1156,7 +1153,7 @@ impl PagedKvResources {
                     // needs one read pin for the batch, even when hundreds of
                     // rows expose that same history in their device tables.
                     // Keep every write claim so conflicting writers still fail
-                    // prepare_writer_access's transactional duplicate check.
+                    // the pool's transactional duplicate check.
                     if page.is_writable() || shared_reads.insert((slab_id, slotnum)) {
                         claims.push(request.state.access_claim(page));
                     }
@@ -1236,8 +1233,7 @@ impl PagedKvResources {
             groups.push(plan);
         }
 
-        let prepared = self.pool.prepare_writer_access(claims)?;
-        let lease = self.pool.acquire_writer_access(prepared)?;
+        let lease = self.pool.acquire_writer_access(claims)?;
         self.batch_active = true;
         Ok(PagedKvBatch { groups, lease })
     }
@@ -1285,9 +1281,9 @@ impl PagedKvResources {
                 let Some(id) = self.last_snapshot_id.checked_add(1) else {
                     break;
                 };
-                let pending = match self
+                let owner = match self
                     .pool
-                    .reserve_request(request.state.sequence(), &self.state_demands)
+                    .allocate_request(request.state.sequence(), &self.state_demands)
                 {
                     Ok(owner) => owner,
                     // Snapshot caching is optional and cannot evict live work.
@@ -1303,7 +1299,7 @@ impl PagedKvResources {
                     id,
                     prefix_length: prefix_length as u32,
                     history_write_end,
-                    owner: self.pool.promote_request(pending),
+                    owner,
                     ready: false,
                 });
             }
@@ -1512,8 +1508,7 @@ mod tests {
             }
             let owner = r.jobs[0].3.as_mut().unwrap();
             let claim = owner.access_claim(&owner.groups()[0].pages()[0]);
-            let prepared = r.pool.prepare_writer_access(vec![claim]).unwrap();
-            let reader = r.pool.acquire_writer_access(prepared).unwrap();
+            let reader = r.pool.acquire_writer_access(vec![claim]).unwrap();
             // A malformed later mask cannot release the earlier valid group.
             let mut live = Vec::new();
             let mut masks = Vec::new();
@@ -1540,8 +1535,7 @@ mod tests {
                 GroupDemand::new(GroupId::new(1), 0),
             ];
             let sequence = SequenceId::new(2);
-            let pending = r.pool.reserve_request(sequence, &demands).unwrap();
-            let filler = r.pool.promote_request(pending);
+            let filler = r.pool.allocate_request(sequence, &demands).unwrap();
             assert_eq!(r.metrics().occupied_slabs, capacity);
             r.poll_storage(false, |_, _, pages| pages).unwrap();
             assert_eq!(r.jobs.len(), 1);
@@ -1855,8 +1849,7 @@ mod tests {
             .flat_map(|group| group.pages())
             .map(|page| state.access_claim(page))
             .collect();
-        let prepared = resources.pool.prepare_writer_access(claims).unwrap();
-        let lease = resources.pool.acquire_writer_access(prepared).unwrap();
+        let lease = resources.pool.acquire_writer_access(claims).unwrap();
         assert!(!resources.reclaimable(&state));
         assert!(matches!(
             resources.can_ensure_contexts(&[(&state, 1, 2)]),
