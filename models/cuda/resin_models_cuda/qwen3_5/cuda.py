@@ -89,6 +89,16 @@ _CACHE_WORKSPACE_BYTES = 512 * 1024**2
 _GRAPH_WORKSPACE_BYTES = 128 * 1024**2
 
 
+@dataclass(slots=True)
+class _MtpStep:
+    drafts: torch.Tensor
+    targets: torch.Tensor
+    logits: torch.Tensor
+    acceptance: DeviceAcceptance
+    next_draft: torch.Tensor
+    next_hidden: torch.Tensor
+
+
 @dataclass(frozen=True, slots=True)
 class _Feedback(DeviceFeedback):
     """Owned model payload attached to the shared admission generation."""
@@ -355,7 +365,9 @@ class Qwen3_5CudaRunner(CudaRunner):
         # seed. One-draft verification also keeps deferred GDN updates.
         self._drafts: dict[int, int] = {}
         self._draft_hidden: dict[int, torch.Tensor] = {}
-        self._pair_offsets = torch.arange(2, device=self.device)[None]
+        self._verify_offsets = torch.arange(
+            self.speculative_draft_tokens + 1, device=self.device
+        )
         self._window_offsets = torch.arange(3, device=self.device)
         geometry = self.attention_config
         self._pending = (
@@ -547,11 +559,6 @@ class Qwen3_5CudaRunner(CudaRunner):
         target = self.config.full_layer_count
         if not self.speculative_draft_tokens:
             return (GraphAttentionSpec(0, target, 1, 1),)
-        if self._fast_speculation:
-            return (
-                GraphAttentionSpec(0, target, 2, 2),
-                GraphAttentionSpec(2, 1, 2, 2, 1),
-            )
         width = self.speculative_draft_tokens + 1
         return (
             *(
@@ -599,11 +606,15 @@ class Qwen3_5CudaRunner(CudaRunner):
             if self.speculative_draft_tokens
             else 1
         )
-        draft_seed = torch.empty(
-            batch_size,
-            self.config.hidden_size,
-            dtype=torch.bfloat16,
-            device=self.device,
+        draft_seed = (
+            torch.empty(
+                batch_size,
+                self.config.hidden_size,
+                dtype=torch.bfloat16,
+                device=self.device,
+            )
+            if self.speculative_draft_tokens > 1
+            else None
         )
         output_ids = torch.empty(
             (batch_size, output_width), dtype=torch.long, device=self.device
@@ -651,174 +662,39 @@ class Qwen3_5CudaRunner(CudaRunner):
                 phase_timing.mark(0)
             attention.reset()
             self._refresh_graph_attention(attention, positions)
-            draft_columns = [draft_ids]
-            draft_input = draft_ids
-            draft_hidden = draft_seed[:, None]
-            # The prior repair owns the first proposal and its MTP hidden state.
-            # Later proposals write only the current leased span, never P-1.
-            for step in range(1, self.speculative_draft_tokens):
-                draft_position = positions + step - 1
-                draft_hidden = self._mtp_forward(
-                    cache,
-                    draft_input[:, None],
-                    draft_hidden,
-                    draft_position[:, None],
-                    attention_runtime=attention,
-                    max_sequence_length=graph_seq_len,
-                    rope_deltas=rope_deltas,
-                )
-                draft_input = graph_sample(
-                    self._sampler,
-                    self._model.logits(draft_hidden[:, -1]),
-                    sampling,
-                    step + 1,
-                )
-                draft_columns.append(draft_input)
-            drafts = torch.stack(draft_columns, dim=1)
-            if phase_timing is not None:
-                phase_timing.mark(1)
-            verify_ids = torch.cat((token_ids[:, None], drafts), dim=1)
-            verify_positions = positions[:, None] + torch.arange(
-                self.speculative_draft_tokens + 1, device=self.device
-            )
-            previous = (positions - 1).clamp_min(0)
-            pool = self._verification_pool(cache, previous, positions, batch_size)
-            verify_hidden, _, windows = self._target_forward(
-                cache,
-                verify_ids,
-                verify_positions,
-                None,
-                cache.convolution_at(previous),
-                max_sequence_length=graph_seq_len,
-                attention_runtime=attention,
-                rotary_positions=(verify_positions + rope_deltas[:, None])[None].expand(
-                    3, -1, -1
-                ),
-                recurrent_pool=pool,
-            )
-            logits = self._model.logits(verify_hidden)
-            self._graph_logits[shape] = logits
-            targets = self._sampler.sample_block(logits, sampling, start_step=0)
-            acceptance = DeviceAcceptance.from_samples(
-                drafts,
-                targets,
-                positions,
-            )
-            self._graph_acceptance[shape] = acceptance
-            accepted = acceptance.accepted_drafts
-            if phase_timing is not None:
-                phase_timing.mark(2)
-            self._commit_verification(
-                cache, pool, positions, verify_hidden, windows, acceptance
-            )
-            if phase_timing is not None:
-                phase_timing.mark(3)
-            # Only the accepted prefix and correction are readable next step.
-            # Repair all K+1 possible slots with a fixed-shape graph operation.
-            repair_ids = acceptance.tokens
-            repair_positions = positions[:, None] + torch.arange(
-                self.speculative_draft_tokens + 1, device=self.device
-            )
-            repaired_hidden = self._mtp_forward(
-                cache,
-                repair_ids,
-                verify_hidden,
-                repair_positions,
-                attention_runtime=attention,
-                max_sequence_length=graph_seq_len,
-                rope_deltas=rope_deltas,
-            )
-            next_hidden = repaired_hidden.gather(
-                1, accepted[:, None, None].expand(-1, 1, repaired_hidden.shape[-1])
-            ).squeeze(1)
-            self._graph_next_hidden[shape] = next_hidden
-            next_draft = graph_sample(
-                self._sampler,
-                self._model.logits(next_hidden),
-                sampling,
-                self.speculative_draft_tokens + 1,
-            )
-            output_ids[:, : self.speculative_draft_tokens].copy_(drafts)
-            output_ids[:, self.speculative_draft_tokens : -1].copy_(targets)
-            output_ids[:, -1].copy_(next_draft)
-            if phase_timing is not None:
-                phase_timing.mark(4)
 
-        def fast_speculative_launch() -> None:
-            # Verify [anchor, draft] in one target forward, commit the accepted
-            # prefix of GDN/conv state, then draft the next token with MTP.
-            if self._pending is None:
-                raise RuntimeError(
-                    "one-draft verification requires a pending state buffer"
-                )
-            if phase_timing is not None:
-                phase_timing.mark(0)
-            attention.reset()
-            self._refresh_graph_attention(attention, positions)
-            previous = (positions - 1).clamp_min(0)
-            pool = self._verification_pool(cache, previous, positions, batch_size)
-            pair = torch.stack((token_ids, draft_ids), dim=1)
-            pair_positions = positions[:, None] + self._pair_offsets
-            pair_rotary = (pair_positions + rope_deltas[:, None])[None].expand(
-                3, -1, -1
-            )
-            hidden, _, windows = self._target_forward(
-                cache,
-                pair,
-                pair_positions,
-                None,
-                cache.convolution_at(previous),
-                max_sequence_length=graph_seq_len,
-                attention_runtime=attention,
-                rotary_positions=pair_rotary,
-                recurrent_pool=pool,
-            )
-            logits = self._model.logits(hidden)
-            self._graph_logits[shape] = logits
-            targets = self._sampler.sample_block(logits, sampling, start_step=0)
-            acceptance = DeviceAcceptance.from_samples(
-                draft_ids[:, None],
-                targets,
-                positions,
-            )
-            self._graph_acceptance[shape] = acceptance
-            accepted = acceptance.accepted_drafts
-            mtp_inputs = acceptance.tokens
-            if phase_timing is not None:
-                phase_timing.mark(1)
-            self._commit_verification(
-                cache, pool, positions, hidden, windows, acceptance
-            )
-            if phase_timing is not None:
-                phase_timing.mark(2)
-            mtp_hidden = self._mtp_forward(
-                cache,
-                mtp_inputs,
-                hidden,
-                pair_positions,
-                attention_runtime=attention,
-                max_sequence_length=graph_seq_len,
-                rope_deltas=rope_deltas,
-            )
-            mtp_selected = mtp_hidden.gather(
-                1, accepted[:, None, None].expand(-1, 1, mtp_hidden.shape[-1])
-            ).squeeze(1)
-            next_draft = graph_sample(
-                self._sampler, self._model.logits(mtp_selected), sampling, 2
-            )
-            # Keep the verified samples and the next proposal in fixed graph outputs.
-            output_ids[:, 0].copy_(draft_ids)
-            output_ids[:, 1:3].copy_(targets)
-            output_ids[:, 3].copy_(next_draft)
-            if phase_timing is not None:
-                phase_timing.mark(3)
+            def sample(logits, step):
+                if logits.ndim == 3:
+                    return self._sampler.sample_block(logits, sampling, start_step=step)
+                return graph_sample(self._sampler, logits, sampling, step)
 
-        if self._fast_speculation:
-            launch = fast_speculative_launch
-        else:
-            launch = (
-                speculative_launch if self.speculative_draft_tokens else ordinary_launch
+            verify_phase = int(not self._fast_speculation)
+            result = self._mtp_step(
+                cache,
+                token_ids,
+                positions,
+                rope_deltas,
+                draft_ids,
+                draft_seed,
+                sample,
+                timing=phase_timing,
+                verify_phase=verify_phase,
+                attention_runtime=attention,
+                max_sequence_length=graph_seq_len,
             )
+            self._graph_logits[shape] = result.logits
+            self._graph_acceptance[shape] = result.acceptance
+            if not self._fast_speculation:
+                self._graph_next_hidden[shape] = result.next_hidden
+            output_ids[:, : self.speculative_draft_tokens].copy_(result.drafts)
+            output_ids[:, self.speculative_draft_tokens : -1].copy_(result.targets)
+            output_ids[:, -1].copy_(result.next_draft)
+            if phase_timing is not None:
+                phase_timing.mark(verify_phase + 3)
+
+        launch = (
+            speculative_launch if self.speculative_draft_tokens else ordinary_launch
+        )
         inputs = {
             "token_ids": token_ids,
             "positions": positions,
@@ -826,7 +702,7 @@ class Qwen3_5CudaRunner(CudaRunner):
         }
         if self.speculative_draft_tokens:
             inputs["draft_ids"] = draft_ids
-            if not self._fast_speculation:
+            if draft_seed is not None:
                 inputs["draft_hidden"] = draft_seed
         inputs.update(self._cache.graph_device_inputs(cache))
         inputs.update(attention.graph_inputs())
@@ -1305,6 +1181,85 @@ class Qwen3_5CudaRunner(CudaRunner):
         ).squeeze(1)
         cache.store_convolution(commit_positions, convolution, selected)
 
+    def _mtp_step(
+        self,
+        cache,
+        anchors,
+        positions,
+        rope_deltas,
+        first_draft,
+        draft_seed,
+        sample,
+        *,
+        timing,
+        verify_phase,
+        attention_runtime=None,
+        max_sequence_length=None,
+    ) -> _MtpStep:
+        """Verify the proposed block, commit accepted state, and repair MTP for the next step."""
+        execution = dict(
+            attention_runtime=attention_runtime, max_sequence_length=max_sequence_length
+        )
+        if self._fast_speculation:
+            drafts = first_draft[:, None]
+        else:
+            columns = [first_draft]
+            draft, hidden = first_draft, draft_seed[:, None]
+            for step in range(1, self.speculative_draft_tokens):
+                hidden = self._mtp_forward(
+                    cache,
+                    draft[:, None],
+                    hidden,
+                    (positions + step - 1)[:, None],
+                    rope_deltas=rope_deltas,
+                    **execution,
+                )
+                draft = sample(self._model.logits(hidden[:, -1]), step + 1)
+                columns.append(draft)
+            drafts = torch.stack(columns, dim=1)
+        if timing is not None and verify_phase:
+            timing.mark(verify_phase)
+        verify_ids = torch.cat((anchors[:, None], drafts), dim=1)
+        verify_positions = positions[:, None] + self._verify_offsets
+        previous = (positions - 1).clamp_min(0)
+        pool = self._verification_pool(cache, previous, positions, len(positions))
+        hidden, _, windows = self._target_forward(
+            cache,
+            verify_ids,
+            verify_positions,
+            None,
+            cache.convolution_at(previous),
+            rotary_positions=(verify_positions + rope_deltas[:, None])[None].expand(
+                3, -1, -1
+            ),
+            recurrent_pool=pool,
+            **execution,
+        )
+        logits = self._model.logits(hidden)
+        targets = sample(logits, 0)
+        acceptance = DeviceAcceptance.from_samples(drafts, targets, positions)
+        if timing is not None:
+            timing.mark(verify_phase + 1)
+        self._commit_verification(cache, pool, positions, hidden, windows, acceptance)
+        if timing is not None:
+            timing.mark(verify_phase + 2)
+        repaired = self._mtp_forward(
+            cache,
+            acceptance.tokens,
+            hidden,
+            verify_positions,
+            rope_deltas=rope_deltas,
+            **execution,
+        )
+        selected = acceptance.accepted_drafts[:, None, None].expand(
+            -1, 1, repaired.shape[-1]
+        )
+        next_hidden = repaired.gather(1, selected).squeeze(1)
+        next_draft = sample(
+            self._model.logits(next_hidden), self.speculative_draft_tokens + 1
+        )
+        return _MtpStep(drafts, targets, logits, acceptance, next_draft, next_hidden)
+
     def _speculative_decode(
         self,
         plan: BatchPlan,
@@ -1327,78 +1282,29 @@ class Qwen3_5CudaRunner(CudaRunner):
             ],
             device=self.device,
         )
-        drafts = [draft_input]
-        draft_hidden = self._persistent_draft_hidden(sequence_ids, len(sequence_ids))[
-            :, None
-        ]
-        for step in range(1, self.speculative_draft_tokens):
-            draft_position = positions + step - 1
-            draft_hidden = self._mtp_forward(
-                cache,
-                draft_input[:, None],
-                draft_hidden,
-                draft_position[:, None],
-                rope_deltas=rope_deltas,
-            )
-            draft_input = self._sample(
-                self._model.logits(draft_hidden[:, -1]), plan, step + 1
-            )
-            drafts.append(draft_input)
-        draft_ids = torch.stack(drafts, dim=1)
-        if phase_timing is not None:
-            phase_timing.mark(1)
-        verify_ids = torch.cat((anchors[:, None], draft_ids), dim=1)
-        verify_positions = positions[:, None] + torch.arange(
-            self.speculative_draft_tokens + 1, device=self.device
+        draft_seed = (
+            None
+            if self._fast_speculation
+            else self._persistent_draft_hidden(sequence_ids, len(sequence_ids))
         )
-        previous = (positions - 1).clamp_min(0)
-        pool = self._verification_pool(cache, previous, positions, plan.num_sequences)
-        verify_hidden, _, windows = self._target_forward(
+        result = self._mtp_step(
             cache,
-            verify_ids,
-            verify_positions,
-            None,
-            cache.convolution_at(previous),
-            recurrent_pool=pool,
-            rotary_positions=(verify_positions + rope_deltas[:, None])[None].expand(
-                3, -1, -1
-            ),
-        )
-        verify_logits = self._model.logits(verify_hidden)
-        targets = self._sample(verify_logits, plan, 0)
-        acceptance = DeviceAcceptance.from_samples(
-            draft_ids,
-            targets,
+            anchors,
             positions,
+            rope_deltas,
+            draft_input,
+            draft_seed,
+            lambda logits, step: self._sample(logits, plan, step),
+            timing=phase_timing,
+            verify_phase=1,
         )
-        if phase_timing is not None:
-            phase_timing.mark(2)
-        self._commit_verification(
-            cache, pool, positions, verify_hidden, windows, acceptance
-        )
-        if phase_timing is not None:
-            phase_timing.mark(3)
-        accepted = acceptance.accepted_drafts
-        repair_ids = acceptance.tokens
-        repaired_hidden = self._mtp_forward(
-            cache,
-            repair_ids,
-            verify_hidden,
-            verify_positions,
-            rope_deltas=rope_deltas,
-        )
-        next_hidden = repaired_hidden.gather(
-            1, accepted[:, None, None].expand(-1, 1, repaired_hidden.shape[-1])
-        ).squeeze(1)
-        next_drafts = self._sample(
-            self._model.logits(next_hidden), plan, self.speculative_draft_tokens + 1
-        )
+        acceptance = result.acceptance
         if phase_timing is not None:
             phase_timing.mark(4)
         return _Completion(
             self,
             sequence_ids,
-            next_drafts,
+            result.next_draft,
             acceptance.tokens,
             acceptance.counts,
             acceptance.feedback(),
@@ -1406,8 +1312,10 @@ class Qwen3_5CudaRunner(CudaRunner):
             stats=self._speculation,
             device=self.device,
             plan=plan,
-            scores=score_completion(verify_logits, acceptance, plan),
-            next_hidden=next_hidden if self.speculative_draft_tokens > 1 else None,
+            scores=score_completion(result.logits, acceptance, plan),
+            next_hidden=result.next_hidden
+            if self.speculative_draft_tokens > 1
+            else None,
         ).result()
 
     @observe_execution
@@ -1415,18 +1323,19 @@ class Qwen3_5CudaRunner(CudaRunner):
     def forward(self, plan: BatchPlan) -> ForwardOutput:
         self._check_cuda_graphs(plan.phase)
         self._continuation.drain()
+        rows, cache_plan = self._prepare_batch(plan)
+        return forward_paged(self, plan, rows, cache_plan)
+
+    def _prepare_batch(self, plan):
         rows = self._validate_plan(plan)
         lookahead = (
             self.speculative_draft_tokens + self.cache_layout.decode_write_extra_tokens
             if plan.phase == BatchPhase.DECODE
             else 0
         )
-        cache_plan = PagedCachePlan.from_plan(
-            plan,
-            self.cache_layout,
-            decode_lookahead=lookahead,
+        return rows, PagedCachePlan.from_plan(
+            plan, self.cache_layout, decode_lookahead=lookahead
         )
-        return forward_paged(self, plan, rows, cache_plan)
 
     def _eager_forward(self, plan, rows, cache, token_ids, positions):
         if plan.phase == BatchPhase.PREFILL:
@@ -1460,21 +1369,9 @@ class Qwen3_5CudaRunner(CudaRunner):
                     plan, shape, inputs, feedback=feedback
                 )
         self._continuation.drain()
-        self._validate_plan(plan)
-        lookahead = (
-            self.speculative_draft_tokens + self.cache_layout.decode_write_extra_tokens
-        )
-        cache_plan = PagedCachePlan.from_plan(
-            plan,
-            self.cache_layout,
-            decode_lookahead=lookahead,
-        )
+        _, cache_plan = self._prepare_batch(plan)
         with self._cuda_failure, torch.inference_mode():
-            result = self._graph_forward(
-                plan, cache_plan, enqueue=True, feedback=feedback
-            )
-        if result is None and feedback is not None:
-            raise RuntimeError("a device continuation requires a captured graph")
+            result = self._graph_forward(plan, cache_plan, enqueue=True)
         return self.forward(plan) if result is None else result
 
     def release(self, sequence_ids: list[int]) -> None:

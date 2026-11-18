@@ -18,15 +18,12 @@ from resin.backend.cuda.completion import (
 )
 from resin.backend.cuda.failures import GraphInputError
 from resin.backend.cuda.metrics import observe_execution
-from resin.backend.cuda.runner import pad_sampling_inputs
 from resin.backend.cuda.scoring import score_completion
 from resin.backend.cuda.tensor_graphs import CudaGraphTensorRegion, TensorSpec
 from resin.backend.sampling import SAMPLING_OFFSET_STRIDE
 from resin.models.gemma4.config import SLIDING_ATTENTION
 from resin.models.gemma4.plan import (
     PAGE_SIZE,
-    expand_gemma4_decode_batch,
-    gemma4_assistant_context,
 )
 from resin_models_cuda.gemma4.cuda import Gemma4CudaRunner
 from resin_models_cuda.gemma4.edge_checkpoint import (
@@ -203,29 +200,12 @@ class Gemma4EdgeCudaRunner(Gemma4CudaRunner):
 
     def _plan_assistant_attention(self, batch, local, global_, custom_mask=None):
         assert self._assistant is not None
-        for is_local, wrapper, plan in zip(
-            (True, False),
+        return self._plan_page_pair(
             self._assistant_decode_wrappers,
-            (local, global_),
-            strict=True,
-        ):
-            wrapper.plan(
-                plan.kv_indptr,
-                plan.page_indices,
-                plan.last_page_lengths,
-                self._assistant.config.num_attention_heads,
-                self.config.num_key_value_heads
-                if is_local
-                else self.config.num_global_key_value_heads,
-                self.config.head_dim if is_local else self.config.global_head_dim,
-                self.page_size,
-                q_data_type=torch.bfloat16,
-                kv_data_type=self._cache.dtype,
-                o_data_type=torch.bfloat16,
-                sm_scale=1.0,
-                window_left=self.sliding_window - 1 if is_local else -1,
-            )
-        return self._assistant_decode_wrappers
+            local,
+            global_,
+            self._assistant.config.num_attention_heads,
+        )
 
     def _configure_feed_forward_graphs(self):
         hidden = TensorSpec((self.config.hidden_size,))
@@ -269,30 +249,13 @@ class Gemma4EdgeCudaRunner(Gemma4CudaRunner):
             qo_indptr = torch.arange(
                 len(batch.last_token_indices) + 1, dtype=torch.int32, device=self.device
             )
-            for is_local, wrapper, plan in zip(
-                (True, False),
+            self._plan_page_pair(
                 self._compact_prefill_wrappers,
-                (local, global_),
-                strict=True,
-            ):
-                wrapper.plan(
-                    qo_indptr,
-                    plan.kv_indptr,
-                    plan.page_indices,
-                    plan.last_page_lengths,
-                    self.config.num_attention_heads,
-                    self.config.num_key_value_heads
-                    if is_local
-                    else self.config.num_global_key_value_heads,
-                    self.config.head_dim if is_local else self.config.global_head_dim,
-                    self.page_size,
-                    causal=True,
-                    q_data_type=torch.bfloat16,
-                    kv_data_type=self._cache.dtype,
-                    o_data_type=torch.bfloat16,
-                    sm_scale=1.0,
-                    window_left=self.sliding_window - 1 if is_local else -1,
-                )
+                local,
+                global_,
+                self.config.num_attention_heads,
+                queries=(qo_indptr, qo_indptr),
+            )
         return wrappers
 
     def _merge_media_embeddings(self, native, batch, hidden):
@@ -426,23 +389,9 @@ class Gemma4EdgeCudaRunner(Gemma4CudaRunner):
             # Fixed Q1/Q4 no-split schedules are independent of KV CSR. Each
             # graph launch repacks the actual readable view from device data.
             return
-        """Reuse only the last identical host schedule of each graph wrapper.
 
-        FlashInfer 0.7.1's native decode scheduler depends on CSR page counts,
-        not physical page IDs or the fractional last page. Verification also
-        has fixed query indptr. All mutable data is still staged by the normal
-        CudaGraphStep before replay. The plan-object identity invalidates this
-        cache if another owner explicitly re-plans the same wrapper.
-        """
-        if self.speculative_draft_tokens:
-            wrappers = self._graph_spec_attention[shape]
-            stages = (
-                ("assistant_", wrappers[:2], None),
-                ("verify_", wrappers[2:], inputs["verify_qo_indptr"]),
-            )
-        else:
-            stages = (("", self._graph_attention[shape], None),)
-
+        # The FA2 schedule depends on CSR counts and query lengths. Page IDs and
+        # fractional lengths are staged each replay even on a plan-cache hit.
         def host_tuple(values):
             if torch.is_tensor(values) and values.is_cuda:
                 raise ValueError("plan signatures require host CSR metadata")
@@ -461,7 +410,9 @@ class Gemma4EdgeCudaRunner(Gemma4CudaRunner):
             return method(name, values, torch.int32)
 
         try:
-            for prefix, wrappers, queries in stages:
+            for prefix, wrappers, queries in self._graph_attention_stages(
+                shape, inputs
+            ):
                 for local, wrapper in zip((True, False), wrappers, strict=True):
                     name = prefix + ("local" if local else "global")
                     indptr = inputs[f"{name}_kv_indptr"]
@@ -661,18 +612,10 @@ class Gemma4EdgeCudaRunner(Gemma4CudaRunner):
         rows = native.num_sequences
         history_envelope = batch.global_envelope or batch.global_
         local_envelope = batch.local_envelope or batch.local
-        history_width = int(np.diff(history_envelope.kv_indptr).max())
-        local_width = int(np.diff(local_envelope.kv_indptr).max())
-        if local_width > self.local_graph_page_capacity:
-            raise GraphInputError("local page table exceeds CUDA graph shape")
-        shape = self._select_cuda_graph(
-            "decode",
-            match=lambda value: value[0] >= rows and value[1] >= history_width,
-        )
+        shape = self._decode_page_shape(rows, local_envelope, history_envelope)
         if shape is None:
             return None
         graph_rows, graph_history_width = shape
-        padding = graph_rows - rows
         width = self.speculative_draft_tokens + 1
         if feedback is not None:
             if not isinstance(feedback, _EdgeDeviceFeedback):
@@ -685,57 +628,16 @@ class Gemma4EdgeCudaRunner(Gemma4CudaRunner):
                 raise GraphInputError(
                     "Gemma continuation exceeds its guarded cache block"
                 )
-        inputs = {
-            "token_ids": np.pad(batch.token_ids, (0, padding)),
-            "positions": np.pad(batch.positions, (0, padding), constant_values=1),
-        }
+        hidden = None
         if self.speculative_draft_tokens:
-            context = gemma4_assistant_context(
-                batch, local_window_tokens=self.sliding_window
+            hidden = (
+                self._gather_target_hidden(sequence_ids, graph_rows)
+                if feedback is None
+                else feedback.target_hidden
             )
-            verify = expand_gemma4_decode_batch(
-                batch,
-                np.zeros((rows, self.speculative_draft_tokens), dtype=np.int64),
-            )
-            if feedback is None:
-                hidden = self._gather_target_hidden(sequence_ids, graph_rows)
-            else:
-                hidden = feedback.target_hidden
-            inputs.update(
-                target_hidden=hidden,
-                verify_qo_indptr=np.arange(
-                    0, (graph_rows + 1) * width, width, dtype=np.int32
-                ),
-            )
-            for kind, assistant_plan, verify_plan, page_width in (
-                ("local", context.local, verify.local, self.local_graph_page_capacity),
-                ("global", context.global_, verify.global_, graph_history_width),
-            ):
-                inputs.update(
-                    self._spec_graph_page_inputs(
-                        kind,
-                        assistant_plan,
-                        verify_plan,
-                        active_rows=rows,
-                        graph_rows=graph_rows,
-                        page_width=page_width,
-                        query_width=width,
-                    )
-                )
-        else:
-            for kind, plan, page_width in (
-                ("local", batch.local, self.local_graph_page_capacity),
-                ("global", batch.global_, graph_history_width),
-            ):
-                inputs.update(
-                    self._graph_page_inputs(
-                        kind,
-                        plan,
-                        active_rows=rows,
-                        graph_rows=graph_rows,
-                        width=page_width,
-                    )
-                )
+        inputs = self._decode_page_inputs(
+            native, batch, shape, hidden, padding_position=1
+        )
         if self._wide_graph(shape):
             for kind, envelope, page_width in (
                 ("local", local_envelope, self.local_graph_page_capacity),
@@ -753,9 +655,6 @@ class Gemma4EdgeCudaRunner(Gemma4CudaRunner):
                     first[row] = envelope.first_token_positions[row] // PAGE_SIZE
                 inputs[f"envelope_{kind}_page_table"] = table
                 inputs[f"envelope_{kind}_first_pages"] = first
-        inputs.update(
-            pad_sampling_inputs(self._sampler, native, self.config.vocab_size, padding)
-        )
         # Planning is required only for non-wide wrappers. Wide graph schedules
         # were initialized once and consume the exact GPU-generated CSR.
         self._prepare_graph_attention(shape, inputs)
