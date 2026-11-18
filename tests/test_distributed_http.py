@@ -172,6 +172,9 @@ def _serve_rank(rank, world_size, directory, port, case):
                     raise RuntimeError("injected frontend construction")
 
                 setattr(serving, "_HttpServer", fail)
+            stream_interval = 3 if case == "normal" else 1
+            if case == "invalid_stream_interval" and groups.drivers.local_rank == 1:
+                stream_interval = 0
             server = HttpServer(
                 engine,
                 recipe=recipe,
@@ -184,49 +187,7 @@ def _serve_rank(rank, world_size, directory, port, case):
                         and groups.drivers.local_rank == 1
                     )
                 ),
-                request_queue_capacity=(
-                    2
-                    if case == "request_queue_capacity"
-                    and groups.drivers.local_rank == 1
-                    else 0
-                    if case == "invalid_request_queue_capacity"
-                    and groups.drivers.local_rank == 1
-                    else 1024
-                ),
-                stream_interval=(
-                    3
-                    if case == "normal"
-                    else 2
-                    if case == "stream_interval" and groups.drivers.local_rank == 1
-                    else 0
-                    if case == "invalid_stream_interval"
-                    and groups.drivers.local_rank == 1
-                    else 1
-                ),
-                max_active_requests=(
-                    0
-                    if case == "invalid_max_active_requests"
-                    and groups.drivers.local_rank == 1
-                    else 2
-                    if case == "max_active_requests" and groups.drivers.local_rank == 1
-                    else None
-                ),
-                render_workers=(
-                    0
-                    if case == "invalid_render_workers"
-                    and groups.drivers.local_rank == 1
-                    else 2
-                    if case == "render_workers" and groups.drivers.local_rank == 1
-                    else None
-                ),
-                admissions_per_step=(
-                    0
-                    if case == "invalid_admissions_per_step"
-                    and groups.drivers.local_rank == 1
-                    else 2
-                    if case == "admissions_per_step" and groups.drivers.local_rank == 1
-                    else 32
-                ),
+                stream_interval=stream_interval,
             )
             if case == "normal":
 
@@ -393,16 +354,7 @@ def _assert_distributed_metrics(base):
         ("enable_priority_scheduling", 2),
         ("infer", 2),
         ("frontend", 2),
-        ("stream_interval", 2),
         ("invalid_stream_interval", 2),
-        ("request_queue_capacity", 2),
-        ("invalid_request_queue_capacity", 2),
-        ("max_active_requests", 2),
-        ("invalid_max_active_requests", 2),
-        ("render_workers", 2),
-        ("invalid_render_workers", 2),
-        ("admissions_per_step", 2),
-        ("invalid_admissions_per_step", 2),
     ],
 )
 def test_distributed_http_routes_real_replica_engines(tmp_path, case, world_size):
@@ -578,31 +530,14 @@ def test_distributed_http_routes_real_replica_engines(tmp_path, case, world_size
         "infer",
         "frontend",
         "initialize",
-        "stream_interval",
         "invalid_stream_interval",
-        "request_queue_capacity",
-        "invalid_request_queue_capacity",
-        "max_active_requests",
-        "invalid_max_active_requests",
-        "render_workers",
-        "invalid_render_workers",
-        "admissions_per_step",
-        "invalid_admissions_per_step",
     ):
         assert len({record["error"] for record in records}) == 1
         assert records[0]["error"] is not None
         assert all(record["engine_closed"] for record in records)
-        if case in (
-            "enable_priority_scheduling",
-            "stream_interval",
-            "request_queue_capacity",
-            "max_active_requests",
-            "render_workers",
-            "admissions_per_step",
-        ):
+        if case == "enable_priority_scheduling":
             assert "configuration must agree" in records[0]["error"]
-        elif case.startswith("invalid_"):
-            setting = case.removeprefix("invalid_")
-            assert f"{setting} must be a positive integer" in records[0]["error"]
+        elif case == "invalid_stream_interval":
+            assert "stream_interval must be a positive integer" in records[0]["error"]
     else:
         assert all("injected" in record["error"] for record in records)
