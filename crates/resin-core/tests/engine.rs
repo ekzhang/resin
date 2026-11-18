@@ -28,7 +28,7 @@ impl Runner<&'static str> for Model {
         if self.report_checkpoints
             && let Ok(rows) = &output
         {
-            for group in &plan.cache_groups {
+            for group in plan.cache_groups.iter() {
                 if let Some(state) = &group.state {
                     for slot in &state.checkpoint_slots {
                         let row = slot.row as usize;
@@ -1194,13 +1194,13 @@ fn cross_page_continuation_reserves_pages_and_updates_physical_append_addresses(
         .unwrap();
     assert_eq!(plan.context_lengths, [31, 32]);
     let mut altered = plan.clone();
-    altered.cache_groups.clear();
+    altered.batch.cache_groups = Default::default();
     assert!(engine.retain_continuation(&altered));
     let next = engine.continuation_plan().unwrap().unwrap();
     assert_eq!(next.context_lengths, [35, 36]);
     assert!(engine.continuation_plan().unwrap().is_none());
     assert!(std::sync::Arc::ptr_eq(&plan.cohort, &next.cohort));
-    for (old, new) in plan.cache_groups.iter().zip(&next.cache_groups) {
+    for (old, new) in plan.cache_groups.iter().zip(next.cache_groups.iter()) {
         assert!(std::sync::Arc::ptr_eq(&old.blocks, &new.blocks));
         assert_eq!(old.block_indptr, new.block_indptr);
         assert_eq!(old.block_slab_ids, new.block_slab_ids);
@@ -1581,7 +1581,12 @@ fn hybrid_reservation_crosses_history_and_window_pages_without_rotating_state() 
     assert!(engine.retain_continuation(&plan));
     let next = engine.continuation_plan().unwrap().unwrap();
     assert_eq!(next.context_lengths, [130]);
-    for (index, (old, new)) in plan.cache_groups.iter().zip(&next.cache_groups).enumerate() {
+    for (index, (old, new)) in plan
+        .cache_groups
+        .iter()
+        .zip(next.cache_groups.iter())
+        .enumerate()
+    {
         assert_eq!(old.block_indptr, new.block_indptr);
         assert_eq!(old.block_slab_ids, new.block_slab_ids);
         assert_eq!(old.block_slotnums, new.block_slotnums);

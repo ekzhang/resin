@@ -1259,14 +1259,13 @@ impl<P: Clone> EngineCore<P> {
             *context += maximum;
         }
         let contexts = &plan.context_lengths;
-        for (group, layout) in plan.cache_groups.iter_mut().zip(
+        for (group, layout) in Arc::make_mut(&mut plan.cache_groups).iter_mut().zip(
             self.runner_config
                 .cache_layout
                 .as_ref()
                 .expect("continuation keeps resources")
                 .groups(),
         ) {
-            let group = Arc::make_mut(group);
             for (row, &position) in contexts.iter().enumerate() {
                 if layout.is_recurrent() {
                     group.append_block_offsets[row] = 0;
@@ -2437,7 +2436,7 @@ fn build_plan<P: Clone>(
     batch_id: u64,
     requests: &[Request<P>],
     scheduled_rows: &[SequenceStep],
-    kv_groups: Option<&mut Vec<Arc<KvGroupPlan>>>,
+    kv_groups: Option<&mut Vec<KvGroupPlan>>,
 ) -> Result<ExecutionPlan<P>> {
     if requests.len() != scheduled_rows.len() {
         return Err(Error::internal(
@@ -2526,7 +2525,7 @@ fn build_plan<P: Clone>(
 
     // Transfer the already-frozen vectors after every fallible validation and
     // payload clone. The batch keeps the independent lease through execution.
-    let cache_groups = kv_groups.map_or_else(Vec::new, std::mem::take);
+    let cache_groups = kv_groups.map_or_else(Arc::default, |groups| std::mem::take(groups).into());
     Ok(ExecutionPlan {
         batch: BatchPlan {
             cohort: Arc::new(BatchCohort {
@@ -2723,7 +2722,7 @@ mod tests {
             state: managed.cache.as_ref().unwrap(),
         }];
         let mut acquired = resources.acquire(&resource_refs, &rows, 0).unwrap();
-        let groups_ptr = acquired.groups.as_ptr();
+        let append_ids_ptr = acquired.groups[0].append_slab_ids.as_ptr();
         let block_ids_ptr = acquired.groups[0].block_slab_ids.as_ptr();
         let plan = build_plan(
             9,
@@ -2734,7 +2733,10 @@ mod tests {
         .unwrap();
 
         assert!(acquired.groups.is_empty());
-        assert_eq!(plan.cache_groups.as_ptr(), groups_ptr);
+        assert_eq!(
+            plan.cache_groups[0].append_slab_ids.as_ptr(),
+            append_ids_ptr
+        );
         assert_eq!(plan.cache_groups[0].block_slab_ids.as_ptr(), block_ids_ptr);
 
         assert_eq!(plan.token_ids, vec![5, 6]);

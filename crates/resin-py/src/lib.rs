@@ -503,7 +503,7 @@ crate::arrays::array_methods! {
             let cache_groups = cache_groups
                 .unwrap_or_default()
                 .into_iter()
-                .map(|group| group.get().inner.clone())
+                .map(|group| (**group.get()).clone())
                 .collect();
             let sampling_mask = sampling_mask
                 .map(arrays::owned_vec)
@@ -608,7 +608,10 @@ crate::arrays::array_methods! {
         /// contains one block-table row for every sequence in this batch.
         #[getter]
         fn cache_groups(&self, py: Python<'_>) -> PyResult<Py<PyTuple>> {
-            let groups = self.cache_groups.iter().map(|inner| CacheGroupPlan { inner: inner.clone() });
+            let groups = (0..self.cache_groups.len()).map(|index| CacheGroupPlan {
+                groups: self.cache_groups.clone(),
+                index,
+            });
             Ok(PyTuple::new(py, groups)?.unbind())
         }
 
@@ -1768,20 +1771,18 @@ mod tests {
     use super::*;
 
     fn wire_plan(group_index: u32) -> BatchPlan {
-        let group = Arc::new(
-            resin_core::resources::kv::KvGroupPlan::new(
-                group_index,
-                vec![0, 1],
-                vec![7],
-                vec![0],
-                vec![0],
-                vec![7, 7],
-                vec![0, 0],
-                vec![0, 1],
-                NonZeroU32::new(1).unwrap(),
-            )
-            .unwrap(),
-        );
+        let group = resin_core::resources::kv::KvGroupPlan::new(
+            group_index,
+            vec![0, 1],
+            vec![7],
+            vec![0],
+            vec![0],
+            vec![7, 7],
+            vec![0, 0],
+            vec![0, 1],
+            NonZeroU32::new(1).unwrap(),
+        )
+        .unwrap();
         BatchPlan {
             batch: NativeBatchPlan {
                 cohort: Arc::new(BatchCohort {
@@ -1801,7 +1802,7 @@ mod tests {
                 context_lengths: vec![0],
                 token_ids: vec![1, 2],
                 batch_id: 1,
-                cache_groups: vec![group],
+                cache_groups: Arc::new([group]),
             },
             payloads: Arc::new(vec![RequestPayload {
                 sampling_params: SamplingParams {
@@ -1876,7 +1877,7 @@ mod tests {
                     0 => Arc::make_mut(&mut plan.cohort).token_indptr[0] = 1,
                     1 => Arc::make_mut(&mut plan.cohort).prefill_lengths[0] = 1,
                     _ => {
-                        let group = Arc::make_mut(&mut plan.cache_groups[0]);
+                        let group = &mut Arc::make_mut(&mut plan.cache_groups)[0];
                         match case {
                             2 => group.blocks_per_slab = 0,
                             3 => Arc::make_mut(&mut group.blocks).block_indptr[1] = 0,

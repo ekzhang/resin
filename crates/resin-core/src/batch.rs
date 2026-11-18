@@ -46,7 +46,7 @@ pub struct BatchPlan {
     pub batch_id: u64,
     pub context_lengths: Vec<u32>,
     pub token_ids: Vec<u32>,
-    pub cache_groups: Vec<Arc<KvGroupPlan>>,
+    pub cache_groups: Arc<[KvGroupPlan]>,
 }
 
 /// Numerical columns that are fixed for the life of a decode cohort.
@@ -79,7 +79,7 @@ impl std::ops::Deref for BatchPlan {
 
 const PLAN_WIRE_MAGIC: &[u8; 8] = b"RSNPLAN\0";
 // Private same-build protocol. Bump when the archived schema or format changes.
-const PLAN_WIRE_VERSION: u32 = 3;
+const PLAN_WIRE_VERSION: u32 = 2;
 const PLAN_WIRE_HEADER: usize = 20;
 
 impl BatchPlan {

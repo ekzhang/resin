@@ -8,6 +8,7 @@ from resin import (
     BatchPhase,
     BatchPlan,
     CacheGroupLayout,
+    CacheGroupPlan,
     CacheLayout,
     Engine,
     RunnerConfig,
@@ -67,6 +68,36 @@ def test_prefill_lengths_are_owned_readonly_views_with_legacy_endpoint_defaults(
         prefill_lengths=[20, 2**32 - 1],
     )
     assert edge.prefill_lengths.tolist() == [20, 2**32 - 1]
+
+
+def test_cache_group_array_views_outlive_the_plan_and_group():
+    plan = BatchPlan(
+        sequence_ids=[1],
+        context_lengths=[0],
+        token_ids=[10],
+        token_indptr=[0, 1],
+        cache_groups=[
+            CacheGroupPlan(
+                group_index=index,
+                block_indptr=[0, 1],
+                block_slab_ids=[slab],
+                block_slotnums=[0],
+                block_table_start_indices=[0],
+                append_slab_ids=[slab],
+                append_slotnums=[0],
+                append_block_offsets=[0],
+            )
+            for index, slab in enumerate((3, 7))
+        ],
+    )
+    group = plan.cache_groups[1]
+    history = group.block_slab_ids
+    append = group.append_slab_ids
+    assert np.shares_memory(history, plan.cache_groups[1].block_slab_ids)
+    assert np.shares_memory(append, plan.cache_groups[1].append_slab_ids)
+    del plan, group
+    assert not history.flags.writeable and not append.flags.writeable
+    assert history.tolist() == append.tolist() == [7]
 
 
 def test_native_plans_keep_full_prefill_lengths_through_chunks():
