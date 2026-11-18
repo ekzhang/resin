@@ -4,7 +4,6 @@ use std::{
     sync::{
         Arc, Mutex,
         atomic::{AtomicBool, Ordering},
-        mpsc as std_mpsc,
     },
     thread,
     time::{Duration, Instant},
@@ -19,7 +18,7 @@ use resin_http::{GenerationJob, MetricsEndpoint, RouteConfig, TokenCounter};
 use tokio::sync::{mpsc, oneshot, watch};
 
 use crate::Engine;
-use crate::http_session::{RenderedJob, Session, count_tokens, render_job};
+use crate::http_session::{Session, count_tokens, render_pool, render_worker_count};
 
 #[derive(Clone, Copy)]
 pub(crate) struct AdmissionConfig {
@@ -103,14 +102,7 @@ impl NativeHttpServer {
                 "admissions_per_step must be positive",
             ));
         }
-        let render_workers = render_workers.map_or_else(
-            || {
-                thread::available_parallelism()
-                    .map_or(1, usize::from)
-                    .min(16)
-            },
-            |value| value as usize,
-        );
+        let render_workers = render_worker_count(render_workers);
         let max_active_requests = max_active_requests.map_or_else(
             || {
                 Python::attach(|py| {
@@ -289,13 +281,7 @@ fn run_server(
     let listener = runtime
         .block_on(tokio::net::TcpListener::bind(address))
         .map_err(|error| format!("failed to bind {address}: {error}"))?;
-    let renders = Arc::new(
-        rayon::ThreadPoolBuilder::new()
-            .num_threads(admission.render_workers)
-            .thread_name(|worker| format!("resin-render-{worker}"))
-            .build()
-            .map_err(|error| format!("failed to create render pool: {error}"))?,
-    );
+    let renders = render_pool(admission.render_workers)?;
     let counter: TokenCounter = {
         let renders = renders.clone();
         let recipe = Python::attach(|py| recipe.clone_ref(py));
@@ -383,28 +369,6 @@ fn run_server(
         .and(actor_result)
 }
 
-fn schedule_render(
-    pool: &ThreadPool,
-    recipe: &Py<PyAny>,
-    job: GenerationJob,
-    completed: &std_mpsc::Sender<(GenerationJob, RenderedJob)>,
-    shutdown: &watch::Receiver<bool>,
-) {
-    let recipe = Python::attach(|py| recipe.clone_ref(py));
-    let completed = completed.clone();
-    let shutdown = shutdown.clone();
-    pool.spawn_fifo(move || {
-        let rendered = catch_unwind(AssertUnwindSafe(|| {
-            if *shutdown.borrow() || job.events.is_closed() {
-                return Err(PyRuntimeError::new_err("prompt rendering was cancelled"));
-            }
-            render_job(&recipe, &job.request)
-        }))
-        .unwrap_or_else(|_| Err(PyRuntimeError::new_err("prompt rendering panicked")));
-        let _ = completed.send((job, rendered));
-    });
-}
-
 #[allow(clippy::too_many_arguments)]
 fn engine_actor(
     engine: Py<Engine>,
@@ -417,12 +381,11 @@ fn engine_actor(
     metrics: Option<MetricsEndpoint>,
     model: &str,
 ) -> Result<(), String> {
-    let mut session =
-        Python::attach(|py| Session::new(py, engine.clone_ref(py), recipe, stream_interval))
-            .map_err(|error| format_python_error("HTTP session preparation failed", error))?;
+    let mut session = Python::attach(|py| {
+        Session::new(py, engine.clone_ref(py), recipe, stream_interval, renders)
+    })
+    .map_err(|error| format_python_error("HTTP session preparation failed", error))?;
     session.metrics = metrics.clone();
-    let (completed, rendered_queue) = std_mpsc::channel();
-    let mut rendering = 0usize;
     let mut next_metrics = Instant::now();
     let mut disconnected = false;
     loop {
@@ -447,29 +410,19 @@ fn engine_actor(
         loop {
             if disconnected
                 || *shutdown.borrow()
-                || session.active_count() + rendering >= admission.max_active_requests
+                || session.admitted_count() >= admission.max_active_requests
             {
                 break;
             }
             match jobs.try_recv() {
-                Ok(job) => {
-                    rendering += 1;
-                    schedule_render(&renders, session.recipe(), job, &completed, &shutdown);
-                }
+                Ok(job) => session
+                    .schedule(job)
+                    .map_err(|error| format_python_error("HTTP scheduling failed", error))?,
                 Err(mpsc::error::TryRecvError::Empty) => break,
                 Err(mpsc::error::TryRecvError::Disconnected) => {
                     disconnected = true;
                     break;
                 }
-            }
-        }
-        for _ in 0..admission.admissions_per_step {
-            match rendered_queue.try_recv() {
-                Ok((job, rendered)) => {
-                    rendering -= 1;
-                    session.admit_rendered(&job.request, job.events, job.enqueued_at, rendered);
-                }
-                Err(_) => break,
             }
         }
         if disconnected || *shutdown.borrow() {
@@ -481,8 +434,10 @@ fn engine_actor(
             })?;
             return Ok(());
         }
+        session.admit_ready(admission.admissions_per_step);
         session.cancel_disconnected()?;
-        if session.active_count() == 0 && !engine_has_work(&engine)? {
+        if session.active_count() == 0 && !Python::attach(|py| engine.bind(py).borrow().has_work())
+        {
             // Rendering requests arrive through the worker queue.
             thread::sleep(Duration::from_millis(1));
             continue;
@@ -506,10 +461,6 @@ fn engine_actor(
         }
         session.process(token_events)?;
     }
-}
-
-fn engine_has_work(engine: &Py<Engine>) -> Result<bool, String> {
-    Ok(Python::attach(|py| engine.bind(py).borrow().has_work()))
 }
 
 fn format_python_error(context: &str, error: PyErr) -> String {

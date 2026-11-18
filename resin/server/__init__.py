@@ -42,11 +42,11 @@ class HttpServer:
       `render_workers` For distributed engines, the total cap scales with the
       number of attention-DP replicas.
 
-    - `render_workers` sets the number of threads rendering prompts and media.
-      Defaults to available CPU parallelism, capped at 16.
+    - `render_workers` sets the number of threads rendering prompts and media
+      per replica. Defaults to available CPU parallelism, capped at 16.
 
-    - `admissions_per_step` limits how many requests are admitted between
-      inference steps.
+    - `admissions_per_step` limits how many rendered requests each replica
+      submits between inference steps.
     """
 
     def __init__(
@@ -153,7 +153,12 @@ class HttpServer:
             from resin.server.distributed import DistributedHttpCoordinator
 
             self._coordinator = DistributedHttpCoordinator(
-                engine, recipe, model=model, stream_interval=stream_interval
+                engine,
+                recipe,
+                model=model,
+                stream_interval=stream_interval,
+                render_workers=render_workers,
+                admissions_per_step=admissions_per_step,
             )
         self._native = None
         error = None

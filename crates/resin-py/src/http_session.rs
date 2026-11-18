@@ -13,11 +13,23 @@ use pyo3::{
     types::{PyDict, PyTuple},
 };
 use pythonize::pythonize;
+use rayon::{ThreadPool, ThreadPoolBuilder};
 use resin_http::{
-    ConversationRequest, EVENT_QUEUE_CAPACITY, FinishReason, GeneratedTokenLogprob, GenerationEvent,
+    ConversationRequest, EVENT_QUEUE_CAPACITY, FinishReason, GeneratedTokenLogprob,
+    GenerationEvent, GenerationJob,
 };
 use resin_recipe::{AttributedEvent, Event as ParsedEvent, FinishReason as ParserFinishReason};
-use std::{collections::HashMap, sync::Mutex, time::Instant};
+use std::{
+    collections::HashMap,
+    panic::{AssertUnwindSafe, catch_unwind},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, Ordering},
+        mpsc as std_mpsc,
+    },
+    thread,
+    time::Instant,
+};
 use tokio::sync::mpsc;
 
 fn into_http(event: ParsedEvent) -> GenerationEvent {
@@ -128,19 +140,14 @@ impl StreamOutput {
             || self.events.len() >= EVENT_QUEUE_CAPACITY / 2
     }
 
-    fn flush(&mut self, sender: &mpsc::Sender<GenerationEvent>) -> bool {
+    fn flush(&mut self, mut send: impl FnMut(GenerationEvent) -> bool) -> bool {
         if self.events.is_empty() && self.scores.is_empty() {
             return true;
         }
         let has_output = self.has_output();
-        let delivered = self
-            .events
-            .drain(..)
-            .all(|event| sender.try_send(event).is_ok())
+        let delivered = self.events.drain(..).all(&mut send)
             && (self.scores.is_empty()
-                || sender
-                    .try_send(GenerationEvent::Logprobs(std::mem::take(&mut self.scores)))
-                    .is_ok());
+                || send(GenerationEvent::Logprobs(std::mem::take(&mut self.scores))));
         self.sent_output |= has_output && delivered;
         self.tokens = 0;
         delivered
@@ -154,7 +161,7 @@ struct ActiveRequest {
     stops: StopFilter,
     scores: Option<OutputScores>,
     prompt_score_ids: Option<Vec<u32>>,
-    events: mpsc::Sender<GenerationEvent>,
+    sender: Option<mpsc::Sender<GenerationEvent>>,
     started: Instant,
     first_token_at: Option<Instant>,
     input_tokens: usize,
@@ -206,12 +213,71 @@ impl ActiveRequest {
     }
 }
 
+type PacketEvents = HashMap<String, Vec<GenerationEvent>>;
+
+fn send_event(
+    sender: Option<&mpsc::Sender<GenerationEvent>>,
+    packet: &mut PacketEvents,
+    id: &str,
+    event: GenerationEvent,
+) -> bool {
+    if let Some(sender) = sender {
+        return sender.try_send(event).is_ok();
+    }
+    let Some(events) = packet.get_mut(id) else {
+        packet.insert(id.to_owned(), vec![event]);
+        return true;
+    };
+    if events.len() < EVENT_QUEUE_CAPACITY {
+        events.push(event);
+        return true;
+    }
+    if events.len() == EVENT_QUEUE_CAPACITY {
+        events.push(GenerationEvent::Error {
+            message: "the inference stream ended before completion".to_owned(),
+        });
+    }
+    false
+}
+
+struct PendingRender {
+    request: ConversationRequest,
+    sender: Option<mpsc::Sender<GenerationEvent>>,
+    enqueued_at: Instant,
+}
+
+pub(crate) fn render_worker_count(requested: Option<u32>) -> usize {
+    requested.map_or_else(
+        || {
+            thread::available_parallelism()
+                .map_or(1, usize::from)
+                .min(16)
+        },
+        |value| value as usize,
+    )
+}
+
+pub(crate) fn render_pool(workers: usize) -> Result<Arc<ThreadPool>, String> {
+    ThreadPoolBuilder::new()
+        .num_threads(workers)
+        .thread_name(|worker| format!("resin-render-{worker}"))
+        .build()
+        .map(Arc::new)
+        .map_err(|error| format!("failed to create render pool: {error}"))
+}
+
 pub(crate) struct Session {
     engine: Py<Engine>,
     recipe: Py<PyAny>,
     stop_token_ids: Vec<u32>,
     vocabulary: Vocabulary,
     active: HashMap<u64, ActiveRequest>,
+    renders: Arc<ThreadPool>,
+    rendering: HashMap<String, Arc<AtomicBool>>,
+    completed: std_mpsc::Sender<(PendingRender, RenderedJob)>,
+    ready: std_mpsc::Receiver<(PendingRender, RenderedJob)>,
+    packet: PacketEvents,
+    released: Vec<String>,
     stream_interval: u32,
     pub(crate) metrics: Option<resin_http::MetricsEndpoint>,
     emit_first_token: bool,
@@ -222,6 +288,7 @@ impl Session {
         engine: Py<Engine>,
         recipe: Py<PyAny>,
         stream_interval: u32,
+        renders: Arc<ThreadPool>,
     ) -> PyResult<Self> {
         if stream_interval == 0 {
             return Err(PyValueError::new_err(
@@ -241,12 +308,19 @@ impl Session {
         } else {
             recipe.bind(py).getattr("stop_token_ids")?.extract()?
         };
+        let (completed, ready) = std_mpsc::channel();
         Ok(Self {
             engine,
             recipe,
             stop_token_ids,
             vocabulary,
             active: HashMap::new(),
+            renders,
+            rendering: HashMap::new(),
+            completed,
+            ready,
+            packet: HashMap::new(),
+            released: Vec::new(),
             stream_interval,
             metrics: None,
             emit_first_token: false,
@@ -255,19 +329,74 @@ impl Session {
     pub fn active_count(&self) -> usize {
         self.active.len()
     }
-    pub fn admit_rendered(
-        &mut self,
-        request: &ConversationRequest,
-        events: mpsc::Sender<GenerationEvent>,
-        enqueued_at: Instant,
-        rendered: RenderedJob,
-    ) {
-        if let Some(metrics) = &self.metrics {
-            metrics.observe_queue_time(enqueued_at.elapsed().as_secs_f64());
+    pub fn admitted_count(&self) -> usize {
+        self.active.len() + self.rendering.len()
+    }
+
+    pub fn schedule(&mut self, job: GenerationJob) -> PyResult<()> {
+        self.enqueue(PendingRender {
+            request: job.request,
+            sender: Some(job.events),
+            enqueued_at: job.enqueued_at,
+        })
+    }
+
+    fn enqueue(&mut self, job: PendingRender) -> PyResult<()> {
+        let id = &job.request.id;
+        if self.rendering.contains_key(id)
+            || (job.sender.is_none() && self.active.values().any(|active| &active.http_id == id))
+        {
+            return Err(PyValueError::new_err("duplicate HTTP request id"));
         }
-        if events.is_closed() {
+        let canceled = Arc::new(AtomicBool::new(false));
+        self.rendering.insert(id.clone(), canceled.clone());
+        let recipe = Python::attach(|py| self.recipe.clone_ref(py));
+        let completed = self.completed.clone();
+        self.renders.spawn_fifo(move || {
+            let rendered = catch_unwind(AssertUnwindSafe(|| {
+                if canceled.load(Ordering::Acquire)
+                    || job.sender.as_ref().is_some_and(mpsc::Sender::is_closed)
+                {
+                    return Err(PyRuntimeError::new_err("prompt rendering was cancelled"));
+                }
+                render_job(&recipe, &job.request)
+            }))
+            .unwrap_or_else(|_| Err(PyRuntimeError::new_err("prompt rendering panicked")));
+            let _ = completed.send((job, rendered));
+        });
+        Ok(())
+    }
+
+    pub fn admit_ready(&mut self, limit: usize) -> usize {
+        let mut ready = 0;
+        while ready < limit
+            && let Ok((job, rendered)) = self.ready.try_recv()
+        {
+            let Some(canceled) = self.rendering.remove(&job.request.id) else {
+                continue;
+            };
+            if canceled.load(Ordering::Acquire) {
+                self.released.push(job.request.id);
+            } else {
+                self.admit_rendered(job, rendered);
+            }
+            ready += 1;
+        }
+        ready
+    }
+
+    fn admit_rendered(&mut self, job: PendingRender, rendered: RenderedJob) {
+        if let Some(metrics) = &self.metrics {
+            metrics.observe_queue_time(job.enqueued_at.elapsed().as_secs_f64());
+        }
+        if job.sender.as_ref().is_some_and(mpsc::Sender::is_closed) {
             return;
         }
+        let PendingRender {
+            request,
+            sender,
+            enqueued_at,
+        } = job;
         let result = Python::attach(|py| {
             let (token_ids, media, parser) = rendered?;
             if token_ids.is_empty() {
@@ -326,7 +455,7 @@ impl Session {
                     stops,
                     scores,
                     prompt_score_ids,
-                    events: events.clone(),
+                    sender: sender.clone(),
                     started: enqueued_at,
                     first_token_at: None,
                     input_tokens,
@@ -337,25 +466,20 @@ impl Session {
                 },
             ))
         });
-        match result {
+        let event = match result {
             Ok((id, active)) => {
-                let _ = events.try_send(GenerationEvent::Started {
-                    input_tokens: active.input_tokens,
-                });
+                let input_tokens = active.input_tokens;
                 self.active.insert(id, active);
+                GenerationEvent::Started { input_tokens }
             }
-            Err(error) => {
-                let _ = events.try_send(GenerationEvent::Error {
-                    message: format_python_error("request admission failed", error),
-                });
-            }
-        }
-    }
-    pub fn recipe(&self) -> &Py<PyAny> {
-        &self.recipe
+            Err(error) => GenerationEvent::Error {
+                message: format_python_error("request admission failed", error),
+            },
+        };
+        send_event(sender.as_ref(), &mut self.packet, &request.id, event);
     }
     pub fn cancel_disconnected(&mut self) -> Result<(), String> {
-        self.cancel_matching(|request| request.events.is_closed())
+        self.cancel_matching(|request| request.sender.as_ref().is_some_and(mpsc::Sender::is_closed))
             .map_err(|error| format_python_error("request cancellation failed", error))
     }
     pub fn process(&mut self, token_events: Vec<TokenEvent>) -> Result<(), String> {
@@ -377,12 +501,11 @@ impl Session {
             let Some(request) = self.active.get_mut(&request_id) else {
                 continue;
             };
-            if !tokens.is_empty() && request.first_token_at.is_none() {
+            let first_token = !tokens.is_empty() && request.first_token_at.is_none();
+            if first_token {
                 request.first_token_at = Some(Instant::now());
                 if let Some(metrics) = &self.metrics {
                     metrics.observe_first_token(request.started.elapsed().as_secs_f64());
-                } else if self.emit_first_token {
-                    let _ = request.events.try_send(GenerationEvent::FirstToken);
                 }
             }
             let mut finished = tokens.is_empty().then_some(CompletionReason::Length);
@@ -459,6 +582,17 @@ impl Session {
                 }
                 Ok(output)
             })();
+            let mut send = |event| {
+                send_event(
+                    request.sender.as_ref(),
+                    &mut self.packet,
+                    &request.http_id,
+                    event,
+                )
+            };
+            if first_token && self.emit_first_token {
+                send(GenerationEvent::FirstToken);
+            }
             let delivered = match parsed {
                 Ok(events) => {
                     request.stream.events = events;
@@ -466,10 +600,10 @@ impl Session {
                     !request
                         .stream
                         .ready(self.stream_interval, finished.is_some())
-                        || request.stream.flush(&request.events)
+                        || request.stream.flush(&mut send)
                 }
                 Err(error) => {
-                    let _ = request.events.try_send(GenerationEvent::Error {
+                    send(GenerationEvent::Error {
                         message: format_python_error("response parser failed", error),
                     });
                     false
@@ -490,9 +624,7 @@ impl Session {
             }
             if let Some(reason) = finished {
                 if let Some(sequence) = request.stops.matched() {
-                    let _ = request
-                        .events
-                        .try_send(GenerationEvent::StopSequence(sequence.to_owned()));
+                    send(GenerationEvent::StopSequence(sequence.to_owned()));
                 }
                 if let Some(prompt_ids) = &request.prompt_score_ids {
                     let scores =
@@ -504,9 +636,7 @@ impl Session {
                                 score.map(|score| self.vocabulary.token(id, score.inner.logprob))
                             })
                             .collect();
-                    let _ = request
-                        .events
-                        .try_send(GenerationEvent::PromptLogprobs(scores));
+                    send(GenerationEvent::PromptLogprobs(scores));
                 }
                 let reason = match reason {
                     CompletionReason::Stop => FinishReason::Stop,
@@ -515,7 +645,7 @@ impl Session {
                 if let Some(metrics) = &self.metrics {
                     metrics.observe_completed(request.started.elapsed().as_secs_f64());
                 }
-                let _ = request.events.try_send(GenerationEvent::Finished {
+                send(GenerationEvent::Finished {
                     reason,
                     input_tokens: request.input_tokens,
                     cached_tokens: request.cached_tokens,
@@ -534,11 +664,28 @@ impl Session {
         Ok(())
     }
     pub fn cancel(&mut self, ids: &[String]) -> PyResult<()> {
+        for id in ids {
+            if let Some(canceled) = self.rendering.get(id) {
+                canceled.store(true, Ordering::Release);
+            }
+            self.packet.remove(id);
+        }
         self.cancel_matching(|request| ids.contains(&request.http_id))
     }
     pub fn close(&mut self) -> PyResult<()> {
-        self.cancel_matching(|_| true)
+        self.cancel_renders();
+        (self.completed, self.ready) = std_mpsc::channel();
+        self.packet.clear();
+        let result = self.cancel_matching(|_| true);
+        self.released.clear();
+        result
     }
+    fn cancel_renders(&mut self) {
+        for (_, canceled) in self.rendering.drain() {
+            canceled.store(true, Ordering::Release);
+        }
+    }
+
     fn cancel_matching(&mut self, matches: impl Fn(&ActiveRequest) -> bool) -> PyResult<()> {
         let ids = self
             .active
@@ -553,12 +700,21 @@ impl Session {
                     .borrow_mut()
                     .cancel(py, request.lease.bind(py).borrow())
             })?;
+            if request.sender.is_none() {
+                self.released.push(request.http_id);
+            }
         }
         Ok(())
     }
 }
+
+impl Drop for Session {
+    fn drop(&mut self) {
+        self.cancel_renders();
+    }
+}
 /// Generation input always includes its response parser.
-pub(crate) type RenderedJob = PyResult<(Vec<u32>, Option<Py<PyTuple>>, Py<PyAny>)>;
+type RenderedJob = PyResult<(Vec<u32>, Option<Py<PyTuple>>, Py<PyAny>)>;
 
 struct RenderInput {
     messages: Vec<Py<Message>>,
@@ -613,7 +769,7 @@ fn render_custom<'py>(
 }
 
 /// Render prompt/media and create its parser off the engine thread.
-pub(crate) fn render_job(recipe: &Py<PyAny>, request: &ConversationRequest) -> RenderedJob {
+fn render_job(recipe: &Py<PyAny>, request: &ConversationRequest) -> RenderedJob {
     Python::attach(|py| {
         let input = render_input(py, recipe, request)?;
         if let Ok(native) = recipe.bind(py).cast::<NativeRecipe>() {
@@ -663,90 +819,76 @@ pub(crate) fn count_tokens(recipe: &Py<PyAny>, request: &ConversationRequest) ->
 /// The same native lifecycle used by the ordinary actor, attached to one DP driver.
 #[pyclass(name = "_HttpSession", module = "resin._resin")]
 pub(crate) struct NativeHttpSession {
-    inner: Mutex<(Session, HashMap<String, mpsc::Receiver<GenerationEvent>>)>,
+    inner: Mutex<Session>,
+    admissions_per_step: usize,
 }
 #[pymethods]
 impl NativeHttpSession {
     #[new]
-    #[pyo3(signature = (engine, recipe: "Recipe", *, stream_interval = 1, emit_first_token = false))]
+    #[pyo3(signature = (engine, recipe: "Recipe", *, stream_interval = 1, emit_first_token = false,
+        render_workers = None, admissions_per_step = 32))]
     fn new(
         py: Python<'_>,
         engine: Py<Engine>,
         recipe: Py<PyAny>,
         stream_interval: u32,
         emit_first_token: bool,
+        render_workers: Option<u32>,
+        admissions_per_step: usize,
     ) -> PyResult<Self> {
-        let mut session = Session::new(py, engine, recipe, stream_interval)?;
+        if render_workers == Some(0) || admissions_per_step == 0 {
+            return Err(PyValueError::new_err(
+                "render and admission limits must be positive",
+            ));
+        }
+        let renders =
+            render_pool(render_worker_count(render_workers)).map_err(PyRuntimeError::new_err)?;
+        let mut session = Session::new(py, engine, recipe, stream_interval, renders)?;
         session.emit_first_token = emit_first_token;
         Ok(Self {
-            inner: Mutex::new((session, HashMap::new())),
+            inner: Mutex::new(session),
+            admissions_per_step,
         })
     }
     #[pyo3(signature = (ingress, *, rank = 0))]
-    fn admit(&self, ingress: &HttpIngress, rank: usize) -> PyResult<()> {
-        let mut inner = self.inner.lock().unwrap_or_else(|error| error.into_inner());
-        let (session, outputs) = &mut *inner;
-        for request in ingress
-            .requests
-            .iter()
+    fn admit(&self, ingress: &mut HttpIngress, rank: usize) -> PyResult<usize> {
+        let mut session = self.inner.lock().unwrap_or_else(|error| error.into_inner());
+        // Each replica owns its decoded ingress. Move large prompt and media
+        // values into the render worker after the coordinator's broadcast.
+        for request in std::mem::take(&mut ingress.requests)
+            .into_iter()
             .filter(|request| request.routed_dp_rank.unwrap_or(0) == rank)
         {
-            if outputs.contains_key(&request.id) {
-                return Err(PyValueError::new_err("duplicate HTTP request id"));
-            }
-            let (events, receiver) = mpsc::channel(EVENT_QUEUE_CAPACITY);
-            outputs.insert(request.id.clone(), receiver);
-            let started = Instant::now();
-            let rendered = render_job(session.recipe(), request);
-            session.admit_rendered(request, events, started, rendered);
+            session.enqueue(PendingRender {
+                request,
+                sender: None,
+                enqueued_at: Instant::now(),
+            })?;
         }
         session.cancel(&ingress.canceled)?;
-        for id in &ingress.canceled {
-            outputs.remove(id);
-        }
-        Ok(())
+        Ok(session.admit_ready(self.admissions_per_step))
     }
     fn process(&self, py: Python<'_>, events: Vec<Py<TokenEvent>>) -> PyResult<HttpEvents> {
         let events = events
             .into_iter()
             .map(|event| event.bind(py).borrow().clone())
             .collect();
-        let mut inner = self.inner.lock().unwrap_or_else(|error| error.into_inner());
-        inner.0.process(events).map_err(PyRuntimeError::new_err)?;
-        let mut output = Vec::new();
-        inner.1.retain(|id, receiver| {
-            let mut finished = false;
-            while let Ok(event) = receiver.try_recv() {
-                finished |= matches!(
-                    event,
-                    GenerationEvent::Finished { .. } | GenerationEvent::Error { .. }
-                );
-                output.push((id.clone(), event));
-            }
-            if !finished && receiver.is_closed() {
-                // A verified block can exceed the bounded per-request queue.
-                // The session cancels that lease; expose the same terminal
-                // failure as an ordinary HTTP receiver reaching EOF.
-                output.push((
-                    id.clone(),
-                    GenerationEvent::Error {
-                        message: "the inference stream ended before completion".to_owned(),
-                    },
-                ));
-                finished = true;
-            }
-            !finished
-        });
+        let mut session = self.inner.lock().unwrap_or_else(|error| error.into_inner());
+        session.process(events).map_err(PyRuntimeError::new_err)?;
         Ok(HttpEvents {
-            events: output,
+            events: std::mem::take(&mut session.packet)
+                .into_iter()
+                .flat_map(|(id, events)| events.into_iter().map(move |event| (id.clone(), event)))
+                .collect(),
+            released: std::mem::take(&mut session.released),
             ..HttpEvents::default()
         })
     }
     fn close(&self) -> PyResult<()> {
-        let mut inner = self.inner.lock().unwrap_or_else(|error| error.into_inner());
-        inner.0.close()?;
-        inner.1.clear();
-        Ok(())
+        self.inner
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .close()
     }
 }
 

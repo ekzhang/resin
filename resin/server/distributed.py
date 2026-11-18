@@ -33,6 +33,8 @@ class DistributedHttpCoordinator:
         recipe: Recipe,
         *,
         stream_interval: int = 1,
+        render_workers: int | None = None,
+        admissions_per_step: int = 32,
         model: str = "resin",
     ):
         self.engine = engine
@@ -53,6 +55,8 @@ class DistributedHttpCoordinator:
                 recipe,
                 stream_interval=stream_interval,
                 emit_first_token=engine.local.metrics_enabled,
+                render_workers=render_workers,
+                admissions_per_step=admissions_per_step,
             )
         except BaseException as exc:
             error = str(exc)

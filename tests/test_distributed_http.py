@@ -97,6 +97,10 @@ class RankRunner:
         self.calls.append(plan is None)
         if plan is None:
             return None
+        if self.case == "blocked_render":
+            time.sleep(0.005)
+            if Path(self.directory, "render-started").exists():
+                Path(self.directory, "inference-progress").touch()
         for row, (start, end) in enumerate(
             zip(plan.token_indptr[:-1], plan.token_indptr[1:], strict=True)
         ):
@@ -145,6 +149,18 @@ def _serve_rank(rank, world_size, directory, port, case):
                 enable_metrics=case in ("normal", "metrics_failure"),
             )
             recipe = RankRecipe(rank, "normal")
+            if case == "blocked_render":
+
+                class BlockingRecipe(RankRecipe):
+                    def render(self, messages, *, tools=(), options=None):
+                        if messages[0].content[0].text == "blocked":
+                            Path(directory, "render-started").touch()
+                            _wait_for_marker(
+                                Path(directory, "release-render"), timeout=20
+                            )
+                        return super().render(messages, tools=tools, options=options)
+
+                recipe = BlockingRecipe(rank, "normal")
             if case == "initialize" and groups.drivers.local_rank == 1:
                 # Native session initialization snapshots an optional tokenizer.
                 class BrokenRecipe(RankRecipe):
@@ -301,6 +317,13 @@ def _wait_ready(base, directory):
     raise AssertionError("distributed HTTP listener did not start")
 
 
+def _wait_for_marker(path, *, timeout=5):
+    deadline = time.monotonic() + timeout
+    while not path.exists():
+        assert time.monotonic() < deadline, f"timed out waiting for {path.name}"
+        time.sleep(0.01)
+
+
 def _metric_rows(text, name):
     return [
         (dict(re.findall(r'(\w+)="([^"]*)"', line)), float(line.rsplit(" ", 1)[1]))
@@ -342,6 +365,7 @@ def _assert_distributed_metrics(base):
     [
         ("counts", 2),
         ("normal", 4),
+        ("blocked_render", 4),
         ("metrics_failure", 4),
         ("fatal", 2),
         ("ingress_decode", 2),
@@ -376,6 +400,7 @@ def test_distributed_http_routes_real_replica_engines(tmp_path, case, world_size
         if case in (
             "counts",
             "normal",
+            "blocked_render",
             "fatal",
             "ingress_decode",
             "ingress_copy",
@@ -399,6 +424,24 @@ def test_distributed_http_routes_real_replica_engines(tmp_path, case, world_size
                 )
                 with urllib.request.urlopen(request, timeout=5) as response:
                     assert json.load(response)["input_tokens"] == 3
+        elif case == "blocked_render":
+            try:
+                with _post(base, 1, stream=True, max_tokens=1000) as active:
+                    while line := active.readline():
+                        if b'"content":"1"' in line:
+                            break
+                    else:
+                        raise AssertionError("the first request never started generating")
+                    with _post(base, 1, content="blocked", stream=True):
+                        _wait_for_marker(tmp_path / "render-started")
+                        _wait_for_marker(tmp_path / "inference-progress")
+                        with _post(base, 0) as response:
+                            assert (
+                                json.load(response)["choices"][0]["message"]["content"]
+                                == "00"
+                            )
+            finally:
+                (tmp_path / "release-render").touch()
         elif case == "fatal":
             with pytest.raises(urllib.error.HTTPError) as failure:
                 _post(base, 1, content="explode")
@@ -495,7 +538,7 @@ def test_distributed_http_routes_real_replica_engines(tmp_path, case, world_size
     if case == "counts":
         assert all(record["error"] is None for record in records)
         assert all(not record["calls"] for record in records)
-    elif case == "normal":
+    elif case in ("normal", "blocked_render"):
         assert all(record["error"] is None for record in records)
         assert all(record["calls"] for record in records)
         assert any(any(record["calls"]) for record in records)
