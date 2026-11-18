@@ -151,6 +151,30 @@ def resolve_decode_graph_shapes(
     return shapes
 
 
+@dataclass(slots=True)
+class CudaGraphResult:
+    """Result buffers allocated by a captured launch.
+
+    A captured region publishes its buffers during warmup and capture. Later
+    regions and replay may write into those buffers. Consumers stage anything
+    retained across replays. Parity checks use the semantic tensor columns.
+    """
+
+    value: Any = None
+    parity: Any = None
+    _sealed: bool = False
+
+    def publish(self, value: Any, *, parity: Any) -> None:
+        if self._sealed:
+            raise RuntimeError("cannot replace a captured CUDA graph result")
+        self.value, self.parity = value, parity
+
+    def seal(self) -> None:
+        if self.parity is None:
+            raise RuntimeError("CUDA graph launch did not publish its result")
+        self._sealed = True
+
+
 @dataclass(frozen=True, slots=True)
 class CudaGraphStep:
     """One fixed-address operation, retained as the simple one-graph API."""
@@ -161,6 +185,7 @@ class CudaGraphStep:
     prepare: Callable[[], None] | None = None
     validate_eager_output: bool = True
     phase_timing: GraphPhaseTiming | None = None
+    resources: Any = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -199,6 +224,7 @@ class CudaGraphProgram:
     prepare: Callable[[], None] | None = None
     validate_eager_output: bool = True
     phase_timing: GraphPhaseTiming | None = None
+    resources: Any = None
 
     def __post_init__(self) -> None:
         regions = tuple(self.regions)
@@ -225,6 +251,7 @@ def _as_program(step: CudaGraphStep | CudaGraphProgram) -> CudaGraphProgram:
             prepare=step.prepare,
             validate_eager_output=step.validate_eager_output,
             phase_timing=step.phase_timing,
+            resources=step.resources,
         )
     raise TypeError("CUDA graph builder must return a step or program")
 
@@ -233,6 +260,14 @@ def _map_output(output, operation):
     if isinstance(output, tuple):
         return tuple(_map_output(value, operation) for value in output)
     return operation(output)
+
+
+def _parity_output(output):
+    if not isinstance(output, CudaGraphResult):
+        return output
+    if output.parity is None:
+        raise RuntimeError("CUDA graph launch did not publish its result")
+    return output.parity
 
 
 def _outputs_equal(left, right) -> bool:
@@ -491,7 +526,8 @@ class _CudaGraphCache:
             self._pending_captures -= 1
         except BaseException as error:
             self._fail("graph capture", error)
-        return entry.program.output
+        output = entry.program.output
+        return output.value if isinstance(output, CudaGraphResult) else output
 
     def run(
         self,
@@ -502,16 +538,8 @@ class _CudaGraphCache:
     ) -> Any:
         """Stage and replay one current batch using a pre-captured graph."""
 
-        self.check()
-        try:
-            entry = self._entries[shape]
-        except KeyError as error:
-            raise ValueError(f"unconfigured CUDA graph shape: {shape}") from error
-        if not entry.captured or entry.program is None or entry.staging is None:
-            raise RuntimeError(
-                f"CUDA graph shape {shape} has not been captured; "
-                "capture configured graphs during runner initialization"
-            )
+        entry = self._ready_entry(shape)
+        assert entry.program is not None and entry.staging is not None
         try:
             entry.staging.copy_into(entry.program.inputs, inputs)
         except StagingError as error:
@@ -535,7 +563,27 @@ class _CudaGraphCache:
             self._fail("graph replay", error)
         entry.replays += 1
         self._replay_count += 1
-        return entry.program.output
+        output = entry.program.output
+        return output.value if isinstance(output, CudaGraphResult) else output
+
+    def program(self, shape: GraphShape) -> CudaGraphProgram:
+        """Return the resources and inputs of a successfully captured program."""
+        program = self._ready_entry(shape).program
+        assert program is not None
+        return program
+
+    def _ready_entry(self, shape: GraphShape) -> _GraphEntry:
+        self.check()
+        try:
+            entry = self._entries[shape]
+        except KeyError as error:
+            raise ValueError(f"unconfigured CUDA graph shape: {shape}") from error
+        if not entry.captured or entry.program is None or entry.staging is None:
+            raise RuntimeError(
+                f"CUDA graph shape {shape} has not been captured; "
+                "capture configured graphs during runner initialization"
+            )
+        return entry
 
     def _capture(self, entry: _GraphEntry, allocation_before: int) -> None:
         program = entry.program
@@ -552,7 +600,9 @@ class _CudaGraphCache:
                 if program.prepare is not None:
                     program.prepare()
                 self._launch(program)
-            expected = _map_output(program.output, lambda tensor: tensor.clone())
+            expected = _map_output(
+                _parity_output(program.output), lambda tensor: tensor.clone()
+            )
         current.wait_stream(warmup)
         entry.warmups = 3
         torch.cuda.synchronize(self.device)
@@ -563,30 +613,35 @@ class _CudaGraphCache:
         with torch.cuda.device(self.device), torch.cuda.stream(warmup):
             if program.prepare is not None:
                 program.prepare()
+            if isinstance(program.output, CudaGraphResult):
+                program.output.value = program.output.parity = None
             graphs = self._capture_regions(entry, warmup)
+            if isinstance(program.output, CudaGraphResult):
+                program.output.seal()
             if program.prepare is not None:
                 program.prepare()
             self._replay(program, graphs)
         current.wait_stream(warmup)
         torch.cuda.synchronize(self.device)
+        actual = _parity_output(program.output)
         if program.validate_eager_output:
-            if not _outputs_equal(expected, program.output):
+            if not _outputs_equal(expected, actual):
                 raise RuntimeError(
                     "CUDA graph replay differs from eager warmup "
-                    f"({_output_difference(expected, program.output)}; "
+                    f"({_output_difference(expected, actual)}; "
                     f"expected: {_output_summary(expected)}; "
-                    f"actual: {_output_summary(program.output)})"
+                    f"actual: {_output_summary(actual)})"
                 )
         else:
-            expected_replay = _map_output(program.output, lambda tensor: tensor.clone())
+            expected_replay = _map_output(actual, lambda tensor: tensor.clone())
             self._replay(program, graphs)
             torch.cuda.synchronize(self.device)
-            if not _outputs_equal(expected_replay, program.output):
+            if not _outputs_equal(expected_replay, actual):
                 raise RuntimeError(
                     "CUDA graph replays are not deterministic "
-                    f"({_output_difference(expected_replay, program.output)}; "
+                    f"({_output_difference(expected_replay, actual)}; "
                     f"expected: {_output_summary(expected_replay)}; "
-                    f"actual: {_output_summary(program.output)})"
+                    f"actual: {_output_summary(actual)})"
                 )
         entry.graphs = graphs
         if program.phase_timing is not None:

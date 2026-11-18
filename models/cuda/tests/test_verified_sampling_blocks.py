@@ -8,6 +8,7 @@ import pytest
 import torch
 
 from resin import BatchPhase, BatchPlan, SamplingParams
+from resin.backend.cuda.completion import CudaContinuation, DeviceAcceptance
 from resin.backend.cuda.sampling import FusedSampler
 from resin.backend.cuda.staging import TensorStager
 from resin.backend.speculative import SpeculativeStats
@@ -55,8 +56,6 @@ def _fixture(runner_type, *, scored=False):
     runner.vocab_size = 10
     runner.config = SimpleNamespace(vocab_size=10, hidden_size=2, num_hidden_layers=1)
     runner._speculation = SpeculativeStats(2)
-    runner._graph_logits = {}
-    runner._graph_acceptance = {}
     runner._eager_phase_timing = lambda *_args: None
     plan = BatchPlan(
         sequence_ids=[7, 8],
@@ -83,8 +82,6 @@ def _inkling_fixture(monkeypatch, runner, logits, drafts, counts, stored):
     )
     runner.parallel_groups = None
     runner.cache_geometry = SimpleNamespace(state_width=4)
-    runner._graph_inputs = {}
-    runner._graph_checkpoint_inputs = {}
     runner._checkpoint_buffers = (
         torch.empty(2, 1, 3, 4, dtype=torch.bfloat16),
         torch.empty(2, 3, 1, 4, dtype=torch.bfloat16),
@@ -191,16 +188,22 @@ def test_eager_verification_routes_scores_and_rolls_back_accepted_state(
     assert runner._sampler.calls == [(2, 3, 10)]
 
 
-def test_deepseek_unscored_graph_harvests_directly_and_rolls_back(monkeypatch):
+@pytest.mark.parametrize("scored", [False, True])
+def test_deepseek_graph_harvest_preserves_scores_and_rollback(monkeypatch, scored):
     from resin.backend.speculative import _accept_speculative_tokens
-    from resin_models_cuda.deepseek_v41 import cuda as runtime
+    from resin_models_cuda import paged_decode
 
-    runner, plan, _logits, drafts, targets = _fixture(DeepSeekV41CudaRunner)
+    runner, plan, logits, drafts, targets = _fixture(
+        DeepSeekV41CudaRunner, scored=scored
+    )
     runner.parallel_groups = None
-    runner._graph_device_caches = {(2, 128): object()}
-    runner._dspark_phase_events = {}
+    runner._captured_cuda_graph = lambda *_args: SimpleNamespace(resources=object())
     runner._cache = SimpleNamespace(graph_plan_inputs=lambda *_args: {})
-    runner._run_cuda_graph = lambda *_args: torch.cat((drafts, targets), dim=1)
+    runner._run_cuda_graph = lambda *_args: (
+        torch.cat((drafts, targets), dim=1),
+        logits,
+        None,
+    )
     processed = []
     runner._model = SimpleNamespace(
         clear_rejected_speculative_state=lambda _positions, counts, *_args, **_kwargs: (
@@ -208,26 +211,40 @@ def test_deepseek_unscored_graph_harvests_directly_and_rolls_back(monkeypatch):
         )
     )
 
-    def forbid_completion(*_args):
-        raise AssertionError("unscored synchronous graph must harvest directly")
-
-    runner._enqueue_graph_output = forbid_completion
-    monkeypatch.setattr(runtime, "pad_sampling_inputs", lambda *_args: {})
-    result = runner._graph_forward(plan, object(), shape=(2, 128))
     expected = _accept_speculative_tokens(drafts.tolist(), targets.tolist())
-    assert result is not None
-    assert result.token_ids.tolist() == sum(expected.token_rows, [])
+    scores = object()
+
+    def score(values, acceptance, native):
+        assert scored, "unscored synchronous graph must harvest directly"
+        assert values is logits and native is plan
+        assert acceptance.counts.tolist() == expected.processed_counts
+        return scores
+
+    def complete(acceptance, **kwargs):
+        assert kwargs["scores"] is scores and kwargs["stats"] is runner._speculation
+        assert kwargs["feedback"] is None
+        return SimpleNamespace(result=lambda: scores)
+
+    monkeypatch.setattr(paged_decode, "pad_sampling_inputs", lambda *_args: {})
+    monkeypatch.setattr(paged_decode, "score_completion", score)
+    monkeypatch.setattr(
+        paged_decode, "DeviceCompletion", SimpleNamespace(from_acceptance=complete)
+    )
+    result = runner._graph_forward(plan, object(), shape=(2, 128))
+    if scored:
+        assert result is scores
+    else:
+        assert result is not None
+        assert result.token_ids.tolist() == sum(expected.token_rows, [])
+        assert runner._speculation.blocks == 2
+        assert runner._speculation.accepted == sum(expected.accepted_counts)
     assert processed == [expected.processed_counts]
-    assert runner._speculation.blocks == 2
-    assert runner._speculation.accepted == sum(expected.accepted_counts)
 
 
 def test_deepseek_graph_verification_samples_and_broadcasts_one_block():
     runner, plan, logits, drafts, targets = _fixture(DeepSeekV41CudaRunner)
     runner.parallel_groups = None
     runner.profile_graph_phases = False
-    runner._graph_device_caches = {}
-    runner._graph_inputs = {}
     runner._cache = SimpleNamespace(
         graph_cache=lambda *_args: object(),
         graph_device_inputs=lambda _cache: {},
@@ -253,8 +270,9 @@ def test_deepseek_graph_verification_samples_and_broadcasts_one_block():
     step.launch()
     assert runner._sampler.calls == [(2, 3, 10)]
     assert broadcasts == [(2, 2), (2, 3)]
-    torch.testing.assert_close(step.output, torch.cat((drafts, targets), dim=1))
-    assert runner._graph_logits[(2, 128)] is logits
+    samples, graph_logits, phase_events = step.output.value
+    torch.testing.assert_close(samples, torch.cat((drafts, targets), dim=1))
+    assert graph_logits is logits and phase_events is None
 
 
 @pytest.mark.parametrize("all_rejected", [False, True])
@@ -264,7 +282,6 @@ def test_inkling2_graph_keeps_target_logits_and_one_device_acceptance(
     runner, plan, logits, drafts, targets = _fixture(Inkling2CudaRunner)
     if all_rejected:
         targets[:, 0].fill_(9)
-    runner._graph_device_caches = {}
     state_positions, state_counts = [], []
     _inkling_fixture(monkeypatch, runner, logits, drafts, state_counts, state_positions)
     shape = (2, 128, 2)
@@ -276,14 +293,16 @@ def test_inkling2_graph_keeps_target_logits_and_one_device_acceptance(
     step.inputs["positions"].copy_(positions)
     step.launch()
 
-    acceptance = runner._graph_acceptance[shape]
+    assert runner._checkpoint_inputs is None
+    runner._run_cuda_graph = lambda *_args: step.output.value
+    acceptance, graph_logits = runner._decode_graph_result(shape, {})
     expected = [1, 1] if all_rejected else [2, 3]
     assert acceptance.counts.tolist() == expected
     assert state_counts[0] == expected
     torch.testing.assert_close(state_positions[0], positions + acceptance.counts - 1)
-    assert runner._graph_logits[shape] is logits
+    assert graph_logits is logits
+    assert runner._checkpoint_inputs is step.output.value[2]
     assert runner._sampler.calls == [(2, 3, 10)]
-    torch.testing.assert_close(step.output, acceptance.tokens)
 
     # Overlapped continuations stage device-owned feedback, whose shapes must
     # agree with the captured buffers without host reshaping.
@@ -293,3 +312,79 @@ def test_inkling2_graph_keeps_target_logits_and_one_device_acceptance(
     )
     torch.testing.assert_close(step.inputs["token_ids"], feedback["token_ids"])
     torch.testing.assert_close(step.inputs["positions"], positions + acceptance.counts)
+
+
+@pytest.mark.parametrize("draft_count", [0, 1, 2])
+def test_qwen_graph_result_preserves_owned_continuation(monkeypatch, draft_count):
+    from resin_models_cuda.qwen3_5 import cuda as runtime
+
+    runner, plan, logits, drafts, targets = _fixture(runtime.Qwen3_5CudaRunner)
+    runner.speculative_draft_tokens = draft_count
+    shape = (2, 128)
+    cache = SimpleNamespace(
+        recurrent_pool=lambda *_: None, store_hidden=lambda *_: None
+    )
+    runner._cache = SimpleNamespace(
+        graph_cache=lambda *_: cache, graph_device_inputs=lambda *_: {}
+    )
+    monkeypatch.setattr(
+        runtime,
+        "GraphPagedAttentionRuntime",
+        lambda *_args, **_kwargs: SimpleNamespace(
+            reset=lambda: None, graph_inputs=lambda: {}
+        ),
+    )
+    runner.attention_config = SimpleNamespace(
+        num_attention_heads=2, num_key_value_heads=1
+    )
+    runner.config.head_dim = 2
+    runner._graph_specs = lambda: ()
+    runner._graph_workspace = object()
+    runner._new_phase_timing = lambda *_: None
+    runner._refresh_graph_attention = lambda *_: None
+    runner._target_forward = lambda *_args, **_kwargs: (logits, None, None)
+    runner._model = SimpleNamespace(logits=lambda *_: logits)
+    monkeypatch.setattr(runtime, "graph_sample", lambda *_: targets[:, 0])
+    raw_next_draft = torch.tensor([7, 8]) if draft_count else None
+    raw_next_hidden = torch.ones(2, 2) if draft_count > 1 else None
+
+    def mtp(_cache, _anchors, positions, *_args, **_kwargs):
+        accepted = DeviceAcceptance.from_samples(
+            drafts[:, :draft_count], targets[:, : draft_count + 1], positions
+        )
+        return runtime._DecodeResult(logits, accepted, raw_next_draft, raw_next_hidden)
+
+    runner._mtp_step = mtp
+    step = runner._new_decode_graph_step(shape)
+    step.inputs["token_ids"].copy_(torch.tensor(plan.token_ids, dtype=torch.int64))
+    step.inputs["positions"].copy_(torch.tensor(plan.positions, dtype=torch.int64))
+    step.launch()
+    graph_result = step.output.value
+    assert graph_result.logits is logits
+    assert graph_result.next_draft is raw_next_draft
+    assert graph_result.next_hidden is raw_next_hidden
+    if raw_next_hidden is not None:
+        assert step.output.parity[-1] is raw_next_hidden
+
+    runner._run_cuda_graph = lambda *_: graph_result
+    runner._captured_cuda_graph = lambda *_: step
+    runner._continuation = CudaContinuation()
+    runner.runner_config = SimpleNamespace(max_accepted_per_step=draft_count + 1)
+    runner.cache_layout = SimpleNamespace(decode_write_extra_tokens=0)
+    monkeypatch.setattr(
+        runtime,
+        "_Completion",
+        lambda *args, **kwargs: SimpleNamespace(feedback=args[-1]),
+    )
+    completion = runner._enqueue_graph_output(plan, shape, {})
+    assert completion.feedback.continuation.sequence_ids == tuple(plan.sequence_ids)
+    torch.testing.assert_close(
+        completion.feedback.positions,
+        step.inputs["positions"] + graph_result.acceptance.counts,
+    )
+    if raw_next_draft is not None:
+        raw_next_draft.zero_()
+        assert completion.feedback.draft_ids.tolist() == [7, 8]
+    if raw_next_hidden is not None:
+        raw_next_hidden.zero_()
+        torch.testing.assert_close(completion.feedback.draft_hidden, torch.ones(2, 2))

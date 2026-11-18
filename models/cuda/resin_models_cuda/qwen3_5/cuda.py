@@ -22,6 +22,7 @@ from resin.backend.cuda.completion import (
 )
 from resin.backend.cuda.graphs import (
     CudaGraphMode,
+    CudaGraphResult,
     CudaGraphStep,
     GraphShape,
     resolve_decode_graph_shapes,
@@ -89,14 +90,20 @@ _CACHE_WORKSPACE_BYTES = 512 * 1024**2
 _GRAPH_WORKSPACE_BYTES = 128 * 1024**2
 
 
-@dataclass(slots=True)
-class _MtpStep:
-    drafts: torch.Tensor
-    targets: torch.Tensor
+@dataclass(frozen=True, slots=True)
+class _DecodeResult:
     logits: torch.Tensor
     acceptance: DeviceAcceptance
-    next_draft: torch.Tensor
-    next_hidden: torch.Tensor
+    next_draft: torch.Tensor | None = None
+    next_hidden: torch.Tensor | None = None
+
+    @property
+    def parity_tensors(self) -> tuple[torch.Tensor, ...]:
+        return self.acceptance.parity_tensors + tuple(
+            tensor
+            for tensor in (self.next_draft, self.next_hidden)
+            if tensor is not None
+        )
 
 
 @dataclass(frozen=True, slots=True)
@@ -290,12 +297,6 @@ class Qwen3_5CudaRunner(CudaRunner):
         self.vocab_size = self.config.vocab_size
         self.eos_token_id = self.config.eos_token_id
         self._speculation = SpeculativeStats(speculative_draft_tokens)
-        self._graph_device_caches: dict[GraphShape, DeviceCache] = {}
-        self._graph_attention: dict[GraphShape, GraphPagedAttentionRuntime] = {}
-        self._graph_acceptance: dict[GraphShape, DeviceAcceptance] = {}
-        self._graph_logits: dict[GraphShape, torch.Tensor] = {}
-        self._feedback_graph_inputs = {}
-        self._graph_next_hidden: dict[GraphShape, torch.Tensor] = {}
         self._continuation = CudaContinuation()
         cache_dtype = self.kv_cache_torch_dtype
 
@@ -569,43 +570,27 @@ class Qwen3_5CudaRunner(CudaRunner):
             GraphAttentionSpec(2, 1, width, width, 1),
         )
 
-    def _graph_attention_for(self, shape: GraphShape) -> GraphPagedAttentionRuntime:
-        runtime = self._graph_attention.get(shape)
-        if runtime is None:
-            cache = self._graph_device_caches.get(shape)
-            if cache is None:
-                cache = self._cache.graph_cache(*shape)
-                self._graph_device_caches[shape] = cache
-            runtime = GraphPagedAttentionRuntime(
-                self.device,
-                cache,
-                self._graph_specs(),
-                num_attention_heads=self.attention_config.num_attention_heads,
-                num_key_value_heads=self.attention_config.num_key_value_heads,
-                head_dim=self.config.head_dim,
-                workspace=self._graph_workspace,
-            )
-            self._graph_attention[shape] = runtime
-        return runtime
-
     def _refresh_graph_attention(self, attention, positions: torch.Tensor) -> None:
         """Resolve exact readable pages from GPU positions and the frozen lease."""
         attention.refresh(positions)
 
     def _new_decode_graph_step(self, shape: GraphShape) -> CudaGraphStep:
         batch_size, graph_seq_len = shape
-        attention = self._graph_attention_for(shape)
-        cache = self._graph_device_caches[shape]
+        cache = self._cache.graph_cache(*shape)
+        attention = GraphPagedAttentionRuntime(
+            self.device,
+            cache,
+            self._graph_specs(),
+            num_attention_heads=self.attention_config.num_attention_heads,
+            num_key_value_heads=self.attention_config.num_key_value_heads,
+            head_dim=self.config.head_dim,
+            workspace=self._graph_workspace,
+        )
         token_ids = torch.empty(batch_size, dtype=torch.long, device=self.device)
         positions = torch.empty(batch_size, dtype=torch.long, device=self.device)
         rope_deltas = torch.empty(batch_size, dtype=torch.long, device=self.device)
         draft_ids = torch.empty(batch_size, dtype=torch.long, device=self.device)
         sampling = self._sampler.empty(batch_size, self.device)
-        output_width = (
-            2 * self.speculative_draft_tokens + 2
-            if self.speculative_draft_tokens
-            else 1
-        )
         draft_seed = (
             torch.empty(
                 batch_size,
@@ -616,9 +601,7 @@ class Qwen3_5CudaRunner(CudaRunner):
             if self.speculative_draft_tokens > 1
             else None
         )
-        output_ids = torch.empty(
-            (batch_size, output_width), dtype=torch.long, device=self.device
-        )
+        output = CudaGraphResult()
 
         if self._fast_speculation:
             phase_timing = self._new_phase_timing("target_verify", "decode", "draft")
@@ -649,13 +632,12 @@ class Qwen3_5CudaRunner(CudaRunner):
             )
             cache.store_hidden(positions, hidden[:, -1])
             logits = self._model.logits(hidden[:, -1])
-            self._graph_logits[shape] = logits
-            output_ids[:, 0].copy_(graph_sample(self._sampler, logits, sampling, 0))
-            self._graph_acceptance[shape] = DeviceAcceptance.from_samples(
-                output_ids[:, :0],
-                output_ids,
-                positions,
+            samples = graph_sample(self._sampler, logits, sampling, 0)[:, None]
+            result = _DecodeResult(
+                logits,
+                DeviceAcceptance.from_samples(samples[:, :0], samples, positions),
             )
+            output.publish(result, parity=result.parity_tensors)
 
         def speculative_launch() -> None:
             if phase_timing is not None:
@@ -682,15 +664,9 @@ class Qwen3_5CudaRunner(CudaRunner):
                 attention_runtime=attention,
                 max_sequence_length=graph_seq_len,
             )
-            self._graph_logits[shape] = result.logits
-            self._graph_acceptance[shape] = result.acceptance
-            if not self._fast_speculation:
-                self._graph_next_hidden[shape] = result.next_hidden
-            output_ids[:, : self.speculative_draft_tokens].copy_(result.drafts)
-            output_ids[:, self.speculative_draft_tokens : -1].copy_(result.targets)
-            output_ids[:, -1].copy_(result.next_draft)
             if phase_timing is not None:
                 phase_timing.mark(verify_phase + 3)
+            output.publish(result, parity=result.parity_tensors)
 
         launch = (
             speculative_launch if self.speculative_draft_tokens else ordinary_launch
@@ -707,7 +683,6 @@ class Qwen3_5CudaRunner(CudaRunner):
         inputs.update(self._cache.graph_device_inputs(cache))
         inputs.update(attention.graph_inputs())
         inputs.update(self._sampler.graph_inputs(sampling))
-        self._feedback_graph_inputs[shape] = inputs
 
         def prepare() -> None:
             attention.reset()
@@ -715,10 +690,11 @@ class Qwen3_5CudaRunner(CudaRunner):
 
         return CudaGraphStep(
             inputs=inputs,
-            output=output_ids,
+            output=output,
             launch=launch,
             phase_timing=phase_timing,
             prepare=prepare,
+            resources=(cache, attention),
         )
 
     def _graph_forward(
@@ -759,12 +735,9 @@ class Qwen3_5CudaRunner(CudaRunner):
             "positions": np.pad(plan.positions, (0, padding), constant_values=1),
             "rope_deltas": np.pad(self._host_rope_deltas(plan), (0, padding)),
         }
-        inputs.update(
-            self._cache.graph_plan_inputs(self._graph_device_caches[shape], cache_plan)
-        )
-        inputs.update(
-            self._graph_attention[shape].plan(cache_plan, np.asarray(plan.positions))
-        )
+        cache, attention = self._captured_cuda_graph("decode", shape).resources
+        inputs.update(self._cache.graph_plan_inputs(cache, cache_plan))
+        inputs.update(attention.plan(cache_plan, np.asarray(plan.positions)))
         self._host_attention_plans = getattr(self, "_host_attention_plans", 0) + 1
         inputs.update(
             pad_sampling_inputs(self._sampler, plan, self.vocab_size, padding)
@@ -807,20 +780,20 @@ class Qwen3_5CudaRunner(CudaRunner):
         sequence_ids = tuple(map(int, plan.sequence_ids))
         if feedback is not None:
             inputs.update(feedback.inputs())
-        output = self._run_cuda_graph("decode", shape, inputs)
-        acceptance = self._graph_acceptance[shape]
+        result = self._run_cuda_graph("decode", shape, inputs)
+        acceptance = result.acceptance
         base = acceptance.feedback()
-        next_drafts = output[:, -1].clone() if self.speculative_draft_tokens else None
+        next_drafts = (
+            result.next_draft.clone() if result.next_draft is not None else None
+        )
         next_hidden = (
-            self._graph_next_hidden[shape].clone()
-            if self.speculative_draft_tokens > 1
-            else None
+            result.next_hidden.clone() if result.next_hidden is not None else None
         )
         state = (
             feedback.continuation
             if feedback is not None
             else self._continuation.begin(
-                sequence_ids, shape, self._feedback_graph_inputs[shape]
+                sequence_ids, shape, self._captured_cuda_graph("decode", shape).inputs
             )
         )
         completion = _Completion(
@@ -835,7 +808,7 @@ class Qwen3_5CudaRunner(CudaRunner):
             stats=self._speculation if self.speculative_draft_tokens else None,
             next_hidden=next_hidden,
             plan=plan,
-            scores=score_completion(self._graph_logits[shape], acceptance, plan),
+            scores=score_completion(result.logits, acceptance, plan),
         )
         # A later conservative plan can advance by the Engine's maximum output
         # width. Drain before it could exceed this graph's token capacity;
@@ -1195,7 +1168,7 @@ class Qwen3_5CudaRunner(CudaRunner):
         verify_phase,
         attention_runtime=None,
         max_sequence_length=None,
-    ) -> _MtpStep:
+    ) -> _DecodeResult:
         """Verify the proposed block, commit accepted state, and repair MTP for the next step."""
         execution = dict(
             attention_runtime=attention_runtime, max_sequence_length=max_sequence_length
@@ -1258,7 +1231,12 @@ class Qwen3_5CudaRunner(CudaRunner):
         next_draft = sample(
             self._model.logits(next_hidden), self.speculative_draft_tokens + 1
         )
-        return _MtpStep(drafts, targets, logits, acceptance, next_draft, next_hidden)
+        return _DecodeResult(
+            logits,
+            acceptance,
+            next_draft,
+            None if self._fast_speculation else next_hidden,
+        )
 
     def _speculative_decode(
         self,
@@ -1313,9 +1291,7 @@ class Qwen3_5CudaRunner(CudaRunner):
             device=self.device,
             plan=plan,
             scores=score_completion(result.logits, acceptance, plan),
-            next_hidden=result.next_hidden
-            if self.speculative_draft_tokens > 1
-            else None,
+            next_hidden=result.next_hidden,
         ).result()
 
     @observe_execution

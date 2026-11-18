@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 from contextlib import nullcontext
-from dataclasses import dataclass, replace
+from dataclasses import replace
 from pathlib import Path
 from typing import cast
 
@@ -13,14 +13,10 @@ import torch
 
 from resin import BatchPhase, BatchPlan, RunnerConfig
 from resin.backend.capacity import plan_cache_capacity
-from resin.backend.cuda.completion import (
-    CudaContinuation,
-    DeviceAcceptance,
-    DeviceCompletion,
-    GraphDeviceFeedback,
-)
+from resin.backend.cuda.completion import DeviceAcceptance, DeviceCompletion
 from resin.backend.cuda.graphs import (
     CudaGraphMode,
+    CudaGraphResult,
     CudaGraphStep,
     resolve_decode_graph_shapes,
 )
@@ -31,10 +27,8 @@ from resin.backend.cuda.parallel import (
     replicated_cache_capacity,
 )
 from resin.backend.cuda.runner import (
-    CudaRunner,
     capture_sampling_inputs,
     graph_sample,
-    pad_sampling_inputs,
     validate_hybrid_plan,
 )
 from resin.backend.cuda.scoring import format_output, prompt_scores, score_completion
@@ -74,14 +68,11 @@ from resin_models_cuda.inkling2.model import DecoderLayer, Inkling2Target
 from resin_models_cuda.inkling2.vision import Inkling2VisionEncoder
 from resin_models_cuda.inkling2.vision_weights import load_vision_weights
 from resin_models_cuda.inkling2.weights import load_target_weights
+from resin_models_cuda.paged_decode import PagedDecodeRunner
 
 
-@dataclass(frozen=True)
-class PreparedBatch:
-    cache_plan: PagedCachePlan | None
-
-
-class Inkling2CudaRunner(CudaRunner):
+class Inkling2CudaRunner(PagedDecodeRunner[CacheArena]):
+    _decode_model = "Inkling 2"
     parallelism_capabilities = ParallelismCapabilities(
         attn_tp=True, attn_dp=True, ep=True, expert_tp=True
     )
@@ -302,12 +293,6 @@ class Inkling2CudaRunner(CudaRunner):
             max_accepted_per_step=speculative_draft_tokens + 1,
             cache_layout=self.cache_layout,
         )
-        (
-            self._graph_device_caches,
-            self._graph_logits,
-            self._graph_acceptance,
-            self._graph_inputs,
-        ) = {}, {}, {}, {}
         # Graphs replay serially. Share verification history across all buckets
         # instead of pinning a separate multi-megabyte state per row per graph.
         self._checkpoint_buffers = (
@@ -331,9 +316,7 @@ class Inkling2CudaRunner(CudaRunner):
             if self._draft is not None
             else None
         )
-        self._graph_checkpoint_inputs = {}
         self._checkpoint_inputs = None
-        self._continuation = CudaContinuation()
         shapes = resolve_decode_graph_shapes(
             cuda_graph_decode_shapes,
             policy=self.cuda_graph_decode,
@@ -467,15 +450,10 @@ class Inkling2CudaRunner(CudaRunner):
     def _new_decode_graph_step(self, shape):
         size, width, algorithm = shape
         cache = self._cache.graph_cache(size, width + self.speculative_draft_tokens)
-        self._graph_device_caches[shape] = cache
         ids = torch.empty((size, 1), device=self.device, dtype=torch.long)
         positions = torch.empty(size, device=self.device, dtype=torch.long)
         sampling = self._sampler.empty(size, self.device)
-        output = torch.empty(
-            (size, self.speculative_draft_tokens + 1),
-            dtype=torch.long,
-            device=self.device,
-        )
+        output = CudaGraphResult()
         valid = (
             torch.empty((), device=self.device, dtype=torch.int32)
             if self.parallel_groups
@@ -503,12 +481,11 @@ class Inkling2CudaRunner(CudaRunner):
                 valid_rows=valid,
                 phase_timing=phase_timing,
             )
-            self._graph_acceptance[shape], self._graph_logits[shape] = (
-                acceptance,
-                logits,
+            output.publish(
+                (acceptance, logits, self._checkpoint_inputs),
+                parity=acceptance.parity_tensors,
             )
-            self._graph_checkpoint_inputs[shape] = self._checkpoint_inputs
-            output.copy_(acceptance.tokens)
+            self._checkpoint_inputs = None
 
         inputs = {
             "token_ids": ids,
@@ -518,13 +495,13 @@ class Inkling2CudaRunner(CudaRunner):
         }
         if valid is not None:
             inputs["ep_valid_rows"] = valid
-        self._graph_inputs[shape] = inputs
         return CudaGraphStep(
             inputs=inputs,
             output=output,
             launch=launch,
             prepare=self._cache.reset_null,
             phase_timing=phase_timing,
+            resources=cache,
         )
 
     def _validate_plan(self, plan: BatchPlan) -> tuple[tuple[int, int], ...]:
@@ -714,153 +691,23 @@ class Inkling2CudaRunner(CudaRunner):
             ),
         )
 
-    def _graph_forward(
-        self, plan, cache_plan, *, shape=None, enqueue=False, feedback=None
-    ):
-        batch_size = plan.num_sequences
-        if shape is None:
-            shape = self._decode_graph_shape(plan, cache_plan)
-        if shape is None:
-            return None
-        padding = shape[0] - batch_size
-        inputs = {
-            "token_ids": np.pad(plan.token_ids, (0, padding)),
-            "positions": np.pad(plan.positions, (0, padding), constant_values=1),
-            **self._cache.graph_plan_inputs(
-                self._graph_device_caches[shape], cache_plan
-            ),
-            **pad_sampling_inputs(self._sampler, plan, self.vocab_size, padding),
-        }
-        if self.parallel_groups is not None:
-            inputs["ep_valid_rows"] = batch_size
-        if enqueue:
-            return self._enqueue_graph_output(plan, shape, inputs, feedback)
-        self._run_cuda_graph("decode", shape, inputs)
-        self._checkpoint_inputs = self._graph_checkpoint_inputs[shape]
-        acceptance = self._graph_acceptance[shape]
-        completion = DeviceCompletion.from_acceptance(
-            acceptance,
-            rows=batch_size,
-            device=self.device,
-            stats=self._speculation if self.speculative_draft_tokens else None,
-            plan=plan,
-            scores=score_completion(self._graph_logits[shape], acceptance, plan),
+    def _decode_graph_result(self, shape, inputs):
+        acceptance, logits, self._checkpoint_inputs = self._run_cuda_graph(
+            "decode", shape, inputs
         )
-        return completion.result()
+        return acceptance, logits
 
     def _enqueue_graph_output(self, plan, shape, inputs, feedback):
         if self._sampling_graph_algorithm(plan) > shape[2]:
             raise ValueError("sampling policy changed inside a greedy continuation")
-        ids = () if plan is None else tuple(map(int, plan.sequence_ids))
-        continuation = (
-            feedback.continuation
-            if feedback is not None
-            else self._continuation.begin(ids, shape, self._graph_inputs[shape])
-        )
-        if feedback is not None:
-            inputs.update(feedback.inputs())
-        self._run_cuda_graph("decode", shape, inputs)
-        self._checkpoint_inputs = self._graph_checkpoint_inputs[shape]
-        acceptance = self._graph_acceptance[shape]
-        next_inputs = acceptance.feedback()
-        completion = DeviceCompletion.from_acceptance(
-            acceptance,
-            feedback=GraphDeviceFeedback(
-                next_inputs.token_ids, next_inputs.positions, continuation
-            ),
-            rows=0 if plan is None else plan.num_sequences,
-            device=self.device,
-            stats=self._speculation
-            if self.speculative_draft_tokens and plan is not None
-            else None,
-            plan=plan,
-            scores=score_completion(self._graph_logits[shape], acceptance, plan),
-        )
-        maximum = self.runner_config.max_accepted_per_step
-        writes = maximum + self.cache_layout.decode_write_extra_tokens
-        capacity = (
-            shape[1]
-            + self.speculative_draft_tokens
-            + self.cache_layout.decode_write_extra_tokens
-        )
-        if plan is not None and np.any(
-            np.asarray(plan.positions, dtype=np.int64) + maximum + writes > capacity
-        ):
-            completion.feedback = None
-            self._continuation.drain(continuation)
-        return completion
+        return super()._enqueue_graph_output(plan, shape, inputs, feedback)
 
     def release(self, sequence_ids):
         self._continuation.drain()
         for sequence_id in sequence_ids:
             self._media_features.pop(int(sequence_id), None)
 
-    @observe_execution
-    @execute_state
-    def forward(self, plan):
-        self._check_cuda_graphs(plan.phase)
-        self._continuation.drain()
-        cache_plan = self._prepare(plan)
-        with (
-            self._cuda_failure,
-            torch.inference_mode(),
-            use_default_dtype(torch.bfloat16),
-            torch.device(self.device),
-        ):
-            if plan.phase == BatchPhase.DECODE:
-                result = self._graph_forward(plan, cache_plan)
-                if result is not None:
-                    return result
-            with (
-                self._prefill_graphs()
-                if plan.phase == BatchPhase.PREFILL
-                else nullcontext()
-            ):
-                return self._eager(plan, cache_plan)
-
-    @observe_execution
-    @execute_state
-    def enqueue(self, plan, *, feedback=None):
-        if feedback is not None:
-            if not isinstance(feedback, GraphDeviceFeedback):
-                raise ValueError("Inkling 2 continuation requires owned graph feedback")
-            inputs = self._continuation.resume(plan.sequence_ids, feedback.continuation)
-            with self._cuda_failure, torch.inference_mode():
-                return self._enqueue_graph_output(
-                    plan, feedback.continuation.shape, inputs, feedback
-                )
-        self._continuation.drain()
-        if plan.phase != BatchPhase.DECODE or plan.needs_prompt_logprobs:
-            return self.forward(plan)
-        self._check_cuda_graphs(plan.phase)
-        cache_plan = self._prepare(plan)
-        with self._cuda_failure, torch.inference_mode():
-            result = self._graph_forward(
-                plan, cache_plan, enqueue=True, feedback=feedback
-            )
-        return self.forward(plan) if result is None else result
-
-    def validate_distributed(self, plan, context):
-        if self.parallel_groups is None or context.groups is not self.parallel_groups:
-            raise ValueError("distributed groups do not match Inkling 2 runner")
-        if plan is None:
-            if context.num_sequences or context.num_tokens:
-                raise ValueError("nonempty distributed replica needs a plan")
-            cache_plan = None
-        else:
-            if (
-                plan.phase != context.phase
-                or plan.num_tokens != context.num_tokens
-                or plan.num_sequences != context.num_sequences
-            ):
-                raise ValueError("distributed metadata does not match plan")
-            cache_plan = self._prepare(plan)
-        self._check_cuda_graphs(context.phase)
-        return PreparedBatch(cache_plan)
-
-    def _distributed_graph(
-        self, plan, context, prepared, *, enqueue=False, feedback=None
-    ):
+    def _distributed_decode_shape(self, plan, context, prepared, *, enqueue, feedback):
         local_shape = (
             feedback.continuation.shape
             if feedback is not None
@@ -868,7 +715,7 @@ class Inkling2CudaRunner(CudaRunner):
             if plan is not None
             else None
         )
-        shape = self._select_distributed_cuda_graph(
+        return self._select_distributed_cuda_graph(
             "decode",
             context,
             required_shape=local_shape
@@ -887,54 +734,6 @@ class Inkling2CudaRunner(CudaRunner):
                 else None
             ),
         )
-        if shape is None:
-            return False, None
-        if feedback is not None:
-            inputs = self._continuation.resume(
-                () if plan is None else plan.sequence_ids,
-                feedback.continuation,
-                shape=shape,
-            )
-            return True, self._enqueue_graph_output(plan, shape, inputs, feedback)
-        if plan is not None:
-            return True, self._graph_forward(
-                plan,
-                prepared.cache_plan,
-                shape=shape,
-                enqueue=enqueue,
-                feedback=feedback,
-            )
-        inputs = self._decode_graph_capture_inputs(shape)
-        inputs["ep_valid_rows"] = 0
-        if enqueue:
-            return True, self._enqueue_graph_output(None, shape, inputs, None)
-        self._run_cuda_graph("decode", shape, inputs)
-        return True, None
-
-    @observe_execution
-    @execute_state
-    def enqueue_distributed(self, plan, context, *, prepared=None, feedback=None):
-        if feedback is not None:
-            if not isinstance(feedback, GraphDeviceFeedback):
-                raise ValueError("Inkling 2 continuation requires owned graph feedback")
-        else:
-            self._continuation.drain()
-        if context.phase != BatchPhase.DECODE or (
-            plan is not None and plan.needs_prompt_logprobs
-        ):
-            return self.forward_distributed(plan, context, prepared=prepared)
-        prepared = (
-            self.validate_distributed(plan, context) if prepared is None else prepared
-        )
-        with self._cuda_failure, torch.inference_mode():
-            used, result = self._distributed_graph(
-                plan, context, prepared, enqueue=True, feedback=feedback
-            )
-        if used:
-            return result
-        if feedback is not None:
-            raise RuntimeError("a device continuation requires a captured graph")
-        return self.forward_distributed(plan, context, prepared=prepared)
 
     @observe_execution
     @execute_state

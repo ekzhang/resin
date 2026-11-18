@@ -31,6 +31,7 @@ from resin.backend.cuda.graphs import (
     CudaGraphMode,
     CudaGraphProgram,
     CudaGraphRegion,
+    CudaGraphResult,
     CudaGraphStep,
     GraphShape,
     resolve_decode_graph_shapes,
@@ -45,7 +46,6 @@ from resin.backend.cuda.runner import (
     CudaRunner,
     capture_sampling_inputs,
     forward_paged,
-    pad_sampling_inputs,
 )
 from resin.backend.cuda.scoring import format_output, prompt_scores, score_completion
 from resin.backend.cuda.staging import TensorStager
@@ -64,6 +64,11 @@ from resin.models.vision import image_patches, media_identity
 from resin.recipe import Media
 from resin_models_cuda.deepseek_v41.cache import CacheArena, CacheGeometry
 from resin_models_cuda.deepseek_v41.checkpoint import load_config, resolve_model_path
+from resin_models_cuda.paged_decode import (
+    complete_graph_decode,
+    paged_decode_graph_inputs,
+    replay_distributed_decode,
+)
 
 if TYPE_CHECKING:
     from resin import BatchPlan, ForwardOutput
@@ -226,12 +231,8 @@ class DeepSeekV41CudaRunner(CudaRunner):
         self.max_batch_size = max_batch_size
         self.speculative_draft_tokens = speculative_draft_tokens
         self.profile_graph_phases = profile_graph_phases
-        self._dspark_phase_events: dict[GraphShape, tuple[torch.cuda.Event, ...]] = {}
         self._last_dspark_phase_ms: dict[str, float] | None = None
-        self._graph_device_caches = {}
-        self._graph_inputs = {}
         self._continuation = CudaContinuation()
-        self._graph_logits = {}
         self.vocab_size = self.config.vocab_size
         self.eos_token_id = 1
         self._speculation = SpeculativeStats(speculative_draft_tokens)
@@ -805,10 +806,10 @@ class DeepSeekV41CudaRunner(CudaRunner):
             return self._new_dspark_graph_step(shape)
         batch_size, graph_seq_len = shape
         cache = self._cache.graph_cache(batch_size, graph_seq_len)
-        self._graph_device_caches[shape] = cache
         token_ids = torch.empty((batch_size, 1), dtype=torch.long, device=self.device)
         positions = torch.empty(batch_size, dtype=torch.long, device=self.device)
         output_ids = torch.empty(batch_size, dtype=torch.long, device=self.device)
+        result = CudaGraphResult()
         valid_rows = (
             torch.empty((), dtype=torch.int32, device=self.device)
             if self.parallel_groups is not None
@@ -828,10 +829,12 @@ class DeepSeekV41CudaRunner(CudaRunner):
                     graph_seq_len,
                     cache=cache,
                 )
-                self._graph_logits[shape] = logits
                 self._sampler.sample_tensors(logits, sampling, out=output_ids)
                 if self.parallel_groups is not None:
                     self._broadcast_tokens(output_ids)
+                result.publish(
+                    (output_ids, logits, None), parity=(output_ids, positions)
+                )
 
         def broadcast() -> None:
             dist.broadcast(
@@ -845,13 +848,13 @@ class DeepSeekV41CudaRunner(CudaRunner):
             inputs["ep_valid_rows"] = valid_rows
         inputs.update(self._cache.graph_device_inputs(cache))
         inputs.update(self._sampler.graph_inputs(sampling))
-        self._graph_inputs[shape] = inputs
         if self.parallel_groups is not None or not self.tensor_parallel.enabled:
             return CudaGraphStep(
                 launch=launch,
                 inputs=inputs,
-                output=output_ids,
+                output=result,
                 prepare=self._reset_model_state,
+                resources=cache,
             )
         if self.cuda_graph_decode == "full":
 
@@ -862,8 +865,9 @@ class DeepSeekV41CudaRunner(CudaRunner):
             return CudaGraphStep(
                 launch=full_launch,
                 inputs=inputs,
-                output=output_ids,
+                output=result,
                 prepare=self._reset_model_state,
+                resources=cache,
             )
         return CudaGraphProgram(
             regions=(
@@ -871,14 +875,14 @@ class DeepSeekV41CudaRunner(CudaRunner):
                 CudaGraphRegion("broadcast", broadcast, capture=False),
             ),
             inputs=inputs,
-            output=output_ids,
+            output=result,
             prepare=self._reset_model_state,
+            resources=cache,
         )
 
     def _new_dspark_graph_step(self, shape: GraphShape) -> CudaGraphStep:
         batch_size, graph_seq_len = shape
         cache = self._cache.graph_cache(batch_size, graph_seq_len)
-        self._graph_device_caches[shape] = cache
         block_size = self.speculative_draft_tokens
         token_ids = torch.empty((batch_size, 1), dtype=torch.long, device=self.device)
         positions = torch.empty(batch_size, dtype=torch.long, device=self.device)
@@ -887,6 +891,7 @@ class DeepSeekV41CudaRunner(CudaRunner):
             dtype=torch.long,
             device=self.device,
         )
+        result = CudaGraphResult()
         valid_rows = (
             torch.empty((), dtype=torch.int32, device=self.device)
             if self.parallel_groups is not None
@@ -899,7 +904,6 @@ class DeepSeekV41CudaRunner(CudaRunner):
             phase_events = tuple(
                 torch.cuda.Event(enable_timing=True, external=True) for _ in range(4)
             )
-            self._dspark_phase_events[shape] = phase_events
 
         def launch() -> None:
             with use_default_dtype(torch.bfloat16), torch.device(self.device):
@@ -931,7 +935,6 @@ class DeepSeekV41CudaRunner(CudaRunner):
                     verify_logits, verify_hidden = self._model.forward_verify(
                         verify_ids, positions, graph_seq_len, cache=cache
                     )
-                self._graph_logits[shape] = verify_logits
                 if phase_timing is not None:
                     phase_timing.mark(2)
                 if phase_events is not None:
@@ -952,19 +955,23 @@ class DeepSeekV41CudaRunner(CudaRunner):
                     phase_timing.mark(3)
                 if phase_events is not None:
                     phase_events[3].record()
+                result.publish(
+                    (output_ids, verify_logits, phase_events),
+                    parity=(output_ids, positions),
+                )
 
         inputs = {"token_ids": token_ids, "positions": positions}
         if valid_rows is not None:
             inputs["ep_valid_rows"] = valid_rows
         inputs.update(self._cache.graph_device_inputs(cache))
         inputs.update(self._sampler.graph_inputs(sampling))
-        self._graph_inputs[shape] = inputs
         return CudaGraphStep(
             inputs=inputs,
-            output=output_ids,
+            output=result,
             launch=launch,
             prepare=self._reset_model_state,
             phase_timing=phase_timing,
+            resources=cache,
         )
 
     @overload
@@ -1012,34 +1019,27 @@ class DeepSeekV41CudaRunner(CudaRunner):
             )
         if shape is None:
             return None
-        padding_rows = shape[0] - batch_size
-        inputs: dict[str, object] = {
-            "token_ids": np.pad(plan.token_ids, (0, padding_rows)),
-            "positions": np.pad(positions, (0, padding_rows), constant_values=1),
-        }
-        graph_cache = self._graph_device_caches[shape]
-        inputs.update(self._cache.graph_plan_inputs(graph_cache, cache_plan))
-        inputs.update(
-            pad_sampling_inputs(self._sampler, plan, self.vocab_size, padding_rows)
+        graph_cache = self._captured_cuda_graph("decode", shape).resources
+        inputs = paged_decode_graph_inputs(self, plan, cache_plan, shape, graph_cache)
+        if enqueue:
+            return self._enqueue_graph_output(plan, shape, inputs, feedback)
+        device_positions = (
+            torch.as_tensor(inputs["positions"], device=self.device, dtype=torch.long)
+            if plan.needs_logprobs and self.speculative_draft_tokens
+            else None
         )
-        if getattr(self, "parallel_groups", None) is not None:
-            inputs["ep_valid_rows"] = batch_size
-        if not enqueue and not self.speculative_draft_tokens:
-            output = self._run_cuda_graph("decode", shape, inputs)
+        output, logits, phase_events = self._run_cuda_graph("decode", shape, inputs)
+        if not self.speculative_draft_tokens:
             if plan.needs_logprobs:
-                return format_output(self._graph_logits[shape], output, plan)
+                return format_output(logits, output, plan)
             return token_output(output[:batch_size])
-        if enqueue or plan.needs_logprobs:
-            completion = self._enqueue_graph_output(plan, shape, inputs, feedback)
-            if enqueue:
-                return completion
-            result = completion.result()
+        if device_positions is not None:
+            acceptance = self._accept_graph_samples(output, device_positions, shape)
+            result = complete_graph_decode(
+                acceptance, logits, plan, stats=self._speculation
+            ).result()
         else:
-            output = (
-                self._run_cuda_graph("decode", shape, inputs)[:batch_size]
-                .cpu()
-                .tolist()
-            )
+            output = output[:batch_size].cpu().tolist()
             width = self.speculative_draft_tokens
             accepted = self._accept_speculative(
                 [row[:width] for row in output],
@@ -1048,7 +1048,6 @@ class DeepSeekV41CudaRunner(CudaRunner):
                 graph_cache,
             )
             result = token_output(accepted)
-        phase_events = self._dspark_phase_events.get(shape)
         if phase_events is not None:
             start, draft_end, verify_end, step_end = phase_events
             step_end.synchronize()
@@ -1066,7 +1065,9 @@ class DeepSeekV41CudaRunner(CudaRunner):
         state = (
             feedback.continuation
             if feedback is not None
-            else self._continuation.begin(ids, shape, self._graph_inputs[shape])
+            else self._continuation.begin(
+                ids, shape, self._captured_cuda_graph("decode", shape).inputs
+            )
         )
         if feedback is not None:
             inputs.update(feedback.inputs())
@@ -1075,33 +1076,10 @@ class DeepSeekV41CudaRunner(CudaRunner):
             positions = torch.as_tensor(
                 inputs["positions"], device=self.device, dtype=torch.long
             )
-        output = self._run_cuda_graph("decode", shape, inputs)
-        draft_tokens = self.speculative_draft_tokens
-        samples = output if draft_tokens else output.reshape(-1, 1)
-        acceptance = DeviceAcceptance.from_samples(
-            samples[:, :draft_tokens],
-            samples[:, draft_tokens:],
-            positions,
-        )
-        counts = acceptance.counts
-        base = acceptance.feedback()
-        if self.speculative_draft_tokens:
-            self._model.clear_rejected_speculative_state(
-                positions,
-                counts,
-                self.speculative_draft_tokens + 1,
-                cache=self._graph_device_caches[shape],
-            )
-        completion = DeviceCompletion.from_acceptance(
-            acceptance,
-            feedback=GraphDeviceFeedback(base.token_ids, base.positions, state),
-            rows=0 if plan is None else plan.num_sequences,
-            stats=self._speculation
-            if self.speculative_draft_tokens and plan is not None
-            else None,
-            device=self.device,
-            plan=plan,
-            scores=score_completion(self._graph_logits[shape], acceptance, plan),
+        output, logits, _ = self._run_cuda_graph("decode", shape, inputs)
+        acceptance = self._accept_graph_samples(output, positions, shape)
+        completion = complete_graph_decode(
+            acceptance, logits, plan, stats=self._speculation, continuation=state
         )
         maximum = self.runner_config.max_accepted_per_step
         writes = maximum + self.cache_layout.decode_write_extra_tokens
@@ -1111,6 +1089,23 @@ class DeepSeekV41CudaRunner(CudaRunner):
             completion.feedback = None
             self._continuation.drain(state)
         return completion
+
+    def _accept_graph_samples(self, output, positions, shape):
+        draft_tokens = self.speculative_draft_tokens
+        samples = output if draft_tokens else output.reshape(-1, 1)
+        acceptance = DeviceAcceptance.from_samples(
+            samples[:, :draft_tokens],
+            samples[:, draft_tokens:],
+            positions,
+        )
+        if draft_tokens:
+            self._model.clear_rejected_speculative_state(
+                positions,
+                acceptance.counts,
+                draft_tokens + 1,
+                cache=self._captured_cuda_graph("decode", shape).resources,
+            )
+        return acceptance
 
     def _validate_plan(self, plan: BatchPlan) -> tuple[tuple[int, int], ...]:
         batch = BatchView.from_plan(plan)
@@ -1419,25 +1414,11 @@ class DeepSeekV41CudaRunner(CudaRunner):
                 required_shape=(0, 0) if local_shape is None else local_shape,
                 eligible=plan is None or local_shape is not None,
             )
-            if shape is not None:
-                if feedback is not None:
-                    inputs = self._continuation.resume(
-                        () if plan is None else plan.sequence_ids,
-                        feedback.continuation,
-                        shape=shape,
-                    )
-                    return self._enqueue_graph_output(plan, shape, inputs, feedback)
-                if plan is not None:
-                    return self._graph_forward(
-                        plan,
-                        prepared.cache_plan,
-                        shape=shape,
-                        enqueue=True,
-                        feedback=feedback,
-                    )
-                inputs = self._decode_graph_capture_inputs(shape)
-                inputs["ep_valid_rows"] = 0
-                return self._enqueue_graph_output(None, shape, inputs, None)
+            used, result = replay_distributed_decode(
+                self, plan, prepared.cache_plan, shape, enqueue=True, feedback=feedback
+            )
+        if used:
+            return result
         if feedback is not None:
             raise RuntimeError(
                 "a device continuation requires its captured decode graph"
@@ -1605,17 +1586,7 @@ class DeepSeekV41CudaRunner(CudaRunner):
                 else int(np.max(plan.positions)) + self.speculative_draft_tokens + 1,
             ),
         )
-        if shape is None:
-            return False, None
-        if plan is not None:
-            return True, self._graph_forward(plan, cache_plan, shape=shape)
-
-        # Idle replicas use only reserved scratch parents and send zero-weight
-        # expert rows. Their local experts still execute work for active peers.
-        inputs = self._decode_graph_capture_inputs(shape)
-        inputs["ep_valid_rows"] = 0
-        self._run_cuda_graph("decode", shape, inputs)
-        return True, None
+        return replay_distributed_decode(self, plan, cache_plan, shape)
 
     def _replay_start(self, plan, slot, tokens):
         """A host-only boundary; scored histories stay full."""

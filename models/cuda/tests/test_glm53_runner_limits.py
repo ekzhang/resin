@@ -22,11 +22,12 @@ from resin_models_cuda.glm5_3_flash.cuda import Glm53FlashCudaRunner
 @pytest.fixture
 def construct_runner(monkeypatch):
     import resin_models_cuda.glm5_3_flash.cuda as module
+    from resin.backend.cuda.runner import CudaRunner
     from resin.models.glm5_3_flash.config import Glm53Config
 
     # Keep real profile/catalog calculation; replace loading and device work.
     monkeypatch.setattr(
-        module.CudaRunner,
+        CudaRunner,
         "__init__",
         lambda self, **kwargs: setattr(self, "device", torch.device("cpu")),
     )
@@ -39,12 +40,12 @@ def construct_runner(monkeypatch):
 
     monkeypatch.setattr(module, "load_model", load)
     for name in ("_configure_parallel_graphs", "_configure_cache_binding"):
-        monkeypatch.setattr(module.CudaRunner, name, lambda *args: None)
+        monkeypatch.setattr(CudaRunner, name, lambda *args: None)
     monkeypatch.setattr(
-        module.CudaRunner, "_configure_prefill_graphs", lambda *args, **kwargs: ()
+        CudaRunner, "_configure_prefill_graphs", lambda *args, **kwargs: ()
     )
     monkeypatch.setattr(
-        module.CudaRunner,
+        CudaRunner,
         "_configure_cuda_graphs",
         lambda self, modes: setattr(self, "observed_modes", modes),
     )
