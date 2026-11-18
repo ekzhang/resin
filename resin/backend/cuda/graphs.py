@@ -151,6 +151,22 @@ def resolve_decode_graph_shapes(
     return shapes
 
 
+@dataclass(slots=True)
+class CudaGraphResult:
+    """Result buffers allocated by a captured launch.
+
+    The launch publishes its buffers during warmup and capture. Replay writes
+    into the same captured buffers, so consumers must stage anything retained
+    across replays. Parity checks use the declared semantic tensor columns.
+    """
+
+    value: Any = None
+    parity: Any = None
+
+    def publish(self, value: Any, *, parity: Any) -> None:
+        self.value, self.parity = value, parity
+
+
 @dataclass(frozen=True, slots=True)
 class CudaGraphStep:
     """One fixed-address operation, retained as the simple one-graph API."""
@@ -211,6 +227,8 @@ class CudaGraphProgram:
             raise ValueError("CUDA graph region names must be unique")
         if not any(region.capture for region in regions):
             raise ValueError("CUDA graph program must capture at least one region")
+        if isinstance(self.output, CudaGraphResult) and len(regions) != 1:
+            raise ValueError("launch-allocated results require one captured region")
         object.__setattr__(self, "regions", regions)
 
 
@@ -233,6 +251,14 @@ def _map_output(output, operation):
     if isinstance(output, tuple):
         return tuple(_map_output(value, operation) for value in output)
     return operation(output)
+
+
+def _parity_output(output):
+    if not isinstance(output, CudaGraphResult):
+        return output
+    if output.parity is None:
+        raise RuntimeError("CUDA graph launch did not publish its result")
+    return output.parity
 
 
 def _outputs_equal(left, right) -> bool:
@@ -491,7 +517,8 @@ class _CudaGraphCache:
             self._pending_captures -= 1
         except BaseException as error:
             self._fail("graph capture", error)
-        return entry.program.output
+        output = entry.program.output
+        return output.value if isinstance(output, CudaGraphResult) else output
 
     def run(
         self,
@@ -535,7 +562,8 @@ class _CudaGraphCache:
             self._fail("graph replay", error)
         entry.replays += 1
         self._replay_count += 1
-        return entry.program.output
+        output = entry.program.output
+        return output.value if isinstance(output, CudaGraphResult) else output
 
     def _capture(self, entry: _GraphEntry, allocation_before: int) -> None:
         program = entry.program
@@ -552,7 +580,9 @@ class _CudaGraphCache:
                 if program.prepare is not None:
                     program.prepare()
                 self._launch(program)
-            expected = _map_output(program.output, lambda tensor: tensor.clone())
+            expected = _map_output(
+                _parity_output(program.output), lambda tensor: tensor.clone()
+            )
         current.wait_stream(warmup)
         entry.warmups = 3
         torch.cuda.synchronize(self.device)
@@ -563,30 +593,33 @@ class _CudaGraphCache:
         with torch.cuda.device(self.device), torch.cuda.stream(warmup):
             if program.prepare is not None:
                 program.prepare()
+            if isinstance(program.output, CudaGraphResult):
+                program.output.value = program.output.parity = None
             graphs = self._capture_regions(entry, warmup)
             if program.prepare is not None:
                 program.prepare()
             self._replay(program, graphs)
         current.wait_stream(warmup)
         torch.cuda.synchronize(self.device)
+        actual = _parity_output(program.output)
         if program.validate_eager_output:
-            if not _outputs_equal(expected, program.output):
+            if not _outputs_equal(expected, actual):
                 raise RuntimeError(
                     "CUDA graph replay differs from eager warmup "
-                    f"({_output_difference(expected, program.output)}; "
+                    f"({_output_difference(expected, actual)}; "
                     f"expected: {_output_summary(expected)}; "
-                    f"actual: {_output_summary(program.output)})"
+                    f"actual: {_output_summary(actual)})"
                 )
         else:
-            expected_replay = _map_output(program.output, lambda tensor: tensor.clone())
+            expected_replay = _map_output(actual, lambda tensor: tensor.clone())
             self._replay(program, graphs)
             torch.cuda.synchronize(self.device)
-            if not _outputs_equal(expected_replay, program.output):
+            if not _outputs_equal(expected_replay, actual):
                 raise RuntimeError(
                     "CUDA graph replays are not deterministic "
-                    f"({_output_difference(expected_replay, program.output)}; "
+                    f"({_output_difference(expected_replay, actual)}; "
                     f"expected: {_output_summary(expected_replay)}; "
-                    f"actual: {_output_summary(program.output)})"
+                    f"actual: {_output_summary(actual)})"
                 )
         entry.graphs = graphs
         if program.phase_timing is not None:

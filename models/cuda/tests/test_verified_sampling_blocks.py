@@ -56,7 +56,6 @@ def _fixture(runner_type, *, scored=False):
     runner.config = SimpleNamespace(vocab_size=10, hidden_size=2, num_hidden_layers=1)
     runner._speculation = SpeculativeStats(2)
     runner._graph_logits = {}
-    runner._graph_acceptance = {}
     runner._eager_phase_timing = lambda *_args: None
     plan = BatchPlan(
         sequence_ids=[7, 8],
@@ -84,7 +83,6 @@ def _inkling_fixture(monkeypatch, runner, logits, drafts, counts, stored):
     runner.parallel_groups = None
     runner.cache_geometry = SimpleNamespace(state_width=4)
     runner._graph_inputs = {}
-    runner._graph_checkpoint_inputs = {}
     runner._checkpoint_buffers = (
         torch.empty(2, 1, 3, 4, dtype=torch.bfloat16),
         torch.empty(2, 3, 1, 4, dtype=torch.bfloat16),
@@ -276,14 +274,16 @@ def test_inkling2_graph_keeps_target_logits_and_one_device_acceptance(
     step.inputs["positions"].copy_(positions)
     step.launch()
 
-    acceptance = runner._graph_acceptance[shape]
+    assert runner._checkpoint_inputs is None
+    runner._run_cuda_graph = lambda *_args: step.output.value
+    acceptance, graph_logits = runner._decode_graph_result(shape, {})
     expected = [1, 1] if all_rejected else [2, 3]
     assert acceptance.counts.tolist() == expected
     assert state_counts[0] == expected
     torch.testing.assert_close(state_positions[0], positions + acceptance.counts - 1)
-    assert runner._graph_logits[shape] is logits
+    assert graph_logits is logits
+    assert runner._checkpoint_inputs is step.output.value[2]
     assert runner._sampler.calls == [(2, 3, 10)]
-    torch.testing.assert_close(step.output, acceptance.tokens)
 
     # Overlapped continuations stage device-owned feedback, whose shapes must
     # agree with the captured buffers without host reshaping.

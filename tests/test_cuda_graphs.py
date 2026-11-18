@@ -3,6 +3,7 @@ from __future__ import annotations
 from contextlib import contextmanager
 from types import SimpleNamespace
 from typing import NoReturn, TypedDict
+from weakref import ref
 
 import numpy as np
 import pytest
@@ -18,6 +19,7 @@ from resin.backend.cuda.graphs import (
     CudaGraphMode,
     CudaGraphProgram,
     CudaGraphRegion,
+    CudaGraphResult,
     CudaGraphStep,
     _CudaGraphCache,
     _graph_shapes,
@@ -989,6 +991,42 @@ class TestCudaGraph:
         graphs.capture((1, 4), {"value": [7]})
 
         assert len(prepared) == 5
+
+    @pytest.mark.parametrize("captured_count", [1, 2, None])
+    def test_capture_owns_launch_outputs_and_checks_acceptance(
+        self, graph_torch, captured_count
+    ) -> None:
+        published = []
+
+        def build(_shape):
+            output = CudaGraphResult()
+
+            def launch():
+                capturing = graph_torch.cuda.capturing
+                if capturing and captured_count is None:
+                    return
+                logits = _Tensor([2 if capturing else 1])
+                published.append(ref(logits))
+                count = _Tensor([captured_count if capturing else 1])
+                output.publish(logits, parity=(_Tensor([3]), count))
+
+            return CudaGraphStep({}, output, launch)
+
+        graphs = _cache(((1, 4),), build)
+        if captured_count != 1:
+            message = "did not publish" if captured_count is None else "differs"
+            with pytest.raises(PostAcceptCudaError, match=message):
+                graphs.capture((1, 4), {})
+            graphs.close()
+            return
+        captured = graphs.capture((1, 4), {})
+        assert captured.tolist() == [2]
+        assert graphs.run((1, 4), {}) is captured
+        assert len(published) == 4
+        assert all(reference() is None for reference in published[:-1])
+        del captured
+        graphs.close()
+        assert published[-1]() is None
 
     def test_graph_inputs_can_copy_directly_from_device_tensors(
         self, graph_torch
