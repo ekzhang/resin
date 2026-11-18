@@ -5,10 +5,18 @@ from dataclasses import dataclass
 from threading import Event
 from types import SimpleNamespace
 
+import numpy as np
 import pytest
 from output_helpers import forward_output
 
-from resin import CacheGroupLayout, CacheLayout, Engine, RunnerConfig, SamplingParams
+from resin import (
+    CacheGroupLayout,
+    CacheLayout,
+    Engine,
+    ForwardOutput,
+    RunnerConfig,
+    SamplingParams,
+)
 
 
 @dataclass
@@ -269,16 +277,57 @@ def test_invalid_immediate_enqueue_result_quarantines_accepted_work(
     runner.shutdown()
 
 
-def test_enqueue_accepts_immediately_completed_native_output(monkeypatch):
+@pytest.mark.parametrize("continuation", [False, True])
+def test_enqueue_accepts_immediately_completed_native_output(monkeypatch, continuation):
     runner = AsyncRunner()
-    monkeypatch.setattr(runner, "enqueue", lambda plan: forward_output([[3, 4]]))
+    original = runner.enqueue
+
+    def enqueue(plan, *, feedback=None):
+        if continuation and feedback is None:
+            return original(plan)
+        return forward_output([[5, 6]] if continuation else [[3, 4]])
+
+    monkeypatch.setattr(runner, "enqueue", enqueue)
+    engine = Engine(runner)
+    request = engine.submit([1], sampling_params=SamplingParams(max_output_tokens=24))
+    expected = [3, 4, 5, 6] if continuation else [3, 4]
+    assert [event.token_id for event in engine.step()] == [2]
+    if continuation:
+        assert engine.step() == [] and engine.overlap_pending
+    assert [event.token_id for event in engine.step()] == expected
+    assert engine.overlap_stats == (int(continuation), 0)
+    assert not engine.overlap_pending and not engine.poisoned
+    engine.close()
+    assert request.cancelled and request.take_result() == [2, *expected]
+    runner.shutdown()
+
+
+def test_malformed_immediate_continuation_keeps_output_storage(monkeypatch):
+    import weakref
+
+    runner = AsyncRunner()
+    original = runner.enqueue
+    output_storage = []
+
+    def enqueue(plan, *, feedback=None):
+        if feedback is None:
+            return original(plan)
+        tokens = np.array([5], dtype=np.uint32)
+        output_storage.append(weakref.ref(tokens))
+        return ForwardOutput(
+            token_ids=tokens, token_indptr=np.array([0, 0], dtype=np.uint32)
+        )
+
+    monkeypatch.setattr(runner, "enqueue", enqueue)
     engine = Engine(runner)
     request = engine.submit([1], sampling_params=SamplingParams(max_output_tokens=24))
     assert [event.token_id for event in engine.step()] == [2]
-    assert [event.token_id for event in engine.step()] == [3, 4]
-    assert not engine.overlap_pending and not engine.poisoned
-    engine.close()
-    assert request.cancelled and request.take_result() == [2, 3, 4]
+    assert engine.step() == []
+    with pytest.raises(RuntimeError, match="invalid output CSR offsets"):
+        engine.step()
+    assert output_storage[0]() is not None
+    assert engine.poisoned and not request.done
+    assert engine.cache_occupied_block_count == 1 and runner.released == []
     runner.shutdown()
 
 
