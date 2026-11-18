@@ -108,12 +108,15 @@ class RankRunner:
         logits = torch.zeros(plan.num_sequences, 32)
         logits[:, 10 + replica] = 2
         all_logits = torch.zeros(len(plan.token_ids), 32)
-        return format_output(
-            logits,
-            logits.argmax(-1),
-            plan,
-            prompt_logprobs=prompt_scores(plan, all_logits),
-        )
+        # This fixture checks scoring and transport. Cold compilation can
+        # outlast the HTTP request timeout on the first scored batch.
+        with torch.compiler.set_stance("force_eager"):
+            return format_output(
+                logits,
+                logits.argmax(-1),
+                plan,
+                prompt_logprobs=prompt_scores(plan, all_logits),
+            )
 
 
 def _serve_rank(rank, world_size, directory, port, case):
