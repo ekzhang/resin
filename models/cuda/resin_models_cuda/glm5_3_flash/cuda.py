@@ -318,12 +318,7 @@ class Glm53FlashCudaRunner(PagedDecodeRunner[CacheArena]):
                     )
                 output.publish(
                     (acceptance, logits),
-                    parity=(
-                        acceptance.tokens,
-                        acceptance.accepted_drafts,
-                        acceptance.counts,
-                        acceptance.positions,
-                    ),
+                    parity=acceptance.parity_tensors,
                 )
 
         inputs = {

@@ -8,6 +8,7 @@ import pytest
 import torch
 
 from resin import BatchPhase, BatchPlan, SamplingParams
+from resin.backend.cuda.completion import CudaContinuation, DeviceAcceptance
 from resin.backend.cuda.sampling import FusedSampler
 from resin.backend.cuda.staging import TensorStager
 from resin.backend.speculative import SpeculativeStats
@@ -315,3 +316,69 @@ def test_inkling2_graph_keeps_target_logits_and_one_device_acceptance(
     )
     torch.testing.assert_close(step.inputs["token_ids"], feedback["token_ids"])
     torch.testing.assert_close(step.inputs["positions"], positions + acceptance.counts)
+
+
+@pytest.mark.parametrize("draft_count", [0, 1, 2])
+def test_qwen_graph_result_preserves_owned_continuation(monkeypatch, draft_count):
+    from resin_models_cuda.qwen3_5 import cuda as runtime
+
+    runner, plan, logits, drafts, targets = _fixture(runtime.Qwen3_5CudaRunner)
+    runner.speculative_draft_tokens = draft_count
+    shape = (2, 128)
+    runner._graph_device_caches = {
+        shape: SimpleNamespace(
+            recurrent_pool=lambda *_: None, store_hidden=lambda *_: None
+        )
+    }
+    runner._cache = SimpleNamespace(graph_device_inputs=lambda *_: {})
+    runner._graph_attention_for = lambda *_: SimpleNamespace(
+        reset=lambda: None, graph_inputs=lambda: {}
+    )
+    runner._feedback_graph_inputs = {}
+    runner._new_phase_timing = lambda *_: None
+    runner._refresh_graph_attention = lambda *_: None
+    runner._target_forward = lambda *_args, **_kwargs: (logits, None, None)
+    runner._model = SimpleNamespace(logits=lambda *_: logits)
+    monkeypatch.setattr(runtime, "graph_sample", lambda *_: targets[:, 0])
+    raw_next_draft = torch.tensor([7, 8]) if draft_count else None
+    raw_next_hidden = torch.ones(2, 2) if draft_count > 1 else None
+
+    def mtp(_cache, _anchors, positions, *_args, **_kwargs):
+        accepted = DeviceAcceptance.from_samples(
+            drafts[:, :draft_count], targets[:, : draft_count + 1], positions
+        )
+        return runtime._DecodeResult(logits, accepted, raw_next_draft, raw_next_hidden)
+
+    runner._mtp_step = mtp
+    step = runner._new_decode_graph_step(shape)
+    step.inputs["token_ids"].copy_(torch.tensor(plan.token_ids, dtype=torch.int64))
+    step.inputs["positions"].copy_(torch.tensor(plan.positions, dtype=torch.int64))
+    step.launch()
+    graph_result = step.output.value
+    assert graph_result.logits is logits
+    assert graph_result.next_draft is raw_next_draft
+    assert graph_result.next_hidden is raw_next_hidden
+    if raw_next_hidden is not None:
+        assert step.output.parity[-1] is raw_next_hidden
+
+    runner._run_cuda_graph = lambda *_: graph_result
+    runner._continuation = CudaContinuation()
+    runner.runner_config = SimpleNamespace(max_accepted_per_step=draft_count + 1)
+    runner.cache_layout = SimpleNamespace(decode_write_extra_tokens=0)
+    monkeypatch.setattr(
+        runtime,
+        "_Completion",
+        lambda *args, **kwargs: SimpleNamespace(feedback=args[-1]),
+    )
+    completion = runner._enqueue_graph_output(plan, shape, {})
+    assert completion.feedback.continuation.sequence_ids == tuple(plan.sequence_ids)
+    torch.testing.assert_close(
+        completion.feedback.positions,
+        step.inputs["positions"] + graph_result.acceptance.counts,
+    )
+    if raw_next_draft is not None:
+        raw_next_draft.zero_()
+        assert completion.feedback.draft_ids.tolist() == [7, 8]
+    if raw_next_hidden is not None:
+        raw_next_hidden.zero_()
+        torch.testing.assert_close(completion.feedback.draft_hidden, torch.ones(2, 2))

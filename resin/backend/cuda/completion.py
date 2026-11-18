@@ -107,6 +107,10 @@ class DeviceAcceptance:
         bonus = self.tokens.gather(1, self.accepted_drafts[:, None]).squeeze(1)
         return DeviceFeedback(bonus.clone(), self.positions + self.counts)
 
+    @property
+    def parity_tensors(self) -> tuple[torch.Tensor, ...]:
+        return self.tokens, self.accepted_drafts, self.counts, self.positions
+
 
 @dataclass(frozen=True, slots=True)
 class DeviceScores:

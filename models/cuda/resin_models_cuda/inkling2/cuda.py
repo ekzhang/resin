@@ -484,12 +484,7 @@ class Inkling2CudaRunner(PagedDecodeRunner[CacheArena]):
             )
             output.publish(
                 (acceptance, logits, self._checkpoint_inputs),
-                parity=(
-                    acceptance.tokens,
-                    acceptance.accepted_drafts,
-                    acceptance.counts,
-                    acceptance.positions,
-                ),
+                parity=acceptance.parity_tensors,
             )
             self._checkpoint_inputs = None
 
