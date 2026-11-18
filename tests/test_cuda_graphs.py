@@ -1040,6 +1040,41 @@ class TestCudaGraph:
 
         assert graphs.capture((1, 4), {"value": source}).tolist() == [9]
 
+    def test_breakable_graph_updates_captured_output_without_replacing_it(
+        self, graph_torch
+    ) -> None:
+        replace_output = False
+
+        def build(_shape):
+            output = CudaGraphResult()
+
+            def compute():
+                tokens = _Tensor([1])
+                output.publish(tokens, parity=tokens)
+
+            def broadcast():
+                tokens = output.value
+                tokens.values[0] = 7
+                if replace_output:
+                    output.publish(tokens.clone(), parity=tokens)
+
+            return CudaGraphProgram(
+                {},
+                output,
+                (
+                    CudaGraphRegion("compute", compute),
+                    CudaGraphRegion("broadcast", broadcast, capture=False),
+                ),
+            )
+
+        graphs = _cache(((1, 4),), build)
+        captured = graphs.capture((1, 4), {})
+        assert captured.tolist() == [7]
+        assert graphs.run((1, 4), {}) is captured
+        replace_output = True
+        with pytest.raises(PostAcceptCudaError, match="cannot replace"):
+            graphs.run((1, 4), {})
+
     def test_staging_the_same_input_mapping_does_not_copy_or_allocate(self) -> None:
         tensor = _Tensor([3, 7])
         tensor.copy_error = AssertionError("unnecessary self-copy")

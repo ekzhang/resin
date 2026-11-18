@@ -55,7 +55,6 @@ def _fixture(runner_type, *, scored=False):
     runner.vocab_size = 10
     runner.config = SimpleNamespace(vocab_size=10, hidden_size=2, num_hidden_layers=1)
     runner._speculation = SpeculativeStats(2)
-    runner._graph_logits = {}
     runner._eager_phase_timing = lambda *_args: None
     plan = BatchPlan(
         sequence_ids=[7, 8],
@@ -189,16 +188,22 @@ def test_eager_verification_routes_scores_and_rolls_back_accepted_state(
     assert runner._sampler.calls == [(2, 3, 10)]
 
 
-def test_deepseek_unscored_graph_harvests_directly_and_rolls_back(monkeypatch):
+@pytest.mark.parametrize("scored", [False, True])
+def test_deepseek_graph_harvest_preserves_scores_and_rollback(monkeypatch, scored):
     from resin.backend.speculative import _accept_speculative_tokens
-    from resin_models_cuda.deepseek_v41 import cuda as runtime
+    from resin_models_cuda import paged_decode
 
-    runner, plan, _logits, drafts, targets = _fixture(DeepSeekV41CudaRunner)
+    runner, plan, logits, drafts, targets = _fixture(
+        DeepSeekV41CudaRunner, scored=scored
+    )
     runner.parallel_groups = None
     runner._graph_device_caches = {(2, 128): object()}
-    runner._dspark_phase_events = {}
     runner._cache = SimpleNamespace(graph_plan_inputs=lambda *_args: {})
-    runner._run_cuda_graph = lambda *_args: torch.cat((drafts, targets), dim=1)
+    runner._run_cuda_graph = lambda *_args: (
+        torch.cat((drafts, targets), dim=1),
+        logits,
+        None,
+    )
     processed = []
     runner._model = SimpleNamespace(
         clear_rejected_speculative_state=lambda _positions, counts, *_args, **_kwargs: (
@@ -206,18 +211,34 @@ def test_deepseek_unscored_graph_harvests_directly_and_rolls_back(monkeypatch):
         )
     )
 
-    def forbid_completion(*_args):
-        raise AssertionError("unscored synchronous graph must harvest directly")
-
-    runner._enqueue_graph_output = forbid_completion
-    monkeypatch.setattr(runtime, "pad_sampling_inputs", lambda *_args: {})
-    result = runner._graph_forward(plan, object(), shape=(2, 128))
     expected = _accept_speculative_tokens(drafts.tolist(), targets.tolist())
-    assert result is not None
-    assert result.token_ids.tolist() == sum(expected.token_rows, [])
+    scores = object()
+
+    def score(values, acceptance, native):
+        assert scored, "unscored synchronous graph must harvest directly"
+        assert values is logits and native is plan
+        assert acceptance.counts.tolist() == expected.processed_counts
+        return scores
+
+    def complete(acceptance, **kwargs):
+        assert kwargs["scores"] is scores and kwargs["stats"] is runner._speculation
+        assert kwargs["feedback"] is None
+        return SimpleNamespace(result=lambda: scores)
+
+    monkeypatch.setattr(paged_decode, "pad_sampling_inputs", lambda *_args: {})
+    monkeypatch.setattr(paged_decode, "score_completion", score)
+    monkeypatch.setattr(
+        paged_decode, "DeviceCompletion", SimpleNamespace(from_acceptance=complete)
+    )
+    result = runner._graph_forward(plan, object(), shape=(2, 128))
+    if scored:
+        assert result is scores
+    else:
+        assert result is not None
+        assert result.token_ids.tolist() == sum(expected.token_rows, [])
+        assert runner._speculation.blocks == 2
+        assert runner._speculation.accepted == sum(expected.accepted_counts)
     assert processed == [expected.processed_counts]
-    assert runner._speculation.blocks == 2
-    assert runner._speculation.accepted == sum(expected.accepted_counts)
 
 
 def test_deepseek_graph_verification_samples_and_broadcasts_one_block():
@@ -251,8 +272,9 @@ def test_deepseek_graph_verification_samples_and_broadcasts_one_block():
     step.launch()
     assert runner._sampler.calls == [(2, 3, 10)]
     assert broadcasts == [(2, 2), (2, 3)]
-    torch.testing.assert_close(step.output, torch.cat((drafts, targets), dim=1))
-    assert runner._graph_logits[(2, 128)] is logits
+    samples, graph_logits, phase_events = step.output.value
+    torch.testing.assert_close(samples, torch.cat((drafts, targets), dim=1))
+    assert graph_logits is logits and phase_events is None
 
 
 @pytest.mark.parametrize("all_rejected", [False, True])

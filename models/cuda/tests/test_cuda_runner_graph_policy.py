@@ -159,7 +159,6 @@ def test_deepseek_decode_policy_places_broadcast_inside_or_between_graphs(
     )
     runner._graph_device_caches = {}
     runner._graph_inputs = {}
-    runner._graph_logits = {}
     setattr(
         runner,
         "_cache",
@@ -209,7 +208,10 @@ def test_deepseek_decode_policy_places_broadcast_inside_or_between_graphs(
         program.launch()
 
     assert events == ["model", "sample", *(["broadcast"] if parallel else [])]
-    assert program.output.tolist() == ([7, 7] if parallel else [1, 1])
+    tokens, logits, phase_events = program.output.value
+    assert tokens.tolist() == ([7, 7] if parallel else [1, 1])
+    assert logits.tolist() == [[0, 1], [0, 1]]
+    assert phase_events is None
 
 
 def cpu_prefill_regions(

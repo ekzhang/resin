@@ -37,6 +37,64 @@ class PreparedBatch:
     cache_plan: PagedCachePlan | None
 
 
+def complete_graph_decode(acceptance, logits, plan, *, stats, continuation=None):
+    feedback = None
+    if continuation is not None:
+        next_inputs = acceptance.feedback()
+        feedback = GraphDeviceFeedback(
+            next_inputs.token_ids, next_inputs.positions, continuation
+        )
+    return DeviceCompletion.from_acceptance(
+        acceptance,
+        feedback=feedback,
+        rows=0 if plan is None else plan.num_sequences,
+        stats=stats if acceptance.draft_tokens and plan is not None else None,
+        plan=plan,
+        scores=score_completion(logits, acceptance, plan),
+    )
+
+
+def paged_decode_graph_inputs(runner, plan, cache_plan, shape):
+    rows = plan.num_sequences
+    padding = shape[0] - rows
+    inputs = {
+        "token_ids": np.pad(plan.token_ids, (0, padding)),
+        "positions": np.pad(plan.positions, (0, padding), constant_values=1),
+        **runner._cache.graph_plan_inputs(
+            runner._graph_device_caches[shape], cache_plan
+        ),
+        **pad_sampling_inputs(runner._sampler, plan, runner.vocab_size, padding),
+    }
+    if runner.parallel_groups is not None:
+        inputs["ep_valid_rows"] = rows
+    return inputs
+
+
+def replay_distributed_decode(
+    runner, plan, cache_plan, shape, *, enqueue=False, feedback=None
+):
+    if shape is None:
+        return False, None
+    if feedback is not None:
+        inputs = runner._continuation.resume(
+            () if plan is None else plan.sequence_ids,
+            feedback.continuation,
+            shape=shape,
+        )
+        return True, runner._enqueue_graph_output(plan, shape, inputs, feedback)
+    if plan is not None:
+        return True, runner._graph_forward(
+            plan, cache_plan, shape=shape, enqueue=enqueue
+        )
+    # Idle replicas join collective operations with scratch cache rows.
+    inputs = runner._decode_graph_capture_inputs(shape)
+    inputs["ep_valid_rows"] = 0
+    if enqueue:
+        return True, runner._enqueue_graph_output(None, shape, inputs, None)
+    runner._run_cuda_graph("decode", shape, inputs)
+    return True, None
+
+
 class PagedDecodeRunner(CudaRunner, Generic[_Cache]):
     """Stage one paged decode batch and complete it before the next replay."""
 
@@ -78,22 +136,12 @@ class PagedDecodeRunner(CudaRunner, Generic[_Cache]):
 
     def _graph_completion(self, plan, shape, inputs, continuation=None):
         acceptance, logits = self._decode_graph_result(shape, inputs)
-        feedback = None
-        if continuation is not None:
-            next_inputs = acceptance.feedback()
-            feedback = GraphDeviceFeedback(
-                next_inputs.token_ids, next_inputs.positions, continuation
-            )
-        return DeviceCompletion.from_acceptance(
+        return complete_graph_decode(
             acceptance,
-            feedback=feedback,
-            rows=0 if plan is None else plan.num_sequences,
-            device=self.device,
-            stats=self._speculation
-            if self.speculative_draft_tokens and plan is not None
-            else None,
-            plan=plan,
-            scores=score_completion(logits, acceptance, plan),
+            logits,
+            plan,
+            stats=self._speculation,
+            continuation=continuation,
         )
 
     def _graph_forward(self, plan, cache_plan, *, shape=None, enqueue=False):
@@ -101,18 +149,7 @@ class PagedDecodeRunner(CudaRunner, Generic[_Cache]):
             shape = self._decode_graph_shape(plan, cache_plan)
         if shape is None:
             return None
-        rows = plan.num_sequences
-        padding = shape[0] - rows
-        inputs = {
-            "token_ids": np.pad(plan.token_ids, (0, padding)),
-            "positions": np.pad(plan.positions, (0, padding), constant_values=1),
-            **self._cache.graph_plan_inputs(
-                self._graph_device_caches[shape], cache_plan
-            ),
-            **pad_sampling_inputs(self._sampler, plan, self.vocab_size, padding),
-        }
-        if self.parallel_groups is not None:
-            inputs["ep_valid_rows"] = rows
+        inputs = paged_decode_graph_inputs(self, plan, cache_plan, shape)
         if enqueue:
             return self._enqueue_graph_output(plan, shape, inputs, None)
         return self._graph_completion(plan, shape, inputs).result()
@@ -215,25 +252,14 @@ class PagedDecodeRunner(CudaRunner, Generic[_Cache]):
         shape = self._distributed_decode_shape(
             plan, context, prepared, enqueue=enqueue, feedback=feedback
         )
-        if shape is None:
-            return False, None
-        if feedback is not None:
-            inputs = self._continuation.resume(
-                () if plan is None else plan.sequence_ids,
-                feedback.continuation,
-                shape=shape,
-            )
-            return True, self._enqueue_graph_output(plan, shape, inputs, feedback)
-        if plan is not None:
-            return True, self._graph_forward(
-                plan, prepared.cache_plan, shape=shape, enqueue=enqueue
-            )
-        inputs = self._decode_graph_capture_inputs(shape)
-        inputs["ep_valid_rows"] = 0
-        if enqueue:
-            return True, self._enqueue_graph_output(None, shape, inputs, None)
-        self._run_cuda_graph("decode", shape, inputs)
-        return True, None
+        return replay_distributed_decode(
+            self,
+            plan,
+            None if prepared is None else prepared.cache_plan,
+            shape,
+            enqueue=enqueue,
+            feedback=feedback,
+        )
 
     @observe_execution
     @execute_state

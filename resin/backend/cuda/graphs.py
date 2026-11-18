@@ -155,16 +155,24 @@ def resolve_decode_graph_shapes(
 class CudaGraphResult:
     """Result buffers allocated by a captured launch.
 
-    The launch publishes its buffers during warmup and capture. Replay writes
-    into the same captured buffers, so consumers must stage anything retained
-    across replays. Parity checks use the declared semantic tensor columns.
+    A captured region publishes its buffers during warmup and capture. Later
+    regions and replay may write into those buffers. Consumers stage anything
+    retained across replays. Parity checks use the semantic tensor columns.
     """
 
     value: Any = None
     parity: Any = None
+    _sealed: bool = False
 
     def publish(self, value: Any, *, parity: Any) -> None:
+        if self._sealed:
+            raise RuntimeError("cannot replace a captured CUDA graph result")
         self.value, self.parity = value, parity
+
+    def seal(self) -> None:
+        if self.parity is None:
+            raise RuntimeError("CUDA graph launch did not publish its result")
+        self._sealed = True
 
 
 @dataclass(frozen=True, slots=True)
@@ -227,8 +235,6 @@ class CudaGraphProgram:
             raise ValueError("CUDA graph region names must be unique")
         if not any(region.capture for region in regions):
             raise ValueError("CUDA graph program must capture at least one region")
-        if isinstance(self.output, CudaGraphResult) and len(regions) != 1:
-            raise ValueError("launch-allocated results require one captured region")
         object.__setattr__(self, "regions", regions)
 
 
@@ -596,6 +602,8 @@ class _CudaGraphCache:
             if isinstance(program.output, CudaGraphResult):
                 program.output.value = program.output.parity = None
             graphs = self._capture_regions(entry, warmup)
+            if isinstance(program.output, CudaGraphResult):
+                program.output.seal()
             if program.prepare is not None:
                 program.prepare()
             self._replay(program, graphs)
