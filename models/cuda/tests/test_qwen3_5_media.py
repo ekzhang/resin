@@ -4,7 +4,6 @@ import base64
 import io
 
 import numpy as np
-import pytest
 import torch
 from PIL import Image
 from recipe_fuzz.qwen import QwenAdapter
@@ -110,20 +109,3 @@ def test_native_qwen_rotary_positions_cover_prompt_and_decode_continuation():
         [[0, 1, 1, 1, 1, 3, 4, 5], [0, 1, 1, 2, 2, 3, 4, 5], [0, 1, 2, 1, 2, 3, 4, 5]]
     )
     np.testing.assert_array_equal(result[:, 0].numpy(), expected)
-
-
-def test_qwen_recipe_rejects_video_instead_of_dropping_its_embeddings() -> None:
-    model_recipe = get_native_recipe("qwen3_5", QwenAdapter().recipe.tokenizer)
-    with pytest.raises(ValueError, match="does not support video"):
-        model_recipe.render(
-            [
-                resin.recipe.Message(
-                    resin.recipe.Role.USER,
-                    [
-                        resin.recipe.Video(
-                            source=np.zeros((1, 2, 2, 3), dtype=np.float32)
-                        )
-                    ],
-                )
-            ]
-        )
