@@ -997,9 +997,12 @@ class TestCudaGraph:
         self, graph_torch, captured_count
     ) -> None:
         published = []
+        resources = []
 
         def build(_shape):
             output = CudaGraphResult()
+            resource = _Tensor([4])
+            resources.append(ref(resource))
 
             def launch():
                 capturing = graph_torch.cuda.capturing
@@ -1010,7 +1013,7 @@ class TestCudaGraph:
                 count = _Tensor([captured_count if capturing else 1])
                 output.publish(logits, parity=(_Tensor([3]), count))
 
-            return CudaGraphStep({}, output, launch)
+            return CudaGraphStep({}, output, launch, resources=resource)
 
         graphs = _cache(((1, 4),), build)
         if captured_count != 1:
@@ -1021,12 +1024,14 @@ class TestCudaGraph:
             return
         captured = graphs.capture((1, 4), {})
         assert captured.tolist() == [2]
+        assert graphs.program((1, 4)).resources is resources[-1]()
         assert graphs.run((1, 4), {}) is captured
         assert len(published) == 4
         assert all(reference() is None for reference in published[:-1])
         del captured
         graphs.close()
         assert published[-1]() is None
+        assert resources[-1]() is None
 
     def test_graph_inputs_can_copy_directly_from_device_tensors(
         self, graph_torch

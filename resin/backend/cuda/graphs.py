@@ -185,6 +185,7 @@ class CudaGraphStep:
     prepare: Callable[[], None] | None = None
     validate_eager_output: bool = True
     phase_timing: GraphPhaseTiming | None = None
+    resources: Any = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -223,6 +224,7 @@ class CudaGraphProgram:
     prepare: Callable[[], None] | None = None
     validate_eager_output: bool = True
     phase_timing: GraphPhaseTiming | None = None
+    resources: Any = None
 
     def __post_init__(self) -> None:
         regions = tuple(self.regions)
@@ -249,6 +251,7 @@ def _as_program(step: CudaGraphStep | CudaGraphProgram) -> CudaGraphProgram:
             prepare=step.prepare,
             validate_eager_output=step.validate_eager_output,
             phase_timing=step.phase_timing,
+            resources=step.resources,
         )
     raise TypeError("CUDA graph builder must return a step or program")
 
@@ -535,16 +538,8 @@ class _CudaGraphCache:
     ) -> Any:
         """Stage and replay one current batch using a pre-captured graph."""
 
-        self.check()
-        try:
-            entry = self._entries[shape]
-        except KeyError as error:
-            raise ValueError(f"unconfigured CUDA graph shape: {shape}") from error
-        if not entry.captured or entry.program is None or entry.staging is None:
-            raise RuntimeError(
-                f"CUDA graph shape {shape} has not been captured; "
-                "capture configured graphs during runner initialization"
-            )
+        entry = self._ready_entry(shape)
+        assert entry.program is not None and entry.staging is not None
         try:
             entry.staging.copy_into(entry.program.inputs, inputs)
         except StagingError as error:
@@ -570,6 +565,25 @@ class _CudaGraphCache:
         self._replay_count += 1
         output = entry.program.output
         return output.value if isinstance(output, CudaGraphResult) else output
+
+    def program(self, shape: GraphShape) -> CudaGraphProgram:
+        """Return the resources and inputs of a successfully captured program."""
+        program = self._ready_entry(shape).program
+        assert program is not None
+        return program
+
+    def _ready_entry(self, shape: GraphShape) -> _GraphEntry:
+        self.check()
+        try:
+            entry = self._entries[shape]
+        except KeyError as error:
+            raise ValueError(f"unconfigured CUDA graph shape: {shape}") from error
+        if not entry.captured or entry.program is None or entry.staging is None:
+            raise RuntimeError(
+                f"CUDA graph shape {shape} has not been captured; "
+                "capture configured graphs during runner initialization"
+            )
+        return entry
 
     def _capture(self, entry: _GraphEntry, allocation_before: int) -> None:
         program = entry.program

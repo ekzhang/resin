@@ -242,7 +242,6 @@ class Glm53FlashCudaRunner(PagedDecodeRunner[CacheArena]):
         # Shape widths describe the public context bound. Verification may
         # compute K further rows which the Engine clips at request completion.
         cache = self._cache.graph_cache(size, width + self.speculative_draft_tokens)
-        self._graph_device_caches[shape] = cache
         ids = torch.empty((size, 1), device=self.device, dtype=torch.long)
         positions = torch.empty(size, device=self.device, dtype=torch.long)
         sequence_indices = torch.arange(size, device=self.device, dtype=torch.long)
@@ -329,13 +328,13 @@ class Glm53FlashCudaRunner(PagedDecodeRunner[CacheArena]):
         }
         if valid is not None:
             inputs["ep_valid_rows"] = valid
-        self._graph_inputs[shape] = inputs
         return CudaGraphStep(
             inputs=inputs,
             output=output,
             launch=launch,
             prepare=self._cache.reset_null,
             phase_timing=phase_timing,
+            resources=cache,
         )
 
     def _validate_plan(self, plan: BatchPlan) -> tuple[tuple[int, int], ...]:

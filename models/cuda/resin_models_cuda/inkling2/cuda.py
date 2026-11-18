@@ -450,7 +450,6 @@ class Inkling2CudaRunner(PagedDecodeRunner[CacheArena]):
     def _new_decode_graph_step(self, shape):
         size, width, algorithm = shape
         cache = self._cache.graph_cache(size, width + self.speculative_draft_tokens)
-        self._graph_device_caches[shape] = cache
         ids = torch.empty((size, 1), device=self.device, dtype=torch.long)
         positions = torch.empty(size, device=self.device, dtype=torch.long)
         sampling = self._sampler.empty(size, self.device)
@@ -496,13 +495,13 @@ class Inkling2CudaRunner(PagedDecodeRunner[CacheArena]):
         }
         if valid is not None:
             inputs["ep_valid_rows"] = valid
-        self._graph_inputs[shape] = inputs
         return CudaGraphStep(
             inputs=inputs,
             output=output,
             launch=launch,
             prepare=self._cache.reset_null,
             phase_timing=phase_timing,
+            resources=cache,
         )
 
     def _validate_plan(self, plan: BatchPlan) -> tuple[tuple[int, int], ...]:

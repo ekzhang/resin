@@ -1,4 +1,4 @@
-"""Host execution shared by the GLM and Inkling paged decode runners."""
+"""Host execution shared by paged decode runners."""
 
 from __future__ import annotations
 
@@ -16,11 +16,10 @@ from resin.backend.cuda.completion import (
     DeviceCompletion,
     GraphDeviceFeedback,
 )
-from resin.backend.cuda.graphs import GraphShape
 from resin.backend.cuda.metrics import observe_execution
 from resin.backend.cuda.runner import CudaRunner, pad_sampling_inputs
 from resin.backend.cuda.scoring import score_completion
-from resin.backend.cuda.slab import GraphPageTableArena, SlabDeviceCache
+from resin.backend.cuda.slab import GraphPageTableArena
 from resin.backend.cuda.state import execute_state
 from resin.backend.plans import PagedCachePlan
 from resin.backend.torch import use_default_dtype
@@ -54,15 +53,13 @@ def complete_graph_decode(acceptance, logits, plan, *, stats, continuation=None)
     )
 
 
-def paged_decode_graph_inputs(runner, plan, cache_plan, shape):
+def paged_decode_graph_inputs(runner, plan, cache_plan, shape, graph_cache):
     rows = plan.num_sequences
     padding = shape[0] - rows
     inputs = {
         "token_ids": np.pad(plan.token_ids, (0, padding)),
         "positions": np.pad(plan.positions, (0, padding), constant_values=1),
-        **runner._cache.graph_plan_inputs(
-            runner._graph_device_caches[shape], cache_plan
-        ),
+        **runner._cache.graph_plan_inputs(graph_cache, cache_plan),
         **pad_sampling_inputs(runner._sampler, plan, runner.vocab_size, padding),
     }
     if runner.parallel_groups is not None:
@@ -108,8 +105,6 @@ class PagedDecodeRunner(CudaRunner, Generic[_Cache]):
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
         self._continuation = CudaContinuation()
-        self._graph_device_caches: dict[GraphShape, SlabDeviceCache] = {}
-        self._graph_inputs: dict[GraphShape, dict[str, torch.Tensor]] = {}
 
     @abstractmethod
     def _prepare(self, plan): ...
@@ -149,7 +144,10 @@ class PagedDecodeRunner(CudaRunner, Generic[_Cache]):
             shape = self._decode_graph_shape(plan, cache_plan)
         if shape is None:
             return None
-        inputs = paged_decode_graph_inputs(self, plan, cache_plan, shape)
+        graph = self._captured_cuda_graph("decode", shape)
+        inputs = paged_decode_graph_inputs(
+            self, plan, cache_plan, shape, graph.resources
+        )
         if enqueue:
             return self._enqueue_graph_output(plan, shape, inputs, None)
         return self._graph_completion(plan, shape, inputs).result()
@@ -161,7 +159,7 @@ class PagedDecodeRunner(CudaRunner, Generic[_Cache]):
             else self._continuation.begin(
                 () if plan is None else plan.sequence_ids,
                 shape,
-                self._graph_inputs[shape],
+                self._captured_cuda_graph("decode", shape).inputs,
             )
         )
         if feedback is not None:

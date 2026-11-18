@@ -82,7 +82,6 @@ def _inkling_fixture(monkeypatch, runner, logits, drafts, counts, stored):
     )
     runner.parallel_groups = None
     runner.cache_geometry = SimpleNamespace(state_width=4)
-    runner._graph_inputs = {}
     runner._checkpoint_buffers = (
         torch.empty(2, 1, 3, 4, dtype=torch.bfloat16),
         torch.empty(2, 3, 1, 4, dtype=torch.bfloat16),
@@ -198,7 +197,7 @@ def test_deepseek_graph_harvest_preserves_scores_and_rollback(monkeypatch, score
         DeepSeekV41CudaRunner, scored=scored
     )
     runner.parallel_groups = None
-    runner._graph_device_caches = {(2, 128): object()}
+    runner._captured_cuda_graph = lambda *_args: SimpleNamespace(resources=object())
     runner._cache = SimpleNamespace(graph_plan_inputs=lambda *_args: {})
     runner._run_cuda_graph = lambda *_args: (
         torch.cat((drafts, targets), dim=1),
@@ -246,8 +245,6 @@ def test_deepseek_graph_verification_samples_and_broadcasts_one_block():
     runner, plan, logits, drafts, targets = _fixture(DeepSeekV41CudaRunner)
     runner.parallel_groups = None
     runner.profile_graph_phases = False
-    runner._graph_device_caches = {}
-    runner._graph_inputs = {}
     runner._cache = SimpleNamespace(
         graph_cache=lambda *_args: object(),
         graph_device_inputs=lambda _cache: {},
@@ -285,7 +282,6 @@ def test_inkling2_graph_keeps_target_logits_and_one_device_acceptance(
     runner, plan, logits, drafts, targets = _fixture(Inkling2CudaRunner)
     if all_rejected:
         targets[:, 0].fill_(9)
-    runner._graph_device_caches = {}
     state_positions, state_counts = [], []
     _inkling_fixture(monkeypatch, runner, logits, drafts, state_counts, state_positions)
     shape = (2, 128, 2)
@@ -325,16 +321,25 @@ def test_qwen_graph_result_preserves_owned_continuation(monkeypatch, draft_count
     runner, plan, logits, drafts, targets = _fixture(runtime.Qwen3_5CudaRunner)
     runner.speculative_draft_tokens = draft_count
     shape = (2, 128)
-    runner._graph_device_caches = {
-        shape: SimpleNamespace(
-            recurrent_pool=lambda *_: None, store_hidden=lambda *_: None
-        )
-    }
-    runner._cache = SimpleNamespace(graph_device_inputs=lambda *_: {})
-    runner._graph_attention_for = lambda *_: SimpleNamespace(
-        reset=lambda: None, graph_inputs=lambda: {}
+    cache = SimpleNamespace(
+        recurrent_pool=lambda *_: None, store_hidden=lambda *_: None
     )
-    runner._feedback_graph_inputs = {}
+    runner._cache = SimpleNamespace(
+        graph_cache=lambda *_: cache, graph_device_inputs=lambda *_: {}
+    )
+    monkeypatch.setattr(
+        runtime,
+        "GraphPagedAttentionRuntime",
+        lambda *_args, **_kwargs: SimpleNamespace(
+            reset=lambda: None, graph_inputs=lambda: {}
+        ),
+    )
+    runner.attention_config = SimpleNamespace(
+        num_attention_heads=2, num_key_value_heads=1
+    )
+    runner.config.head_dim = 2
+    runner._graph_specs = lambda: ()
+    runner._graph_workspace = object()
     runner._new_phase_timing = lambda *_: None
     runner._refresh_graph_attention = lambda *_: None
     runner._target_forward = lambda *_args, **_kwargs: (logits, None, None)
@@ -362,6 +367,7 @@ def test_qwen_graph_result_preserves_owned_continuation(monkeypatch, draft_count
         assert step.output.parity[-1] is raw_next_hidden
 
     runner._run_cuda_graph = lambda *_: graph_result
+    runner._captured_cuda_graph = lambda *_: step
     runner._continuation = CudaContinuation()
     runner.runner_config = SimpleNamespace(max_accepted_per_step=draft_count + 1)
     runner.cache_layout = SimpleNamespace(decode_write_extra_tokens=0)

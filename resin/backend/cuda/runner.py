@@ -17,6 +17,7 @@ from resin.backend.collectives import (
     layer_collectives,
 )
 from resin.backend.control_plane import ControlPlane
+from resin.backend.cuda.completion import CudaContinuation
 from resin.backend.cuda.failures import CudaFailureGuard
 from resin.backend.cuda.graphs import (
     CudaGraphCounts,
@@ -597,6 +598,9 @@ class CudaRunner(Runner):
 
         if self._cuda_graph_executor is not None:
             self._cuda_graph_executor.close()
+        continuation = getattr(self, "_continuation", None)
+        if isinstance(continuation, CudaContinuation):
+            continuation.drain()
         for graphs in getattr(self, "_prefill_tensor_graphs", {}).values():
             graphs.buffers.clear()
         if (
@@ -669,6 +673,9 @@ class CudaRunner(Runner):
         if metrics is not None:
             metrics.graph(mode)
         return output
+
+    def _captured_cuda_graph(self, mode: str, shape: GraphShape) -> CudaGraphProgram:
+        return self._require_cuda_graph_executor().mode(mode).program(shape)
 
     def _cuda_graph_fallback(self, mode: str, reason: str) -> None:
         """Record a model-level reason that a configured mode ran eagerly."""

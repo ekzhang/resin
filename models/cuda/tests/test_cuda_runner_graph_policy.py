@@ -157,8 +157,6 @@ def test_deepseek_decode_policy_places_broadcast_inside_or_between_graphs(
         "tensor_parallel",
         SimpleNamespace(enabled=parallel, process_group=object()),
     )
-    runner._graph_device_caches = {}
-    runner._graph_inputs = {}
     setattr(
         runner,
         "_cache",
