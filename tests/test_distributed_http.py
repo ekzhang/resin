@@ -46,8 +46,11 @@ class RankRecipe:
         )
 
     def create_parser(self, prompt):
+        owner = threading.get_ident()
+
         class Parser:
             def feed(self, ids):
+                assert threading.get_ident() == owner
                 return [
                     resin.recipe.TextDelta("".join(str(token - 10) for token in ids))
                 ]

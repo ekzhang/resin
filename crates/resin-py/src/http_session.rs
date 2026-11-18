@@ -359,7 +359,7 @@ impl Session {
                 {
                     return Err(PyRuntimeError::new_err("prompt rendering was cancelled"));
                 }
-                render_job(&recipe, &job.request)
+                render_job(&recipe, &job.request, job.sender.is_none())
             }))
             .unwrap_or_else(|_| Err(PyRuntimeError::new_err("prompt rendering panicked")));
             let _ = completed.send((job, rendered));
@@ -398,7 +398,12 @@ impl Session {
             enqueued_at,
         } = job;
         let result = Python::attach(|py| {
-            let (token_ids, media, parser) = rendered?;
+            let (token_ids, media, parser) = match rendered? {
+                Rendered::Ready(parts) => parts,
+                Rendered::CustomPrompt(prompt) => {
+                    prepare_custom_parser(py, self.recipe.bind(py), prompt.bind(py))?
+                }
+            };
             if token_ids.is_empty() {
                 return Err(PyValueError::new_err(
                     "recipe.render returned an empty token_ids sequence",
@@ -713,8 +718,15 @@ impl Drop for Session {
         self.cancel_renders();
     }
 }
-/// Generation input always includes its response parser.
-type RenderedJob = PyResult<(Vec<u32>, Option<Py<PyTuple>>, Py<PyAny>)>;
+type PreparedPrompt = (Vec<u32>, Option<Py<PyTuple>>, Py<PyAny>);
+type RenderedJob = PyResult<Rendered>;
+
+enum Rendered {
+    Ready(PreparedPrompt),
+    // Routed custom parsers can be thread-affine. The replica driver creates
+    // these parsers on the same thread that will feed them.
+    CustomPrompt(Py<PyAny>),
+}
 
 struct RenderInput {
     messages: Vec<Py<Message>>,
@@ -768,27 +780,47 @@ fn render_custom<'py>(
     recipe.call_method("render", (input.messages,), Some(&kwargs))
 }
 
-/// Render prompt/media and create its parser off the engine thread.
-fn render_job(recipe: &Py<PyAny>, request: &ConversationRequest) -> RenderedJob {
+fn prepare_custom_parser(
+    py: Python<'_>,
+    recipe: &Bound<'_, PyAny>,
+    rendered: &Bound<'_, PyAny>,
+) -> PyResult<PreparedPrompt> {
+    let parser = recipe.call_method1("create_parser", (rendered,))?.unbind();
+    let prompt = rendered.cast::<RenderedPrompt>()?.borrow();
+    Ok((
+        prompt.token_ids.clone(),
+        prompt.media.as_ref().map(|value| value.clone_ref(py)),
+        parser,
+    ))
+}
+
+/// Render prompt/media off the engine thread.
+fn render_job(
+    recipe: &Py<PyAny>,
+    request: &ConversationRequest,
+    defer_custom_parser: bool,
+) -> RenderedJob {
     Python::attach(|py| {
         let input = render_input(py, recipe, request)?;
         if let Ok(native) = recipe.bind(py).cast::<NativeRecipe>() {
             let native = native.borrow();
             let rendered = native.render(py, input.messages, input.tools, Some(&input.options))?;
             let parser = Py::new(py, native.create_parser(py, &rendered)?)?.into_any();
-            Ok((rendered.token_ids, rendered.media, parser))
-        } else {
-            let rendered = render_custom(py, recipe.bind(py), input)?;
-            let parser = recipe
-                .bind(py)
-                .call_method1("create_parser", (&rendered,))?
-                .unbind();
-            let prompt = rendered.cast::<RenderedPrompt>()?.borrow();
-            Ok((
-                prompt.token_ids.clone(),
-                prompt.media.as_ref().map(|value| value.clone_ref(py)),
+            Ok(Rendered::Ready((
+                rendered.token_ids,
+                rendered.media,
                 parser,
-            ))
+            )))
+        } else {
+            let recipe = recipe.bind(py);
+            let rendered = render_custom(py, recipe, input)?;
+            if defer_custom_parser {
+                Ok(Rendered::CustomPrompt(rendered.unbind()))
+            } else {
+                Ok(Rendered::Ready(prepare_custom_parser(
+                    py, recipe, &rendered,
+                )?))
+            }
         }
     })
 }
