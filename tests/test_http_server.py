@@ -40,7 +40,10 @@ def test_http_server_validates_route_configuration() -> None:
             HttpServer(engine, recipe=_Recipe(), model="test", enable_openai=False)
         with pytest.raises(ValueError, match="flags must be booleans"):
             HttpServer(
-                engine, recipe=_Recipe(), model="test", enable_priority_scheduling=1
+                engine,
+                recipe=_Recipe(),
+                model="test",
+                enable_priority_scheduling=1,  # ty: ignore[invalid-argument-type]
             )
 
 

@@ -81,7 +81,6 @@ def test_session_overflow_terminates_client_and_keeps_other_requests_usable(
         "type": "error",
         "data": {"message": "the inference stream ended before completion"},
     }
-    assert session.active_count == 0
     assert not engine.has_work() and not engine.closed and not engine.poisoned
     assert session.process([]).to_bytes() == b""
 
@@ -95,7 +94,7 @@ def test_session_overflow_terminates_client_and_keeps_other_requests_usable(
     ]
     assert all(request_id == "ordinary" for request_id, _ in ordinary)
     assert ordinary[-1][1]["data"]["reason"] == "length"
-    assert session.active_count == 0 and session.process([]).to_bytes() == b""
+    assert not engine.has_work() and session.process([]).to_bytes() == b""
     session.close()
     assert not engine.closed
     engine.close()
@@ -273,7 +272,7 @@ def test_http_session_snapshots_recipe_stops_before_rendering():
             assert len(finished) == 1
             assert finished[0]["data"]["reason"] == "stop"
             assert finished[0]["data"]["output_tokens"] == 1
-            assert session.active_count == 0 and not engine.has_work()
+            assert not engine.has_work() and session.process([]).to_bytes() == b""
         assert recipe.stop_reads == 1
     finally:
         session.close()
