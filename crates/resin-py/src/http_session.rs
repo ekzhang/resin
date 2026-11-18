@@ -706,14 +706,6 @@ impl NativeHttpSession {
         }
         Ok(())
     }
-    fn cancel(&self, ids: Vec<String>) -> PyResult<()> {
-        let mut inner = self.inner.lock().unwrap_or_else(|error| error.into_inner());
-        inner.0.cancel(&ids)?;
-        for id in ids {
-            inner.1.remove(&id);
-        }
-        Ok(())
-    }
     fn process(&self, py: Python<'_>, events: Vec<Py<TokenEvent>>) -> PyResult<HttpEvents> {
         let events = events
             .into_iter()
@@ -755,14 +747,6 @@ impl NativeHttpSession {
         inner.0.close()?;
         inner.1.clear();
         Ok(())
-    }
-    #[getter]
-    fn active_count(&self) -> usize {
-        self.inner
-            .lock()
-            .unwrap_or_else(|error| error.into_inner())
-            .0
-            .active_count()
     }
 }
 

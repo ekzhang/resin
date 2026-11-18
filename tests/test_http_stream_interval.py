@@ -185,7 +185,7 @@ def test_first_output_is_immediate_then_token_interval_and_final_residual(
         assert output[-1][1]["type"] == "finished"
         assert output[-1][1]["data"]["reason"] == "length"
         assert_scores(output, recipe.ids)
-        assert session.active_count == 0 and not engine.has_work()
+        assert not engine.has_work()
 
 
 def test_verified_blocks_count_tokens_and_coalesce_without_waiting_for_more_steps():
@@ -267,7 +267,7 @@ def test_terminal_paths_flush_residual_and_stops_still_parse_every_step(
         assert "".join(data["delta"] for _, data in text_events(output)) == expected
         assert output[-1][1]["data"]["reason"] == reason
         assert_scores(output, recipe.ids[:consumed])
-        assert runner.released and session.active_count == 0
+        assert runner.released
         assert not engine.has_work() and not engine.poisoned
 
 
@@ -292,8 +292,8 @@ def test_intervals_belong_to_each_request_and_cancel_discards_only_its_pending_o
         assert [(name, data["delta"]) for name, data in next_text()] == [
             ("first", "bcd")
         ]
-        session.cancel(["second"])
-        assert session.active_count == 1 and runner.released
+        session.admit(ingress(canceled=["second"]))
+        assert len(runner.released) == 1
         remaining = []
         while engine.has_work():
             remaining.extend(tick(session, engine))
@@ -302,7 +302,7 @@ def test_intervals_belong_to_each_request_and_cancel_discards_only_its_pending_o
         assert [(name, data["delta"]) for name, data in text_events(remaining)] == [
             ("first", "ef")
         ]
-        assert session.active_count == 0
+        assert remaining[-1][1]["type"] == "finished"
         assert_scores([event for event in output if event[0] == "first"], recipe.ids)
         assert_scores(
             [event for event in output if event[0] == "second"], recipe.ids[:1]

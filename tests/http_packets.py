@@ -5,8 +5,10 @@ import json
 from resin._resin import _HttpEvents, _HttpIngress
 
 
-def ingress(requests):
-    return _HttpIngress.from_bytes(json.dumps({"requests": requests}).encode())
+def ingress(requests=(), *, canceled=()):
+    return _HttpIngress.from_bytes(
+        json.dumps({"requests": requests, "canceled": canceled}).encode()
+    )
 
 
 def decoded_events(packet: _HttpEvents):
