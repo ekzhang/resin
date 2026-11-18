@@ -73,7 +73,8 @@ pub trait PrefixStorageOperation: fmt::Debug + Send + Sync {
     fn poll(&mut self, wait: bool) -> Option<u32>;
 }
 pub trait PrefixStorage: fmt::Debug + Send + Sync {
-    fn lookup(&mut self, key: &PrefixKey<'_>) -> StorageOp;
+    /// Return the longest stored prefix at a multiple of the reader's checkpoint alignment.
+    fn lookup(&mut self, key: &PrefixKey<'_>, checkpoint_alignment: u32) -> StorageOp;
     fn transfer(
         &mut self,
         key: &PrefixKey<'_>,
@@ -271,7 +272,7 @@ impl PagedKvResources {
         if maximum < alignment as usize {
             return false;
         }
-        let operation = storage.lookup(&key.prefix(maximum));
+        let operation = storage.lookup(&key.prefix(maximum), alignment);
         self.jobs
             .push((operation, request, key.prefix(maximum).into_owned(), None));
         true
@@ -1449,7 +1450,7 @@ mod tests {
         }
     }
     impl PrefixStorage for HeldStorage {
-        fn lookup(&mut self, _: &PrefixKey<'_>) -> StorageOp {
+        fn lookup(&mut self, _: &PrefixKey<'_>, _: u32) -> StorageOp {
             unreachable!("the test only exports checkpoints")
         }
         fn transfer(

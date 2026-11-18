@@ -1,4 +1,5 @@
 from concurrent.futures import Future, ThreadPoolExecutor, TimeoutError
+from contextlib import closing
 from random import Random
 from threading import Event
 from time import sleep
@@ -9,7 +10,13 @@ import pytest
 import torch
 from test_flat_cache import RecordingCachedRunner, _window_layout
 
-from resin import CacheGroupLayout, CacheLayout, Engine, SamplingParams
+from resin import (
+    CacheGroupFamily,
+    CacheGroupLayout,
+    CacheLayout,
+    Engine,
+    SamplingParams,
+)
 from resin.cache_storage import MemoryCacheStorage
 
 
@@ -24,8 +31,10 @@ def make_engine(
     capacity=32,
     checkpoint_interval=0,
     window=False,
+    runner=None,
+    state_tracking_interval=256,
 ):
-    runner = RecordingCachedRunner(
+    runner = runner or RecordingCachedRunner(
         _window_layout(capacity)
         if window
         else CacheLayout(parent_capacity=capacity, groups=[CacheGroupLayout(2)])
@@ -42,6 +51,7 @@ def make_engine(
     setattr(runner, "cache_storage_buffers", buffers)
     options: dict[str, Any] = dict(
         prefix_cache=True,
+        state_tracking_interval=state_tracking_interval,
         max_running_requests=running,
         prefix_cache_checkpoint_interval=checkpoint_interval,
     )
@@ -51,6 +61,46 @@ def make_engine(
         options["prefix_cache_storage_policy"] = policy
     engine = Engine(runner, prefix_cache_storage=store, **options)
     return engine, runner, arena
+
+
+def test_storage_restores_longest_compatible_recurrent_checkpoint():
+    class RecurrentRunner(RecordingCachedRunner):
+        def forward(self, plan):
+            output = super().forward(plan)
+            end = plan.context_lengths[0] + len(plan.token_ids)
+            slots = plan.cache_groups[1].state.checkpoint_slots
+            return output.with_state_checkpoints(
+                tuple(
+                    reservation
+                    for reservation, _, prefix, _, _ in slots
+                    if prefix == end
+                )
+            )
+
+    groups = [CacheGroupLayout(2), CacheGroupLayout(2, family=CacheGroupFamily.STATE)]
+    layout = CacheLayout(parent_capacity=32, groups=groups)
+    params = SamplingParams(max_output_tokens=1)
+
+    def cached(interval, size):
+        engine, _, _ = make_engine(
+            store,
+            runner=RecurrentRunner(layout),
+            state_tracking_interval=interval,
+            checkpoint_interval=interval,
+            limit=32,
+        )
+        with engine:
+            request = engine.submit(list(range(size)), sampling_params=params)
+            while engine.has_work():
+                engine.step()
+                sleep(0.001)
+            return request.cached_tokens
+
+    with closing(MemoryCacheStorage(max_bytes=8192)) as store:
+        assert cached(2, 5) == 0
+        assert cached(2, 7) == 4
+        assert cached(2, 7) == 6
+        assert cached(4, 7) == 4
 
 
 @pytest.mark.parametrize(("capacity", "count"), [(4, 2), (8, 4)])

@@ -55,17 +55,21 @@ class _PrefixStorage:
             keys.append((b"s" if namespace else b"") + digest.digest())
         return keys
 
-    def lookup(self, key):
+    def lookup(self, key, checkpoint_alignment):
         bases = self._keys(key)
-        tags = ([b"h"] if self.history else []) + [b"t"]
-        keys = tuple(key + tag for tag in tags for key in bases)
+        # History objects keep their storage block size across Engines. Only
+        # checkpoint tails that this Engine can restore are lookup candidates.
+        stride = checkpoint_alignment // self.alignment
+        endpoints = bases[stride - 1 :: stride]
+        history = [key + b"h" for key in bases] if self.history else []
+        keys = (*history, *(key + b"t" for key in endpoints))
 
         def matched(mask):
             present, length = dict(zip(keys, mask, strict=True)), 0
             for i, key in enumerate(bases):
                 if self.history and not present[key + b"h"]:
                     break
-                if present[key + b"t"]:
+                if (i + 1) % stride == 0 and present[key + b"t"]:
                     length = (i + 1) * self.alignment
             return length
 
