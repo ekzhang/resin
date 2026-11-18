@@ -803,11 +803,23 @@ impl RenderOptions {
         let Value::Object(mut value) = serde_json::to_value(Self::default()).unwrap() else {
             unreachable!()
         };
+        let root_kwargs = template_kwargs(request)?;
+        let extra_kwargs = template_kwargs(&request["extra"])?;
         for (key, field) in &mut value {
             *field = request
                 .get(key)
                 .filter(|v| !v.is_null())
                 .or_else(|| request["extra"].get(key).filter(|v| !v.is_null()))
+                .or_else(|| {
+                    root_kwargs
+                        .and_then(|m| m.get(key))
+                        .filter(|v| !v.is_null())
+                })
+                .or_else(|| {
+                    extra_kwargs
+                        .and_then(|m| m.get(key))
+                        .filter(|v| !v.is_null())
+                })
                 .cloned()
                 .unwrap_or(Value::Null);
         }
@@ -829,5 +841,61 @@ impl RenderOptions {
             ));
         }
         Ok(self)
+    }
+}
+
+fn template_kwargs(source: &Value) -> PyResult<Option<&Map<String, Value>>> {
+    match source.get("chat_template_kwargs") {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::Object(map)) => {
+            let mut checked = map.clone();
+            checked.retain(|_, value| !value.is_null());
+            let parsed: RenderOptions = serde_path_to_error::deserialize(Value::Object(checked))
+                .map_err(|error| PyValueError::new_err(error.to_string()))?;
+            parsed.validate()?;
+            Ok(Some(map))
+        }
+        Some(_) => Err(PyValueError::new_err(
+            "chat_template_kwargs must be an object",
+        )),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::RenderOptions;
+    use serde_json::json;
+
+    #[test]
+    fn wire_chat_template_kwargs_apply_validate_and_yield_to_explicit_fields() {
+        let options = RenderOptions::from_wire(&json!({
+            "extra": {
+                "chat_template_kwargs": {
+                    "enable_thinking": false,
+                    "preserve_thinking": true,
+                    "clear_thinking": null,
+                }
+            }
+        }))
+        .unwrap();
+        assert_eq!(options.enable_thinking, Some(false));
+        assert_eq!(options.preserve_thinking, Some(true));
+        assert_eq!(options.clear_thinking, None);
+
+        let overridden = RenderOptions::from_wire(&json!({
+            "reasoning_effort": "high",
+            "extra": {
+                "enable_thinking": true,
+                "chat_template_kwargs": {
+                    "reasoning_effort": "low",
+                    "enable_thinking": false,
+                    "preserve_thinking": true,
+                }
+            }
+        }))
+        .unwrap();
+        assert_eq!(overridden.to_map()["reasoning_effort"], json!("high"));
+        assert_eq!(overridden.enable_thinking, Some(true));
+        assert_eq!(overridden.preserve_thinking, Some(true));
     }
 }

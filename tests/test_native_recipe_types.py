@@ -4,12 +4,14 @@ from __future__ import annotations
 
 import gc
 import json
+import urllib.error
 import weakref
 
 import numpy as np
 import pytest
 from output_helpers import forward_output
 from test_http_lifecycle import post, running_server
+from test_http_stops import send
 from test_recipe import _byte_tokenizer
 
 import resin
@@ -368,3 +370,127 @@ def test_native_recipe_stop_defaults_and_overrides_share_one_contract(
     stops[0] = 0
     stops.append(903)
     assert recipe.stop_token_ids == [901, 902]
+
+
+def test_http_chat_template_kwargs_apply_and_respect_explicit_overrides():
+    backend = tokenizer()
+    backend.add_special_tokens(
+        [
+            "<|im_start|>",
+            "<|im_end|>",
+            "<|endoftext|>",
+            "<think>",
+            "</think>",
+            "<tool_call>",
+            "</tool_call>",
+            "<tool_response>",
+            "</tool_response>",
+            "<|vision_start|>",
+            "<|image_pad|>",
+            "<|video_pad|>",
+            "<|vision_end|>",
+        ]
+    )
+    native = get_native_recipe("qwen3_5", backend, text_only=True)
+    messages = [
+        resin.recipe.Message(resin.recipe.Role.USER, [resin.recipe.Text("First")]),
+        resin.recipe.Message(
+            resin.recipe.Role.ASSISTANT,
+            [resin.recipe.Thinking("prior"), resin.recipe.Text("Done")],
+        ),
+        resin.recipe.Message(resin.recipe.Role.USER, [resin.recipe.Text("Second")]),
+    ]
+    default_ids = native.render(messages).token_ids
+    kwargs_ids = native.render(
+        messages,
+        options=resin.recipe.RenderOptions(
+            enable_thinking=False, preserve_thinking=True
+        ),
+    ).token_ids
+    override_ids = native.render(
+        messages,
+        options=resin.recipe.RenderOptions(
+            enable_thinking=True, preserve_thinking=True
+        ),
+    ).token_ids
+    assert not np.array_equal(kwargs_ids, default_ids)
+    assert not np.array_equal(kwargs_ids, override_ids)
+
+    seen: list[list[int]] = []
+    eos = backend.token_to_id("<|im_end|>")
+
+    class Runner:
+        def forward(self, plan):
+            seen.append(plan.token_ids.tolist())
+            return forward_output([eos])
+
+    wire_messages = [
+        {"role": "user", "content": "First"},
+        {"role": "assistant", "reasoning_content": "prior", "content": "Done"},
+        {"role": "user", "content": "Second"},
+    ]
+    with running_server(Runner(), native) as (_, _, _, errors, base, _):
+        with post(
+            base,
+            json.dumps(
+                {
+                    "model": "test",
+                    "messages": wire_messages,
+                    "max_tokens": 1,
+                    "chat_template_kwargs": {
+                        "enable_thinking": False,
+                        "preserve_thinking": True,
+                    },
+                }
+            ).encode(),
+        ) as response:
+            assert response.status == 200
+        with post(
+            base,
+            json.dumps(
+                {
+                    "model": "test",
+                    "messages": wire_messages,
+                    "max_tokens": 1,
+                    "enable_thinking": True,
+                    "chat_template_kwargs": {
+                        "enable_thinking": False,
+                        "preserve_thinking": True,
+                    },
+                }
+            ).encode(),
+        ) as response:
+            assert response.status == 200
+        with send(
+            base,
+            "/v1/responses/input_tokens",
+            {
+                "model": "test",
+                "input": wire_messages,
+                "chat_template_kwargs": {
+                    "enable_thinking": False,
+                    "preserve_thinking": True,
+                },
+            },
+        ) as response:
+            assert json.load(response)["input_tokens"] == len(kwargs_ids)
+        for bad_kwargs, expected_error in [
+            ("bad", "chat_template_kwargs must be an object"),
+            ({"unknown_option": True}, "unknown field"),
+        ]:
+            with pytest.raises(urllib.error.HTTPError) as failure:
+                send(
+                    base,
+                    "/v1/responses/input_tokens",
+                    {
+                        "model": "test",
+                        "input": wire_messages,
+                        "chat_template_kwargs": bad_kwargs,
+                    },
+                )
+            assert failure.value.code == 500
+            assert expected_error in json.load(failure.value)["error"]["message"]
+        assert not errors
+
+    np.testing.assert_array_equal(seen[0], kwargs_ids)
+    np.testing.assert_array_equal(seen[1], override_ids)
