@@ -24,11 +24,13 @@ impl PythonPrefixStorage {
     }
 }
 impl PrefixStorage for PythonPrefixStorage {
-    fn lookup(&mut self, key: &PrefixKey<'_>) -> StorageOp {
+    fn lookup(&mut self, key: &PrefixKey<'_>, checkpoint_alignment: u32) -> StorageOp {
         Python::attach(|py| {
             self.wrap(
                 py,
-                self.0.bind(py).call_method1("lookup", (key.parts(),)),
+                self.0
+                    .bind(py)
+                    .call_method1("lookup", (key.parts(), checkpoint_alignment)),
                 true,
             )
         })
