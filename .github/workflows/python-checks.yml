@@ -23,6 +23,51 @@ jobs:
       - name: Clippy
         run: cargo clippy --locked --workspace --all-targets -- -D warnings
 
+  cpu-tests:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    env:
+      RUSTUP_TOOLCHAIN: stable
+      OMP_NUM_THREADS: "1"
+      MKL_NUM_THREADS: "1"
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: astral-sh/setup-uv@1c37ad07a6a961277cf70c0d37d6f313000f5884 # v10.3.0
+        with:
+          python-version: "3.13"
+          enable-cache: true
+      - name: Install Rust
+        run: rustup toolchain install stable --profile minimal
+      - name: Install CPU test dependencies and build the extension
+        # Install separately from the workspace, whose dev group includes CUDA kernels.
+        run: |
+          uv venv
+          uv pip install --index https://download.pytorch.org/whl/cpu 'torch==2.13.0+cpu'
+          uv pip install 'blake3>=1,<2' 'numpy>=1.26,<3' 'pytest>=8,<9' 'tokenizers>=0.22.2' pillow
+          uv pip install --no-deps --editable .
+          uv pip check
+      - name: Verify CPU Torch and Gloo
+        run: |
+          .venv/bin/python - <<'PY'
+          import torch
+          import torch.distributed as dist
+
+          assert torch.version.cuda is None
+          assert dist.is_gloo_available()
+          PY
+      - name: Python runtime contracts
+        timeout-minutes: 6
+        run: |
+          .venv/bin/python -m pytest -x -vv -o faulthandler_timeout=60 \
+            tests/test_engine_execution.py tests/test_engine_overlap.py \
+            tests/test_backend_plans.py tests/test_plan_metadata.py tests/test_plan_transport.py \
+            tests/test_cache_storage.py \
+            tests/test_http_lifecycle.py tests/test_http_session.py tests/test_http_token_counts.py \
+            tests/test_recipe.py tests/test_recipe_media_preparation.py \
+            tests/test_control_plane.py tests/test_distributed_transport.py \
+            'tests/test_distributed_http.py::test_distributed_http_routes_real_replica_engines[normal-4]' \
+            'tests/test_distributed_http.py::test_distributed_http_routes_real_replica_engines[ingress_decode-2]'
+
   lint-and-types:
     # Match local development without installing the Linux-only CUDA runtime.
     runs-on: macos-latest
