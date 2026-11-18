@@ -339,7 +339,7 @@ def test_qwen_and_inkling2_native_bitmap_geometry_and_token_counts() -> None:
     assert media.span.length == 6 and not media.atomic
     expected = np.pad(pixels, ((0, 1), (0, 1), (0, 0)), constant_values=-1 / 255)
     np.testing.assert_allclose(
-        media.image, expected, rtol=np.finfo(np.float32).eps, atol=0
+        media.image, expected, rtol=float(np.finfo(np.float32).eps), atol=0
     )
 
 
