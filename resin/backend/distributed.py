@@ -290,50 +290,11 @@ class DistributedWorker:
             raise RuntimeError("only replica drivers coordinate serving")
         return group
 
-    def _drivers(self, operation, value):
+    def _gather_drivers(self, operation, value):
+        """Exchange objects during setup, using the same operation-order check as steps."""
         group = self._driver_group
-        if operation in {"initialize", "commit", "close"}:
-            _, errors = self._vote(group, operation, error=value)
-            return errors
-        if operation == "work":
-            records, errors = self._vote(
-                group, operation, (int(value[0]),), error=value[1]
-            )
-            return [(bool(row[0]), error) for row, error in zip(records, errors)]
-        if operation == "phase":
-            phases = (None, "prefill", "decode")
-            records, errors = self._vote(
-                group,
-                operation,
-                (phases.index(value[0]), int(value[2]), int(value[3])),
-                error=value[1],
-            )
-            return [
-                (phases[row[0]], error, bool(row[1]), bool(row[2]))
-                for row, error in zip(records, errors)
-            ]
-        if operation == "prepare":
-            records, errors = self._vote(
-                group,
-                operation,
-                (value[0], value[1], int(value[3]), int(value[4])),
-                error=value[2],
-            )
-            return [
-                (row[0], row[1], error, bool(row[2]), bool(row[3]))
-                for row, error in zip(records, errors)
-            ]
-        # Startup configuration can carry arbitrary objects; serving rounds
-        # use driver_vote and opaque byte packets instead.
-        # Their fixed header must still match hot step votes before any rank
-        # enters a different collective or model callback.
-        self._vote(group, operation)
-        results = self._gather(group, (operation, value))
-        if any(kind != operation for kind, _ in results):
-            raise DistributedExecutionError(
-                "drivers called collective engine operations in different orders"
-            )
-        return [value for _, value in results]
+        self._vote(group, f"object {operation}")
+        return self._gather(group, value)
 
     def driver_vote(self, operation: str, values=(), *, error: str | None = None):
         """Exchange a small fixed integer record and optional failure on drivers.
@@ -439,22 +400,22 @@ class DistributedWorker:
                     payload = self._plans.prepare(plan)
         except BaseException as exc:
             error = _message(exc)
-        descriptors = self._drivers(
+        descriptors, errors = self.driver_vote(
             "prepare",
             (
                 0 if plan is None else plan.num_sequences,
                 0 if plan is None else len(plan.token_ids),
-                error,
-                bool(enqueue and self._enqueue is not None),
-                bool(feedback),
+                enqueue and self._enqueue is not None,
+                feedback,
             ),
+            error=error,
         )
-        failure = _first_error(self._driver_group, [item[2] for item in descriptors])
+        failure = _first_error(self._driver_group, errors)
         if failure:
             raise DistributedExecutionError(failure)
-        sizes = tuple((item[0], item[1]) for item in descriptors)
-        asynchronous = all(item[3] for item in descriptors)
-        if any(item[4] for item in descriptors) and not asynchronous:
+        sizes = tuple((rows, tokens) for rows, tokens, _, _ in descriptors)
+        asynchronous = all(can_enqueue for _, _, can_enqueue, _ in descriptors)
+        if any(feedback for _, _, _, feedback in descriptors) and not asynchronous:
             raise DistributedExecutionError(
                 "decode continuations must enqueue together across attention replicas"
             )
@@ -584,7 +545,7 @@ class DistributedEngine:
             self._local = Engine(worker, **engine_options)
         except BaseException as exc:
             error = _message(exc)
-        errors = worker._drivers("initialize", error)
+        _, errors = worker.driver_vote("initialize", error=error)
         failure = _first_error(worker._driver_group, errors)
         if failure:
             self._record_failure(failure)
@@ -622,10 +583,11 @@ class DistributedEngine:
                 self.worker.failure = _message(exc)
             raise
 
-    def _finish(self, failure):
-        self._record_failure(failure)
-        self.worker._send({"operation": "finish", "error": failure})
+    def _raise_driver_failure(self, errors):
+        failure = _first_error(self.worker._driver_group, errors)
         if failure:
+            self._record_failure(failure)
+            self.worker._send({"operation": "finish", "error": failure})
             raise DistributedExecutionError(failure)
 
     def _record_failure(self, failure):
@@ -637,65 +599,59 @@ class DistributedEngine:
     def has_work(self):
         if self.closed:
             return False
-        states = self.worker._drivers(
+        states, errors = self.worker.driver_vote(
             "work",
-            (self.local.has_work(), self.worker.failure or self.local.poison_error),
+            (self.local.has_work(),),
+            error=self.worker.failure or self.local.poison_error,
         )
-        failure = _first_error(
-            self.worker._driver_group, [error for _, error in states]
-        )
-        if failure:
-            self._finish(failure)
-        return any(work for work, _ in states)
+        self._raise_driver_failure(errors)
+        return any(work for (work,) in states)
 
     def step(self, *, allow_overlap=True):
         if self.closed:
             raise RuntimeError("distributed engine is closed")
-        proposal, error = None, self.worker.failure
+        phase, error = None, self.worker.failure
         try:
             phase = self.local.next_phase()
-            proposal = (
-                None
-                if phase is None
-                else ("prefill" if phase == BatchPhase.PREFILL else "decode")
-            )
         except BaseException as exc:
             error = _message(exc)
-        proposals = self.worker._drivers(
+        phases = (None, BatchPhase.PREFILL, BatchPhase.DECODE)
+        records, errors = self.worker.driver_vote(
             "phase",
             (
-                proposal,
-                error,
+                phases.index(phase),
                 self.local.overlap_pending,
                 bool(allow_overlap and self.local.overlap and self.local.overlap_ready),
             ),
+            error=error,
         )
-        failure = _first_error(
-            self.worker._driver_group, [item[1] for item in proposals]
-        )
-        if failure:
-            self._finish(failure)
-        available = {item[0] for item in proposals} - {None}
-        active = [item for item in proposals if item[0] is not None]
+        self._raise_driver_failure(errors)
+        proposals = [(phases[code], pending, ready) for code, pending, ready in records]
+        available = {phase for phase, _, _ in proposals} - {None}
         allow_overlap = (
-            all(item[0] in (None, "decode") and item[3] for item in proposals)
-            and len({item[2] for item in active}) == 1
+            all(
+                phase in (None, BatchPhase.DECODE) and ready
+                for phase, _, ready in proposals
+            )
+            and len({pending for phase, pending, _ in proposals if phase is not None})
+            == 1
         )
         if not available:
             return []
         # A mixed domain alternates phases, bounding starvation of either cohort.
         phase = (
-            "decode"
-            if "decode" in available
-            and (self._last_phase == "prefill" or "prefill" not in available)
-            else "prefill"
+            BatchPhase.DECODE
+            if BatchPhase.DECODE in available
+            and (
+                self._last_phase == BatchPhase.PREFILL
+                or BatchPhase.PREFILL not in available
+            )
+            else BatchPhase.PREFILL
         )
         self._last_phase = phase
         self._step_id += 1
         self.worker._step_id = self._step_id
-        self.worker._phase = (
-            BatchPhase.PREFILL if phase == "prefill" else BatchPhase.DECODE
-        )
+        self.worker._phase = phase
         self.worker._entered = False
         events, error = [], None
         try:
@@ -713,8 +669,8 @@ class DistributedEngine:
                 self.worker._coordinate(None, error, enqueue=allow_overlap)
             except BaseException as exc:
                 error = error or _message(exc)
-        errors = self.worker._drivers("commit", error)
-        self._finish(_first_error(self.worker._driver_group, errors))
+        _, errors = self.worker.driver_vote("commit", error=error)
+        self._raise_driver_failure(errors)
         return events
 
     def close(self):
@@ -730,7 +686,7 @@ class DistributedEngine:
                     self.worker._completion = None
         except BaseException as exc:
             error = error or _message(exc)
-        errors = self.worker._drivers("close", error)
+        _, errors = self.worker.driver_vote("close", error=error)
         failure = _first_error(self.worker._driver_group, errors)
         self._record_failure(failure)
         self.worker._send({"operation": "close", "error": failure})

@@ -114,8 +114,10 @@ def _transport_process(rank, rendezvous, directory):
     worker = DistributedWorker(runner, groups)
     encodings = []
     large_broadcasts = []
+    finishes = []
     original_encode = native._media_to_buffers
     original_broadcast = dist.broadcast
+    original_receive = worker._wire.receive
 
     def encode(media):
         encodings.append(media)
@@ -131,12 +133,19 @@ def _transport_process(rank, rendezvous, directory):
     def object_collective(*_args, **_kwargs):
         raise AssertionError("object collectives are forbidden after worker setup")
 
+    def receive():
+        command = original_receive()
+        if command["operation"] == "finish":
+            finishes.append(command["error"])
+        return command
+
     try:
         with pytest.MonkeyPatch.context() as patch, torch.inference_mode():
             patch.setattr(native, "_media_to_buffers", encode)
             patch.setattr(dist, "broadcast", broadcast)
             patch.setattr(dist, "broadcast_object_list", object_collective)
             patch.setattr(dist, "all_gather_object", object_collective)
+            patch.setattr(worker._wire, "receive", receive)
             if groups.is_driver:
                 engine = DistributedEngine(worker)
                 media = _media()
@@ -184,6 +193,7 @@ def _transport_process(rank, rendezvous, directory):
             assert worker.closed
             assert not worker._plans._requests
             assert not runner.active
+            assert not finishes
         Path(directory, f"{rank}.json").write_text(
             json.dumps(
                 {
