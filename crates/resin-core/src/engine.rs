@@ -1201,6 +1201,9 @@ impl<P: Clone> EngineCore<P> {
     }
 
     fn can_continue(&self, batch: &Batch<P>, plan: &BatchPlan) -> bool {
+        let Some(layout) = &self.runner_config.cache_layout else {
+            return false;
+        };
         let maximum = u64::from(self.runner_config.max_accepted_per_step);
         let two_step_writes = maximum
             + u64::from(
@@ -1208,75 +1211,27 @@ impl<P: Clone> EngineCore<P> {
                     .decode_write_tokens()
                     .expect("validated decode write footprint"),
             );
-        batch.rows.iter().all(|row| {
-            !row.terminal
-                && row
-                    .request
-                    .max_output_tokens
-                    .saturating_sub(row.request.generated.len()) as u64
-                    > 2 * maximum
-                && u64::from(row.scheduled.token_start()) + two_step_writes
-                    <= u64::from(self.context_length.get())
-        }) && self
-            .runner_config
-            .cache_layout
-            .as_ref()
-            .is_some_and(|layout| {
-                layout.groups().iter().enumerate().all(|(index, group)| {
-                    plan.context_lengths
-                        .iter()
-                        .enumerate()
-                        .all(|(row, &start)| {
-                            let block = u64::from(group.block_tokens().get());
-                            if group.is_recurrent() {
-                                // Live recurrent state has no token-page
-                                // boundary. Its one private slot is pinned
-                                // for the entire continuation chain.
-                                plan.cache_groups[index]
-                                    .state
-                                    .as_ref()
-                                    .is_some_and(|state| {
-                                        self.prefix_alignment().is_none_or(|alignment| {
-                                            let alignment = u64::from(alignment);
-                                            let first =
-                                                (u64::from(start) / alignment + 1) * alignment;
-                                            let end = u64::from(start) + two_step_writes;
-                                            // A continuation cannot allocate snapshot slots.
-                                            // Drain before crossing an unreserved boundary.
-                                            (first..=end).step_by(alignment as usize).all(
-                                                |prefix| {
-                                                    state.checkpoint_slots.iter().any(|slot| {
-                                                        slot.row as usize == row
-                                                            && u64::from(slot.prefix_length)
-                                                                == prefix
-                                                    })
-                                                },
-                                            )
-                                        })
-                                    })
-                            } else {
-                                // The page table is the frozen lease envelope,
-                                // not a promise that new pages may be allocated.
-                                // Full-page leases permit further continuations
-                                // only until the last already-pinned page ends.
-                                let table = &plan.cache_groups[index];
-                                let first = u64::from(table.block_table_start_indices[row]);
-                                let count = u64::from(
-                                    table.block_indptr[row + 1] - table.block_indptr[row],
-                                );
-                                let earliest_read = group
-                                    .read_window_tokens()
-                                    .map_or(0, |window| start.saturating_sub(window.get() - 1));
-                                let lease_end = (first + count) * block;
-                                u64::from(earliest_read) / block >= first
-                                    && u64::from(start) + two_step_writes <= lease_end
-                                    && group.max_write_tokens().is_none_or(|limit| {
-                                        lease_end - u64::from(start) <= u64::from(limit.get())
-                                    })
-                            }
-                        })
-                })
-            })
+        let context_limit = u64::from(self.context_length.get());
+        for row in &batch.rows {
+            let remaining = row
+                .request
+                .max_output_tokens
+                .saturating_sub(row.request.generated.len()) as u64;
+            let write_end = u64::from(row.scheduled.token_start()) + two_step_writes;
+            if row.terminal || remaining <= 2 * maximum || write_end > context_limit {
+                return false;
+            }
+        }
+
+        let checkpoint_alignment = self.prefix_alignment();
+        layout.groups().iter().enumerate().all(|(index, layout)| {
+            plan.cache_groups[index].covers_continuation(
+                layout,
+                &plan.context_lengths,
+                two_step_writes,
+                checkpoint_alignment,
+            )
+        })
     }
 
     /// Issue one successor from the current writer lease. The host uses the

@@ -380,6 +380,18 @@ pub struct StatePlan {
     pub checkpoint_slots: Vec<StateCheckpointSlot>,
 }
 
+impl StatePlan {
+    /// A continuation can only publish snapshots reserved by its writer lease.
+    fn covers_checkpoints(&self, row: usize, start: u64, end: u64, alignment: u64) -> bool {
+        let first = (start / alignment + 1) * alignment;
+        (first..=end).step_by(alignment as usize).all(|prefix| {
+            self.checkpoint_slots
+                .iter()
+                .any(|slot| slot.row as usize == row && u64::from(slot.prefix_length) == prefix)
+        })
+    }
+}
+
 /// Executor-facing block table and append locations for one cache group.
 #[derive(Clone, Debug, Eq, PartialEq, rkyv::Archive, rkyv::Serialize, rkyv::Deserialize)]
 pub struct KvGroupPlan {
@@ -410,6 +422,44 @@ impl std::ops::Deref for KvGroupPlan {
 }
 
 impl KvGroupPlan {
+    pub(crate) fn covers_continuation(
+        &self,
+        layout: &KvGroupLayout,
+        starts: &[u32],
+        write_tokens: u64,
+        checkpoint_alignment: Option<u32>,
+    ) -> bool {
+        if layout.is_recurrent() {
+            // The private live slot stays pinned for the entire lease.
+            let Some(state) = &self.state else {
+                return false;
+            };
+            let Some(alignment) = checkpoint_alignment.map(u64::from) else {
+                return true;
+            };
+            return starts.iter().enumerate().all(|(row, &start)| {
+                let start = u64::from(start);
+                state.covers_checkpoints(row, start, start + write_tokens, alignment)
+            });
+        }
+
+        let block_tokens = u64::from(layout.block_tokens().get());
+        let read_window = layout.read_window_tokens();
+        let write_limit = layout.max_write_tokens();
+        starts.iter().enumerate().all(|(row, &start)| {
+            let first = u64::from(self.block_table_start_indices[row]);
+            let blocks = u64::from(self.block_indptr[row + 1] - self.block_indptr[row]);
+            let earliest_read =
+                read_window.map_or(0, |window| start.saturating_sub(window.get() - 1));
+            let lease_end = (first + blocks) * block_tokens;
+            let start = u64::from(start);
+            // Both steps must fit inside the history pages already pinned by the lease.
+            u64::from(earliest_read) / block_tokens >= first
+                && start + write_tokens <= lease_end
+                && write_limit.is_none_or(|limit| lease_end - start <= u64::from(limit.get()))
+        })
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         group_index: u32,
