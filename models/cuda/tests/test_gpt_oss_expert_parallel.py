@@ -353,11 +353,11 @@ def test_checkpoint_prepares_independent_attention_ep_and_expert_tp_shards(
         )
 
     monkeypatch.setattr(mxfp4, "ExpertParallelDispatch", Dispatch)
+    monkeypatch.setattr(checkpoint, "FlashInferSM90MXFP4Kernel", Kernel)
     monkeypatch.setattr(checkpoint, "load_gpt_oss_weights", load_weights)
     model, _ = checkpoint.load_model(
         tmp_path,
         device="cpu",
-        kernel_moe=Kernel(),
         parallel_groups=cast(ParallelGroups, groups),
     )
     assert dispatches == [(8, groups)]

@@ -177,25 +177,10 @@ class TestGptOssTorch:
             )
         ]
 
-    def test_mxfp4_checkpoint_has_precise_kernel_boundary_error(
-        self, tmp_path: Path
-    ) -> None:
-        from resin_models_cuda.gpt_oss.checkpoint import load_model
-
-        path = tmp_path
-        (path / "config.json").write_text(
-            json.dumps(_config(self.args, quantization={"quant_method": "mxfp4"}))
-        )
-        with pytest.raises(
-            NotImplementedError,
-            match="MXFP4 expert weights.*kernel_moe",
-        ):
-            load_model(path, device="cpu")
-
     def test_loader_rejects_non_mxfp4_checkpoints(self, tmp_path: Path) -> None:
         from resin_models_cuda.gpt_oss.checkpoint import load_model
 
         path = tmp_path
         (path / "config.json").write_text(json.dumps(_config(self.args)))
         with pytest.raises(ValueError, match="requires an MXFP4 checkpoint"):
-            load_model(path, device="cpu", kernel_moe=object())
+            load_model(path, device="cpu")

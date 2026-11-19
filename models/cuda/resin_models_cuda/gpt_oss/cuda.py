@@ -104,15 +104,15 @@ class _EmptyFa4AuxData:
         return self
 
 
-def _register_empty_fa4_aux_data() -> None:
-    """Adapt FA4's empty auxiliary bundle to the CUTLASS JIT boundary."""
-
+def _load_fa4():
+    """Load FA4 and register its empty auxiliary bundle with CUTLASS."""
     from cutlass.base_dsl.runtime.jit_arg_adapters import JitArgAdapterRegistry
+    from flash_attn.cute import flash_attn_varlen_func
     from flash_attn.cute.utils import AuxData
 
-    if AuxData in JitArgAdapterRegistry.jit_arg_adapter_registry:
-        return
-    JitArgAdapterRegistry.register_jit_arg_adapter(AuxData)(_EmptyFa4AuxData)
+    if AuxData not in JitArgAdapterRegistry.jit_arg_adapter_registry:
+        JitArgAdapterRegistry.register_jit_arg_adapter(AuxData)(_EmptyFa4AuxData)
+    return flash_attn_varlen_func
 
 
 def plan_gpt_oss_kv_capacity(
@@ -181,9 +181,6 @@ class GptOssCudaRunner(CudaRunner):
         cache_parent_capacity: int | None = None,
         revision: str | None = None,
         device: str | torch.device,
-        dtype=None,
-        kernel_attention=None,
-        kernel_moe=None,
         cuda_graph_prefill: str = "breakable",
         cuda_graph_decode: str = "full",
         cuda_graph_decode_shapes: object = None,
@@ -195,15 +192,6 @@ class GptOssCudaRunner(CudaRunner):
                 parallel_groups.topology, model=self.model_label
             )
         self.parallel_groups = parallel_groups
-        if kernel_attention is None:
-            from flash_attn.cute import flash_attn_varlen_func
-
-            kernel_attention = flash_attn_varlen_func
-        if not callable(kernel_attention):
-            raise TypeError("kernel_attention must be callable")
-        if getattr(kernel_attention, "__module__", "").startswith("flash_attn."):
-            _register_empty_fa4_aux_data()
-
         if cache_parent_capacity is not None and (
             isinstance(cache_parent_capacity, bool)
             or not isinstance(cache_parent_capacity, int)
@@ -224,30 +212,17 @@ class GptOssCudaRunner(CudaRunner):
             cuda_graph_decode=cuda_graph_decode,
         )
 
-        self._fa4 = kernel_attention
         if torch.cuda.get_device_capability(self.device)[0] != 9:
             raise RuntimeError(
                 f"the {self.model_label} FA4 runner requires an SM90 GPU"
             )
-        resolved_dtype = torch.bfloat16 if dtype is None else dtype
-        if isinstance(resolved_dtype, str):
-            resolved_dtype = getattr(torch, resolved_dtype.removeprefix("torch."), None)
-        if resolved_dtype is not torch.bfloat16:
-            raise ValueError(
-                f"the {self.model_label} FA4 runner requires bfloat16 activations"
-            )
+        self._fa4 = _load_fa4()
 
         selected_model = DEFAULT_MODEL if model is None else model
-        self.model_path = resolve_model_path(
-            selected_model,
-            revision,
-            kernel_moe=kernel_moe,
-        )
+        self.model_path = resolve_model_path(selected_model, revision)
         self._model, self.config = load_model(
             self.model_path,
             device=self.device,
-            dtype=torch.bfloat16,
-            kernel_moe=kernel_moe,
             parallel_groups=parallel_groups,
         )
         self._configure_parallel_graphs(self._model, parallel_groups)

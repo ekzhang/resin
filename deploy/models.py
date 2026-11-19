@@ -661,7 +661,6 @@ def create_runner(
         if draft_tokens:
             raise ValueError("GPT-OSS has no draft model; use draft_tokens=0")
         from resin_models_cuda.gpt_oss.cuda import GptOssCudaRunner
-        from resin_models_cuda.gpt_oss.flashinfer import FlashInferSM90MXFP4Kernel
 
         class Runner(GptOssCudaRunner):
             pass
@@ -670,7 +669,6 @@ def create_runner(
         return Runner(
             checkpoint,
             parallel_groups=groups,
-            kernel_moe=FlashInferSM90MXFP4Kernel(),
             gpu_memory_utilization=memory,
             **common,
         )

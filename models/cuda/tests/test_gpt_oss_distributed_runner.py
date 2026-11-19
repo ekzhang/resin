@@ -419,7 +419,6 @@ def test_distributed_graph_policies_pass_topology_preparation(monkeypatch, paral
         GptOssCudaRunner(
             device="cuda",
             parallel_groups=_groups(parallelism),
-            kernel_attention=lambda *args: None,
         )
 
 

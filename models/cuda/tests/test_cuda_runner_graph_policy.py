@@ -82,7 +82,7 @@ def test_inkling_distributed_graph_selection_covers_the_complete_native_lease(
         ),
         (Inkling2CudaRunner, ("unused",), {"max_seq_len": 32}),
         (Qwen3_5CudaRunner, (), {}),
-        (GptOssCudaRunner, (), {"kernel_attention": lambda: None}),
+        (GptOssCudaRunner, (), {}),
         (Gemma4CudaRunner, (), {}),
     ],
 )

@@ -10,14 +10,9 @@ from typing import TYPE_CHECKING, Any, cast
 import torch
 
 from resin.backend.cuda.parallel import TensorParallelLayout
-from resin.backend.loading import (
-    MODEL_FILES,
-    read_config,
-    resolve_dtype,
-    resolve_model,
-)
+from resin.backend.loading import MODEL_FILES, read_config, resolve_model
 from resin.models.gpt_oss.config import GptOssConfig
-from resin_models_cuda.gpt_oss.flashinfer import MXFP4Config
+from resin_models_cuda.gpt_oss.flashinfer import FlashInferSM90MXFP4Kernel, MXFP4Config
 from resin_models_cuda.gpt_oss.model import MoEForCausalLM
 from resin_models_cuda.gpt_oss.mxfp4 import (
     EXPERT_CHECKPOINT_NAMES,
@@ -39,23 +34,14 @@ MODEL_REVISIONS = {
 }
 
 
-def _download_model(
-    repo_id: str,
-    revision: str | None,
-    *,
-    kernel_moe=None,
-) -> Path:
+def _download_model(repo_id: str, revision: str | None) -> Path:
     from huggingface_hub import hf_hub_download, snapshot_download
 
-    # Inspect the tiny config before asking the Hub for tens of gigabytes of
-    # packed weights. Without an explicit kernel, fail before shard download.
+    # Check the weight format before downloading tens of gigabytes of shards.
     config_file = Path(
         hf_hub_download(repo_id=repo_id, filename="config.json", revision=revision)
     )
-    _check_quantization(
-        json.loads(config_file.read_text()),
-        kernel_moe=kernel_moe,
-    )
+    _check_quantization(json.loads(config_file.read_text()))
     return Path(
         snapshot_download(
             repo_id=repo_id,
@@ -65,56 +51,29 @@ def _download_model(
     )
 
 
-def resolve_model_path(
-    model: str | Path,
-    revision: str | None,
-    *,
-    kernel_moe=None,
-) -> Path:
+def resolve_model_path(model: str | Path, revision: str | None) -> Path:
     repo_id = str(model)
     selected_revision = MODEL_REVISIONS.get(repo_id) if revision is None else revision
-    return resolve_model(
-        model,
-        selected_revision,
-        lambda repository, selected: _download_model(
-            repository,
-            selected,
-            kernel_moe=kernel_moe,
-        ),
-    )
+    return resolve_model(model, selected_revision, _download_model)
 
 
-def _check_quantization(
-    config: dict[str, Any],
-    *,
-    kernel_moe=None,
-) -> None:
+def _check_quantization(config: dict[str, Any]) -> None:
     checkpoint_config = config.get("quantization_config") or config.get("quantization")
     method = checkpoint_config.get("quant_method") if checkpoint_config else None
     if method != "mxfp4":
         raise ValueError("GPT-OSS CUDA inference requires an MXFP4 checkpoint")
-    if kernel_moe is None:
-        raise NotImplementedError(
-            "the released GPT-OSS checkpoint uses MXFP4 expert weights; "
-            "pass an imported CUDA implementation as kernel_moe"
-        )
 
 
 def load_model(
     model_path: str | Path,
     *,
     device: str | torch.device,
-    dtype: str | torch.dtype | None = None,
-    kernel_moe=None,
     parallel_groups: ParallelGroups | None = None,
 ) -> tuple[MoEForCausalLM, dict[str, Any]]:
     root = Path(model_path).expanduser().resolve()
     config = read_config(root)
     args = GptOssConfig.from_dict(config)
-    _check_quantization(
-        config,
-        kernel_moe=kernel_moe,
-    )
+    _check_quantization(config)
     if parallel_groups is not None:
         group = parallel_groups.attn_tp
         tensor_parallel = TensorParallelLayout(rank=group.local_rank, size=group.size)
@@ -130,9 +89,6 @@ def load_model(
         tensor_parallel = TensorParallelLayout()
         expert_tensor_parallel = tensor_parallel
     target = torch.device(device)
-    resolved_dtype = resolve_dtype(dtype)
-    if resolved_dtype not in {None, torch.bfloat16}:
-        raise ValueError("the packed SM90 GPT-OSS path requires bfloat16 activations")
     local_args = shard_model_config(
         args,
         tensor_parallel,
@@ -149,15 +105,15 @@ def load_model(
         else local_args
     )
     kernel_config = MXFP4Config.from_model(expert_args)
-    assert kernel_moe is not None
-    kernel_moe.validate_device(target)
-    kernel_moe.validate(kernel_config)
+    kernel = FlashInferSM90MXFP4Kernel()
+    kernel.validate_device(target)
+    kernel.validate(kernel_config)
     with torch.device("meta"):
         model = MoEForCausalLM(local_args)
     for layer in model.model.layers:
         layer.mlp.experts = KernelExperts(
             local_args,
-            kernel_moe,
+            kernel,
             kernel_config,
             parallel_groups=parallel_groups,
         )

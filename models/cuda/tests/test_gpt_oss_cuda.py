@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import inspect
 from contextlib import nullcontext
 from types import SimpleNamespace
 from typing import cast
@@ -227,6 +226,7 @@ class TestGptOssCudaNativePlan:
 
         monkeypatch.setattr(CudaRunner, "__init__", initialize)
         monkeypatch.setattr(GptOssCudaRunner, "_configure_cuda_graphs", configure)
+        monkeypatch.setattr(gpt_oss_runtime, "_load_fa4", lambda: None)
         monkeypatch.setattr(
             gpt_oss_runtime, "resolve_model_path", lambda *a, **k: "unused"
         )
@@ -240,7 +240,6 @@ class TestGptOssCudaNativePlan:
             GptOssCudaRunner(
                 device="cuda",
                 cache_parent_capacity=capacity,
-                kernel_attention=lambda: None,
             )
         assert received == [
             default_decode_graph_shapes(
@@ -274,16 +273,6 @@ class TestGptOssCudaNativePlan:
             cache_pool_id=pool_id,
             cache_layout=runner.cache_layout if layout is None else layout,
         )
-
-    def test_kernels_are_flat_explicit_constructor_arguments(self) -> None:
-        parameters = inspect.signature(GptOssCudaRunner.__init__).parameters
-
-        assert "kernel_attention" in parameters
-        assert "kernel_moe" in parameters
-        assert "kernels" not in parameters
-        assert "moe_kernel" not in parameters
-        with pytest.raises(TypeError, match="kernel_attention"):
-            GptOssCudaRunner(device="cuda", kernel_attention=object())
 
     def test_graph_capture_inputs_use_only_the_reserved_null_page(self) -> None:
         runner = GptOssCudaRunner.__new__(GptOssCudaRunner)
