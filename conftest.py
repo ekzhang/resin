@@ -51,18 +51,3 @@ if importlib.util.find_spec("flashinfer") is None:
     sys.modules["flashinfer.comm"] = comm
     sys.modules["flashinfer.comm.mnnvl"] = mnnvl
     sys.modules["flashinfer.gemm"] = gemm
-
-if (
-    importlib.util.find_spec("cuda") is None
-    or importlib.util.find_spec("cuda.tile") is None
-):
-    cuda = ModuleType("cuda")
-    tile = ModuleType("cuda.tile")
-
-    def _kernel(function: object) -> object:
-        return function
-
-    setattr(tile, "kernel", _kernel)
-    setattr(cuda, "tile", tile)
-    sys.modules["cuda"] = cuda
-    sys.modules["cuda.tile"] = tile

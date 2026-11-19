@@ -1,5 +1,8 @@
 """Both GPT-OSS expert counts use the same fused routing path."""
 
+from types import SimpleNamespace
+from typing import cast
+
 import pytest
 import torch
 
@@ -11,7 +14,10 @@ pytestmark = pytest.mark.skipif(
 @pytest.mark.parametrize("experts", [32, 128])
 @pytest.mark.parametrize("rows", [1, 33, 1024])
 def test_top4_matches_selected_bf16_softmax_and_replays_changed_routes(experts, rows):
-    from resin_models_cuda.gpt_oss.cutile import top4_softmax
+    from resin_models_cuda.gpt_oss.cuda import _route
+    from resin_models_cuda.gpt_oss.model import TopKRouter
+
+    router = cast(TopKRouter, SimpleNamespace(top_k=4, balanced_routing=None))
 
     torch.manual_seed(71)
     # Unique representable BF16 scores make expert-ID equality meaningful;
@@ -30,12 +36,12 @@ def test_top4_matches_selected_bf16_softmax_and_replays_changed_routes(experts, 
     stream.wait_stream(torch.cuda.current_stream())
     with torch.cuda.stream(stream):
         for _ in range(2):
-            indices, weights = top4_softmax(logits)
+            indices, weights = _route(router, logits)
     stream.synchronize()
     check(indices, weights)
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph, stream=stream):
-        indices, weights = top4_softmax(logits)
+        indices, weights = _route(router, logits)
     torch.cuda.current_stream().wait_stream(stream)
     for shift in (1, 7, 17):
         logits.copy_(logits.roll(shift, dims=-1))
@@ -45,5 +51,7 @@ def test_top4_matches_selected_bf16_softmax_and_replays_changed_routes(experts, 
     logits.zero_()
     graph.replay()
     torch.testing.assert_close(weights, torch.full_like(weights, 0.25), atol=0, rtol=0)
-    assert ((indices >= 0) & (indices < experts)).all()
-    assert (indices.sort(-1).values.diff(dim=-1) > 0).all()
+    first_experts = torch.arange(4, device=indices.device, dtype=torch.int32)
+    torch.testing.assert_close(
+        indices, first_experts.expand_as(indices), atol=0, rtol=0
+    )

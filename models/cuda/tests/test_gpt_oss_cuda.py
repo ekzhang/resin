@@ -663,19 +663,13 @@ class TestGptOssCudaTinyOracle:
         torch.testing.assert_close(actual, expected)
         assert calls == ([128] if rows == 128 else [])
 
-    @pytest.mark.parametrize("top_k,experts", [(4, 32), (4, 128), (2, 16)])
-    def test_router_selects_fused_or_generic_topk(self, monkeypatch, top_k, experts):
-        router = cast(TopKRouter, SimpleNamespace(top_k=top_k, balanced_routing=None))
-        logits = torch.randn(3, experts, dtype=torch.bfloat16)
-        fused = (object(), object())
-        monkeypatch.setattr(gpt_oss_runtime, "top4_softmax", lambda value: fused)
+    def test_router_falls_back_for_other_expert_counts(self):
+        router = cast(TopKRouter, SimpleNamespace(top_k=4, balanced_routing=None))
+        logits = torch.randn(3, 16, dtype=torch.bfloat16)
         actual = _route(router, logits)
-        if top_k == 4:
-            assert actual is fused
-        else:
-            values, indices = logits.topk(top_k, dim=-1)
-            torch.testing.assert_close(actual[0], indices)
-            torch.testing.assert_close(actual[1], values.softmax(-1))
+        values, indices = logits.topk(4, dim=-1)
+        torch.testing.assert_close(actual[0], indices)
+        torch.testing.assert_close(actual[1], values.softmax(-1))
 
     def test_benchmark_routing_balances_expert_parallel_owners(self):
         from resin.bench import BenchmarkRunner

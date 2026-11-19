@@ -26,7 +26,6 @@ dependencies = [
   "nvidia-cutlass-dsl==4.6.2; sys_platform == 'linux'",
   "nvidia-cutlass-dsl-libs-base==4.6.2; sys_platform == 'linux'",
   "apache-tvm-ffi==0.1.12; sys_platform == 'linux'",
-  "cuda-tile==1.5.0; sys_platform == 'linux'",
   "quack-kernels==0.6.4; sys_platform == 'linux'",
   "deep-gemm==2.8.2; sys_platform == 'linux'",
   "deep-select==1.0.0; sys_platform == 'linux'",

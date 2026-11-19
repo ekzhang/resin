@@ -3569,7 +3569,6 @@ version = "0.1.0"
 source = { editable = "models/cuda" }
 dependencies = [
     { name = "apache-tvm-ffi", marker = "sys_platform == 'linux'" },
-    { name = "cuda-tile", marker = "sys_platform == 'linux'" },
     { name = "deep-gemm", marker = "sys_platform == 'linux'" },
     { name = "deep-select", marker = "sys_platform == 'linux'" },
     { name = "flash-attn-4", marker = "sys_platform == 'linux'" },
@@ -3595,7 +3594,6 @@ dependencies = [
 [package.metadata]
 requires-dist = [
     { name = "apache-tvm-ffi", marker = "sys_platform == 'linux'", specifier = "==0.1.12" },
-    { name = "cuda-tile", marker = "sys_platform == 'linux'", specifier = "==1.5.0" },
     { name = "deep-gemm", marker = "sys_platform == 'linux'", git = "https://github.com/deepseek-ai/DeepGEMM?rev=1fc9c66975ee322d628b3288534ca0e9ce12a64d" },
     { name = "deep-select", marker = "sys_platform == 'linux'", git = "https://github.com/deepseek-ai/DeepSelect?rev=bfa4507d935f17ebfc3d0f00ff7d3c9a4d0e5c18" },
     { name = "flash-attn-4", marker = "sys_platform == 'linux'", specifier = "==4.0.0b26" },

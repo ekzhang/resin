@@ -60,7 +60,6 @@ from resin_models_cuda.gpt_oss.checkpoint import (
     load_model,
     resolve_model_path,
 )
-from resin_models_cuda.gpt_oss.cutile import top4_softmax
 from resin_models_cuda.gpt_oss.model import MLP, TopKRouter
 from resin_models_cuda.gpt_oss.paged_kv import (
     DeviceAttentionBatch,
@@ -943,6 +942,8 @@ def _route(router: TopKRouter, logits: Tensor) -> tuple[Tensor, Tensor]:
         indices = router.balanced_routing.indices(logits, router.top_k)
         return indices, torch.softmax(logits.gather(1, indices), dim=-1)
     if router.top_k == 4 and logits.shape[-1] in (32, 128):
+        from resin_models_cuda.gpt_oss.routing import top4_softmax
+
         return top4_softmax(logits)
     values, indices = torch.topk(logits, router.top_k, dim=-1, sorted=True)
     return indices, torch.softmax(values, dim=-1)
