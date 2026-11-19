@@ -184,7 +184,7 @@ class _Nucleus:
     def initialize(self, p, g):
         tid, _, _ = cute.arch.thread_idx()
         row, _, _ = cute.arch.block_idx()
-        allocator = cutlass.utils.SmemAllocator()
+        allocator = cutlass.memory.SmemAllocator()
         reduction = allocator.allocate_tensor(
             Float64, cute.make_ordered_layout((1, (4, 1), 2), order=(1, 0, 2))
         )
@@ -242,7 +242,7 @@ class _Nucleus:
     def histogram(self, p, g):
         tid, _, _ = cute.arch.thread_idx()
         row, part, _ = cute.arch.block_idx()
-        allocator = cutlass.utils.SmemAllocator()
+        allocator = cutlass.memory.SmemAllocator()
         shared_s = allocator.allocate_tensor(Int64, cute.make_layout(4 * self.bins))
         shared_c = allocator.allocate_tensor(Int32, cute.make_layout(4 * self.bins))
         shared_lo = allocator.allocate_tensor(Int32, cute.make_layout(4 * self.bins))
@@ -325,7 +325,7 @@ class _Nucleus:
         tid, _, _ = cute.arch.thread_idx()
         row, _, _ = cute.arch.block_idx()
         lane, warp = tid % 32, tid // 32
-        allocator = cutlass.utils.SmemAllocator()
+        allocator = cutlass.memory.SmemAllocator()
         warp_totals = allocator.allocate_tensor(Float64, cute.make_layout(4))
         int_reduce = allocator.allocate_tensor(
             Int32, cute.make_ordered_layout((1, (4, 1), 2), order=(1, 0, 2))

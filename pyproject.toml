@@ -22,10 +22,10 @@ dependencies = ["blake3>=1.0,<2", "numpy>=1.26,<3", "torch>=2.13.0"]
 cuda = [
   "flashinfer-python>=0.6.15.post1; sys_platform == 'linux'",
   "cuda-bindings>=13.3,<14; sys_platform == 'linux'",
-  "nvidia-cutlass-dsl==4.6.2; sys_platform == 'linux'",
-  "nvidia-cutlass-dsl-libs-base==4.6.2; sys_platform == 'linux'",
+  "nvidia-cutlass-dsl==4.8.1; sys_platform == 'linux'",
+  "nvidia-cutlass-dsl-libs-base==4.8.1; sys_platform == 'linux'",
   "apache-tvm-ffi==0.1.12; sys_platform == 'linux'",
-  "quack-kernels==0.6.4; sys_platform == 'linux'",
+  "quack-kernels==0.6.5; sys_platform == 'linux'",
 ]
 
 [dependency-groups]
@@ -99,8 +99,8 @@ default-groups = ["dev"]
 # do not become dependencies of the published core Resin package.
 override-dependencies = [
   "apache-tvm-ffi==0.1.12; sys_platform == 'linux'",
-  "nvidia-cutlass-dsl==4.6.2; sys_platform == 'linux'",
-  "nvidia-cutlass-dsl-libs-base==4.6.2; sys_platform == 'linux'",
+  "nvidia-cutlass-dsl==4.8.1; sys_platform == 'linux'",
+  "nvidia-cutlass-dsl-libs-base==4.8.1; sys_platform == 'linux'",
 ]
 
 # DeepGEMM's setup.py imports CUDA while computing metadata. Keep resolution

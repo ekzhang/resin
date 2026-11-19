@@ -247,7 +247,7 @@ class _Kernels:
             first = q[1] == 0
             active = enabled & (first | (count > q[1]))
         maximum, mass = Float32(-Float32.inf), Float32(0)
-        allocator = cutlass.utils.SmemAllocator()
+        allocator = cutlass.memory.SmemAllocator()
         stages = 3 if cutlass.const_expr(self.original or self.top) else 2
         reduction = allocator.allocate_tensor(
             Float32, cute.make_ordered_layout((1, (4, 1), stages), order=(1, 0, 2))
@@ -398,7 +398,7 @@ class _Kernels:
         row, group, _ = cute.arch.block_idx()
         enabled, request, column = _policy(p, g, row, self.flags)
         count = _requested(p, g, request, column, q[0], self.flags)
-        allocator = cutlass.utils.SmemAllocator()
+        allocator = cutlass.memory.SmemAllocator()
         cache = allocator.allocate_tensor(
             Uint64, cute.make_layout((16, 32), stride=(33, 1))
         )
@@ -427,7 +427,7 @@ class _Kernels:
         maximum, log_mass, chosen = Float32(0), Float32(0), Float32(0)
         key = Uint64(0)
         stats = cute.make_tensor(o[2], cute.make_layout((g[0], 2), stride=(2, 1)))
-        allocator = cutlass.utils.SmemAllocator()
+        allocator = cutlass.memory.SmemAllocator()
         threads = 128 if cutlass.const_expr(self.original) else 32
         if cutlass.const_expr(self.original):
             reduction = allocator.allocate_tensor(
