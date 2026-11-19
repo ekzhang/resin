@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from itertools import accumulate
 from pathlib import Path
-from typing import TYPE_CHECKING, cast
+from typing import TYPE_CHECKING
 
 import torch
 
@@ -13,7 +13,6 @@ from resin.backend.safetensors import SafetensorReader, indexed_tensor_files
 from resin_models_cuda.gpt_oss.mxfp4 import (
     EXPERT_CHECKPOINT_NAMES,
     CheckpointShards,
-    KernelExperts,
 )
 
 if TYPE_CHECKING:
@@ -82,7 +81,7 @@ def load_gpt_oss_weights(
             destination.copy_(source.to(dtype=destination.dtype))
 
         for layer, keys in zip(model.model.layers, experts, strict=True):
-            cast(KernelExperts, layer.mlp.experts).load_weights(
+            layer.mlp.experts.load_weights(
                 {
                     name: shards(key, reader.read(files[key], key)).to(device=device)
                     for name, key in keys.items()

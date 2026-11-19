@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from functools import partial
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -88,15 +89,15 @@ def load_model(
     kernel = FlashInferSM90MXFP4Kernel()
     kernel.validate_device(target)
     kernel.validate(kernel_config)
+    make_experts = partial(
+        KernelExperts,
+        local_args,
+        kernel,
+        kernel_config,
+        parallel_groups=parallel_groups,
+    )
     with torch.device("meta"):
-        model = MoEForCausalLM(local_args)
-    for layer in model.model.layers:
-        layer.mlp.experts = KernelExperts(
-            local_args,
-            kernel,
-            kernel_config,
-            parallel_groups=parallel_groups,
-        )
+        model = MoEForCausalLM(local_args, make_experts)
 
     load_gpt_oss_weights(root, model, device=target, shards=shards)
 

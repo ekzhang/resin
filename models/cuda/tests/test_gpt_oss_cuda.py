@@ -677,7 +677,7 @@ class TestGptOssCudaTinyOracle:
             torch.testing.assert_close(actual[0], indices)
             torch.testing.assert_close(actual[1], values.softmax(-1))
 
-    def test_synthetic_routes_balance_ep_owners_in_both_router_paths(self):
+    def test_benchmark_routing_balances_expert_parallel_owners(self):
         from resin.bench import BenchmarkRunner
         from resin.models.gpt_oss.config import GptOssConfig
 
@@ -695,7 +695,8 @@ class TestGptOssCudaTinyOracle:
             router.weight.zero_()
             router.bias.copy_(torch.arange(32))
         hidden = torch.zeros(1, 8)
-        assert (router(hidden)[2] // 16 == 1).all()
+        logits = torch.nn.functional.linear(hidden, router.weight, router.bias)
+        assert (logits.topk(4).indices // 16 == 1).all()
         BenchmarkRunner(
             SimpleNamespace(
                 _model=torch.nn.Sequential(router),
@@ -706,11 +707,8 @@ class TestGptOssCudaTinyOracle:
             ),
             balanced_experts=True,
         )
-        logits, weights, indices = router(hidden)
+        indices, weights = _route(router, logits)
         assert indices.tolist() == [[2, 18, 3, 19]]
-        cuda_indices, cuda_weights = _route(router, logits)
-        torch.testing.assert_close(cuda_indices, indices)
-        torch.testing.assert_close(cuda_weights, weights)
         torch.testing.assert_close(weights, logits.gather(1, indices).softmax(-1))
 
     def test_rotary_adapter_passes_packed_rows_in_place_and_skips_empty(

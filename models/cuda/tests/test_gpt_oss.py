@@ -4,9 +4,6 @@ import json
 from pathlib import Path
 
 import pytest
-import torch
-
-from resin_models_cuda.gpt_oss.model import DenseExperts, MoEForCausalLM
 
 
 def _tiny_args():
@@ -36,8 +33,8 @@ def _tiny_args():
     )
 
 
-def _config(args, *, quantization=None):
-    config = {
+def _config(args):
+    return {
         "model_type": "gpt_oss",
         "vocab_size": args.vocab_size,
         "hidden_size": args.hidden_size,
@@ -62,13 +59,9 @@ def _config(args, *, quantization=None):
         "swiglu_limit": args.swiglu_limit,
         "attention_bias": args.attention_bias,
         "attention_dropout": args.attention_dropout,
-        "initializer_range": args.initializer_range,
         "layer_types": list(args.layer_types),
         "tie_word_embeddings": False,
     }
-    if quantization is not None:
-        config["quantization_config"] = quantization
-    return config
 
 
 class TestGptOssImport:
@@ -122,65 +115,9 @@ class TestGptOssImport:
             GptOssConfig.from_dict({"model_type": "llama"})
 
 
-class TestGptOssTorch:
-    def setup_method(self) -> None:
-        torch.manual_seed(11)
-        self.args = _tiny_args()
-        self.model = MoEForCausalLM(self.args).eval()
+def test_loader_rejects_non_mxfp4_checkpoints(tmp_path: Path) -> None:
+    from resin_models_cuda.gpt_oss.checkpoint import load_model
 
-    def test_topk_moe_routes_and_weights_selected_experts(self) -> None:
-        mlp = self.model.model.layers[0].mlp
-        assert isinstance(mlp.experts, DenseExperts)
-        with torch.no_grad():
-            mlp.router.weight.zero_()
-            mlp.router.bias.copy_(torch.tensor([10.0, 9.0, -10.0, -20.0]))
-            mlp.experts.gate_up_proj.zero_()
-            mlp.experts.gate_up_proj_bias.zero_()
-            mlp.experts.down_proj.zero_()
-            mlp.experts.down_proj_bias.zero_()
-            mlp.experts.down_proj_bias[0].fill_(2.0)
-            mlp.experts.down_proj_bias[1].fill_(4.0)
-
-        hidden = torch.randn(1, 1, self.args.hidden_size)
-        _, weights, indices = mlp.router(hidden.reshape(1, -1))
-        assert indices.tolist() == [[0, 1]]
-        expected_value = 2.0 * weights[0, 0] + 4.0 * weights[0, 1]
-        with torch.inference_mode():
-            actual = mlp(hidden)
-        torch.testing.assert_close(
-            actual,
-            torch.full_like(actual, expected_value.item()),
-            rtol=0,
-            atol=1e-6,
-        )
-
-    def test_expert_boundary_receives_selected_routes_and_weights(self) -> None:
-        calls = []
-
-        class RecordingExperts(torch.nn.Module):
-            def forward(self, hidden, indices, weights):
-                calls.append((hidden.shape, indices.shape, weights.shape))
-                return torch.zeros_like(hidden)
-
-        model = MoEForCausalLM(self.args).eval()
-        mlp = model.model.layers[0].mlp
-        mlp.experts = RecordingExperts()
-        hidden = torch.randn(1, 3, self.args.hidden_size)
-        with torch.inference_mode():
-            output = mlp(hidden)
-        assert output.shape == hidden.shape
-        assert calls == [
-            (
-                torch.Size([3, self.args.hidden_size]),
-                torch.Size([3, self.args.num_experts_per_tok]),
-                torch.Size([3, self.args.num_experts_per_tok]),
-            )
-        ]
-
-    def test_loader_rejects_non_mxfp4_checkpoints(self, tmp_path: Path) -> None:
-        from resin_models_cuda.gpt_oss.checkpoint import load_model
-
-        path = tmp_path
-        (path / "config.json").write_text(json.dumps(_config(self.args)))
-        with pytest.raises(ValueError, match="requires an MXFP4 checkpoint"):
-            load_model(path, device="cpu")
+    (tmp_path / "config.json").write_text(json.dumps(_config(_tiny_args())))
+    with pytest.raises(ValueError, match="requires an MXFP4 checkpoint"):
+        load_model(tmp_path, device="cpu")

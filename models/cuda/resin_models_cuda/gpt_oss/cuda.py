@@ -625,7 +625,7 @@ class GptOssCudaRunner(CudaRunner):
         shape = hidden.shape
         flat = hidden.reshape(-1, shape[-1])
         if flat.shape[0] == 0:
-            getattr(mlp.experts, "forward_empty")()
+            mlp.experts.forward_empty()
             return hidden
         logits = _router_logits(mlp.router, flat)
         indices, weights = _route(mlp.router, logits)
@@ -915,7 +915,7 @@ class GptOssCudaRunner(CudaRunner):
 
     def _forward_experts_empty(self):
         for layer in self._model.model.layers:
-            getattr(layer.mlp.experts, "forward_empty")()
+            layer.mlp.experts.forward_empty()
 
 
 def _router_logits(router: TopKRouter, hidden: Tensor) -> Tensor:

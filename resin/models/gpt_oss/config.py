@@ -31,7 +31,6 @@ class GptOssConfig:
     attention_bias: bool
     layer_types: tuple[str, ...]
     attention_dropout: float = 0.0
-    initializer_range: float = 0.02
     pad_token_id: int | None = None
     eos_token_id: int | None = None
 

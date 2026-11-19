@@ -6,16 +6,18 @@
 from __future__ import annotations
 
 import math
-from collections.abc import Sequence
-from typing import cast
+from collections.abc import Callable, Sequence
+from typing import TYPE_CHECKING, cast
 
 import torch
 from torch import Tensor, nn
-from torch.nn import functional as F
 
 from resin.backend.balanced_routing import BalancedRoutingMixin
 from resin.backend.layers import RMSNorm
 from resin.models.gpt_oss.config import GptOssConfig
+
+if TYPE_CHECKING:
+    from resin_models_cuda.gpt_oss.mxfp4 import KernelExperts
 
 
 class YarnRotaryEmbedding(nn.Module):
@@ -71,12 +73,6 @@ class YarnRotaryEmbedding(nn.Module):
         )
 
 
-def apply_rotary(hidden: Tensor, cos: Tensor, sin: Tensor) -> Tensor:
-    first, second = hidden.chunk(2, dim=-1)
-    cos, sin = cos.unsqueeze(1), sin.unsqueeze(1)
-    return torch.cat((first * cos - second * sin, second * cos + first * sin), dim=-1)
-
-
 class SinkAttention(nn.Module):
     def __init__(self, config: GptOssConfig, layer_index: int) -> None:
         super().__init__()
@@ -100,75 +96,21 @@ class TopKRouter(BalancedRoutingMixin, nn.Module):
         )
         self.bias = nn.Parameter(torch.empty(config.num_local_experts))
 
-    def forward(self, hidden: Tensor) -> tuple[Tensor, Tensor, Tensor]:
-        logits = F.linear(hidden, self.weight, self.bias)
-        if self.balanced_routing is not None:
-            indices = self.balanced_routing.indices(logits, self.top_k)
-            values = logits.gather(1, indices)
-        else:
-            values, indices = torch.topk(logits, self.top_k, dim=-1, sorted=True)
-        return logits, torch.softmax(values, dim=-1), indices
-
-
-class DenseExperts(nn.Module):
-    """Readable dense experts used by tests and unquantized checkpoints."""
-
-    storage_format = "dense"
-
-    def __init__(self, config: GptOssConfig) -> None:
-        super().__init__()
-        experts, hidden, intermediate = (
-            config.num_local_experts,
-            config.hidden_size,
-            config.intermediate_size,
-        )
-        self.intermediate_size = intermediate
-        self.swiglu_limit = config.swiglu_limit
-        self.gate_up_proj = nn.Parameter(torch.empty(experts, hidden, 2 * intermediate))
-        self.gate_up_proj_bias = nn.Parameter(torch.empty(experts, 2 * intermediate))
-        self.down_proj = nn.Parameter(torch.empty(experts, intermediate, hidden))
-        self.down_proj_bias = nn.Parameter(torch.empty(experts, hidden))
-
-    def forward(
-        self,
-        hidden: Tensor,
-        expert_indices: Tensor,
-        routing_weights: Tensor,
-    ) -> Tensor:
-        gate_up = torch.einsum(
-            "tkhi,th->tki", self.gate_up_proj[expert_indices], hidden
-        )
-        gate_up += self.gate_up_proj_bias[expert_indices]
-        gate = gate_up[..., ::2].clamp(max=self.swiglu_limit)
-        up = gate_up[..., 1::2].clamp(-self.swiglu_limit, self.swiglu_limit)
-        activated = gate * torch.sigmoid(1.702 * gate) * (up + 1)
-        output = torch.einsum(
-            "tkih,tki->tkh", self.down_proj[expert_indices], activated
-        )
-        output += self.down_proj_bias[expert_indices]
-        return torch.einsum("tkh,tk->th", output, routing_weights)
-
 
 class MLP(nn.Module):
-    experts: nn.Module
-
-    def __init__(self, config: GptOssConfig) -> None:
+    def __init__(self, config: GptOssConfig, experts: KernelExperts) -> None:
         super().__init__()
         self.router = TopKRouter(config)
-        self.experts = DenseExperts(config)
-
-    def forward(self, hidden: Tensor) -> Tensor:
-        shape = hidden.shape
-        flat = hidden.reshape(-1, shape[-1])
-        _, weights, indices = self.router(flat)
-        return self.experts(flat, indices, weights).reshape(shape)
+        self.experts = experts
 
 
 class MoEDecoderLayer(nn.Module):
-    def __init__(self, config: GptOssConfig, layer_index: int) -> None:
+    def __init__(
+        self, config: GptOssConfig, layer_index: int, experts: KernelExperts
+    ) -> None:
         super().__init__()
         self.self_attn = SinkAttention(config, layer_index)
-        self.mlp = MLP(config)
+        self.mlp = MLP(config, experts)
         self.input_layernorm = RMSNorm(
             config.hidden_size, config.rms_norm_eps, weight_dtype=torch.float32
         )
@@ -178,7 +120,9 @@ class MoEDecoderLayer(nn.Module):
 
 
 class MoETransformerModel(nn.Module):
-    def __init__(self, config: GptOssConfig) -> None:
+    def __init__(
+        self, config: GptOssConfig, make_experts: Callable[[], KernelExperts]
+    ) -> None:
         super().__init__()
         self.embed_tokens = nn.Embedding(
             config.vocab_size, config.hidden_size, padding_idx=config.pad_token_id
@@ -186,7 +130,7 @@ class MoETransformerModel(nn.Module):
         self.layers = cast(
             Sequence[MoEDecoderLayer],
             nn.ModuleList(
-                MoEDecoderLayer(config, index)
+                MoEDecoderLayer(config, index, make_experts())
                 for index in range(config.num_hidden_layers)
             ),
         )
@@ -197,40 +141,19 @@ class MoETransformerModel(nn.Module):
 
 
 class MoEForCausalLM(nn.Module):
-    def __init__(self, config: GptOssConfig) -> None:
+    def __init__(
+        self, config: GptOssConfig, make_experts: Callable[[], KernelExperts]
+    ) -> None:
         super().__init__()
-        self.config = config
         self.args = config
-        self.model = MoETransformerModel(config)
+        self.model = MoETransformerModel(config, make_experts)
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
-        self.apply(self._initialize)
-
-    def _initialize(self, module: nn.Module) -> None:
-        std = self.config.initializer_range
-        if isinstance(module, (nn.Linear, nn.Embedding)):
-            nn.init.normal_(module.weight, std=std)
-            if isinstance(module, nn.Linear) and module.bias is not None:
-                nn.init.zeros_(module.bias)
-        elif isinstance(module, RMSNorm):
-            if module.weight is not None:
-                nn.init.ones_(module.weight)
-        elif isinstance(module, SinkAttention):
-            nn.init.normal_(module.sinks, std=std)
-        elif isinstance(module, TopKRouter):
-            nn.init.normal_(module.weight, std=std)
-            nn.init.normal_(module.bias, std=std)
-        elif isinstance(module, DenseExperts):
-            nn.init.normal_(module.gate_up_proj, std=std)
-            nn.init.zeros_(module.gate_up_proj_bias)
-            nn.init.normal_(module.down_proj, std=std)
-            nn.init.zeros_(module.down_proj_bias)
 
     def materialize_buffers(self, device) -> None:
         self.model.rotary_emb.materialize(device)
 
 
 __all__ = [
-    "DenseExperts",
     "MLP",
     "MoEDecoderLayer",
     "MoEForCausalLM",
@@ -238,5 +161,4 @@ __all__ = [
     "SinkAttention",
     "TopKRouter",
     "YarnRotaryEmbedding",
-    "apply_rotary",
 ]
