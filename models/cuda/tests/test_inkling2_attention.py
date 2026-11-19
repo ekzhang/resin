@@ -45,12 +45,13 @@ def dense_attention(q, relative, cache, lengths, window, *, query_indices=None):
         query_indices = torch.arange(tokens, device=q.device)
     else:
         q, relative = q[:, query_indices], relative[:, query_indices]
+    query_heads_per_kv_head = q.shape[2] // cache.keys.shape[-2]
     output, lse = [], []
     for row, end in enumerate(lengths.tolist()):
         logical = torch.arange(end, device=q.device)
         page = cache.groups[0].slab_ids[row, logical // 128].long()
         k, v = (
-            x[page, logical % 128].float().repeat_interleave(6, 1)
+            x[page, logical % 128].float().repeat_interleave(query_heads_per_kv_head, 1)
             for x in (cache.keys, cache.values)
         )
         distance = end - tokens + query_indices[:, None] - logical
@@ -214,7 +215,8 @@ def test_generic_fp32_split_kv_reuses_compilation():
     assert fa4.compile_count == compiled
 
 
-def test_global_prefill_split_bias_boundary_and_compilation():
+@pytest.mark.parametrize("heads", [6, 8])
+def test_global_prefill_split_bias_boundary_and_compilation(heads):
     from resin_models_cuda.inkling2 import fa4
     from resin_models_cuda.inkling2.attention import (
         gated_attention,
@@ -229,7 +231,7 @@ def test_global_prefill_split_bias_boundary_and_compilation():
     if torch.cuda.get_device_capability(device) != (10, 3):
         pytest.skip("requires the SM103 global prefill kernel")  # ty: ignore[too-many-positional-arguments]
     warm_prefill_split(
-        1, 1024, device, prefill_chunk_size=4096, max_sequence_length=32768
+        heads, 1, 1024, device, prefill_chunk_size=4096, max_sequence_length=32768
     )
     fa4_compiles = fa4.compile_count
     merge_compiles = set(_merge_gate.device_caches[device.index][0])
@@ -237,12 +239,17 @@ def test_global_prefill_split_bias_boundary_and_compilation():
     def check(tokens, history, pages, *, replay=False):
         lengths = torch.tensor([history + tokens], dtype=torch.int32, device=device)
         cache = cache_fixture(lengths, 1)
-        q = torch.randn((1, tokens, 6, 128), dtype=torch.bfloat16, device=device) * 0.2
+        q = (
+            torch.randn((1, tokens, heads, 128), dtype=torch.bfloat16, device=device)
+            * 0.2
+        )
         relative = torch.zeros((*q.shape[:3], 1024), dtype=q.dtype, device=device)
         relative[..., 0], relative[..., 1023] = 4, 5
-        packed = torch.randn((1, tokens, 6 * 128 + 10), dtype=q.dtype, device=device)
-        gate = packed[..., 2 : 2 + 6 * 128].view_as(q)
-        sinks = packed[..., -6:]
+        packed = torch.randn(
+            (1, tokens, heads * 128 + heads + 4), dtype=q.dtype, device=device
+        )
+        gate = packed[..., 2 : 2 + heads * 128].view_as(q)
+        sinks = packed[..., -heads:]
         positions = history + torch.arange(tokens, device=device)[None]
         options: dict[str, Any] = dict(
             cache=cache,

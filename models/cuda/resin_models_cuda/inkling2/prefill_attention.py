@@ -133,6 +133,7 @@ def gated_prefill_split(
 
 @torch.inference_mode()
 def warm_prefill_split(
+    query_heads: int,
     kv_heads: int,
     relative_extent: int,
     device: torch.device,
@@ -153,9 +154,9 @@ def warm_prefill_split(
         4, 2, PAGE_TOKENS, kv_heads, 128, device=device, dtype=torch.bfloat16
     )
     keys, values = storage.unbind(1)
-    tokens, heads = PAGE_TOKENS, kv_heads * 6
-    q = keys.new_zeros((tokens, heads, 128))
-    relative = keys.new_zeros((tokens, heads, relative_extent))
+    tokens = PAGE_TOKENS
+    q = keys.new_zeros((tokens, query_heads, 128))
+    relative = keys.new_zeros((tokens, query_heads, relative_extent))
     pages = torch.arange(4, device=device, dtype=torch.int32)[None]
     lengths = torch.full((1,), 2 * PAGE_TOKENS, device=device, dtype=torch.int32)
     gated_prefill_split(

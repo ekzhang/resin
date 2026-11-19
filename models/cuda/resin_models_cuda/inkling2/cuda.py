@@ -286,6 +286,7 @@ class Inkling2CudaRunner(CudaRunner):
         from resin_models_cuda.inkling2.prefill_attention import warm_prefill_split
 
         warm_prefill_split(
+            self.config.num_attention_heads // parallel.size,
             geometry.kv_heads,
             self.config.rel_extent,
             self.device,
