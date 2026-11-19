@@ -144,6 +144,8 @@ def _serve_rank(rank, world_size, directory, port, case):
     worker = DistributedWorker(runner, groups)
     engine = None
     error = None
+    finished = threading.Event()
+    stop_thread = None
     try:
         if not groups.is_driver:
             worker.serve()
@@ -263,15 +265,20 @@ def _serve_rank(rank, world_size, directory, port, case):
             if groups.drivers.local_rank == 0:
 
                 def stop():
-                    while not Path(directory, "stop").exists():
-                        time.sleep(0.01)
-                    server.shutdown()
+                    while not finished.wait(0.01):
+                        if Path(directory, "stop").exists():
+                            server.shutdown()
+                            return
 
-                threading.Thread(target=stop, daemon=True).start()
+                stop_thread = threading.Thread(target=stop)
+                stop_thread.start()
             server.serve(port=port)
     except BaseException as exc:
         error = str(exc)
     finally:
+        finished.set()
+        if stop_thread is not None:
+            stop_thread.join()
         patch.undo()
         Path(directory, f"rank-{rank}.json").write_text(
             json.dumps(
