@@ -70,7 +70,7 @@ def test_rank_warms_then_serves_and_closes_on_failure(monkeypatch, name, rank, f
     def make_runner(model, **options):
         assert model is spec
         assert options["draft_tokens"] == spec.draft_tokens
-        assert options["fast_allreduce"] == (spec.family in {"gpt_oss", "inkling2"})
+        assert options["fast_allreduce"] == (spec.family == "inkling2")
         assert options["context_length"] == spec.context_length + (
             spec.family == "gpt_oss"
         )

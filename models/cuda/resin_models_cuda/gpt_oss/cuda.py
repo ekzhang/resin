@@ -10,13 +10,6 @@ from typing import TYPE_CHECKING
 import numpy as np
 import torch
 import torch.distributed as dist
-from flashinfer.comm import (
-    AllReduceFusionPattern,
-    AllReduceFusionWorkspace,
-    allreduce_fusion,
-    create_allreduce_fusion_workspace,
-)
-from flashinfer.comm.mnnvl import TorchDistBackend
 from flashinfer.gemm import tinygemm_bf16
 from quack import rmsnorm
 from quack.rotary import apply_rotary
@@ -42,7 +35,7 @@ from resin.backend.cuda.graphs import (
     resolve_decode_graph_shapes,
 )
 from resin.backend.cuda.metrics import observe_execution
-from resin.backend.cuda.parallel import TensorParallelContext, TensorParallelLayout
+from resin.backend.cuda.parallel import TensorParallelContext
 from resin.backend.cuda.runner import (
     CudaRunner,
     capture_sampling_inputs,
@@ -195,21 +188,12 @@ class GptOssCudaRunner(CudaRunner):
         cuda_graph_prefill: str = "breakable",
         cuda_graph_decode: str = "full",
         cuda_graph_decode_shapes: object = None,
-        tensor_parallel: TensorParallelContext | None = None,
         parallel_groups: ParallelGroups | None = None,
-        fast_allreduce: bool = True,
         gpu_memory_utilization: float = 0.95,
     ) -> None:
         if parallel_groups is not None:
-            if tensor_parallel is not None:
-                raise ValueError("pass either tensor_parallel or parallel_groups")
             self.parallelism_capabilities.validate(
                 parallel_groups.topology, model=self.model_label
-            )
-            group = parallel_groups.attn_tp
-            tensor_parallel = TensorParallelContext(
-                TensorParallelLayout(rank=group.local_rank, size=group.size),
-                group.handle if group.size > 1 else None,
             )
         self.parallel_groups = parallel_groups
         if kernel_attention is None:
@@ -229,9 +213,10 @@ class GptOssCudaRunner(CudaRunner):
             raise ValueError("cache_parent_capacity must be a positive integer")
         if not 0.0 < gpu_memory_utilization < 1.0:
             raise ValueError("gpu_memory_utilization must be between zero and one")
-        self.tensor_parallel = tensor_parallel or TensorParallelContext()
-        self.tensor_parallel_rank = self.tensor_parallel.rank
-        self.tensor_parallel_size = self.tensor_parallel.size
+        self.tensor_parallel = TensorParallelContext.from_group(
+            parallel_groups.attn_tp if parallel_groups is not None else None
+        )
+        tensor_parallel_size = self.tensor_parallel.size
         super().__init__(
             device=device,
             label=self.model_label,
@@ -264,7 +249,6 @@ class GptOssCudaRunner(CudaRunner):
             device=self.device,
             dtype=torch.bfloat16,
             kernel_moe=kernel_moe,
-            tensor_parallel=self.tensor_parallel.layout,
             parallel_groups=parallel_groups,
         )
         self._configure_parallel_graphs(self._model, parallel_groups)
@@ -272,8 +256,8 @@ class GptOssCudaRunner(CudaRunner):
         args = self._model.args
         checkpoint_args = GptOssConfig.from_dict(self.config)
         expected_attention = (
-            checkpoint_args.num_attention_heads // self.tensor_parallel_size,
-            checkpoint_args.num_key_value_heads // self.tensor_parallel_size,
+            checkpoint_args.num_attention_heads // tensor_parallel_size,
+            checkpoint_args.num_key_value_heads // tensor_parallel_size,
             checkpoint_args.head_dim,
             self.sliding_window,
         )
@@ -297,30 +281,8 @@ class GptOssCudaRunner(CudaRunner):
         self.vocab_size = args.vocab_size
         self.eos_token_id = self.config.get("eos_token_id")
 
-        self._allreduce_workspace: AllReduceFusionWorkspace | None = None
-        self.allreduce_backend = "local"
-        if self.tensor_parallel.enabled and fast_allreduce and parallel_groups is None:
-            self._allreduce_workspace = create_allreduce_fusion_workspace(
-                backend="auto",
-                world_size=self.tensor_parallel_size,
-                rank=self.tensor_parallel_rank,
-                max_token_num=self.prefill_chunk_size,
-                hidden_dim=self.hidden_size,
-                dtype=torch.bfloat16,
-                comm_backend=TorchDistBackend(group=self.tensor_parallel.process_group),
-                group=self.tensor_parallel.process_group,
-            )
-            self.allreduce_backend = self._allreduce_workspace.backend
-        elif self.tensor_parallel.enabled:
-            self.allreduce_backend = "nccl"
-
         for layer in self._model.model.layers:
             layer.self_attn.pack_qkv_projection()
-            # MNNVL's fused RMSNorm reads gamma in the communication tensor's
-            # dtype.
-            layer.input_layernorm.to(dtype=torch.bfloat16)
-            layer.post_attention_layernorm.to(dtype=torch.bfloat16)
-        self._model.model.norm.to(dtype=torch.bfloat16)
 
         self._full_layers = tuple(
             index
@@ -349,7 +311,7 @@ class GptOssCudaRunner(CudaRunner):
             free_memory,
             gpu_memory_utilization,
             attention_layers_per_group=len(self._full_layers),
-            tensor_parallel_size=self.tensor_parallel_size,
+            tensor_parallel_size=tensor_parallel_size,
         )
         local_capacity = capacity_plan.parent_capacity
         if cache_parent_capacity is not None:
@@ -360,16 +322,6 @@ class GptOssCudaRunner(CudaRunner):
                 capacity_tensor,
                 op=dist.ReduceOp.MIN,
                 group=parallel_groups.replica.handle,
-            )
-            local_capacity = int(capacity_tensor.item())
-        elif self.tensor_parallel.enabled:
-            capacity_tensor = torch.tensor(
-                local_capacity, dtype=torch.int64, device=self.device
-            )
-            dist.all_reduce(
-                capacity_tensor,
-                op=dist.ReduceOp.MIN,
-                group=self.tensor_parallel.process_group,
             )
             local_capacity = int(capacity_tensor.item())
         self.cache_parent_capacity = local_capacity
@@ -673,54 +625,25 @@ class GptOssCudaRunner(CudaRunner):
         partial = torch.mm(hidden, projection.weight.t(), out_dtype=torch.float32)
         if projection.bias is not None:
             partial.add_(projection.bias.float())
-        return partial
+        return self.tensor_parallel.sum(partial)
 
-    def _allreduce_residual_rmsnorm(
-        self,
+    @staticmethod
+    def _residual_rmsnorm(
         partial: Tensor,
         residual: Tensor,
         weight: Tensor,
         eps: float,
-        *,
-        reduce: bool = True,
     ) -> tuple[Tensor, Tensor]:
         if partial.numel() == 0:
             return partial, residual
-        workspace = (
-            self._allreduce_workspace
-            if reduce and partial.dtype == residual.dtype
-            else None
+        normalized, combined = rmsnorm(
+            partial.to(residual.dtype),
+            weight,
+            residual=residual,
+            eps=eps,
+            prenorm=True,
         )
-        if workspace is None:
-            reduced = self.tensor_parallel.sum(partial) if reduce else partial
-            reduced = reduced.to(residual.dtype)
-            normalized, combined = rmsnorm(
-                reduced,
-                weight,
-                residual=residual,
-                eps=eps,
-                prenorm=True,
-            )
-            return normalized, combined
-
-        shape = partial.shape
-        flat_partial = partial.reshape(-1, shape[-1])
-        flat_residual = residual.reshape(-1, shape[-1])
-        combined = torch.empty_like(flat_partial)
-        normalized = torch.empty_like(flat_partial)
-        allreduce_fusion(
-            input=flat_partial,
-            workspace=workspace,
-            pattern=AllReduceFusionPattern.kARResidualRMSNorm,
-            launch_with_pdl=False,
-            trigger_completion_at_end=True,
-            residual_in=flat_residual,
-            residual_out=combined,
-            norm_out=normalized,
-            rms_gamma=weight,
-            rms_eps=eps,
-        )
-        return normalized.view(shape), combined.view(shape)
+        return normalized, combined
 
     @staticmethod
     def _feed_forward(mlp: MLP, hidden: Tensor) -> Tensor:
@@ -770,7 +693,7 @@ class GptOssCudaRunner(CudaRunner):
                 context_parallel=context_parallel,
                 query_batch=query_batch,
             )
-            normalized_mlp_input, hidden = self._allreduce_residual_rmsnorm(
+            normalized_mlp_input, hidden = self._residual_rmsnorm(
                 attention_out,
                 hidden,
                 layer.post_attention_layernorm.weight,
@@ -784,12 +707,11 @@ class GptOssCudaRunner(CudaRunner):
                 if layer_index + 1 < len(layers)
                 else self._model.model.norm
             )
-            normalized, hidden = self._allreduce_residual_rmsnorm(
+            normalized, hidden = self._residual_rmsnorm(
                 feed_forward_output,
                 hidden,
                 next_norm.weight,
                 next_norm.eps,
-                reduce=self.parallel_groups is None,
             )
         final_hidden = normalized.squeeze(0)
         if context_parallel is not None:

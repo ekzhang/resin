@@ -139,11 +139,12 @@ def test_fast_allreduce_reaches_runner_and_rejects_unsupported_models(monkeypatc
     assert options["fast_allreduce"] is True
     assert runner_options["fast_allreduce"] is True
     assert topology.world_size == 2
-    args = bench.argument_parser().parse_args(
-        ["--model", "glm-5.3-flash", "--fast-allreduce"]
-    )
-    with pytest.raises(ValueError, match="does not support fast all-reduce"):
-        bench._configuration(args)
+    for model in ("gpt-oss-120b", "glm-5.3-flash"):
+        args = bench.argument_parser().parse_args(
+            ["--model", model, "--fast-allreduce"]
+        )
+        with pytest.raises(ValueError, match="does not support fast all-reduce"):
+            bench._configuration(args)
 
 
 @pytest.mark.parametrize("name", bench.MODEL_SPECS)
