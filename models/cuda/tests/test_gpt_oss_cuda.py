@@ -40,7 +40,7 @@ from resin_models_cuda.gpt_oss.cuda import (
     _router_logits,
     plan_gpt_oss_kv_capacity,
 )
-from resin_models_cuda.gpt_oss.model import SinkAttention, TopKRouter
+from resin_models_cuda.gpt_oss.model import TopKRouter
 
 
 def build_attention_batch(plan, *, parent_capacity: int = 2048):
@@ -636,35 +636,6 @@ class TestGptOssCudaTinyOracle:
         assert calls == ["reduce", "norm"]
         torch.testing.assert_close(normalized, torch.full_like(residual, 2))
         torch.testing.assert_close(combined, torch.full_like(residual, 2.5))
-
-    def test_packed_qkv_matches_three_loaded_projections(self) -> None:
-        import torch
-
-        # This projection-only fixture supplies the checkpoint-loaded fields.
-        attention = cast(
-            SinkAttention,
-            SimpleNamespace(
-                q_proj=torch.nn.Linear(8, 12, bias=True),
-                k_proj=torch.nn.Linear(8, 4, bias=True),
-                v_proj=torch.nn.Linear(8, 4, bias=True),
-            ),
-        )
-        hidden = torch.randn(7, 8)
-        expected = torch.cat(
-            (
-                attention.q_proj(hidden),
-                attention.k_proj(hidden),
-                attention.v_proj(hidden),
-            ),
-            dim=-1,
-        )
-
-        SinkAttention.pack_qkv_projection(attention)
-
-        torch.testing.assert_close(attention.qkv_proj(hidden), expected)
-        assert not hasattr(attention, "q_proj")
-        assert not hasattr(attention, "k_proj")
-        assert not hasattr(attention, "v_proj")
 
     @pytest.mark.parametrize("rows", [128, 129])
     def test_router_dispatches_at_tinygemm_row_boundary(self, monkeypatch, rows):

@@ -19,9 +19,8 @@ from resin_models_cuda.gpt_oss.flashinfer import (
 )
 from resin_models_cuda.gpt_oss.mxfp4 import (
     EXPERT_CHECKPOINT_NAMES,
+    CheckpointShards,
     KernelExperts,
-    shard_checkpoint_tensor,
-    shard_model_config,
 )
 
 
@@ -41,48 +40,29 @@ def _args():
 @pytest.mark.parametrize("name", EXPERT_CHECKPOINT_NAMES)
 def test_all_expert_checkpoint_tensors_are_sharded_on_the_expert_axis(name):
     tensor = torch.arange(8 * 16).view(8, 4, 4)
-    shard = shard_checkpoint_tensor(
-        f"model.layers.0.mlp.experts.{name}",
-        tensor,
-        args=_args(),
-        tensor_parallel=TensorParallelLayout(),
-        expert_parallel=TensorParallelLayout(rank=1, size=2),
+    shards = CheckpointShards(
+        _config(), expert_parallel=TensorParallelLayout(rank=1, size=2)
     )
+    shard = shards(f"model.layers.0.mlp.experts.{name}", tensor)
     torch.testing.assert_close(shard, tensor[4:])
     assert shard.is_contiguous()
 
 
 def test_expert_and_attention_shards_use_independent_axes():
-    args = _args()
-    tensor = torch.arange(8 * 128 * 32).view(8, 128, 2, 16)
-    expert_shard = shard_checkpoint_tensor(
-        "model.layers.0.mlp.experts.gate_up_proj_blocks",
-        tensor,
-        args=args,
-        tensor_parallel=TensorParallelLayout(rank=0, size=2),
+    shards = CheckpointShards(
+        replace(_config(), intermediate_size=64),
+        TensorParallelLayout(rank=0, size=2),
         expert_parallel=TensorParallelLayout(rank=1, size=2),
+        expert_tensor_parallel=TensorParallelLayout(rank=0, size=2),
     )
+    tensor = torch.arange(8 * 128 * 32).view(8, 128, 2, 16)
+    expert_shard = shards("model.layers.0.mlp.experts.gate_up_proj_blocks", tensor)
     torch.testing.assert_close(expert_shard, tensor[4:, :64])
     query = torch.arange(32 * 32).view(32, 32)
-    query_shard = shard_checkpoint_tensor(
-        "model.layers.0.self_attn.q_proj.weight",
-        query,
-        args=args,
-        tensor_parallel=TensorParallelLayout(rank=0, size=2),
-        expert_parallel=TensorParallelLayout(rank=1, size=2),
-    )
+    query_shard = shards("model.layers.0.self_attn.q_proj.weight", query)
     torch.testing.assert_close(query_shard, query[:16])
     router = torch.arange(8 * 32).view(8, 32)
-    assert (
-        shard_checkpoint_tensor(
-            "model.layers.0.mlp.router.weight",
-            router,
-            args=args,
-            tensor_parallel=TensorParallelLayout(),
-            expert_parallel=TensorParallelLayout(rank=1, size=2),
-        )
-        is router
-    )
+    assert shards("model.layers.0.mlp.router.weight", router) is router
 
 
 def _config():
@@ -107,21 +87,17 @@ def test_local_model_heads_and_expert_channels_use_different_tp_sizes():
     args = _config()
     # Uneven aligned expert shards are legal; their width is unrelated to the
     # number of local attention heads or the expert-owner axis.
-    local = shard_model_config(
+    local = CheckpointShards(
         args,
         TensorParallelLayout(rank=1, size=2),
         expert_tensor_parallel=TensorParallelLayout(rank=1, size=3),
-    )
+    ).model_args
     assert local == replace(
         args, num_attention_heads=2, num_key_value_heads=1, intermediate_size=32
     )
-    legacy = shard_model_config(args, TensorParallelLayout(rank=1, size=2))
-    assert legacy.intermediate_size == 32
-    full_attention = shard_model_config(
-        args,
-        TensorParallelLayout(),
-        expert_tensor_parallel=TensorParallelLayout(rank=0, size=2),
-    )
+    full_attention = CheckpointShards(
+        args, expert_tensor_parallel=TensorParallelLayout(rank=0, size=2)
+    ).model_args
     assert full_attention.num_attention_heads == args.num_attention_heads
     assert full_attention.intermediate_size == 64
 
@@ -133,15 +109,7 @@ def test_attention_tp_rejects_query_shards_that_would_replicate_kv(
     args = replace(_config(), num_attention_heads=queries, num_key_value_heads=kv_heads)
     layout = TensorParallelLayout(size=tp)
     with pytest.raises(ValueError, match="num_key_value_heads=.*must be divisible"):
-        shard_model_config(args, layout)
-    for projection in ("k_proj", "v_proj"):
-        with pytest.raises(ValueError, match="num_key_value_heads=.*must be divisible"):
-            shard_checkpoint_tensor(
-                f"model.layers.0.self_attn.{projection}.weight",
-                torch.empty(kv_heads * args.head_dim, args.hidden_size),
-                args=args,
-                tensor_parallel=layout,
-            )
+        CheckpointShards(args, layout)
 
 
 @pytest.mark.parametrize("projection", ["k_proj", "v_proj"])
@@ -150,11 +118,8 @@ def test_attention_tp_partitions_complete_kv_heads_without_replication(projectio
     weight = torch.arange(args.num_key_value_heads * args.head_dim * args.hidden_size)
     weight = weight.reshape(args.num_key_value_heads * args.head_dim, args.hidden_size)
     shards = [
-        shard_checkpoint_tensor(
-            f"model.layers.0.self_attn.{projection}.weight",
-            weight,
-            args=args,
-            tensor_parallel=TensorParallelLayout(rank=rank, size=2),
+        CheckpointShards(args, TensorParallelLayout(rank=rank, size=2))(
+            f"model.layers.0.self_attn.{projection}.weight", weight
         )
         for rank in range(2)
     ]
@@ -177,19 +142,17 @@ def test_composed_ep_and_expert_tp_reconstruct_all_checkpoint_weights(name):
     owners = []
     for ep_rank in range(2):
         channels = [
-            shard_checkpoint_tensor(
-                f"model.layers.0.mlp.experts.{name}",
-                tensor,
-                args=args,
-                tensor_parallel=TensorParallelLayout(rank=1, size=2),
+            CheckpointShards(
+                args,
+                TensorParallelLayout(rank=1, size=2),
                 expert_parallel=TensorParallelLayout(rank=ep_rank, size=2),
                 expert_tensor_parallel=TensorParallelLayout(rank=rank, size=2),
-            )
+            )(f"model.layers.0.mlp.experts.{name}", tensor)
             for rank in range(2)
         ]
         assert all(shard.is_contiguous() for shard in channels)
         if name == "down_proj_bias":
-            owners.append(sum(channels))
+            owners.append(channels[0] + channels[1])
             assert torch.count_nonzero(channels[1]) == 0
         else:
             owners.append(torch.cat(channels, dim=1 if name.startswith("gate") else 2))
@@ -199,17 +162,15 @@ def test_composed_ep_and_expert_tp_reconstruct_all_checkpoint_weights(name):
 def test_output_biases_belong_to_their_own_tp_group():
     args = _config()
     bias = torch.arange(32, dtype=torch.float32)
-    layouts = dict(
-        args=args,
-        tensor_parallel=TensorParallelLayout(rank=1, size=2),
+    shards = CheckpointShards(
+        args,
+        TensorParallelLayout(rank=1, size=2),
         expert_tensor_parallel=TensorParallelLayout(rank=0, size=2),
     )
-    attention = shard_checkpoint_tensor("layer.self_attn.o_proj.bias", bias, **layouts)
-    experts = shard_checkpoint_tensor(
-        "layer.mlp.experts.down_proj_bias", bias, **layouts
-    )
+    attention = shards("layer.self_attn.o_proj.bias", bias)
+    experts = shards("layer.mlp.experts.down_proj_bias", bias.expand(8, -1))
     torch.testing.assert_close(attention, torch.zeros_like(bias))
-    torch.testing.assert_close(experts, bias)
+    torch.testing.assert_close(experts, bias.expand(8, -1))
 
 
 def test_sharded_expert_projections_match_complete_weighted_moe():
@@ -245,9 +206,9 @@ def test_sharded_expert_projections_match_complete_weighted_moe():
     actual = torch.zeros_like(hidden)
     for ep_rank in range(2):
         for expert_tp_rank in range(2):
-            layouts = dict(
-                args=args,
-                tensor_parallel=TensorParallelLayout(rank=1, size=2),
+            shards = CheckpointShards(
+                args,
+                TensorParallelLayout(rank=1, size=2),
                 expert_parallel=TensorParallelLayout(rank=ep_rank, size=2),
                 expert_tensor_parallel=TensorParallelLayout(
                     rank=expert_tp_rank, size=2
@@ -255,9 +216,7 @@ def test_sharded_expert_projections_match_complete_weighted_moe():
             )
             actual += project(
                 *(
-                    shard_checkpoint_tensor(
-                        f"layer.mlp.experts.{name}", tensor, **layouts
-                    )
+                    shards(f"layer.mlp.experts.{name}", tensor)
                     for name, tensor in (
                         ("gate_up_proj_blocks", gate_up),
                         ("gate_up_proj_bias", gate_bias),
@@ -333,7 +292,7 @@ def test_checkpoint_prepares_independent_attention_ep_and_expert_tp_shards(
             assert torch.count_nonzero(weights.down_bias) == 0
             return weights
 
-    def load_weights(root, model, *, transform_tensor, install_expert_layer, **kwargs):
+    def load_weights(root, model, *, device, shards):
         assert validated_devices == [torch.device("cpu")]
         model.to_empty(device="cpu")
         tensors = {
@@ -344,12 +303,11 @@ def test_checkpoint_prepares_independent_attention_ep_and_expert_tp_shards(
             "down_proj_scales": torch.zeros(8, 32, 3, dtype=torch.uint8),
             "down_proj_bias": torch.ones(8, 32),
         }
-        install_expert_layer(
-            0,
+        model.model.layers[0].mlp.experts.load_weights(
             {
-                name: transform_tensor(f"model.layers.0.mlp.experts.{name}", value)
+                name: shards(f"model.layers.0.mlp.experts.{name}", value)
                 for name, value in tensors.items()
-            },
+            }
         )
 
     monkeypatch.setattr(mxfp4, "ExpertParallelDispatch", Dispatch)

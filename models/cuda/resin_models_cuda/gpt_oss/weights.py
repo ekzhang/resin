@@ -1,84 +1,90 @@
-"""Stream an official GPT-OSS checkpoint into a materialized model."""
+"""Stream GPT-OSS weights into the final rank-local model layout."""
 
 from __future__ import annotations
 
-import re
-from collections.abc import Callable, Collection, Mapping
+from itertools import accumulate
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, cast
 
 import torch
 
-from resin.backend.loading import load_safetensor_weights, resolve_dtype
+from resin.backend.loading import assign_model_tensor
 from resin.backend.safetensors import SafetensorReader, indexed_tensor_files
-
-_EXPERT_KEY = re.compile(
-    r"^model\.layers\.(?P<layer>[0-9]+)\.mlp\.experts\.(?P<name>.+)$"
+from resin_models_cuda.gpt_oss.mxfp4 import (
+    EXPERT_CHECKPOINT_NAMES,
+    CheckpointShards,
+    KernelExperts,
 )
 
+if TYPE_CHECKING:
+    from resin_models_cuda.gpt_oss.model import MoEForCausalLM
 
-def _identity_tensor(_key: str, tensor: Any) -> Any:
-    return tensor
 
-
+@torch.no_grad()
 def load_gpt_oss_weights(
-    model_path: str | Path,
-    model: Any,
-    *,
-    device: Any,
-    num_hidden_layers: int,
-    expert_tensor_names: Collection[str],
-    install_expert_layer: Callable[[int, Mapping[str, Any]], None],
-    transform_tensor: Callable[[str, Any], Any] | None = None,
-    dtype: Any = None,
+    root: Path, model: MoEForCausalLM, *, device: torch.device, shards: CheckpointShards
 ) -> None:
-    """Load ordinary tensors and install one packed expert layer at a time."""
+    """Load Q/K/V directly into packed storage and repack one expert layer at a time."""
 
-    root = Path(model_path).expanduser().resolve()
-    if not root.is_dir():
-        raise FileNotFoundError(f"checkpoint directory does not exist: {root}")
-    target = torch.device(device)
-    if target.type == "meta":
-        raise ValueError("GPT-OSS weights must be loaded onto a material device")
-    resolved_dtype = resolve_dtype(dtype)
-    if resolved_dtype is not None and not resolved_dtype.is_floating_point:
-        raise ValueError("model dtype must be floating point")
-
-    tensor_files = indexed_tensor_files(root)
-    transform_tensor = transform_tensor or _identity_tensor
-    ordinary_keys = tuple(
-        key for key in model.state_dict() if _EXPERT_KEY.fullmatch(key) is None
-    )
-    expert_names = tuple(expert_tensor_names)
-    expected_experts = {
-        f"model.layers.{layer}.mlp.experts.{name}"
-        for layer in range(num_hidden_layers)
-        for name in expert_names
+    files = indexed_tensor_files(root)
+    ordinary = {
+        name: tensor
+        for name, tensor in model.state_dict().items()
+        if ".mlp.experts." not in name
     }
-    expected = set(ordinary_keys) | expected_experts
-    actual = set(tensor_files)
-    if missing := expected - actual:
+    packed_sources = {}
+    experts = []
+    for index, layer in enumerate(model.model.layers):
+        prefix = f"model.layers.{index}"
+        experts.append(
+            {name: f"{prefix}.mlp.experts.{name}" for name in EXPERT_CHECKPOINT_NAMES}
+        )
+        attention = layer.self_attn
+        bounds = tuple(accumulate(attention.qkv_widths, initial=0))
+        for name, _ in attention.qkv_proj.named_parameters():
+            target = f"{prefix}.self_attn.qkv_proj.{name}"
+            for projection, start, stop in zip(
+                ("q_proj", "k_proj", "v_proj"), bounds[:-1], bounds[1:], strict=True
+            ):
+                source = f"{prefix}.self_attn.{projection}.{name}"
+                packed_sources[source] = (target, slice(start, stop))
+
+    ordinary_sources = (
+        ordinary.keys() - {target for target, _ in packed_sources.values()}
+        | packed_sources.keys()
+    )
+    expected = ordinary_sources | {key for layer in experts for key in layer.values()}
+    if missing := expected - files.keys():
         raise ValueError(f"checkpoint is missing tensors: {sorted(missing)[:8]}")
-    if unexpected := actual - expected:
+    if unexpected := files.keys() - expected:
         raise ValueError(f"checkpoint has unexpected tensors: {sorted(unexpected)[:8]}")
 
-    load_safetensor_weights(
-        root,
-        model,
-        device=target,
-        dtype=resolved_dtype,
-        checkpoint_keys=ordinary_keys,
-        transform_tensor=transform_tensor,
-    )
+    packed = {}
     with SafetensorReader() as reader:
-        for layer in range(num_hidden_layers):
-            tensors = {}
-            for name in expert_names:
-                key = f"model.layers.{layer}.mlp.experts.{name}"
-                tensor = reader.read(tensor_files[key], key)
-                tensor = transform_tensor(key, tensor)
-                tensors[name] = tensor.to(device=target)
-            install_expert_layer(layer, tensors)
+        for key in sorted(ordinary_sources, key=lambda key: (files[key], key)):
+            source = shards(key, reader.read(files[key], key))
+            if key not in packed_sources:
+                assign_model_tensor(
+                    model, key, source, device=device, dtype=torch.bfloat16
+                )
+                continue
+            target, interval = packed_sources[key]
+            if target not in packed:
+                packed[target] = torch.empty_like(
+                    ordinary[target], device=device, dtype=torch.bfloat16
+                )
+                assign_model_tensor(model, target, packed[target], device=device)
+            destination = packed[target][interval]
+            if destination.shape != source.shape:
+                raise ValueError(
+                    f"shape mismatch for {key!r}: expected {destination.shape}, got {source.shape}"
+                )
+            destination.copy_(source.to(dtype=destination.dtype))
 
-
-__all__ = ["load_gpt_oss_weights"]
+        for layer, keys in zip(model.model.layers, experts, strict=True):
+            cast(KernelExperts, layer.mlp.experts).load_weights(
+                {
+                    name: shards(key, reader.read(files[key], key)).to(device=device)
+                    for name, key in keys.items()
+                }
+            )

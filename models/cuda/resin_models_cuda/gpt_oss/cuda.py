@@ -255,9 +255,6 @@ class GptOssCudaRunner(CudaRunner):
         self.vocab_size = args.vocab_size
         self.eos_token_id = self.config.get("eos_token_id")
 
-        for layer in self._model.model.layers:
-            layer.self_attn.pack_qkv_projection()
-
         self._full_layers = tuple(
             index
             for index, layer_type in enumerate(args.layer_types)

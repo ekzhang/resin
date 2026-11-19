@@ -8,8 +8,9 @@ from typing import TYPE_CHECKING, Any
 
 import torch
 
-from resin.backend.cuda.parallel import TensorParallelLayout, TensorShard
+from resin.backend.cuda.parallel import TensorParallelLayout
 from resin.backend.expert_parallel import ExpertParallelDispatch
+from resin.models.gpt_oss.config import GptOssConfig
 from resin_models_cuda.gpt_oss.flashinfer import MXFP4Config, MXFP4Weights
 
 if TYPE_CHECKING:
@@ -26,116 +27,77 @@ _CHECKPOINT_TO_STANDARD = {
 EXPERT_CHECKPOINT_NAMES = tuple(_CHECKPOINT_TO_STANDARD)
 
 
-def _slice_axis(tensor, axis: int, shard: TensorShard):
-    selection = [slice(None)] * tensor.ndim
-    selection[axis] = shard.as_slice()
-    return tensor[tuple(selection)].contiguous()
+class CheckpointShards:
+    """Use the same rank-local geometry for model construction and checkpoint reads."""
 
-
-def shard_model_config(
-    args,
-    tensor_parallel: TensorParallelLayout,
-    *,
-    expert_tensor_parallel: TensorParallelLayout | None = None,
-):
-    """Keep attention heads and expert channels on their independent meshes."""
-
-    expert_tensor_parallel = expert_tensor_parallel or tensor_parallel
-    query_heads = tensor_parallel.even_shard(
-        args.num_attention_heads, name="num_attention_heads"
-    )
-    kv_heads = tensor_parallel.even_shard(
-        args.num_key_value_heads, name="num_key_value_heads"
-    )
-    intermediate = expert_tensor_parallel.aligned_shard(
-        args.intermediate_size,
-        alignment=32,
-        name="intermediate_size",
-    )
-    return replace(
-        args,
-        num_attention_heads=query_heads.size,
-        num_key_value_heads=kv_heads.size,
-        intermediate_size=intermediate.size,
-    )
-
-
-def shard_checkpoint_tensor(
-    key: str,
-    tensor,
-    *,
-    args,
-    tensor_parallel: TensorParallelLayout,
-    expert_parallel: TensorParallelLayout | None = None,
-    expert_tensor_parallel: TensorParallelLayout | None = None,
-):
-    """Return one rank's canonical contiguous checkpoint shard."""
-
-    expert_name = key.rsplit(".", 1)[-1]
-    if expert_name in EXPERT_CHECKPOINT_NAMES and expert_parallel is not None:
-        shard = expert_parallel.even_shard(args.num_local_experts, name="num_experts")
-        tensor = _slice_axis(tensor, 0, shard)
-    expert_tensor_parallel = expert_tensor_parallel or tensor_parallel
-
-    if expert_name in EXPERT_CHECKPOINT_NAMES and expert_tensor_parallel.enabled:
-        intermediate = expert_tensor_parallel.aligned_shard(
-            args.intermediate_size,
-            alignment=32,
-            name="intermediate_size",
+    def __init__(
+        self,
+        args: GptOssConfig,
+        tensor_parallel: TensorParallelLayout = TensorParallelLayout(),
+        *,
+        expert_parallel: TensorParallelLayout = TensorParallelLayout(),
+        expert_tensor_parallel: TensorParallelLayout = TensorParallelLayout(),
+    ) -> None:
+        query = tensor_parallel.even_shard(
+            args.num_attention_heads, name="num_attention_heads"
         )
-        if expert_name in {
-            "gate_up_proj_blocks",
-            "gate_up_proj_scales",
-            "gate_up_proj_bias",
-        }:
-            paired = TensorShard(2 * intermediate.start, 2 * intermediate.stop)
-            return _slice_axis(tensor, 1, paired)
-        if expert_name in {"down_proj_blocks", "down_proj_scales"}:
-            grouped = TensorShard(intermediate.start // 32, intermediate.stop // 32)
-            return _slice_axis(tensor, 2, grouped)
-        if expert_name == "down_proj_bias":
-            return (
-                tensor if expert_tensor_parallel.rank == 0 else torch.zeros_like(tensor)
-            )
+        kv = tensor_parallel.even_shard(
+            args.num_key_value_heads, name="num_key_value_heads"
+        )
+        experts = expert_parallel.even_shard(args.num_local_experts, name="num_experts")
+        intermediate = expert_tensor_parallel.aligned_shard(
+            args.intermediate_size, alignment=32, name="intermediate_size"
+        )
+        self.model_args = replace(
+            args,
+            num_attention_heads=query.size,
+            num_key_value_heads=kv.size,
+            intermediate_size=intermediate.size,
+        )
+        self.kernel_args = replace(self.model_args, num_local_experts=experts.size)
 
-    if not tensor_parallel.enabled:
-        return tensor
+        all_rows = slice(None)
+        query_rows = slice(query.start * args.head_dim, query.stop * args.head_dim)
+        kv_rows = slice(kv.start * args.head_dim, kv.stop * args.head_dim)
+        owner = experts.as_slice() if expert_parallel.enabled else all_rows
+        pairs = groups = all_rows
+        if expert_tensor_parallel.enabled:
+            pairs = slice(2 * intermediate.start, 2 * intermediate.stop)
+            groups = slice(intermediate.start // 32, intermediate.stop // 32)
+        self._slices: dict[str, tuple[slice, ...]] = (
+            {
+                "q_proj.weight": (query_rows,),
+                "q_proj.bias": (query_rows,),
+                "k_proj.weight": (kv_rows,),
+                "k_proj.bias": (kv_rows,),
+                "v_proj.weight": (kv_rows,),
+                "v_proj.bias": (kv_rows,),
+                "o_proj.weight": (all_rows, query_rows),
+                "self_attn.sinks": (query.as_slice(),),
+            }
+            if tensor_parallel.enabled
+            else {}
+        )
+        self._slices.update(
+            {
+                "experts.gate_up_proj_blocks": (owner, pairs),
+                "experts.gate_up_proj_scales": (owner, pairs),
+                "experts.gate_up_proj_bias": (owner, pairs),
+                "experts.down_proj_blocks": (owner, all_rows, groups),
+                "experts.down_proj_scales": (owner, all_rows, groups),
+                "experts.down_proj_bias": (owner,),
+            }
+        )
+        self._remote_bias = {
+            "o_proj.bias": tensor_parallel.rank != 0,
+            "experts.down_proj_bias": expert_tensor_parallel.rank != 0,
+        }
 
-    query_heads = tensor_parallel.even_shard(
-        args.num_attention_heads, name="num_attention_heads"
-    )
-    kv_heads = tensor_parallel.even_shard(
-        args.num_key_value_heads, name="num_key_value_heads"
-    )
-    query_width = TensorShard(
-        query_heads.start * args.head_dim,
-        query_heads.stop * args.head_dim,
-    )
-    kv_width = TensorShard(
-        kv_heads.start * args.head_dim,
-        kv_heads.stop * args.head_dim,
-    )
-
-    if key.endswith(".self_attn.q_proj.weight") or key.endswith(
-        ".self_attn.q_proj.bias"
-    ):
-        return _slice_axis(tensor, 0, query_width)
-    if key.endswith(".self_attn.k_proj.weight") or key.endswith(
-        ".self_attn.k_proj.bias"
-    ):
-        return _slice_axis(tensor, 0, kv_width)
-    if key.endswith(".self_attn.v_proj.weight") or key.endswith(
-        ".self_attn.v_proj.bias"
-    ):
-        return _slice_axis(tensor, 0, kv_width)
-    if key.endswith(".self_attn.o_proj.weight"):
-        return _slice_axis(tensor, 1, query_width)
-    if key.endswith(".self_attn.sinks"):
-        return _slice_axis(tensor, 0, query_heads)
-    if key.endswith(".self_attn.o_proj.bias"):
-        return tensor if tensor_parallel.rank == 0 else torch.zeros_like(tensor)
-
-    return tensor
+    def __call__(self, key: str, tensor: torch.Tensor) -> torch.Tensor:
+        name = ".".join(key.rsplit(".", 2)[-2:])
+        if (selection := self._slices.get(name)) is not None:
+            tensor = tensor[selection].contiguous()
+        return torch.zeros_like(tensor) if self._remote_bias.get(name) else tensor
 
 
 class KernelExperts(torch.nn.Module):
@@ -274,6 +236,5 @@ class KernelExperts(torch.nn.Module):
 __all__ = [
     "EXPERT_CHECKPOINT_NAMES",
     "KernelExperts",
-    "shard_checkpoint_tensor",
-    "shard_model_config",
+    "CheckpointShards",
 ]

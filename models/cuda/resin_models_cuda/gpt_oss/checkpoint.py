@@ -3,9 +3,8 @@
 from __future__ import annotations
 
 import json
-from dataclasses import replace
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, cast
+from typing import TYPE_CHECKING, Any
 
 import torch
 
@@ -14,12 +13,7 @@ from resin.backend.loading import MODEL_FILES, read_config, resolve_model
 from resin.models.gpt_oss.config import GptOssConfig
 from resin_models_cuda.gpt_oss.flashinfer import FlashInferSM90MXFP4Kernel, MXFP4Config
 from resin_models_cuda.gpt_oss.model import MoEForCausalLM
-from resin_models_cuda.gpt_oss.mxfp4 import (
-    EXPERT_CHECKPOINT_NAMES,
-    KernelExperts,
-    shard_checkpoint_tensor,
-    shard_model_config,
-)
+from resin_models_cuda.gpt_oss.mxfp4 import CheckpointShards, KernelExperts
 from resin_models_cuda.gpt_oss.weights import load_gpt_oss_weights
 
 if TYPE_CHECKING:
@@ -74,37 +68,23 @@ def load_model(
     config = read_config(root)
     args = GptOssConfig.from_dict(config)
     _check_quantization(config)
-    if parallel_groups is not None:
-        group = parallel_groups.attn_tp
-        tensor_parallel = TensorParallelLayout(rank=group.local_rank, size=group.size)
-        expert_parallel = TensorParallelLayout(
-            rank=parallel_groups.ep.local_rank, size=parallel_groups.ep.size
+
+    def layout(group):
+        return TensorParallelLayout(group.local_rank, group.size)
+
+    shards = (
+        CheckpointShards(args)
+        if parallel_groups is None
+        else CheckpointShards(
+            args,
+            layout(parallel_groups.attn_tp),
+            expert_parallel=layout(parallel_groups.ep),
+            expert_tensor_parallel=layout(parallel_groups.expert_tp),
         )
-        expert_tensor_parallel = TensorParallelLayout(
-            rank=parallel_groups.expert_tp.local_rank,
-            size=parallel_groups.expert_tp.size,
-        )
-    else:
-        expert_parallel = None
-        tensor_parallel = TensorParallelLayout()
-        expert_tensor_parallel = tensor_parallel
+    )
     target = torch.device(device)
-    local_args = shard_model_config(
-        args,
-        tensor_parallel,
-        expert_tensor_parallel=expert_tensor_parallel,
-    )
-    expert_args = (
-        replace(
-            local_args,
-            num_local_experts=expert_parallel.even_shard(
-                args.num_local_experts, name="num_experts"
-            ).size,
-        )
-        if expert_parallel is not None
-        else local_args
-    )
-    kernel_config = MXFP4Config.from_model(expert_args)
+    local_args = shards.model_args
+    kernel_config = MXFP4Config.from_model(shards.kernel_args)
     kernel = FlashInferSM90MXFP4Kernel()
     kernel.validate_device(target)
     kernel.validate(kernel_config)
@@ -118,25 +98,7 @@ def load_model(
             parallel_groups=parallel_groups,
         )
 
-    load_gpt_oss_weights(
-        root,
-        model,
-        device=device,
-        dtype=torch.bfloat16,
-        num_hidden_layers=args.num_hidden_layers,
-        expert_tensor_names=EXPERT_CHECKPOINT_NAMES,
-        transform_tensor=lambda key, tensor: shard_checkpoint_tensor(
-            key,
-            tensor,
-            args=args,
-            tensor_parallel=tensor_parallel,
-            expert_parallel=expert_parallel,
-            expert_tensor_parallel=expert_tensor_parallel,
-        ),
-        install_expert_layer=lambda layer, tensors: cast(
-            KernelExperts, model.model.layers[layer].mlp.experts
-        ).load_weights(tensors),
-    )
+    load_gpt_oss_weights(root, model, device=target, shards=shards)
 
     model.materialize_buffers(target)
     unprepared = [

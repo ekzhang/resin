@@ -78,65 +78,17 @@ def apply_rotary(hidden: Tensor, cos: Tensor, sin: Tensor) -> Tensor:
 
 
 class SinkAttention(nn.Module):
-    qkv_proj: nn.Linear
-
     def __init__(self, config: GptOssConfig, layer_index: int) -> None:
         super().__init__()
         self.layer_type = config.layer_types[layer_index]
-        self.head_dim = config.head_dim
-        self.num_heads = config.num_attention_heads
-        self.num_kv_heads = config.num_key_value_heads
-        self.kv_groups = self.num_heads // self.num_kv_heads
-        self.scale = self.head_dim**-0.5
-        self.sliding_window = (
-            config.sliding_window if self.layer_type == "sliding_attention" else None
+        query = config.num_attention_heads * config.head_dim
+        kv = config.num_key_value_heads * config.head_dim
+        self.qkv_widths = (query, kv, kv)
+        self.qkv_proj = nn.Linear(
+            config.hidden_size, sum(self.qkv_widths), bias=config.attention_bias
         )
-        width = config.hidden_size
-        self.q_proj = nn.Linear(
-            width, self.num_heads * self.head_dim, bias=config.attention_bias
-        )
-        self.k_proj = nn.Linear(
-            width, self.num_kv_heads * self.head_dim, bias=config.attention_bias
-        )
-        self.v_proj = nn.Linear(
-            width, self.num_kv_heads * self.head_dim, bias=config.attention_bias
-        )
-        self.o_proj = nn.Linear(
-            self.num_heads * self.head_dim, width, bias=config.attention_bias
-        )
-        self.sinks = nn.Parameter(torch.empty(self.num_heads))
-
-    def pack_qkv_projection(self) -> None:
-        """Replace the loaded local Q/K/V shards with one packed projection."""
-
-        projections = (self.q_proj, self.k_proj, self.v_proj)
-        weight = torch.cat(tuple(projection.weight for projection in projections))
-        packed = nn.Linear(
-            weight.shape[1],
-            weight.shape[0],
-            bias=self.q_proj.bias is not None,
-            device="meta",
-            dtype=weight.dtype,
-        )
-        packed.weight = nn.Parameter(
-            weight,
-            requires_grad=self.q_proj.weight.requires_grad,
-        )
-        if self.q_proj.bias is not None:
-            packed.bias = nn.Parameter(
-                torch.cat(
-                    tuple(
-                        projection.bias
-                        for projection in projections
-                        if projection.bias is not None
-                    )
-                ),
-                requires_grad=self.q_proj.bias.requires_grad,
-            )
-        self.qkv_proj = packed
-        del self.q_proj
-        del self.k_proj
-        del self.v_proj
+        self.o_proj = nn.Linear(query, config.hidden_size, bias=config.attention_bias)
+        self.sinks = nn.Parameter(torch.empty(config.num_attention_heads))
 
 
 class TopKRouter(BalancedRoutingMixin, nn.Module):
