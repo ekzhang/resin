@@ -659,11 +659,13 @@ def create_runner(
         shapes = tuple((batch, width) for batch in sorted(set(decode_batch_sizes)))
     common["cuda_graph_decode_shapes"] = shapes if decode_graph != "disabled" else ()
     if spec.family == "gpt_oss":
-        from resin_models_cuda.gpt_oss.cuda import GptOssCudaRunner
-        from resin_models_cuda.gpt_oss.flashinfer import FlashInferSM90MXFP4Kernel
-
         if draft_tokens:
             raise ValueError("GPT-OSS has no draft model; use draft_tokens=0")
+        if fast_allreduce:
+            raise ValueError(f"{spec.name} does not support fast all-reduce")
+
+        from resin_models_cuda.gpt_oss.cuda import GptOssCudaRunner
+        from resin_models_cuda.gpt_oss.flashinfer import FlashInferSM90MXFP4Kernel
 
         class Runner(GptOssCudaRunner):
             pass
@@ -673,7 +675,6 @@ def create_runner(
             checkpoint,
             parallel_groups=groups,
             kernel_moe=FlashInferSM90MXFP4Kernel(),
-            fast_allreduce=fast_allreduce,
             gpu_memory_utilization=memory,
             **common,
         )

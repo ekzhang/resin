@@ -426,11 +426,8 @@ The GPT-OSS 120B HTTP deployment constructs
 `Parallelism(world_size=2, attn_tp=2)` and passes `parallel_groups=` to its
 runner. Attention TP and expert TP both equal two, and its distributed callback
 uses the same coordinated validation and execution path as composed layouts.
-The separate TP server wrapper/follower loop has been removed. Model-level
-`tensor_parallel=` contexts remain available for diagnostic callers; they are
-mutually exclusive with `parallel_groups=`. DeepSeek's single KV head still
-requires `attn_tp=1`, and the retired query-head-only TP HTTP route fails before
-loading a model.
+Direct callers also pass `parallel_groups=` to run GPT-OSS with tensor
+parallelism. DeepSeek's single KV head requires `attn_tp=1`.
 
 ## Process integration
 

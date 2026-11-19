@@ -575,7 +575,6 @@ def _validate_configuration(model, cases, topology, options):
     }:
         raise ValueError(f"{model} does not support balanced expert routing")
     if options.get("fast_allreduce", False) and spec.family not in {
-        "gpt_oss",
         "deepseek_v41",
         "inkling2",
     }:

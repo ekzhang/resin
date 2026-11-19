@@ -581,7 +581,9 @@ class TestGptOssCudaTinyOracle:
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         runner = GptOssCudaRunner.__new__(GptOssCudaRunner)
-        setattr(runner, "tensor_parallel", SimpleNamespace(enabled=True))
+        setattr(
+            runner, "tensor_parallel", SimpleNamespace(enabled=True, sum=lambda x: x)
+        )
         projection = torch.nn.Linear(4, 3, bias=True, dtype=torch.bfloat16)
         hidden = torch.randn(2, 4, dtype=torch.bfloat16)
         calls = []
@@ -613,11 +615,13 @@ class TestGptOssCudaTinyOracle:
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         runner = GptOssCudaRunner.__new__(GptOssCudaRunner)
-        # The BF16-only fused all-reduce cannot preserve FP32 GEMM partials.
-        monkeypatch.setattr(runner, "_allreduce_workspace", object(), raising=False)
-        partial = torch.full((1, 2, 4), 1000.75, dtype=torch.float32)
+        projection = torch.nn.Linear(4, 4, dtype=torch.bfloat16)
+        torch.nn.init.constant_(projection.bias, 0.75)
         residual = torch.full((1, 2, 4), 0.5, dtype=torch.bfloat16)
         calls = []
+
+        def mm(left, right, *, out_dtype):
+            return torch.full((left.shape[0], right.shape[1]), 1000, dtype=out_dtype)
 
         def reduce(tensor):
             assert tensor.dtype == torch.float32
@@ -630,60 +634,18 @@ class TestGptOssCudaTinyOracle:
             calls.append("norm")
             return tensor, tensor + residual
 
-        setattr(runner, "tensor_parallel", SimpleNamespace(sum=reduce))
+        setattr(runner, "tensor_parallel", SimpleNamespace(enabled=True, sum=reduce))
+        monkeypatch.setattr(gpt_oss_runtime.torch, "mm", mm)
         monkeypatch.setattr(gpt_oss_runtime, "rmsnorm", norm)
-        normalized, combined = runner._allreduce_residual_rmsnorm(
+        partial = runner._attention_output_projection(
+            projection, residual.squeeze(0)
+        ).unsqueeze(0)
+        normalized, combined = runner._residual_rmsnorm(
             partial, residual, torch.ones(4, dtype=torch.bfloat16), 1e-5
         )
         assert calls == ["reduce", "norm"]
         torch.testing.assert_close(normalized, torch.full_like(residual, 2))
         torch.testing.assert_close(combined, torch.full_like(residual, 2.5))
-
-    def test_flashinfer_allreduce_fuses_residual_and_rmsnorm(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        import torch
-
-        runner = GptOssCudaRunner.__new__(GptOssCudaRunner)
-        monkeypatch.setattr(
-            runner,
-            "_allreduce_workspace",
-            SimpleNamespace(backend="trtllm"),
-            raising=False,
-        )
-        partial = torch.randn(1, 3, 8, dtype=torch.bfloat16)
-        residual = torch.randn(1, 3, 8, dtype=torch.bfloat16)
-        weight = torch.randn(8, dtype=torch.bfloat16)
-        eps = 1e-5
-        calls = []
-
-        def fused(**kwargs):
-            calls.append(kwargs)
-            combined = kwargs["input"] + kwargs["residual_in"]
-            kwargs["residual_out"].copy_(combined)
-            normalized = combined.float()
-            normalized *= torch.rsqrt(
-                normalized.square().mean(-1, keepdim=True) + kwargs["rms_eps"]
-            )
-            kwargs["norm_out"].copy_((normalized * kwargs["rms_gamma"]).bfloat16())
-            return kwargs["norm_out"]
-
-        monkeypatch.setattr("resin_models_cuda.gpt_oss.cuda.allreduce_fusion", fused)
-        normalized, combined = runner._allreduce_residual_rmsnorm(
-            partial, residual, weight, eps
-        )
-
-        expected_combined = partial + residual
-        expected_normalized = expected_combined.float()
-        expected_normalized *= torch.rsqrt(
-            expected_normalized.square().mean(-1, keepdim=True) + eps
-        )
-        expected_normalized = (expected_normalized * weight).bfloat16()
-        torch.testing.assert_close(combined, expected_combined)
-        torch.testing.assert_close(normalized, expected_normalized)
-        assert "use_oneshot" not in calls[0]
-        assert not calls[0]["launch_with_pdl"]
-        assert calls[0]["trigger_completion_at_end"]
 
     def test_packed_qkv_matches_three_loaded_projections(self) -> None:
         import torch

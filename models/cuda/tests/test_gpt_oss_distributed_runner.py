@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from contextlib import contextmanager, nullcontext
 from types import SimpleNamespace
-from typing import Any, NoReturn
+from typing import NoReturn
 
 import numpy as np
 import pytest
@@ -11,7 +11,6 @@ import torch
 import resin_models_cuda.gpt_oss.cuda as implementation
 from resin import BatchPhase, BatchPlan, ForwardOutput, Parallelism, SamplingParams
 from resin.backend.cuda.graphs import CudaGraphMode
-from resin.backend.cuda.parallel import TensorParallelContext
 from resin.backend.cuda.runner import CudaRunner
 from resin.backend.cuda.sampling import FusedSampler
 from resin.backend.distributed import StepContext
@@ -57,7 +56,6 @@ def _runner(monkeypatch, groups):
 
     runner = GptOssCudaRunner.__new__(GptOssCudaRunner)
     runner.parallel_groups = groups
-    runner.tensor_parallel = TensorParallelContext()
     runner.device = torch.device("cpu")
     runner.hidden_size = 32
     setattr(runner, "cache_layout", object())
@@ -398,27 +396,6 @@ def test_missing_graph_capture_is_rejected_in_worker_readiness_validation(
 
     assert runner.calls == runner.tensorized == []
     assert runner._cuda_failure.synchronizations == 0
-
-
-@pytest.mark.parametrize(
-    ("parallelism", "options", "message"),
-    [
-        (
-            Parallelism(world_size=2, ep=2),
-            {"tensor_parallel": TensorParallelContext()},
-            "either",
-        ),
-    ],
-)
-def test_unsupported_distributed_preparation_fails_before_cuda(
-    parallelism, options, message
-):
-    kwargs: dict[str, Any] = dict(
-        cuda_graph_prefill="disabled", cuda_graph_decode="disabled"
-    )
-    kwargs.update(options)
-    with pytest.raises(ValueError, match=message):
-        GptOssCudaRunner(device="cuda", parallel_groups=_groups(parallelism), **kwargs)
 
 
 @pytest.mark.parametrize(

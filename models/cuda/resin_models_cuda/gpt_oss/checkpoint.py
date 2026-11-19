@@ -106,7 +106,6 @@ def load_model(
     device: str | torch.device,
     dtype: str | torch.dtype | None = None,
     kernel_moe=None,
-    tensor_parallel: TensorParallelLayout | None = None,
     parallel_groups: ParallelGroups | None = None,
 ) -> tuple[MoEForCausalLM, dict[str, Any]]:
     root = Path(model_path).expanduser().resolve()
@@ -118,10 +117,7 @@ def load_model(
     )
     if parallel_groups is not None:
         group = parallel_groups.attn_tp
-        attention_layout = TensorParallelLayout(rank=group.local_rank, size=group.size)
-        if tensor_parallel is not None and tensor_parallel != attention_layout:
-            raise ValueError("tensor_parallel does not match the attention TP group")
-        tensor_parallel = attention_layout
+        tensor_parallel = TensorParallelLayout(rank=group.local_rank, size=group.size)
         expert_parallel = TensorParallelLayout(
             rank=parallel_groups.ep.local_rank, size=parallel_groups.ep.size
         )
@@ -131,7 +127,7 @@ def load_model(
         )
     else:
         expert_parallel = None
-        tensor_parallel = tensor_parallel or TensorParallelLayout()
+        tensor_parallel = TensorParallelLayout()
         expert_tensor_parallel = tensor_parallel
     target = torch.device(device)
     resolved_dtype = resolve_dtype(dtype)
