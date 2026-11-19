@@ -77,7 +77,7 @@ def prepare_paged_attention_batch(
 
 @cache
 def relative_attention_score_mod(
-    rel_extent: int, window_at_start: int = 0
+    rel_extent: int, window_at_start: int = 0, *, skip_distant_bias: bool = False
 ) -> Callable[..., Any]:
     """Build FA4's hidden-conditioned relative-bias score modifier."""
 
@@ -105,11 +105,16 @@ def relative_attention_score_mod(
             rel_logits = aux_tensors[0]
             distance = (q_idx + local_offset) - kv_idx
             global_q = seqlen_info.offset_q + q_idx
-            distance_0 = distance[0]
-            relative = distance_0 if distance_0 >= 0 else 0
-            relative = relative if relative < rel_extent else rel_extent - 1
-            bias = rel_logits[global_q[0], h_idx[0], relative]
-            bias = Float32(bias) if distance_0 == relative else Float32(0.0)
+            relative = distance[0]
+            if const_expr(skip_distant_bias):
+                bias = Float32(0.0)
+                if (relative >= 0) & (relative < rel_extent):
+                    bias = Float32(rel_logits[global_q[0], h_idx[0], relative])
+            else:
+                index = relative if relative >= 0 else 0
+                index = index if index < rel_extent else rel_extent - 1
+                bias = rel_logits[global_q[0], h_idx[0], index]
+                bias = Float32(bias) if relative == index else Float32(0.0)
             scores = scores + bias
         if const_expr(window_at_start > 0):
             if kv_idx[0] < local_offset - window_at_start:
@@ -186,6 +191,9 @@ def paged_attention(
                 window_left
                 if window_anchor_at_start and window_left is not None
                 else 0,
+                # Full attention traverses tiles beyond the relative-bias table.
+                # Sliding layers benefit from their branch-free bias load.
+                skip_distant_bias=causal and window_left is None,
             ),
             aux_tensors=[relative_logits] if relative_logits is not None else [],
         )
