@@ -8,12 +8,13 @@ from pathlib import Path
 KERNEL_CACHE_VOLUME_NAME = "resin-kernel-cache-v2"
 KERNEL_CACHE_VOLUME_VERSION = 2
 KERNEL_CACHE_MOUNT = "/cache/resin-kernels"
+CUDA_KERNEL_ABI = (
+    "cuda13.3.1-torch2.15.0-cu132-triton3.9.0-flashinfer0.7.1-"
+    "fa4b40-cutlassdsl4.8.1-tvmffi0.1.12-quack0.6.5-cutile1.5.0"
+)
 KERNEL_CACHE_ABI = (
-    "v12-blake3-localpublish1-h100-sm90a-py312-cuda13.3.1-torch2.13.0-cu130-"
-    "triton3.7.1-"
-    "flashinfer0.7.1-fijit0.7.1cu130-fa4b30-cutlassdsl4.8.1-"
-    "tvmffi0.1.12-fa4emptyaux1-quack0.6.5-cutile1.5.0-"
-    "qkvpack-tinygemm-top4-fiar"
+    f"v12-blake3-localpublish1-h100-sm90a-py312-{CUDA_KERNEL_ABI}-"
+    "fijit0.7.1cu130-fa4emptyaux1-qkvpack-tinygemm-top4-fiar"
 )
 KERNEL_CACHE_ROOT = f"{KERNEL_CACHE_MOUNT}/{KERNEL_CACHE_ABI}"
 FLASHINFER_BUILD_WORKSPACE = "/tmp/resin-flashinfer-build"

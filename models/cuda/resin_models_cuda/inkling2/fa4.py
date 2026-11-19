@@ -1,9 +1,8 @@
 """Blackwell FA4 launch preserving FP32 attention until Inkling's sink/gate.
 
-FA4 4.0.0b26's SM100 kernel supports independent output precision, but its public
-wrapper forces the query dtype. This narrow launcher reuses that kernel directly,
-with paged BF16 KV, runtime lengths and the same FP32 boundary as pinned SGLang.
-Launch preparation follows flash_attn/cute/interface.py in flash-attn-4 4.0.0b26
+FA4's public wrapper forces the query dtype. Use the SM100 kernel directly
+for paged BF16 KV and the same FP32 output boundary as pinned SGLang.
+Launch preparation follows flash_attn/cute/interface.py in flash-attn-4 4.0.0b40
 (BSD-3-Clause, see LICENSE.flash-attention); SGLang reference: e62ac6279646c686d3b328f58d9b5c2c2d5927dc.
 """
 
@@ -43,6 +42,7 @@ def paged_attention_fp32(
     num_splits=1,
 ):
     import cutlass.cute as cute
+    from flash_attn.cute.config import FwdConfig, Sm100Registers
     from flash_attn.cute.cute_dsl_utils import (
         get_aux_tensor_metadata,
         get_broadcast_dims,
@@ -74,8 +74,9 @@ def paged_attention_fp32(
     ratio = q.shape[1] // k.shape[2]
     pack_gqa = 128 % ratio == 0 and ratio > 1
     aux = aux_tensors or []
+    capability = torch.cuda.get_device_capability(q.device)
     key = (
-        torch.cuda.get_device_capability(q.device),
+        capability,
         ratio,
         causal,
         local,
@@ -87,18 +88,45 @@ def paged_attention_fp32(
     )
     kernels = _kernel_cache()
     if key not in kernels:
+        major, minor = capability
+        sm103 = major == 10 and minor >= 3
+        softmax_regs, correction_regs = 192, 80
+        if causal:
+            softmax_regs, correction_regs = (176, 64) if sm103 else (192, 72)
+        emulation = 0 if sm103 else 32 if pack_gqa and not (causal or local) else 16
+        # Keep the old 1-CTA, one-Q-stage launch. FP32 O shares the Q buffer in
+        # split mode, leaving room for five rather than four BF16 KV stages.
+        # The kernel reads the actual split count from the output tensor shape.
+        config = FwdConfig(
+            device_capacity=major,
+            tile_m=128,
+            tile_n=128,
+            mma_pv_is_rs=False,
+            intra_wg_overlap=False,
+            q_stage=1,
+            pack_gqa=pack_gqa,
+            use_clc_scheduler=False,
+            is_static_persistent=False,
+            use_tma_o=False,
+            use_s_ping_pong=False,
+            num_splits=num_splits,
+            use_2cta_instrs=False,
+            registers=Sm100Registers(
+                softmax_regs, correction_regs, 512 - 2 * softmax_regs - correction_regs
+            ),
+            ex2_emu_freq=emulation,
+            ex2_emu_start_frg=int(bool(emulation)),
+            overlap_sO_sQ=split,
+            kv_stage=5 if split else 4,
+            sm_stats_cross_stage=False,
+        )
         kernel = FlashAttentionForwardSm100(
             128,
             128,
             qhead_per_kvhead=ratio,
             is_causal=causal,
             is_local=local,
-            is_split_kv=split,
-            pack_gqa=pack_gqa,
-            m_block_size=128,
-            n_block_size=128,
-            q_stage=1,
-            is_static_persistent=False,
+            config=config,
             score_mod=score_mod,
             has_aux_tensors=bool(aux),
             paged_kv_non_tma=False,
@@ -130,6 +158,10 @@ def paged_attention_fp32(
                 None,
                 None,
                 max_seqlen_q,
+                None,  # Tensor-map workspace for ragged V.
+                None,  # Q scales for MXFP8.
+                None,  # K scales for MXFP8.
+                None,  # V scales for MXFP8.
                 cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True),
             ]
         )
@@ -163,5 +195,9 @@ def paged_attention_fp32(
         None,
         None,
         max_seqlen_q,
+        None,
+        None,
+        None,
+        None,
     )
     return out, lse

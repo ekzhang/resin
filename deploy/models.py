@@ -508,7 +508,9 @@ def image_environment(model: str | ModelSpec) -> dict[str, str]:
             "MAX_JOBS": "12",
             "CMAKE_BUILD_PARALLEL_LEVEL": "12",
         }
-    root = spec.kernel_mount
+    from deploy.jit_cache import CUDA_KERNEL_ABI
+
+    root = f"{spec.kernel_mount}/{CUDA_KERNEL_ABI}" if spec.kernel_mount else None
     cache_env = (
         {
             "CUTE_DSL_CACHE_DIR": f"{root}/cute-dsl",
@@ -524,8 +526,8 @@ def image_environment(model: str | ModelSpec) -> dict[str, str]:
                 **cache_env,
                 "TORCH_CUDA_ARCH_LIST": "8.0",
                 "FLASHINFER_CUDA_ARCH_LIST": "8.0",
-                "TRITON_CACHE_DIR": f"{spec.kernel_mount}/triton",
-                "FLASHINFER_WORKSPACE_BASE": f"{spec.kernel_mount}/flashinfer",
+                "TRITON_CACHE_DIR": f"{root}/triton",
+                "FLASHINFER_WORKSPACE_BASE": f"{root}/flashinfer",
             }
         return {
             **cache_env,

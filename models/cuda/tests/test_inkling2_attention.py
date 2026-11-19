@@ -177,6 +177,43 @@ def test_paged_attention_and_sink_match_dense(window):
     )
 
 
+def test_generic_fp32_split_kv_reuses_compilation():
+    from resin_models_cuda.inkling2 import fa4
+    from resin_models_cuda.inkling2.decode_attention import gated_decode
+
+    lengths = torch.tensor([727, 1185], dtype=torch.int32, device="cuda")
+    cache = cache_fixture(lengths, 2)
+    batch, tokens, heads = 2, 3, 12
+    q = torch.randn(batch, tokens, heads, 128, device="cuda").bfloat16() * 0.2
+    relative = torch.randn(batch, tokens, heads, 1024, device="cuda").bfloat16() * 0.05
+    gate, sinks = torch.randn_like(q), torch.randn_like(q[..., 0])
+    window = 1023
+    dense, lse = dense_attention(q, relative, cache, lengths, window)
+    expected = gated_reference(dense, lse, gate, sinks).flatten(0, 1)
+    cu_q = torch.arange(batch + 1, dtype=torch.int32, device=q.device) * tokens
+
+    def attend(splits):
+        return gated_decode(
+            q.flatten(0, 1),
+            cache.keys,
+            cache.values,
+            relative.flatten(0, 1),
+            gate.flatten(0, 1),
+            sinks.flatten(0, 1),
+            page_table=cache.groups[0].slab_ids,
+            seqused_k=lengths,
+            cu_seqlens_q=cu_q,
+            tokens=tokens,
+            num_splits=splits,
+            window_left=window,
+        )
+
+    torch.testing.assert_close(attend(2), expected, rtol=0.02, atol=0.001)
+    compiled = fa4.compile_count
+    torch.testing.assert_close(attend(4), expected, rtol=0.02, atol=0.001)
+    assert fa4.compile_count == compiled
+
+
 def pad_and_shear(q, relative, used, local):
     """Independent Torch layout for the native consumer's last ten KV tiles."""
     padded_q, biases = [], []

@@ -60,11 +60,9 @@ def _attention(fa4, query, keys, values, batch, *, sliding):
 
 
 def _rank(rank, rendezvous):
-    from flash_attn.cute import flash_attn_varlen_func
+    from resin_models_cuda.gpt_oss.cuda import _load_fa4
 
-    from resin_models_cuda.gpt_oss.cuda import _register_empty_fa4_aux_data
-
-    _register_empty_fa4_aux_data()
+    flash_attn_varlen_func = _load_fa4()
     faulthandler.dump_traceback_later(120, repeat=True)
     torch.cuda.set_device(rank)
     device = torch.device(f"cuda:{rank}")

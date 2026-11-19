@@ -87,8 +87,14 @@ class FlashAttentionForwardSm100(FA4Forward):
         assert bias_block_size in (8, 64)
         assert is_causal != is_local
         self.head_dim_padded = self.head_dim_v_padded = 128
+        self.epi_head_dim_v = self.head_dim_v_padded
         self.m_block_size = self.n_block_size = 128
         self.q_stage = self.bias_stage = self.cta_group_size = 1
+        # Keep the inherited FA4 MMA and correction stages on one BF16 slot.
+        self.s_p_o_stage = self.q_stage
+        self.use_s_ping_pong = self.sm_stats_cross_stage = False
+        self.qk_blockscaled = self.pv_blockscaled = self.sf_overlap = False
+        self.track_unquantized_sum = self.chunked_split_epi = False
         self.split_P_arrive = 96
         self.arch = BaseDSL._get_dsl().get_arch_enum()
         assert self.arch.is_family_of(Arch.sm_100f) or self.arch.is_family_of(

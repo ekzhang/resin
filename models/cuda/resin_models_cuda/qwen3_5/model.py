@@ -81,7 +81,7 @@ class Qwen35GatedRMSNorm(nn.Module):
 
     def forward(self, hidden: Tensor, gate: Tensor) -> Tensor:
         if hidden.is_cuda:
-            from fla.modules.fused_norm_gate import rms_norm_gated
+            from fla.modules.norm.fused_norm_gate import rms_norm_gated
 
             # FLA supports bias=None despite its public Tensor annotation.
             return rms_norm_gated(hidden, gate, self.weight, None, eps=self.eps)  # ty: ignore[invalid-argument-type]

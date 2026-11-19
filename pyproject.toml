@@ -132,7 +132,7 @@ deep-gemm = [
 ]
 flash-mla = [
   { requirement = "torch", match-runtime = true },
-  "triton==3.7.1",
+  "triton==3.9.0",
   "setuptools==80.9.0",
   "wheel==0.45.1",
   "ninja>=1.11",
@@ -140,7 +140,7 @@ flash-mla = [
 ]
 deep-select = [
   { requirement = "torch", match-runtime = true },
-  "triton==3.7.1",
+  "triton==3.9.0",
   "setuptools==80.9.0",
   "wheel==0.45.1",
   "ninja>=1.11",

@@ -42,7 +42,7 @@ jobs:
         # Install separately from the workspace, whose dev group includes CUDA kernels.
         run: |
           uv venv
-          uv pip install --index https://download.pytorch.org/whl/cpu 'torch==2.13.0+cpu'
+          uv pip install --index https://download.pytorch.org/whl/cpu 'torch==2.15.0+cpu'
           uv pip install 'blake3>=1,<2' 'numpy>=1.26,<3' 'pytest>=8,<9' 'tokenizers>=0.22.2' pillow
           uv pip install --no-deps --editable .
           uv pip check
