@@ -150,16 +150,18 @@ def test_experts_match_reference_and_changed_input_graph(mode):
 
 
 @BLACKWELL
+@pytest.mark.parametrize("rows", [8, 513])
 @torch.inference_mode()
-def test_native_adapter_matches_generic_for_changed_routes(monkeypatch):
+def test_native_adapter_matches_generic_for_changed_routes(monkeypatch, rows):
     from resin_models_cuda.inkling2 import expert_kernels, expert_native
 
-    monkeypatch.setattr(expert_native, "supports", lambda *args: False)
     torch.manual_seed(75)
     module = make_experts("nvfp4")
-    hidden = torch.randn(8, 256, device="cuda").bfloat16()
-    ids = torch.randint(8, (8, 8), device="cuda")
-    weights = torch.rand(8, 8, device="cuda")
+    hidden = torch.randn(rows, 256, device="cuda").bfloat16()
+    ids = torch.randint(8, (rows, 8), device="cuda")
+    weights = torch.rand(rows, 8, device="cuda")
+    assert expert_native.supports(module, hidden, ids, weights)
+    monkeypatch.setattr(expert_native, "supports", lambda *args: False)
     expected = expert_kernels.local_experts(module, hidden, ids, weights)
     actual = expert_native.local_experts(module, hidden, ids, weights)
     torch.testing.assert_close(actual, expected, atol=0, rtol=0)

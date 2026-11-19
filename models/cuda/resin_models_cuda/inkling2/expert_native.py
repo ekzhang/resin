@@ -42,16 +42,9 @@ def native():
 
 
 def supports(module, hidden, ids, weights):
-    # Use the fused pipeline for verification and the full EP2 prefill chunk.
-    verify = ids.shape[0] <= 256 and ids.numel() <= 2048
-    prefill = (
-        ids.shape == (4096, 8)
-        and module.replicated_ep is not None
-        and module.replicated_ep.size == 2
-    )
     return (
-        (verify or prefill)
-        and module.expert_tp_size == 1
+        module.expert_tp_size == 1
+        and module.expert_count <= 1024  # kMaxExperts in expert_native.cu
         and set(module.precision.values()) == {"nvfp4"}
         and hidden.shape[1] in (128, 256, 2304, 4608)
         and module.intermediate in (128, 256, 2304, 4608)
