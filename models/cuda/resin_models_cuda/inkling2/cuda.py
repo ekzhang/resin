@@ -283,6 +283,15 @@ class Inkling2CudaRunner(CudaRunner):
             prefill_chunk_size=prefill_chunk_size,
             draft_enabled=bool(speculative_draft_tokens),
         )
+        from resin_models_cuda.inkling2.prefill_attention import warm_prefill_split
+
+        warm_prefill_split(
+            geometry.kv_heads,
+            self.config.rel_extent,
+            self.device,
+            prefill_chunk_size=prefill_chunk_size,
+            max_sequence_length=max_seq_len,
+        )
         self.cache_geometry = geometry
         torch.cuda.synchronize(self.device)
         free, total = torch.cuda.mem_get_info(self.device)

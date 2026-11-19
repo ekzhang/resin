@@ -39,7 +39,12 @@ def cache_fixture(lengths, kv_heads):
     )
 
 
-def dense_attention(q, relative, cache, lengths, window):
+def dense_attention(q, relative, cache, lengths, window, *, query_indices=None):
+    tokens = q.shape[1]
+    if query_indices is None:
+        query_indices = torch.arange(tokens, device=q.device)
+    else:
+        q, relative = q[:, query_indices], relative[:, query_indices]
     output, lse = [], []
     for row, end in enumerate(lengths.tolist()):
         logical = torch.arange(end, device=q.device)
@@ -48,12 +53,7 @@ def dense_attention(q, relative, cache, lengths, window):
             x[page, logical % 128].float().repeat_interleave(6, 1)
             for x in (cache.keys, cache.values)
         )
-        distance = (
-            end
-            - q.shape[1]
-            + torch.arange(q.shape[1], device=q.device)[:, None]
-            - logical
-        )
+        distance = end - tokens + query_indices[:, None] - logical
         scores = torch.einsum("qhd,khd->qhk", q[row].float(), k) / 128**0.5
         bias = (
             relative[row]
@@ -212,6 +212,110 @@ def test_generic_fp32_split_kv_reuses_compilation():
     compiled = fa4.compile_count
     torch.testing.assert_close(attend(4), expected, rtol=0.02, atol=0.001)
     assert fa4.compile_count == compiled
+
+
+def test_global_prefill_split_bias_boundary_and_compilation():
+    from resin_models_cuda.inkling2 import fa4
+    from resin_models_cuda.inkling2.attention import (
+        gated_attention,
+        prepare_paged_attention_batch,
+    )
+    from resin_models_cuda.inkling2.prefill_attention import (
+        _merge_gate,
+        warm_prefill_split,
+    )
+
+    device = torch.device("cuda", torch.cuda.current_device())
+    if torch.cuda.get_device_capability(device) != (10, 3):
+        pytest.skip("requires the SM103 global prefill kernel")  # ty: ignore[too-many-positional-arguments]
+    warm_prefill_split(
+        1, 1024, device, prefill_chunk_size=4096, max_sequence_length=32768
+    )
+    fa4_compiles = fa4.compile_count
+    merge_compiles = set(_merge_gate.device_caches[device.index][0])
+
+    def check(tokens, history, pages, *, replay=False):
+        lengths = torch.tensor([history + tokens], dtype=torch.int32, device=device)
+        cache = cache_fixture(lengths, 1)
+        q = torch.randn((1, tokens, 6, 128), dtype=torch.bfloat16, device=device) * 0.2
+        relative = torch.zeros((*q.shape[:3], 1024), dtype=q.dtype, device=device)
+        relative[..., 0], relative[..., 1023] = 4, 5
+        packed = torch.randn((1, tokens, 6 * 128 + 10), dtype=q.dtype, device=device)
+        gate = packed[..., 2 : 2 + 6 * 128].view_as(q)
+        sinks = packed[..., -6:]
+        positions = history + torch.arange(tokens, device=device)[None]
+        options: dict[str, Any] = dict(
+            cache=cache,
+            group_index=0,
+            layer=0,
+            layer_count=1,
+            positions=positions,
+            sequence_lengths=lengths,
+            max_sequence_length=history + tokens,
+            softmax_scale=128**-0.5,
+            relative_logits=relative.flatten(0, 1),
+        )
+        batch_args: dict[str, Any] = dict(batch=1, tokens=tokens, layer_counts={0: 1})
+        prepared = prepare_paged_attention_batch(
+            cache,
+            lengths,
+            history + tokens,
+            global_prefill_relative_extent=1024,
+            **batch_args,
+        )
+        stock = prepare_paged_attention_batch(
+            cache,
+            lengths,
+            history + tokens,
+            **batch_args,
+        )
+        split = prepared.global_prefill_split
+        assert stock.global_prefill_split is None
+        if pages:
+            assert split is not None and split.pages == pages
+            assert split.far_lengths.item() == pages * 128
+            assert split.near_lengths.item() == history + tokens - pages * 128
+        else:
+            assert split is None
+
+        def attend(batch=prepared):
+            return gated_attention(q, gate, sinks, prepared_batch=batch, **options)
+
+        indices = torch.tensor([0, 1, 127, 128, tokens - 1], device=device)
+
+        def assert_dense(actual):
+            out, lse = dense_attention(
+                q, relative, cache, lengths, None, query_indices=indices
+            )
+            expected = gated_reference(out, lse, gate[:, indices], sinks[:, indices])
+            torch.testing.assert_close(
+                actual[:, indices], expected, rtol=0.014, atol=0.0005
+            )
+
+        actual = attend()
+        torch.testing.assert_close(
+            actual,
+            attend(stock),
+            rtol=0.014 if pages else 0,
+            atol=0.0005 if pages else 0,
+        )
+        assert_dense(actual)
+        if replay:
+            graph, actual = capture(attend)
+            q.mul_(-0.875)
+            sinks.add_(0.25)
+            reordered = cache.groups[0].slab_ids.flip(1)
+            cache.groups[0].slab_ids.copy_(reordered)
+            prepared.page_tables[0][0].copy_(reordered)
+            graph.replay()
+            torch.testing.assert_close(actual, attend(), rtol=0, atol=0)
+            assert_dense(actual)
+
+    check(1024, 16384 + 1022, 0)
+    check(1024, 16384 + 1023, 128, replay=True)
+    check(1153, 16384 + 1024 + 128, 129)
+    assert fa4.compile_count == fa4_compiles
+    assert set(_merge_gate.device_caches[device.index][0]) == merge_compiles
 
 
 def pad_and_shear(q, relative, used, local):

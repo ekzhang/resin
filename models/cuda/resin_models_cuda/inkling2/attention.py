@@ -10,7 +10,26 @@ from typing import Any
 import torch
 from torch import Tensor
 
-from resin_models_cuda.inkling2.cache import DeviceCache
+from resin_models_cuda.inkling2.cache import GLOBAL_GROUP, PAGE_TOKENS, DeviceCache
+
+MIN_SPLIT_QUERY_TOKENS = 1024
+MIN_UNBIASED_PREFIX_TOKENS = 16384
+
+
+def _unbiased_prefix_pages(end: int, tokens: int, relative_extent: int) -> int:
+    # The first query is at end - tokens. The largest possible biased key
+    # interval starts relative_extent - 1 tokens before that query.
+    far_tokens = (end - tokens - (relative_extent - 1)) // PAGE_TOKENS * PAGE_TOKENS
+    if tokens < MIN_SPLIT_QUERY_TOKENS or far_tokens < MIN_UNBIASED_PREFIX_TOKENS:
+        return 0
+    return far_tokens // PAGE_TOKENS
+
+
+@dataclass(frozen=True, slots=True)
+class _GlobalPrefillSplit:
+    pages: int
+    far_lengths: Tensor
+    near_lengths: Tensor
 
 
 @dataclass(frozen=True, slots=True)
@@ -22,6 +41,7 @@ class PagedAttentionBatch:
     max_lengths: dict[int, int]
     cu_query_lengths: Tensor
     log_tau: Tensor | None = None
+    global_prefill_split: _GlobalPrefillSplit | None = None
 
 
 def prepare_paged_attention_batch(
@@ -33,6 +53,7 @@ def prepare_paged_attention_batch(
     tokens: int,
     layer_counts: Mapping[int, int],
     log_tau: Tensor | None = None,
+    global_prefill_relative_extent: int | None = None,
 ) -> PagedAttentionBatch:
     """Build graph-stable page tables once for all attention layers."""
 
@@ -66,12 +87,34 @@ def prepare_paged_attention_batch(
         torch.arange(batch + 1, dtype=torch.int32, device=sequence_lengths.device)
         * tokens
     )
+    split = None
+    if (
+        global_prefill_relative_extent is not None
+        and batch == 1
+        and GLOBAL_GROUP in layer_counts
+    ):
+        # Serialized target prefill supplies the exact host endpoint. Full
+        # attention retains the entire prefix, so its pages start at token zero.
+        pages = _unbiased_prefix_pages(
+            max_lengths[GLOBAL_GROUP], tokens, global_prefill_relative_extent
+        )
+        if (
+            pages
+            and sequence_lengths.is_cuda
+            and torch.cuda.get_device_capability(sequence_lengths.device) == (10, 3)
+        ):
+            length = pages * PAGE_TOKENS
+            used = used_lengths[GLOBAL_GROUP]
+            split = _GlobalPrefillSplit(
+                pages, torch.full_like(used, length), used - length
+            )
     return PagedAttentionBatch(
         page_tables,
         used_lengths,
         max_lengths,
         cu_query_lengths,
         log_tau,
+        split,
     )
 
 
@@ -261,6 +304,7 @@ def gated_attention(
     layer: int,
     prepared_batch: PagedAttentionBatch,
     relative_logits: Tensor,
+    softmax_scale: float,
     window_left: int | None = None,
     inputs_padded: bool = False,
     **kwargs: Any,
@@ -323,6 +367,29 @@ def gated_attention(
         ).view(batch, tokens, heads, dim)
     if inputs_padded:
         raise ValueError("padded Inkling inputs require the selected decode geometry")
+    split = prepared_batch.global_prefill_split
+    if (
+        group_index == GLOBAL_GROUP
+        and split is not None
+        and window_left is None
+        and kwargs.get("causal", True)
+    ):
+        from resin_models_cuda.inkling2.prefill_attention import gated_prefill_split
+
+        return gated_prefill_split(
+            queries.flatten(0, 1),
+            cache.keys,
+            cache.values,
+            relative_logits,
+            gate.reshape(batch * tokens, heads, dim),
+            sinks.reshape(batch * tokens, heads),
+            page_table=prepared_batch.page_tables[group_index][layer],
+            far_pages=split.pages,
+            far_lengths=split.far_lengths,
+            near_lengths=split.near_lengths,
+            cu_query=prepared_batch.cu_query_lengths,
+            softmax_scale=softmax_scale,
+        ).view_as(queries)
     output, lse = paged_attention(
         queries,
         cache=cache,
@@ -330,6 +397,7 @@ def gated_attention(
         layer=layer,
         prepared_batch=prepared_batch,
         relative_logits=relative_logits,
+        softmax_scale=softmax_scale,
         window_left=window_left,
         return_lse=True,
         output_dtype=torch.float32,

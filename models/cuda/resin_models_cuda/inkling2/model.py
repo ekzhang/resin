@@ -574,6 +574,7 @@ class Inkling2Target(nn.Module):
                 GLOBAL_GROUP: config.global_layer_count,
                 LOCAL_GROUP: config.local_layer_count,
             },
+            global_prefill_relative_extent=config.rel_extent if prefill else None,
             # The scale is exactly one below the floor. Keep the same global
             # attention specialization on both sides of that boundary.
             log_tau=log_scaling_tau(
