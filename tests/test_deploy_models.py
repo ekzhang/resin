@@ -59,7 +59,7 @@ def test_mlx_factory_constructs_single_device_runner(monkeypatch, tmp_path, name
             device="mps",
             context_length=8192,
             max_batch_size=8,
-            prefill_chunk_size=4096,
+            prefill_chunk_size=spec.prefill_chunk_size,
             draft_tokens=0,
         )
         return create_runner(spec, checkpoint, **(options | overrides))
@@ -73,6 +73,7 @@ def test_mlx_factory_constructs_single_device_runner(monkeypatch, tmp_path, name
                 "memory_utilization": spec.gpu_memory_utilization,
                 "max_seq_len": 8192,
                 "max_batch_size": 8,
+                "prefill_chunk_size": 8192,
                 "include_vision": not spec.text_only,
             },
         )
@@ -83,8 +84,8 @@ def test_mlx_factory_constructs_single_device_runner(monkeypatch, tmp_path, name
         create(draft_tokens=1, assistant_checkpoint=tmp_path / "mtp")
     with pytest.raises(ValueError, match="one Apple Silicon device"):
         create(groups=object())
-    with pytest.raises(ValueError, match="4096-token chunks"):
-        create(prefill_chunk_size=8192)
+    create(prefill_chunk_size=4096)
+    assert calls[-1][1]["prefill_chunk_size"] == 4096
     with pytest.raises(ValueError, match="expert_backend"):
         create(expert_backend="flashinfer")
     # MLX presets have no managed volume; their checkpoint is always explicit.
@@ -94,7 +95,7 @@ def test_mlx_factory_constructs_single_device_runner(monkeypatch, tmp_path, name
             device="mps",
             context_length=8192,
             max_batch_size=8,
-            prefill_chunk_size=4096,
+            prefill_chunk_size=spec.prefill_chunk_size,
             draft_tokens=0,
         )
 

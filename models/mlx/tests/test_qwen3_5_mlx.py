@@ -14,7 +14,7 @@ from mlx.utils import tree_flatten  # noqa: E402
 
 from resin import Engine, SamplingParams  # noqa: E402
 from resin.models.qwen3_5.config import Qwen35Config  # noqa: E402
-from resin_models_mlx.qwen3_5.cache import PREFILL_CHUNK_SIZE  # noqa: E402
+from resin_models_mlx.qwen3_5.cache import STATE_BLOCK_TOKENS  # noqa: E402
 from resin_models_mlx.qwen3_5.model import Qwen35Model  # noqa: E402
 from resin_models_mlx.qwen3_5.runner import Qwen35MlxRunner  # noqa: E402
 
@@ -384,19 +384,43 @@ def test_checkpoint_loader_matches_transformers_reference(tmp_path, dense):
     assert (actual.argmax(-1) == expected.argmax(-1)).mean() > 0.9
 
 
-def test_prefix_restore_and_overlap_match_fresh_synchronous_decode():
+@pytest.mark.parametrize(
+    ("prefix_length", "cached_start"),
+    [
+        (STATE_BLOCK_TOKENS, 0),
+        (2 * STATE_BLOCK_TOKENS, 0),
+        (3 * STATE_BLOCK_TOKENS, STATE_BLOCK_TOKENS),
+    ],
+)
+def test_prefix_restore_and_overlap_match_fresh_synchronous_decode(
+    monkeypatch, prefix_length, cached_start
+):
     model = _model(all_experts=True)
-    shared = _prompt(PREFILL_CHUNK_SIZE, seed=4)
+    shared = _prompt(prefix_length, seed=4)
     prompts = [shared + _prompt(9, seed=5), _prompt(37, seed=6)]
     with Engine(_runner(model), context_length=16384, enable_overlap=False) as engine:
         expected = _generate(engine, prompts, 5)
-    with Engine(_runner(model), context_length=16384, prefix_cache=True) as engine:
+    runner = _runner(model)
+    assert runner.runner_config.prefill_chunk_size == 8192
+    launch = runner._launch
+    chunks = []
+
+    def record_chunk(plan, rows, tokens, token_ids=None):
+        chunks.append((int(plan.batch.context_lengths[rows[0]]), tokens.shape[1]))
+        return launch(plan, rows, tokens, token_ids)
+
+    monkeypatch.setattr(runner, "_launch", record_chunk)
+    with Engine(runner, context_length=16384, prefix_cache=True) as engine:
+        if cached_start:
+            _generate(engine, [shared[:cached_start] + [2] * 50], 1)
+            chunks.clear()
         _generate(engine, [shared + [3] * 50], 1)
+        assert chunks[0] == (cached_start, prefix_length - cached_start)
         params = SamplingParams(max_output_tokens=5, temperature=0.0)
         requests = [engine.submit(prompt, sampling_params=params) for prompt in prompts]
         while engine.has_work():
             engine.step()
-        assert requests[0].cached_tokens == PREFILL_CHUNK_SIZE
+        assert requests[0].cached_tokens == prefix_length
         assert engine.overlap_stats[1] > 0
         assert [request.take_result() for request in requests] == expected
 

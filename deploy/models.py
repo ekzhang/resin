@@ -60,7 +60,7 @@ class ModelSpec:
     ep: int = 1
     context_length: int = 131_072
     max_batch_size: int = 128
-    prefill_chunk_size: int = 4096
+    prefill_chunk_size: int = 8192
     draft_tokens: int = 0
     gpu_memory_utilization: float = 0.9
     expert_backend: str = "flashinfer"
@@ -112,7 +112,6 @@ MODEL_SPECS = {
         world_size=world_size,
         attn_tp=world_size,
         label=f"gpt-oss-{size}",
-        prefill_chunk_size=8192,
         gpu_memory_utilization=0.95,
     )
     for size, revision, world_size in (
@@ -150,7 +149,6 @@ MODEL_SPECS.update(
             label="gemma4-e2b-bf16",
             context_length=131072,
             max_batch_size=256,
-            prefill_chunk_size=8192,
             draft_tokens=3,
             gpu_memory_utilization=0.90,
             memory=128 * 1024,
@@ -185,7 +183,6 @@ MODEL_SPECS.update(
             # the checkpoint's 1M architectural limit at startup.
             context_length=16384,
             max_batch_size=8,
-            prefill_chunk_size=8192,
             gpu_memory_utilization=0.65,
             image_warmup=True,
         ),
@@ -215,7 +212,6 @@ MODEL_SPECS.update(
             label="deepseek-v41",
             context_length=1_048_576,
             max_batch_size=32,
-            prefill_chunk_size=8192,
             draft_tokens=3,
             gpu_memory_utilization=0.85,
             image_warmup=True,
@@ -253,7 +249,6 @@ MODEL_SPECS.update(
             label="gemma4-31b",
             app_name="resin-gemma4-nvfp4",
             context_length=262_144,
-            prefill_chunk_size=8192,
             draft_tokens=3,
             gpu_memory_utilization=0.95,
             memory=128 * 1024,
@@ -623,14 +618,9 @@ def create_runner(
                 "use draft_tokens=0"
             )
         from resin_models_mlx.qwen3_5 import Qwen35MlxRunner
-        from resin_models_mlx.qwen3_5.cache import PREFILL_CHUNK_SIZE
 
         if groups is not None:
             raise ValueError("the MLX runner executes on one Apple Silicon device")
-        if prefill_chunk_size != PREFILL_CHUNK_SIZE:
-            raise ValueError(
-                f"the MLX Qwen3.5 runner uses {PREFILL_CHUNK_SIZE}-token chunks"
-            )
         if expert_backend not in (None, spec.expert_backend):
             raise ValueError(f"{spec.name} uses expert_backend={spec.expert_backend!r}")
         # MLX has no CUDA graphs or graph batch catalog; graph options and
@@ -640,6 +630,7 @@ def create_runner(
             memory_utilization=memory,
             max_seq_len=context_length,
             max_batch_size=max_batch_size,
+            prefill_chunk_size=prefill_chunk_size,
             include_vision=not spec.text_only,
         )
     common: dict[str, Any] = dict(
@@ -736,6 +727,7 @@ def create_runner(
             max_seq_len=context_length,
             max_batch_size=max_batch_size,
             speculative_draft_tokens=draft_tokens,
+            prefill_chunk_size=prefill_chunk_size,
             gpu_memory_utilization=memory,
             kv_cache_dtype="fp8",
             **common,

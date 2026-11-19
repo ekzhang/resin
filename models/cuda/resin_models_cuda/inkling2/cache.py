@@ -22,7 +22,7 @@ from resin.backend.cuda.slab import (
 from resin.backend.resources import CachePoolBinding
 
 PAGE_TOKENS = 128
-PREFILL_CHUNK_SIZE = 4096
+PREFILL_CHUNK_SIZE = 8192
 GLOBAL_GROUP, LOCAL_GROUP, DRAFT_GLOBAL_GROUP, DRAFT_LOCAL_GROUP, STATE_GROUP = range(5)
 
 
@@ -64,7 +64,7 @@ class CacheGeometry:
         draft,
         *,
         attn_tp: int = 1,
-        prefill_chunk_size=4096,
+        prefill_chunk_size=PREFILL_CHUNK_SIZE,
         draft_enabled: bool = True,
     ):
         if attn_tp <= 0 or target.num_key_value_heads % attn_tp:

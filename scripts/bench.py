@@ -578,8 +578,6 @@ def _validate_configuration(model, cases, topology, options):
         raise ValueError(
             "Inkling 2 requires zero or seven drafts and 128-token aligned prefill chunks"
         )
-    if spec.family == "qwen3_5" and prefill_chunk_size > 4096:
-        raise ValueError(f"{model} supports prefill chunks up to 4096 tokens")
     if spec.family == "glm5_3_flash":
         if (
             topology.attn_tp != 1
@@ -598,8 +596,6 @@ def _validate_configuration(model, cases, topology, options):
     if _apple_silicon(spec):
         if expert_backend != spec.expert_backend:
             raise ValueError(f"{model} uses {spec.expert_backend} experts")
-        if prefill_chunk_size != 4096:
-            raise ValueError(f"{model} prefills in 4096-token chunks")
     elif spec.family == "inkling2":
         if expert_backend not in ("triton", "cute-dsl"):
             raise ValueError("Inkling 2 expert backend must be triton or cute-dsl")
@@ -1042,7 +1038,7 @@ def _configuration(args):
     ]
     cases, budget_skips = _prefill_budget(cases, args.max_prefill_tokens)
     chunk = (
-        max(4096, spec.prefill_chunk_size)
+        spec.prefill_chunk_size
         if args.prefill_chunk_size is None
         else args.prefill_chunk_size
     )

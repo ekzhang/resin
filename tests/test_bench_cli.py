@@ -125,6 +125,7 @@ def test_model_defaults_build_valid_natural_sweeps(name):
     spec, cases, topology, options = bench._configuration(args)
     assert {case["phase"] for case in cases} == {"prefill", "decode"}
     assert topology.world_size == spec.world_size
+    assert spec.prefill_chunk_size == 8192
     assert options["draft_tokens"] == spec.draft_tokens
     assert "accepted_drafts" not in options
     assert options["balanced_experts"] is False
@@ -315,20 +316,12 @@ def test_local_presets_have_no_modal_checkpoint_actions(action, capsys):
     assert "runs locally" in capsys.readouterr().err
 
 
-def test_local_preset_prefill_chunk_is_checked_before_loading(capsys):
-    with pytest.raises(SystemExit) as error:
-        bench.main(
-            [
-                "--model",
-                "ornith-1.0-35b",
-                "--checkpoint",
-                "/missing",
-                "--prefill-chunk-size",
-                "8192",
-            ]
-        )
-    assert error.value.code == 2
-    assert "4096-token chunks" in capsys.readouterr().err
+def test_local_preset_allows_explicit_prefill_chunk():
+    args = bench.argument_parser().parse_args(
+        ["--model", "ornith-1.0-35b", "--prefill-chunk-size", "4096"]
+    )
+    _, _, _, options = bench._configuration(args)
+    assert options["prefill_chunk_size"] == 4096
 
 
 def test_local_requires_explicit_checkpoint(capsys):

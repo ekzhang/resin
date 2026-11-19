@@ -43,7 +43,7 @@ def test_snapshot_preserves_state_and_draft_features_without_aliasing():
 
 def test_state_alignment_is_independent_of_prefill_chunk_size():
     geometry = CacheGeometry(2, 3, 1, 2, 2, 8, 32, 3, 128, 128)
-    assert geometry.prefill_chunk_size == 4096
+    assert geometry.prefill_chunk_size == 8192
     assert geometry.layout(64).groups[geometry.state_group].block_tokens == 128
 
 

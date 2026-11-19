@@ -17,11 +17,7 @@ from resin.backend.plans import PagedCachePlan
 from resin.backend.sampling import PromptScores, format_output, prompt_scores
 from resin.backend.topology import ParallelismCapabilities
 from resin.models.qwen3_5.config import Qwen35Config
-from resin_models_mlx.qwen3_5.cache import (
-    PREFILL_CHUNK_SIZE,
-    CacheArena,
-    CacheGeometry,
-)
+from resin_models_mlx.qwen3_5.cache import CacheArena, CacheGeometry
 from resin_models_mlx.qwen3_5.checkpoint import checkpoint_quantization, load_model
 from resin_models_mlx.qwen3_5.model import Qwen35Model, StepOutput
 from resin_models_mlx.qwen3_5.state import LiveStates
@@ -101,7 +97,6 @@ class Qwen35MlxRunner:
     """Qwen3.5 runner with paged attention, DeltaNet state and optional vision."""
 
     page_size = 128
-    prefill_chunk_size = PREFILL_CHUNK_SIZE
     parallelism_capabilities = ParallelismCapabilities()
 
     def __init__(
@@ -114,10 +109,14 @@ class Qwen35MlxRunner:
         cache_slab_capacity: int | None = None,
         max_seq_len: int | None = None,
         max_batch_size: int = 16,
+        prefill_chunk_size: int = 8192,
         workspace_bytes: int = _WORKSPACE_BYTES,
         include_vision: bool = True,
         compile_vision: bool = True,
     ) -> None:
+        if type(prefill_chunk_size) is not int or prefill_chunk_size <= 0:
+            raise ValueError("prefill_chunk_size must be a positive integer")
+        self.prefill_chunk_size = prefill_chunk_size
         self._media = None
         if workspace_bytes < 0:
             raise ValueError("workspace_bytes must be non-negative")
@@ -220,8 +219,8 @@ class Qwen35MlxRunner:
 
             _warm_paged_attention()
         self.runner_config = RunnerConfig(
-            max_batch_tokens=PREFILL_CHUNK_SIZE,
-            prefill_chunk_size=PREFILL_CHUNK_SIZE,
+            max_batch_tokens=self.prefill_chunk_size,
+            prefill_chunk_size=self.prefill_chunk_size,
             continuation_prefill=True,
             cache_layout=self.cache_layout,
         )

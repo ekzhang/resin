@@ -69,7 +69,6 @@ from resin_models_cuda.qwen3_5.attention import (
 )
 from resin_models_cuda.qwen3_5.cache import (
     PAGE_TOKENS,
-    PREFILL_CHUNK_SIZE,
     CacheArena,
     CacheGeometry,
     DeviceCache,
@@ -169,7 +168,6 @@ class Qwen3_5CudaRunner(CudaRunner):
     """Dense Qwen3.5/Qwen3.8 text runner over paged FA4 and DeltaNet state."""
 
     page_size = 128
-    prefill_chunk_size = PREFILL_CHUNK_SIZE
     parallelism_capabilities = ParallelismCapabilities(attn_tp=True, expert_tp=True)
 
     def __init__(
@@ -179,6 +177,7 @@ class Qwen3_5CudaRunner(CudaRunner):
         revision: str | None = None,
         max_seq_len: int | None = None,
         max_batch_size: int = 32,
+        prefill_chunk_size: int = 8192,
         speculative_draft_tokens: int = 0,
         device: str | torch.device,
         gpu_memory_utilization: float = 0.90,
@@ -213,6 +212,9 @@ class Qwen3_5CudaRunner(CudaRunner):
             or max_batch_size <= 0
         ):
             raise ValueError("max_batch_size must be a positive integer")
+        if type(prefill_chunk_size) is not int or prefill_chunk_size <= 0:
+            raise ValueError("prefill_chunk_size must be a positive integer")
+        self.prefill_chunk_size = prefill_chunk_size
         if not 0.0 < gpu_memory_utilization < 1.0:
             raise ValueError("gpu_memory_utilization must be between zero and one")
         if cache_slab_capacity is not None and (
@@ -395,8 +397,8 @@ class Qwen3_5CudaRunner(CudaRunner):
             }
         )
         self.runner_config = RunnerConfig(
-            max_batch_tokens=PREFILL_CHUNK_SIZE,
-            prefill_chunk_size=PREFILL_CHUNK_SIZE,
+            max_batch_tokens=self.prefill_chunk_size,
+            prefill_chunk_size=self.prefill_chunk_size,
             continuation_prefill=True,
             max_accepted_per_step=speculative_draft_tokens + 1,
             cache_layout=self.cache_layout,

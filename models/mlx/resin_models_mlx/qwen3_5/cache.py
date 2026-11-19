@@ -37,7 +37,7 @@ from resin_models_mlx.qwen3_5.model import (
 )
 
 PAGE_TOKENS = 128
-PREFILL_CHUNK_SIZE = 4096
+STATE_BLOCK_TOKENS = 4096
 KV_GROUP = 0
 STATE_GROUP = 1
 
@@ -135,7 +135,7 @@ class CacheGeometry:
             groups=[
                 CacheGroupLayout(PAGE_TOKENS, blocks_per_slab=self.kv_blocks_per_slab),
                 CacheGroupLayout(
-                    PREFILL_CHUNK_SIZE,
+                    STATE_BLOCK_TOKENS,
                     blocks_per_slab=self.state_blocks_per_slab,
                     family=CacheGroupFamily.STATE,
                 ),
@@ -411,7 +411,7 @@ class _GatheredHistory(Sequence[AttentionHistory | None]):
 
 __all__ = [
     "PAGE_TOKENS",
-    "PREFILL_CHUNK_SIZE",
+    "STATE_BLOCK_TOKENS",
     "CacheArena",
     "CacheGeometry",
 ]

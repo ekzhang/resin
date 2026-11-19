@@ -25,7 +25,7 @@ from resin.backend.resources import CachePoolBinding
 from resin.models.qwen3_5.config import Qwen35Config
 
 PAGE_TOKENS = 128
-PREFILL_CHUNK_SIZE = 4096
+STATE_BLOCK_TOKENS = 4096
 TARGET_GROUP = 0
 STATE_GROUP = 1
 MTP_GROUP = 2
@@ -178,7 +178,7 @@ class CacheGeometry:
         groups = [
             CacheGroupLayout(PAGE_TOKENS, blocks_per_slab=self.target_blocks_per_slab),
             CacheGroupLayout(
-                PREFILL_CHUNK_SIZE,
+                STATE_BLOCK_TOKENS,
                 blocks_per_slab=self.state_blocks_per_slab,
                 family=CacheGroupFamily.STATE,
             ),
@@ -208,7 +208,7 @@ class DeviceCache(SlabDeviceCache):
 
     def state_at(self, positions: Tensor) -> tuple[Tensor, Tensor, Tensor]:
         slabs, slots, _ = self.locations(
-            STATE_GROUP, positions, block_tokens=PREFILL_CHUNK_SIZE
+            STATE_GROUP, positions, block_tokens=STATE_BLOCK_TOKENS
         )
         indices = slabs.long(), slots.long()
         return (
@@ -219,14 +219,14 @@ class DeviceCache(SlabDeviceCache):
 
     def hidden_at(self, positions: Tensor) -> Tensor:
         slabs, slots, _ = self.locations(
-            STATE_GROUP, positions[:, None], block_tokens=PREFILL_CHUNK_SIZE
+            STATE_GROUP, positions[:, None], block_tokens=STATE_BLOCK_TOKENS
         )
         return self.target_hidden_states[slabs[:, 0].long(), slots[:, 0].long()]
 
     def state_offsets(self, positions: Tensor) -> Tensor:
         """Element offsets of each row's layer-zero recurrent state slot."""
         slabs, slots, _ = self.locations(
-            STATE_GROUP, positions[:, None], block_tokens=PREFILL_CHUNK_SIZE
+            STATE_GROUP, positions[:, None], block_tokens=STATE_BLOCK_TOKENS
         )
         stride = self.recurrent_states.stride()
         return slabs[:, 0].long() * stride[0] + slots[:, 0].long() * stride[1]
@@ -261,13 +261,13 @@ class DeviceCache(SlabDeviceCache):
 
     def convolution_at(self, positions: Tensor) -> Tensor:
         slabs, slots, _ = self.locations(
-            STATE_GROUP, positions[:, None], block_tokens=PREFILL_CHUNK_SIZE
+            STATE_GROUP, positions[:, None], block_tokens=STATE_BLOCK_TOKENS
         )
         return self.convolution_states[slabs[:, 0].long(), slots[:, 0].long()]
 
     def store_hidden(self, positions: Tensor, target_hidden: Tensor) -> None:
         slabs, slots, _ = self.locations(
-            STATE_GROUP, positions[:, None], block_tokens=PREFILL_CHUNK_SIZE
+            STATE_GROUP, positions[:, None], block_tokens=STATE_BLOCK_TOKENS
         )
         self.target_hidden_states[slabs[:, 0].long(), slots[:, 0].long()] = (
             target_hidden
@@ -277,7 +277,7 @@ class DeviceCache(SlabDeviceCache):
         self, positions: Tensor, convolution: Tensor, target_hidden: Tensor
     ) -> None:
         slabs, slots, _ = self.locations(
-            STATE_GROUP, positions[:, None], block_tokens=PREFILL_CHUNK_SIZE
+            STATE_GROUP, positions[:, None], block_tokens=STATE_BLOCK_TOKENS
         )
         indices = slabs[:, 0].long(), slots[:, 0].long()
         self.convolution_states[indices] = convolution
@@ -291,7 +291,7 @@ class DeviceCache(SlabDeviceCache):
         target_hidden: Tensor,
     ) -> None:
         slabs, slots, _ = self.locations(
-            STATE_GROUP, positions, block_tokens=PREFILL_CHUNK_SIZE
+            STATE_GROUP, positions, block_tokens=STATE_BLOCK_TOKENS
         )
         indices = slabs.long(), slots.long()
         self.recurrent_states[indices] = recurrent
@@ -425,8 +425,8 @@ __all__ = [
     "DeviceCache",
     "MTP_GROUP",
     "PAGE_TOKENS",
-    "PREFILL_CHUNK_SIZE",
     "RecurrentStatePool",
+    "STATE_BLOCK_TOKENS",
     "STATE_GROUP",
     "TARGET_GROUP",
 ]

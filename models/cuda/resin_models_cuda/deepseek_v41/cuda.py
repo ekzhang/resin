@@ -97,7 +97,7 @@ class DeepSeekV41CudaRunner(CudaRunner):
         profile_graph_phases: bool = False,
         gpu_memory_utilization: float = 0.95,
         cache_parent_capacity: int | None = None,
-        prefill_chunk_size: int = 4096,
+        prefill_chunk_size: int = 8192,
         expert_backend: str = "flashinfer",
         swa_replay_tokens: int = 140,
         swa_replay_mode: str = "compact",
