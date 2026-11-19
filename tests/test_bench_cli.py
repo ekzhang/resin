@@ -119,34 +119,6 @@ def test_resident_sweep_api_accepts_and_forwards_cli_repeat_options(monkeypatch)
     assert checked[0]["capacity_probe_batch_sizes"] == [64]
 
 
-def test_fast_allreduce_reaches_runner_and_rejects_unsupported_models(monkeypatch):
-    from resin.bench import BenchCase
-
-    args = bench.argument_parser().parse_args(
-        ["--model", "inkling2", "--fast-allreduce"]
-    )
-    spec, cases, topology, options = bench._configuration(args)
-    monkeypatch.setattr(bench, "create_runner", lambda *args, **kwargs: kwargs)
-    runner_options = bench._runner(
-        spec.name,
-        "/checkpoint",
-        device="cuda:0",
-        groups=None,
-        cases=[BenchCase(**cases[0])],
-        options=options,
-        context_capacity=8192,
-    )
-    assert options["fast_allreduce"] is True
-    assert runner_options["fast_allreduce"] is True
-    assert topology.world_size == 2
-    for model in ("gpt-oss-120b", "glm-5.3-flash"):
-        args = bench.argument_parser().parse_args(
-            ["--model", model, "--fast-allreduce"]
-        )
-        with pytest.raises(ValueError, match="does not support fast all-reduce"):
-            bench._configuration(args)
-
-
 @pytest.mark.parametrize("name", bench.MODEL_SPECS)
 def test_model_defaults_build_valid_natural_sweeps(name):
     args = bench.argument_parser().parse_args(["--model", name])

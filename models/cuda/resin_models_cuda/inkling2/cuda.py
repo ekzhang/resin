@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import socket
 from collections.abc import Sequence
 from contextlib import nullcontext
 from dataclasses import dataclass, replace
@@ -76,6 +77,25 @@ from resin_models_cuda.inkling2.vision_weights import load_vision_weights
 from resin_models_cuda.inkling2.weights import load_target_weights
 
 
+def _use_flashinfer_allreduce(parallel: TensorParallelContext) -> bool:
+    if not parallel.enabled:
+        return False
+
+    from flashinfer.comm.mnnvl import TorchDistBackend, is_multicast_supported
+    from flashinfer.utils import is_confidential_compute
+
+    # Agree before selecting a CUDA workspace shared by all attention TP ranks.
+    hostname = socket.gethostname()
+    multicast = not is_confidential_compute() and is_multicast_supported(
+        torch.cuda.current_device()
+    )
+    comm = TorchDistBackend(group=parallel.process_group)
+    return all(
+        host == hostname and supported
+        for host, supported in comm.allgather((hostname, multicast))
+    )
+
+
 @dataclass(frozen=True)
 class PreparedBatch:
     cache_plan: PagedCachePlan | None
@@ -97,7 +117,6 @@ class Inkling2CudaRunner(CudaRunner):
         prefill_chunk_size: int = PREFILL_CHUNK_SIZE,
         speculative_draft_tokens: int = 7,
         expert_backend: str = "triton",
-        fast_allreduce: bool = False,
         fused_attention_prologue: bool = False,
         cuda_graph_prefill: str = "breakable",
         cuda_graph_decode: str = "full",
@@ -208,12 +227,13 @@ class Inkling2CudaRunner(CudaRunner):
         if self._draft is not None:
             self._draft.to_empty(device=self.device).eval()
             self.weight_load["draft"] = load_draft_weights(self.model_path, self._draft)
+        use_flashinfer = _use_flashinfer_allreduce(parallel)
         self._allreduce = FlashInferAllReduce(
             parallel,
             max_token_num=max_batch_size * (speculative_draft_tokens + 1),
             hidden_dim=self.config.hidden_size,
             dtype=torch.bfloat16,
-            enabled=fast_allreduce,
+            enabled=use_flashinfer,
         )
         layers = cast(Sequence[DecoderLayer], self._model.layers)
         self._expert_allreduce = (
@@ -222,7 +242,7 @@ class Inkling2CudaRunner(CudaRunner):
                 max_token_num=max_batch_size * (speculative_draft_tokens + 1),
                 hidden_dim=self.config.hidden_size,
                 dtype=torch.float32,
-                enabled=fast_allreduce,
+                enabled=use_flashinfer,
             )
             if layers[0].mlp.experts.replicated_ep is not None
             else None

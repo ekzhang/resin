@@ -16,7 +16,6 @@ from typing import TYPE_CHECKING, Literal, cast, overload
 import numpy as np
 import torch
 import torch.distributed as dist
-import torch.nn.functional as F
 from tokenizers import Tokenizer
 
 from resin import BatchPhase, RunnerConfig
@@ -36,11 +35,7 @@ from resin.backend.cuda.graphs import (
     resolve_decode_graph_shapes,
 )
 from resin.backend.cuda.metrics import observe_execution
-from resin.backend.cuda.parallel import (
-    FlashInferAllReduce,
-    TensorParallelContext,
-    TensorParallelLayout,
-)
+from resin.backend.cuda.parallel import TensorParallelContext, TensorParallelLayout
 from resin.backend.cuda.runner import (
     CudaRunner,
     capture_sampling_inputs,
@@ -100,7 +95,6 @@ class DeepSeekV41CudaRunner(CudaRunner):
         cuda_graph_prefill: str = "breakable",
         cuda_graph_decode: str = "full",
         cuda_graph_decode_shapes: object | None = None,
-        fast_allreduce: bool = True,
         speculative_draft_tokens: int = 0,
         profile_graph_phases: bool = False,
         gpu_memory_utilization: float = 0.95,
@@ -288,48 +282,6 @@ class DeepSeekV41CudaRunner(CudaRunner):
         else:
             inference_values["n_mtp_layers"] = 0
         args, self._model = self._build_model(inference_values)
-        self._allreduce = FlashInferAllReduce(
-            self.tensor_parallel,
-            max_token_num=max_batch_size * max(1, speculative_draft_tokens + 1),
-            hidden_dim=self.config.hidden_size,
-            dtype=torch.bfloat16,
-            enabled=fast_allreduce,
-        )
-        index_widths = sorted(
-            {
-                min(
-                    ((args.max_seq_len + 255) // 256) * 64,
-                    ((shape[1] + 255) // 256) * 64,
-                )
-                for shape in decode_graph_shapes
-            }
-        )
-        self._index_allreduces = {
-            width: FlashInferAllReduce(
-                self.tensor_parallel,
-                max_token_num=max_batch_size * max(1, speculative_draft_tokens + 1),
-                hidden_dim=(width + 7) // 8 * 8,
-                dtype=torch.bfloat16,
-                enabled=fast_allreduce,
-            )
-            for width in index_widths
-        }
-
-        def reduce_index_scores(tensor: torch.Tensor) -> torch.Tensor:
-            reducer = self._index_allreduces.get(tensor.shape[-1])
-            if reducer is None:
-                return self.tensor_parallel.sum(tensor)
-            padding = reducer.hidden_dim - tensor.shape[-1]
-            if padding == 0:
-                return reducer.sum(tensor)
-            padded = F.pad(tensor, (0, padding))
-            return reducer.sum(padded)[..., : tensor.shape[-1]].contiguous()
-
-        self.allreduce_backend = self._allreduce.backend
-        self._model.set_allreduce(
-            self._allreduce.sum,
-            indexer_reducer=reduce_index_scores,
-        )
         self.weight_load = self._load_weights()
         self._prepare_model_weights()
         self._configure_parallel_graphs(self._model, parallel_groups)
@@ -527,7 +479,7 @@ class DeepSeekV41CudaRunner(CudaRunner):
 
     def _prepare_model_weights(self):
         self._model.prepare_weights(
-            self._allreduce.sum,
+            self.tensor_parallel.sum,
             expert_backend=self.expert_backend,
             max_tokens=max(
                 self.prefill_chunk_size,
