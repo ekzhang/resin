@@ -42,11 +42,15 @@ def native():
 
 
 def supports(module, hidden, ids, weights):
+    # Use the fused pipeline for verification and the full EP2 prefill chunk.
+    verify = ids.shape[0] <= 256 and ids.numel() <= 2048
+    prefill = (
+        ids.shape == (4096, 8)
+        and module.replicated_ep is not None
+        and module.replicated_ep.size == 2
+    )
     return (
-        # Q8 verification through B32. CUDA rows are persistent loop bounds;
-        # shared storage depends only on model width and local expert count.
-        ids.shape[0] <= 256
-        and ids.numel() <= 2048
+        (verify or prefill)
         and module.expert_tp_size == 1
         and set(module.precision.values()) == {"nvfp4"}
         and hidden.shape[1] in (128, 256, 2304, 4608)
