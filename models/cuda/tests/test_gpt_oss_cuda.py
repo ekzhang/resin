@@ -292,7 +292,7 @@ class TestGptOssCudaNativePlan:
         runner.parallel_groups = None
         runner._sampler = FusedSampler.__new__(FusedSampler)
         shape = (2, 4)
-        inputs = runner._decode_graph_capture_inputs(shape)
+        inputs = runner._decode_graph_inputs(shape, capture=True)
         step = runner._new_decode_graph_step(shape)
 
         assert inputs.keys() == step.inputs.keys()

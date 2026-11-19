@@ -371,7 +371,7 @@ class GptOssCudaRunner(CudaRunner):
                 "decode": CudaGraphMode(
                     decode_graph_shapes,
                     self._new_decode_graph_step,
-                    self._decode_graph_capture_inputs,
+                    lambda shape: self._decode_graph_inputs(shape, capture=True),
                 )
             }
         )
@@ -434,9 +434,6 @@ class GptOssCudaRunner(CudaRunner):
         # before a request can reach the runner.
         self._kv.storage[:, :, 0].zero_()
         torch.cuda.synchronize(self.device)
-
-    def _decode_graph_capture_inputs(self, shape):
-        return self._decode_graph_inputs(shape, capture=True)
 
     def _decode_graph_inputs(
         self,
