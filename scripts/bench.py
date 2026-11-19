@@ -80,7 +80,6 @@ def _runner(model, checkpoint, *, device, groups, cases, options, context_capaci
         decode_batch_sizes=batches,
         expert_backend=options.get("expert_backend"),
         profile_graph_phases=options.get("profile_graph_phases", False),
-        fast_allreduce=options.get("fast_allreduce", False),
         assistant_checkpoint=options.get("assistant_checkpoint"),
     )
 
@@ -410,7 +409,6 @@ def _rank(
         "load_seconds": loaded_seconds,
         "capture_seconds": capture_seconds,
         "profile_graph_phases": options.get("profile_graph_phases", False),
-        "fast_allreduce": options.get("fast_allreduce", False),
         "overlap": overlap,
         "timing": "continuous_completions" if overlap else "synchronized_steps",
         "prefill_chunk_size": options["prefill_chunk_size"],
@@ -574,11 +572,6 @@ def _validate_configuration(model, cases, topology, options):
         "deepseek_v41",
     }:
         raise ValueError(f"{model} does not support balanced expert routing")
-    if options.get("fast_allreduce", False) and spec.family not in {
-        "deepseek_v41",
-        "inkling2",
-    }:
-        raise ValueError(f"{model} does not support fast all-reduce")
     if spec.family == "inkling2" and (
         draft_tokens not in (0, 7) or prefill_chunk_size % 128
     ):
@@ -676,7 +669,6 @@ def run_benchmark(
     metadata: dict | None = None,
     expert_backend: str | None = None,
     profile_graph_phases: bool = False,
-    fast_allreduce: bool = False,
     retain_outputs: bool = False,
     overlap: bool = True,
     numa: Literal["auto", "off", "required"] = "auto",
@@ -721,7 +713,6 @@ def run_benchmark(
         metadata=metadata or {},
         expert_backend=expert_backend,
         profile_graph_phases=profile_graph_phases,
-        fast_allreduce=fast_allreduce,
         retain_outputs=retain_outputs,
         overlap=overlap,
         numa=numa,
@@ -959,7 +950,6 @@ def argument_parser() -> argparse.ArgumentParser:
         "--expert-backend", choices=("flashinfer", "deepgemm", "triton", "cute-dsl")
     )
     parser.add_argument("--profile-graph-phases", action="store_true")
-    parser.add_argument("--fast-allreduce", action="store_true")
     parser.add_argument("--retain-outputs", action="store_true")
     parser.add_argument(
         "--skip-capacity-exceeded",
@@ -1094,7 +1084,6 @@ def _configuration(args):
         if args.expert_backend is None
         else args.expert_backend,
         profile_graph_phases=args.profile_graph_phases,
-        fast_allreduce=args.fast_allreduce,
         retain_outputs=args.retain_outputs,
         overlap=args.overlap,
         numa=args.numa,

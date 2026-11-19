@@ -599,7 +599,6 @@ def create_runner(
     decode_batch_sizes=None,
     expert_backend: str | None = None,
     profile_graph_phases: bool = False,
-    fast_allreduce: bool = False,
     assistant_checkpoint: str | Path | None = None,
 ):
     """Construct one runner with model-specific cache geometry and draft support."""
@@ -661,9 +660,6 @@ def create_runner(
     if spec.family == "gpt_oss":
         if draft_tokens:
             raise ValueError("GPT-OSS has no draft model; use draft_tokens=0")
-        if fast_allreduce:
-            raise ValueError(f"{spec.name} does not support fast all-reduce")
-
         from resin_models_cuda.gpt_oss.cuda import GptOssCudaRunner
         from resin_models_cuda.gpt_oss.flashinfer import FlashInferSM90MXFP4Kernel
 
@@ -690,7 +686,6 @@ def create_runner(
             prefill_chunk_size=prefill_chunk_size,
             expert_backend=expert_backend or spec.expert_backend,
             profile_graph_phases=profile_graph_phases,
-            fast_allreduce=fast_allreduce,
             gpu_memory_utilization=memory,
             **common,
         )
@@ -759,7 +754,6 @@ def create_runner(
             prefill_chunk_size=prefill_chunk_size,
             gpu_memory_utilization=memory,
             expert_backend=expert_backend or spec.expert_backend,
-            fast_allreduce=fast_allreduce,
             fused_attention_prologue=True,
             **common,
         )

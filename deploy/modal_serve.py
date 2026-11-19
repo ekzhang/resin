@@ -141,7 +141,6 @@ def _serve_rank(rank: int, port: int, model: str) -> None:
         max_batch_size=spec.max_batch_size,
         prefill_chunk_size=spec.prefill_chunk_size,
         draft_tokens=spec.draft_tokens,
-        fast_allreduce=spec.family == "inkling2",
     )
     if capacity := getattr(runner, "cache_capacity_plan", None):
         print(f"[serve] {spec.name} rank {rank} cache: {capacity}", flush=True)

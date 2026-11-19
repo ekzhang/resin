@@ -834,17 +834,6 @@ class Transformer(nn.Module):
             lower,
         )
 
-    def set_allreduce(self, reducer, *, indexer_reducer=None):
-        for module in self.modules():
-            if (
-                isinstance(module, ParallelEmbedding)
-                or isinstance(module, Linear)
-                and module.axis == 1
-            ):
-                module.allreduce = reducer
-            elif isinstance(module, Indexer):
-                module.allreduce = indexer_reducer or reducer
-
     def forward_experts_empty(self, *, stage="target", prefill=False):
         hooks = (
             self.engram_runtime.fetch(None)

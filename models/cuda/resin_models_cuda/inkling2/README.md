@@ -22,7 +22,7 @@ implemented.
 
 The `inkling2` Modal preset uses two B300s with TP2/EP2, a 1,048,576-token
 context limit, up to 256 concurrent requests and seven DSpark proposals. It enables
-the CuTe expert backend, fused attention prologue and fast allreduce.
+the CuTe expert backend and fused attention prologue.
 
 ETP preserves the full expert's activation scale and reduces W2 partial sums in
 FP32 before rounding each route to BF16. With EP1 and matching attention TP,
@@ -51,9 +51,9 @@ remain runtime inputs.
 KV writes and prepares padded queries and relative bias for native single-request
 and batched decode attention.
 
-`fast_allreduce=True` enables FlashInfer collectives for eligible
-small attention and replicated-EP reductions. Other reductions use NCCL. Both
-settings are opt-in.
+Inkling uses FlashInfer for eligible small attention and replicated-EP reductions
+when the attention TP ranks share a host and support NVLink multicast. Other
+distributed reductions use NCCL. Single-rank attention runs locally.
 
 The Engine owns page allocation and prefix checkpoints. Separate cache groups
 hold target global/local KV, optional draft global/local KV, and recurrent state.

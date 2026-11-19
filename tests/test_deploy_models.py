@@ -220,11 +220,9 @@ def test_inkling2_factory_enables_qualified_attention_prologue(monkeypatch):
         prefill_chunk_size=4096,
         draft_tokens=7,
         expert_backend="cute-dsl",
-        fast_allreduce=True,
     )
     assert options["fused_attention_prologue"] is True
     assert options["expert_backend"] == "cute-dsl"
-    assert options["fast_allreduce"] is True
 
 
 @pytest.mark.parametrize(
