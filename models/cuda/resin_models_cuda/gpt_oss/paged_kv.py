@@ -2,23 +2,23 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping
 from dataclasses import dataclass, replace
-from typing import TYPE_CHECKING, Any, cast
+from typing import TYPE_CHECKING, Any
 
 import numpy as np
-import numpy.typing as npt
 import torch
 
 from resin import BatchPhase
 from resin.backend.cache_storage import byte_regions, live_rows
 from resin.backend.cuda.context_parallel import ContextParallelTokens
 from resin.backend.resources import CachePoolBinding
+from resin.models.gpt_oss.plan import ATTENTION_GROUPS, dense_page_table
 
 if TYPE_CHECKING:
     from resin import CacheLayout
+    from resin.backend.cuda.graphs import GraphShape
     from resin.backend.cuda.staging import TensorStager
-    from resin.models.gpt_oss.plan import AttentionBatch, AttentionGroup
+    from resin.models.gpt_oss.plan import AttentionBatch
 
 
 class PagedKvArena:
@@ -117,18 +117,15 @@ def stage_paged_attention_batch(
     row_count = len(batch.query_lengths)
     groups = []
     for group in batch.groups:
-        if (
-            group.page_table.size
-            and int(cast(np.ndarray, group.page_table).max()) > np.iinfo(np.int32).max
-        ):
-            raise ValueError(f"paged attention group {group.name!r} exceeds CUDA int32")
         groups.append(
             (
                 group.name,
                 PagedKvTable(
                     page_table=staging.device(
-                        f"{group.name}.pages", group.page_table, torch.int32
-                    ).view(row_count, group.width),
+                        f"{group.name}.pages",
+                        dense_page_table(group, row_count, group.width),
+                        torch.int32,
+                    ),
                     lengths=staging.device(
                         f"{group.name}.lengths", group.lengths, torch.int32
                     ),
@@ -148,56 +145,45 @@ def stage_paged_attention_batch(
     )
 
 
-def empty_decode_paged_attention_batch(
-    device: str | torch.device,
-    batch_size: int,
-    group_shapes: Mapping[str, tuple[int, int]],
-) -> DeviceAttentionBatch:
-    """Allocate one fixed-address decode batch for CUDA graph capture."""
+def _decode_group_widths(shape: GraphShape, window_width: int):
+    return zip(ATTENTION_GROUPS, (shape[1], window_width), strict=True)
 
-    if (
-        isinstance(batch_size, bool)
-        or not isinstance(batch_size, int)
-        or batch_size <= 0
-    ):
-        raise ValueError("batch_size must be a positive integer")
-    if not group_shapes:
-        raise ValueError("a decode attention batch needs at least one cache group")
-    for name, dimensions in group_shapes.items():
-        if not isinstance(name, str) or not name.strip():
-            raise ValueError("paged attention group name must be nonempty")
-        if (
-            not isinstance(dimensions, tuple)
-            or len(dimensions) != 2
-            or any(
-                isinstance(value, bool) or not isinstance(value, int) or value <= 0
-                for value in dimensions
-            )
-        ):
-            raise ValueError("paged attention group shapes must be positive pairs")
+
+def empty_decode_paged_attention_batch(
+    device: str | torch.device, shape: GraphShape, window_width: int, page_size: int
+) -> DeviceAttentionBatch:
+    """Allocate the fixed addresses that replay will overwrite."""
+    rows = shape[0]
 
     def empty(dtype: torch.dtype, *shape: int) -> torch.Tensor:
         return torch.empty(shape, dtype=dtype, device=device)
 
-    groups = tuple(
-        (
-            name,
-            PagedKvTable(
-                page_table=empty(torch.int32, batch_size, width),
-                lengths=empty(torch.int32, batch_size),
-                append_slots=empty(torch.long, batch_size),
-                min_length=1,
-                max_length=width * page_size,
-            ),
-        )
-        for name, (width, page_size) in group_shapes.items()
-    )
     return DeviceAttentionBatch(
         phase=BatchPhase.DECODE,
-        cu_seqlens_q=torch.arange(batch_size + 1, dtype=torch.int32, device=device),
+        cu_seqlens_q=torch.arange(rows + 1, dtype=torch.int32, device=device),
         max_seqlen_q=1,
-        groups=groups,
+        groups=tuple(
+            (
+                name,
+                PagedKvTable(
+                    page_table=empty(torch.int32, rows, width),
+                    lengths=empty(torch.int32, rows),
+                    append_slots=empty(torch.long, rows),
+                    min_length=1,
+                    max_length=width * page_size,
+                ),
+            )
+            for name, width in _decode_group_widths(shape, window_width)
+        ),
     )
+
+
+def _graph_fields(name, pages, lengths, slots):
+    return {
+        f"{name}_page_table": pages,
+        f"{name}_seqused_k": lengths,
+        f"{name}_append_slots": slots,
+    }
 
 
 def paged_attention_graph_inputs(
@@ -207,41 +193,32 @@ def paged_attention_graph_inputs(
 
     inputs = {}
     for name, group in batch.groups:
-        inputs[f"{name}_page_table"] = group.page_table
-        inputs[f"{name}_seqused_k"] = group.lengths
-        inputs[f"{name}_append_slots"] = group.append_slots
+        inputs.update(
+            _graph_fields(name, group.page_table, group.lengths, group.append_slots)
+        )
     return inputs
 
 
-def _pad_paged_attention_table(
-    group: AttentionGroup, width: int
-) -> npt.NDArray[np.uint64]:
-    """Pad each host row by repeating one page already owned by that row."""
-
-    if group.width > width:
-        raise ValueError("paged attention table exceeds fixed CUDA graph shape")
-    rows = len(group.lengths)
-    source = group.page_table.reshape(rows, group.width)
-    padded = np.empty((rows, width), dtype=group.page_table.dtype)
-    padded[:, : group.width] = source
-    padded[:, group.width :] = source[:, :1]
-    return padded.reshape(-1)
-
-
-def paged_attention_host_inputs(
-    batch: AttentionBatch, group_widths: Mapping[str, int]
+def decode_paged_attention_inputs(
+    shape: GraphShape, window_width: int, batch: AttentionBatch | None
 ) -> dict[str, Any]:
-    """Build named host values matching :func:`paged_attention_graph_inputs`."""
-
+    """Pack sparse decode rows directly into capture or replay shapes."""
+    rows = shape[0]
     inputs = {}
-    if set(group_widths) != {group.name for group in batch.groups}:
-        raise ValueError("CUDA graph group widths do not match attention groups")
-    for group in batch.groups:
-        inputs[f"{group.name}_page_table"] = _pad_paged_attention_table(
-            group, group_widths[group.name]
+    groups = (None, None) if batch is None else batch.groups
+    for (name, width), group in zip(
+        _decode_group_widths(shape, window_width), groups, strict=True
+    ):
+        lengths = np.ones(rows, dtype=np.int32)
+        # Each inactive row writes a separate slot on the shared null page.
+        slots = np.arange(rows, dtype=np.int64)
+        if group is not None:
+            live = len(group.lengths)
+            lengths[:live] = group.lengths
+            slots[:live] = group.append_slots
+        inputs.update(
+            _graph_fields(name, dense_page_table(group, rows, width), lengths, slots)
         )
-        inputs[f"{group.name}_seqused_k"] = group.lengths
-        inputs[f"{group.name}_append_slots"] = group.append_slots
     return inputs
 
 
@@ -288,8 +265,8 @@ __all__ = [
     "context_parallel_query_batch",
     "PagedKvArena",
     "PagedKvTable",
+    "decode_paged_attention_inputs",
     "empty_decode_paged_attention_batch",
     "paged_attention_graph_inputs",
-    "paged_attention_host_inputs",
     "stage_paged_attention_batch",
 ]

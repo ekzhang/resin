@@ -28,6 +28,7 @@ from resin.models.gpt_oss.plan import (
     SLIDING_WINDOW,
     WINDOW_RETENTION_TOKENS,
     WINDOW_TABLE_WIDTH,
+    dense_page_table,
 )
 from resin.models.gpt_oss.plan import (
     build_attention_batch as _build_attention_batch,
@@ -41,7 +42,6 @@ from resin_models_cuda.gpt_oss.cuda import (
     plan_gpt_oss_kv_capacity,
 )
 from resin_models_cuda.gpt_oss.model import SinkAttention, TopKRouter
-from resin_models_cuda.gpt_oss.paged_kv import paged_attention_host_inputs
 
 
 def build_attention_batch(plan, *, parent_capacity: int = 2048):
@@ -286,12 +286,21 @@ class TestGptOssCudaNativePlan:
             GptOssCudaRunner(device="cuda", kernel_attention=object())
 
     def test_graph_capture_inputs_use_only_the_reserved_null_page(self) -> None:
-        inputs = GptOssCudaRunner._graph_capture_inputs((2, 4))
+        runner = GptOssCudaRunner.__new__(GptOssCudaRunner)
+        runner.device = torch.device("cpu")
+        runner.vocab_size = 16
+        runner.parallel_groups = None
+        runner._sampler = FusedSampler.__new__(FusedSampler)
+        shape = (2, 4)
+        inputs = runner._decode_graph_capture_inputs(shape)
+        step = runner._new_decode_graph_step(shape)
 
-        assert inputs["full_page_table"] == (0,) * 8
-        assert inputs["sliding_page_table"] == (0,) * (2 * WINDOW_TABLE_WIDTH)
-        assert inputs["full_append_slots"] == (0, 1)
-        assert inputs["sliding_append_slots"] == (0, 1)
+        assert inputs.keys() == step.inputs.keys()
+        for name, values in inputs.items():
+            assert np.shape(values) == tuple(step.inputs[name].shape)
+        for name in ("full", "sliding"):
+            np.testing.assert_array_equal(inputs[f"{name}_page_table"], 0)
+            np.testing.assert_array_equal(inputs[f"{name}_append_slots"], [0, 1])
 
     @pytest.mark.parametrize("rows,expected_bucket", [(3, 4), (4, 4), (6, 8)])
     def test_decode_graph_buckets_preserve_live_rows_and_isolate_padding(
@@ -333,19 +342,23 @@ class TestGptOssCudaNativePlan:
         mode, shape, inputs = captured.pop()
         assert mode == "decode"
         assert shape == (expected_bucket, 4)
-        expected = paged_attention_host_inputs(
-            batch, {"full": 4, "sliding": WINDOW_TABLE_WIDTH}
-        )
-        for name, values in expected.items():
-            np.testing.assert_array_equal(inputs[name][: len(values)], values)
         for name, values in FusedSampler.host_inputs(plan, 16).items():
             assert inputs[name][:rows] == values
         for name in ("token_ids", "positions"):
             np.testing.assert_array_equal(inputs[name][:rows], getattr(plan, name))
             np.testing.assert_array_equal(inputs[name][rows:], 0)
-        for name, width in (("full", 4), ("sliding", WINDOW_TABLE_WIDTH)):
+        for group, width in zip(batch.groups, (4, WINDOW_TABLE_WIDTH), strict=True):
+            name = group.name
+            pages = inputs[f"{name}_page_table"]
             np.testing.assert_array_equal(
-                inputs[f"{name}_page_table"][rows * width :], 0
+                pages[:rows], dense_page_table(group, rows, width)
+            )
+            np.testing.assert_array_equal(pages[rows:], 0)
+            np.testing.assert_array_equal(
+                inputs[f"{name}_seqused_k"][:rows], group.lengths
+            )
+            np.testing.assert_array_equal(
+                inputs[f"{name}_append_slots"][:rows], group.append_slots
             )
             np.testing.assert_array_equal(inputs[f"{name}_seqused_k"][rows:], 1)
             np.testing.assert_array_equal(
@@ -450,21 +463,18 @@ class TestGptOssCudaNativePlan:
         batch = build_attention_batch(_prefill_plan())
         assert batch.phase == BatchPhase.PREFILL
         assert batch.query_lengths == (128, 5)
-        assert batch.group("full").width == 2
-        assert batch.group("full").page_table.tolist() == [1, 1, 129, 130]
-        assert batch.group("full").lengths == (128, 135)
-        assert batch.group("sliding").width == WINDOW_TABLE_WIDTH
-        assert (
-            batch.group("sliding").page_table[:WINDOW_TABLE_WIDTH].tolist()
-            == [1025] * WINDOW_TABLE_WIDTH
-        )
-        assert batch.group("sliding").page_table[
-            WINDOW_TABLE_WIDTH : WINDOW_TABLE_WIDTH + 2
-        ].tolist() == [1153, 1154]
-        assert batch.group("sliding").lengths == (128, 135)
-        assert batch.group("full").append_slots[0] == 128
-        assert batch.group("full").append_slots[-1] == 130 * 128 + 6
-        assert batch.group("sliding").append_slots[-1] == 1154 * 128 + 6
+        full, sliding = batch.groups
+        assert full.width == 2
+        assert dense_page_table(full, 2, full.width).tolist() == [[1, 1], [129, 130]]
+        assert full.lengths == (128, 135)
+        assert sliding.width == WINDOW_TABLE_WIDTH
+        pages = dense_page_table(sliding, 2, sliding.width)
+        assert pages[0].tolist() == [1025] * WINDOW_TABLE_WIDTH
+        assert pages[1, :2].tolist() == [1153, 1154]
+        assert sliding.lengths == (128, 135)
+        assert full.append_slots[0] == 128
+        assert full.append_slots[-1] == 130 * 128 + 6
+        assert sliding.append_slots[-1] == 1154 * 128 + 6
 
     def test_one_token_continuation_remains_explicit_prefill(self) -> None:
         plan = _flat_plan([260], [1])
@@ -472,47 +482,37 @@ class TestGptOssCudaNativePlan:
 
         assert batch.phase == BatchPhase.PREFILL
         assert batch.query_lengths == (1,)
-        assert batch.group("full").page_table.tolist() == [1, 2, 3]
-        assert batch.group("full").lengths == (261,)
-        assert batch.group("sliding").page_table[:3].tolist() == [1025, 1026, 1027]
-        assert batch.group("sliding").lengths == (261,)
+        full, sliding = batch.groups
+        assert full.pages[0].tolist() == [1, 2, 3]
+        assert full.lengths == (261,)
+        assert sliding.pages[0].tolist() == [1025, 1026, 1027]
+        assert sliding.lengths == (261,)
 
     def test_graph_padding_repeats_only_pages_owned_by_each_row(self) -> None:
         batch = build_attention_batch(_decode_plan())
-        assert batch is not None
-        inputs = paged_attention_host_inputs(
-            batch, {"full": 4, "sliding": WINDOW_TABLE_WIDTH}
-        )
-        assert inputs["full_page_table"].tolist() == [
-            1,
-            2,
-            1,
-            1,
-            129,
-            130,
-            131,
-            129,
+        assert dense_page_table(batch.groups[0], 2, 4).tolist() == [
+            [1, 2, 1, 1],
+            [129, 130, 131, 129],
         ]
 
     def test_decode_tables_and_append_slots_come_from_sparse_groups(self) -> None:
         batch = build_attention_batch(_decode_plan())
 
-        assert batch is not None
-        assert batch is not None
         assert batch.query_lengths == (1, 1)
-        assert batch.group("full").width == 3
-        assert batch.group("full").page_table.tolist() == [1, 2, 1, 129, 130, 131]
-        assert batch.group("full").lengths == (131, 261)
-        assert batch.group("sliding").page_table[:3].tolist() == [1025, 1026, 1025]
-        assert batch.group("sliding").page_table[
-            WINDOW_TABLE_WIDTH : WINDOW_TABLE_WIDTH + 3
-        ].tolist() == [1153, 1154, 1155]
-        assert batch.group("sliding").lengths == (131, 261)
-        assert batch.group("sliding").append_slots.tolist() == [
+        full, sliding = batch.groups
+        assert full.width == 3
+        assert [row.tolist() for row in full.pages] == [[1, 2], [129, 130, 131]]
+        assert full.lengths == (131, 261)
+        assert [row.tolist() for row in sliding.pages] == [
+            [1025, 1026],
+            [1153, 1154, 1155],
+        ]
+        assert sliding.lengths == (131, 261)
+        assert sliding.append_slots.tolist() == [
             1026 * 128 + 2,
             1155 * 128 + 4,
         ]
-        assert batch.group("full").append_slots.tolist() == [2 * 128 + 2, 131 * 128 + 4]
+        assert full.append_slots.tolist() == [2 * 128 + 2, 131 * 128 + 4]
 
     def test_frozen_append_destinations_are_a_validation_oracle(self) -> None:
         plan = _prefill_plan()
@@ -544,9 +544,10 @@ class TestGptOssCudaNativePlan:
         batch = build_attention_batch(_flat_plan([0], [PREFILL_CHUNK_SIZE]))
 
         assert batch.query_lengths == (PREFILL_CHUNK_SIZE,)
-        assert batch.group("full").width == PREFILL_CHUNK_SIZE // 128
-        assert batch.group("sliding").width == WINDOW_TABLE_WIDTH
-        assert len(set(batch.group("sliding").append_slots)) == PREFILL_CHUNK_SIZE
+        full, sliding = batch.groups
+        assert full.width == PREFILL_CHUNK_SIZE // 128
+        assert sliding.width == WINDOW_TABLE_WIDTH
+        assert len(set(sliding.append_slots)) == PREFILL_CHUNK_SIZE
 
         with pytest.raises(ValueError, match="exceeds 8192"):
             build_attention_batch(_flat_plan([0], [PREFILL_CHUNK_SIZE + 1]))

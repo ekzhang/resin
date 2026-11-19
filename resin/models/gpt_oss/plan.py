@@ -16,15 +16,16 @@ PREFILL_CHUNK_SIZE = 8192
 # Paged prefill retains the whole query plus the preceding attention window.
 WINDOW_RETENTION_TOKENS = PREFILL_CHUNK_SIZE + SLIDING_WINDOW - 1
 WINDOW_TABLE_WIDTH = 1 + (WINDOW_RETENTION_TOKENS - 1 + PAGE_SIZE - 1) // PAGE_SIZE
+ATTENTION_GROUPS = ("full", "sliding")
 
 
 @dataclass(frozen=True, slots=True)
 class AttentionGroup:
-    """One dense page table and its cache append locations."""
+    """Sparse page rows and append slots before the runner chooses a shape."""
 
     name: str
     width: int
-    page_table: npt.NDArray[np.uint64]
+    pages: tuple[npt.NDArray[np.uint64], ...]
     lengths: tuple[int, ...]
     append_slots: npt.NDArray[np.int64]
 
@@ -35,15 +36,9 @@ class AttentionBatch:
     query_lengths: tuple[int, ...]
     groups: tuple[AttentionGroup, ...]
 
-    def group(self, name: str) -> AttentionGroup:
-        try:
-            return next(group for group in self.groups if group.name == name)
-        except StopIteration as error:
-            raise KeyError(f"unknown attention group: {name!r}") from error
-
 
 def build_attention_batch(plan, cache_layout) -> AttentionBatch:
-    """Lower a homogeneous native plan to GPT-OSS's two dense page tables."""
+    """Validate and retain sparse attention rows for eager or graph execution."""
 
     cache = PagedCachePlan.from_plan(plan, cache_layout)
     if len(cache.groups) != 2:
@@ -65,15 +60,13 @@ def build_attention_batch(plan, cache_layout) -> AttentionBatch:
     post_lengths = native.post_lengths
     groups = []
     for name, group, minimum_width in zip(
-        ("full", "sliding"), cache.groups, (1, WINDOW_TABLE_WIDTH), strict=True
+        ATTENTION_GROUPS, cache.groups, (1, WINDOW_TABLE_WIDTH), strict=True
     ):
         packed_blocks = group.packed_block_ids
+        if packed_blocks.size and np.max(packed_blocks) > np.iinfo(np.int32).max:
+            raise ValueError(f"paged attention group {name!r} exceeds CUDA int32")
         page_rows = tuple(packed_blocks[group.block_slice(row)] for row in rows)
         width = max(minimum_width, *(len(row) for row in page_rows))
-        table = np.empty((len(rows), width), dtype=np.uint64)
-        for index, row in enumerate(page_rows):
-            table[index, : len(row)] = row
-            table[index, len(row) :] = row[0]
         page_size = int(cache_layout.groups[group.group_index].block_tokens)
         lengths = tuple(
             int(post_lengths[row])
@@ -87,7 +80,7 @@ def build_attention_batch(plan, cache_layout) -> AttentionBatch:
             AttentionGroup(
                 name=name,
                 width=width,
-                page_table=table.reshape(-1),
+                pages=page_rows,
                 lengths=lengths,
                 append_slots=append_slots,
             )
@@ -99,7 +92,24 @@ def build_attention_batch(plan, cache_layout) -> AttentionBatch:
     )
 
 
+def dense_page_table(
+    group: AttentionGroup | None, rows: int, width: int
+) -> npt.NDArray[np.int32]:
+    """Write directly into the final table. Keep inactive rows on null page zero."""
+    pages = () if group is None else group.pages
+    if group is not None and (group.width > width or len(pages) > rows):
+        raise ValueError("paged attention table exceeds target shape")
+    table = np.empty((rows, width), dtype=np.int32)
+    for index, row in enumerate(pages):
+        table[index, : len(row)] = row
+        # A live row may only address its own pages, including masked columns.
+        table[index, len(row) :] = row[0]
+    table[len(pages) :] = 0
+    return table
+
+
 __all__ = [
+    "ATTENTION_GROUPS",
     "AttentionBatch",
     "AttentionGroup",
     "PAGE_SIZE",
@@ -108,4 +118,5 @@ __all__ = [
     "WINDOW_RETENTION_TOKENS",
     "WINDOW_TABLE_WIDTH",
     "build_attention_batch",
+    "dense_page_table",
 ]

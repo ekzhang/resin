@@ -66,9 +66,9 @@ from resin_models_cuda.gpt_oss.paged_kv import (
     DeviceAttentionBatch,
     PagedKvArena,
     context_parallel_query_batch,
+    decode_paged_attention_inputs,
     empty_decode_paged_attention_batch,
     paged_attention_graph_inputs,
-    paged_attention_host_inputs,
     stage_paged_attention_batch,
 )
 
@@ -173,7 +173,6 @@ class GptOssCudaRunner(CudaRunner):
     prefill_chunk_size = PREFILL_CHUNK_SIZE
     window_retention_tokens = WINDOW_RETENTION_TOKENS
     window_table_width = WINDOW_TABLE_WIDTH
-    default_vocab_size = 201_088
 
     def __init__(
         self,
@@ -429,28 +428,6 @@ class GptOssCudaRunner(CudaRunner):
             mode="prefill_attention",
         )
 
-    @classmethod
-    def _graph_capture_inputs(
-        cls, shape: GraphShape, vocab_size: int | None = None
-    ) -> dict[str, tuple]:
-        """Return valid synthetic decode inputs backed only by null page zero."""
-
-        batch_size, full_width = shape
-        vocab_size = cls.default_vocab_size if vocab_size is None else vocab_size
-        rows = tuple(range(batch_size))
-        zeros = (0,) * batch_size
-        return {
-            "token_ids": zeros,
-            "positions": zeros,
-            "full_page_table": (0,) * (batch_size * full_width),
-            "full_seqused_k": (1,) * batch_size,
-            "sliding_page_table": (0,) * (batch_size * cls.window_table_width),
-            "sliding_seqused_k": (1,) * batch_size,
-            "full_append_slots": rows,
-            "sliding_append_slots": rows,
-            **capture_sampling_inputs(batch_size, vocab_size, stochastic=True),
-        }
-
     def _after_cuda_graph_capture(self) -> None:
         # Capture writes synthetic K/V to parent zero, which the native
         # allocator permanently reserves. Restore its null-page contract
@@ -459,9 +436,38 @@ class GptOssCudaRunner(CudaRunner):
         torch.cuda.synchronize(self.device)
 
     def _decode_graph_capture_inputs(self, shape):
-        inputs = self._graph_capture_inputs(shape, self.vocab_size)
+        return self._decode_graph_inputs(shape, capture=True)
+
+    def _decode_graph_inputs(
+        self,
+        shape: GraphShape,
+        plan: BatchPlan | None = None,
+        batch: AttentionBatch | None = None,
+        *,
+        capture: bool = False,
+    ):
+        inputs = decode_paged_attention_inputs(shape, self.window_table_width, batch)
+        rows = shape[0]
+        if plan is None:
+            live_rows = rows if capture else 0
+            zeros = (0,) * rows
+            inputs.update(token_ids=zeros, positions=zeros)
+            inputs.update(
+                capture_sampling_inputs(rows, self.vocab_size, stochastic=True)
+            )
+        else:
+            live_rows = plan.num_sequences
+            padding = rows - live_rows
+            for name, values in (
+                ("token_ids", plan.token_ids),
+                ("positions", plan.positions),
+            ):
+                inputs[name] = np.pad(values, (0, padding)) if padding else values
+            inputs.update(
+                pad_sampling_inputs(self._sampler, plan, self.vocab_size, padding)
+            )
         if self.parallel_groups is not None:
-            inputs["ep_valid_rows"] = shape[0]
+            inputs["ep_valid_rows"] = live_rows
         return inputs
 
     def _apply_yarn_rotary(self, hidden, cos, sin):
@@ -719,18 +725,13 @@ class GptOssCudaRunner(CudaRunner):
         return final_hidden
 
     def _new_decode_graph_step(self, shape: GraphShape) -> CudaGraphStep:
-        batch_size, full_width = shape
+        batch_size = shape[0]
 
         def empty(dtype, *shape):
             return torch.empty(shape, dtype=dtype, device=self.device)
 
         batch = empty_decode_paged_attention_batch(
-            self.device,
-            batch_size,
-            {
-                "full": (full_width, self.page_size),
-                "sliding": (self.window_table_width, self.page_size),
-            },
+            self.device, shape, self.window_table_width, self.page_size
         )
         token_ids = empty(torch.long, batch_size)
         positions = empty(torch.long, batch_size)
@@ -740,21 +741,14 @@ class GptOssCudaRunner(CudaRunner):
             if self.parallel_groups is not None
             else None
         )
-        sampling = (
-            self._sampler.empty(batch_size, self.device)
-            if hasattr(self._sampler, "empty")
-            else None
-        )
+        sampling = self._sampler.empty(batch_size, self.device)
 
         def launch() -> None:
             with self._parallel_graph_capacity(batch_size, valid_rows=valid_rows):
                 hidden = self._forward_batch(token_ids, positions, batch)
                 logits = self._model.lm_head(hidden)
                 self._graph_logits[shape] = logits
-                if sampling is None:
-                    self._sampler(logits, out=output_ids)
-                else:
-                    self._sampler.sample_tensors(logits, sampling, out=output_ids)
+                self._sampler.sample_tensors(logits, sampling, out=output_ids)
                 groups = self.parallel_groups
                 if groups is not None and groups.device_replica.size > 1:
                     groups.distributed.broadcast(
@@ -767,11 +761,10 @@ class GptOssCudaRunner(CudaRunner):
             "token_ids": token_ids,
             "positions": positions,
             **paged_attention_graph_inputs(batch),
+            **self._sampler.graph_inputs(sampling),
         }
         if valid_rows is not None:
             inputs["ep_valid_rows"] = valid_rows
-        if sampling is not None:
-            inputs.update(self._sampler.graph_inputs(sampling))
         return CudaGraphStep(
             inputs=inputs,
             output=output_ids,
@@ -787,14 +780,9 @@ class GptOssCudaRunner(CudaRunner):
     ) -> ForwardOutput | None:
         if not self._cuda_graph_mode_enabled("decode"):
             return None
-        rows = len(plan.sequence_ids)
-        full = host.group("full")
-        sliding = host.group("sliding")
-        if (
-            host.phase != BatchPhase.DECODE
-            or host.query_lengths != (1,) * rows
-            or sliding.width != self.window_table_width
-        ):
+        rows = plan.num_sequences
+        full, sliding = host.groups
+        if host.phase != BatchPhase.DECODE or sliding.width != self.window_table_width:
             raise GraphInputError("plan is not a fixed-shape decode batch")
         if shape is None:
             shape = self._select_cuda_graph(
@@ -805,41 +793,9 @@ class GptOssCudaRunner(CudaRunner):
             )
         if shape is None:
             return None
-        inputs = {
-            "token_ids": plan.token_ids,
-            "positions": plan.positions,
-            **paged_attention_host_inputs(
-                host,
-                {"full": shape[1], "sliding": self.window_table_width},
-            ),
-        }
-        if self.parallel_groups is not None:
-            inputs["ep_valid_rows"] = rows
-        padding = shape[0] - rows
-        if padding:
-            for name in ("token_ids", "positions"):
-                inputs[name] = np.pad(inputs[name], (0, padding))
-            inactive_rows = np.arange(rows, shape[0], dtype=np.int64)
-            for name, width in (
-                ("full", shape[1]),
-                ("sliding", self.window_table_width),
-            ):
-                inputs[f"{name}_page_table"] = np.pad(
-                    inputs[f"{name}_page_table"], (0, padding * width)
-                )
-                inputs[f"{name}_seqused_k"] = np.pad(
-                    inputs[f"{name}_seqused_k"], (0, padding), constant_values=1
-                )
-                # Parent zero is reserved. Distinct offsets keep inactive
-                # writes from racing while leaving every live page untouched.
-                inputs[f"{name}_append_slots"] = np.concatenate(
-                    (inputs[f"{name}_append_slots"], inactive_rows)
-                )
-        if hasattr(self._sampler, "host_inputs"):
-            inputs.update(
-                pad_sampling_inputs(self._sampler, plan, self.vocab_size, padding)
-            )
-        output = self._run_cuda_graph("decode", shape, inputs)
+        output = self._run_cuda_graph(
+            "decode", shape, self._decode_graph_inputs(shape, plan, host)
+        )
         return format_output(
             self._graph_logits[shape],
             output if plan.needs_logprobs else output[:rows],
@@ -961,15 +917,15 @@ class GptOssCudaRunner(CudaRunner):
                     context,
                     required_shape=(
                         context.num_sequences,
-                        0 if plan is None else prepared.group("full").width,
+                        0 if plan is None else prepared.groups[0].width,
                     ),
                 )
                 if shape is not None:
                     if plan is not None:
                         return self._graph_forward(plan, prepared, shape=shape)
-                    inputs = self._decode_graph_capture_inputs(shape)
-                    inputs["ep_valid_rows"] = 0
-                    self._run_cuda_graph("decode", shape, inputs)
+                    self._run_cuda_graph(
+                        "decode", shape, self._decode_graph_inputs(shape)
+                    )
                     return None
             if context.phase == BatchPhase.PREFILL:
                 with self._distributed_prefill_graphs(context):

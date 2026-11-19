@@ -53,11 +53,11 @@ class _Guard(nullcontext):
 
 
 def _runner(monkeypatch, groups):
-
     runner = GptOssCudaRunner.__new__(GptOssCudaRunner)
     runner.parallel_groups = groups
     runner.device = torch.device("cpu")
     runner.hidden_size = 32
+    runner.vocab_size = 32
     setattr(runner, "cache_layout", object())
     runner.cuda_graph_prefill = "disabled"
     runner.cuda_graph_decode = "disabled"
@@ -101,8 +101,9 @@ def _runner(monkeypatch, groups):
         batch = SimpleNamespace(
             phase=plan.phase,
             query_lengths=tuple(np.diff(plan.token_indptr)),
-            group=lambda name: SimpleNamespace(
-                width=1 if name == "full" else runner.window_table_width
+            groups=(
+                SimpleNamespace(width=1),
+                SimpleNamespace(width=runner.window_table_width),
             ),
         )
         return batch
@@ -241,9 +242,6 @@ def test_worker_prepared_attention_is_reused_for_every_execution_path(
             return token_output([9])
 
         monkeypatch.setattr(runner, "_graph_forward", replay)
-        monkeypatch.setattr(
-            runner, "_decode_graph_capture_inputs", lambda shape: {"ep_valid_rows": 2}
-        )
 
         def empty_replay(mode, shape, inputs):
             assert mode == "decode" and inputs["ep_valid_rows"] == 0
@@ -408,7 +406,6 @@ def test_missing_graph_capture_is_rejected_in_worker_readiness_validation(
     ],
 )
 def test_distributed_graph_policies_pass_topology_preparation(monkeypatch, parallelism):
-
     class CudaEntry(Exception):
         pass
 
@@ -461,15 +458,14 @@ def test_idle_graph_replica_rejoins_with_zero_valid_expert_rows(monkeypatch):
     runner = _runner(monkeypatch, groups)
     replayed = []
     runner._select_distributed_cuda_graph = lambda *args, **kwargs: (2, 1)
-    runner._decode_graph_capture_inputs = lambda shape: {
-        "shape": shape,
-        "ep_valid_rows": shape[0],
-    }
     runner._run_cuda_graph = lambda mode, shape, inputs: replayed.append(inputs)
     idle = _context(groups, BatchPhase.DECODE, ((0, 0), (2, 2)), None)
 
     assert runner.forward_distributed(None, idle) is None
-    assert replayed == [{"shape": (2, 1), "ep_valid_rows": 0}]
+    assert len(replayed) == 1
+    assert replayed[0]["ep_valid_rows"] == 0
+    assert replayed[0]["full_page_table"].tolist() == [[0], [0]]
+    assert replayed[0]["full_append_slots"].tolist() == [0, 1]
     assert runner.calls == runner.tensorized == []
 
     plan = BatchPlan(
@@ -522,7 +518,7 @@ def _decode_host(runner, plan):
             AttentionGroup(
                 name=name,
                 width=width,
-                page_table=np.ones(rows * width, dtype=np.uint64),
+                pages=tuple(np.ones(width, dtype=np.uint64) for _ in range(rows)),
                 lengths=tuple(int(value) + 1 for value in plan.context_lengths),
                 append_slots=np.arange(rows, dtype=np.int64),
             )
@@ -577,7 +573,12 @@ def test_decode_graph_retains_logits_and_stages_active_row_count(monkeypatch):
     assert output.logprobs.tolist() == pytest.approx([expected[0, 1], expected[1, 2]])
     assert len(replayed) == 1
     assert replayed[0][2]["ep_valid_rows"] == 2
-    assert replayed[0][2]["full_page_table"].tolist() == [1, 1, 1, 1, 0, 0, 0, 0]
+    assert replayed[0][2]["full_page_table"].tolist() == [
+        [1, 1],
+        [1, 1],
+        [0, 0],
+        [0, 0],
+    ]
     assert runner._graph_logits[shape] is logits
 
 
