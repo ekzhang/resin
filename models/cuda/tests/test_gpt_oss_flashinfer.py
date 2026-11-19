@@ -28,13 +28,19 @@ def _config(**changes):
 
 def test_preparation_preserves_paired_rows_and_neutral_padding(monkeypatch):
     kernel = FlashInferSM90MXFP4Kernel()
-    monkeypatch.setattr(kernel, "_validate_sm90_tensor", lambda *args: None)
-    monkeypatch.setattr(
-        kernel,
-        "_get_fused_moe",
-        lambda: SimpleNamespace(
+    monkeypatch.setattr(kernel, "validate_device", lambda device: None)
+
+    def fold_scales(value, group):
+        assert group == 32
+        experts, rows, columns = value.shape
+        return value.view(experts, rows // 64, columns // 4, 16, 16)
+
+    monkeypatch.setitem(
+        kernel.__dict__,
+        "_fused_moe",
+        SimpleNamespace(
             interleave_moe_weights_for_sm90_mixed_gemm=lambda value, kind: value,
-            interleave_moe_scales_for_sm90_mixed_gemm=lambda value, group: value,
+            interleave_moe_scales_for_sm90_mixed_gemm=fold_scales,
         ),
     )
     rows = torch.arange(64, dtype=torch.uint8)[None, :, None]
@@ -55,7 +61,10 @@ def test_preparation_preserves_paired_rows_and_neutral_padding(monkeypatch):
     scales = torch.full((4, 256, 4), 127, dtype=torch.uint8)
     scales[:, :32, :1] = source.gate_up_scales[:, 1::2]
     scales[:, 128:160, :1] = source.gate_up_scales[:, ::2]
-    torch.testing.assert_close(prepared.fc1_scales.view(torch.uint8), scales)
+    assert prepared.fc1_scales.shape == (4, 4, 1, 16, 4)
+    torch.testing.assert_close(
+        prepared.fc1_scales.view(torch.uint8).view_as(scales), scales
+    )
     bias = torch.zeros(4, 256, dtype=torch.bfloat16)
     bias[:, :32] = source.gate_up_bias[:, 1::2]
     bias[:, 128:160] = source.gate_up_bias[:, ::2]
@@ -64,6 +73,11 @@ def test_preparation_preserves_paired_rows_and_neutral_padding(monkeypatch):
     assert not prepared.fc2_weights[:, 32:].any()
     assert not prepared.fc2_weights[:, :, 16:].any()
     assert not prepared.fc2_bias[:, 32:].any()
+    down_scales = torch.full((4, 128, 4), 127, dtype=torch.uint8)
+    down_scales[:, :32, :1] = source.down_scales
+    torch.testing.assert_close(
+        prepared.fc2_scales.view(torch.uint8).view_as(down_scales), down_scales
+    )
 
 
 @pytest.mark.parametrize("change", [{"top_k": 2}, {"num_experts": 129}])
@@ -72,16 +86,13 @@ def test_adapter_rejects_unsupported_geometry(change):
         FlashInferSM90MXFP4Kernel().validate(replace(_config(), **change))
 
 
-def test_adapter_rejects_unsupported_device_and_api(monkeypatch):
+def test_adapter_rejects_unsupported_device(monkeypatch):
     kernel = FlashInferSM90MXFP4Kernel()
     with pytest.raises(ValueError, match="CUDA"):
         kernel.validate_device(torch.device("cpu"))
     monkeypatch.setattr(torch.cuda, "get_device_capability", lambda device: (10, 0))
     with pytest.raises(ValueError, match="SM90"):
         kernel.validate_device(torch.device("cuda"))
-    monkeypatch.setattr(kernel, "_fused_moe", SimpleNamespace(), raising=False)
-    with pytest.raises(RuntimeError, match="pinned SM90 MXFP4 API"):
-        kernel._get_fused_moe()
 
 
 def test_inactive_route_sentinel_reaches_cutlass_without_rerouting(monkeypatch):
@@ -91,7 +102,6 @@ def test_inactive_route_sentinel_reaches_cutlass_without_rerouting(monkeypatch):
 
     config = _config(num_experts=4, hidden_size=32, intermediate_size=32)
     kernel = adapter.FlashInferSM90MXFP4Kernel()
-    monkeypatch.setattr(kernel, "_validate_sm90_tensor", lambda *args: None)
     indices = torch.tensor([[4, 0, 1, 2], [0, 4, 4, 4]], dtype=torch.int64)
     weights = torch.tensor([[0, 0.5, 0.25, 0.25], [1, 0, 0, 0]], dtype=torch.float32)
     hidden = torch.ones(2, 32, dtype=torch.bfloat16)
@@ -106,10 +116,10 @@ def test_inactive_route_sentinel_reaches_cutlass_without_rerouting(monkeypatch):
         scales = ((actual_ids + 1) * actual_weights * active).sum(1)
         kwargs["output"].copy_(hidden * scales[:, None])
 
-    monkeypatch.setattr(
-        kernel,
-        "_get_fused_moe",
-        lambda: SimpleNamespace(
+    monkeypatch.setitem(
+        kernel.__dict__,
+        "_fused_moe",
+        SimpleNamespace(
             ActivationType=SimpleNamespace(Swiglu=object()),
             cutlass_fused_moe=cutlass,
         ),
@@ -135,17 +145,13 @@ def test_inactive_route_sentinel_reaches_cutlass_without_rerouting(monkeypatch):
     )
 
 
-@pytest.mark.parametrize("limit", [2, 5, 8])
-def test_fp32_partials_preserve_cancellation_and_chunk_expanded_routes(
-    monkeypatch, limit
-):
+def test_fp32_partials_preserve_cancellation_across_kernel_chunks(monkeypatch):
     import torch
 
     import resin_models_cuda.gpt_oss.flashinfer as adapter
 
     config = _config(num_experts=4, hidden_size=32, intermediate_size=32)
     kernel = adapter.FlashInferSM90MXFP4Kernel()
-    monkeypatch.setattr(kernel, "max_tokens", limit)
     packed = torch.empty(1, dtype=torch.uint8)
     bias = torch.zeros(4, 32, dtype=torch.bfloat16)
     bias[0] = 0.75
@@ -169,7 +175,6 @@ def test_fp32_partials_preserve_cancellation_and_chunk_expanded_routes(
 
     def unweighted(hidden, indices, routing_weights, weights):
         assert weights.config is config
-        assert len(hidden) <= limit
         assert weights.fc1_weights is packed and weights.fc2_weights is packed
         assert weights.fc1_bias is prepared.fc1_bias
         assert not weights.fc2_bias.any()
@@ -181,14 +186,16 @@ def test_fp32_partials_preserve_cancellation_and_chunk_expanded_routes(
         values = torch.tensor([1000, -1000, 4, -8, float("nan")], dtype=torch.bfloat16)
         return values[indices[:, 0].long(), None].expand(-1, 32)
 
-    monkeypatch.setattr(kernel, "forward", unweighted)
+    monkeypatch.setattr(kernel, "_launch", unweighted)
 
     def dynamic_shape(*args, **kwargs):
         # pytest's _WithException wrapper obscures fail's callable signature.
         pytest.fail("partial execution must not compact routes dynamically")  # ty: ignore[invalid-argument-type]
 
     monkeypatch.setattr(torch.Tensor, "nonzero", dynamic_shape)
-    hidden = torch.ones(4, 32, dtype=torch.bfloat16)
+    num_tokens = 2051
+    repeats = (num_tokens + 3) // 4
+    hidden = torch.ones(num_tokens, 32, dtype=torch.bfloat16)
     ids = torch.tensor([[0, 4, 4, 4], [1, 4, 4, 4], [0, 1, 2, 4], [0, 1, 2, 3]])
     scales = torch.tensor(
         [
@@ -198,16 +205,18 @@ def test_fp32_partials_preserve_cancellation_and_chunk_expanded_routes(
             [0.25, 0.5, 0.125, 0.125],
         ]
     )
+    ids = ids.repeat(repeats, 1)[:num_tokens]
+    scales = scales.repeat(repeats, 1)[:num_tokens]
     output = kernel.forward_partial(hidden, ids, scales, prepared)
     assert output.dtype == torch.float32
     torch.testing.assert_close(
-        output[:, 0], torch.tensor([1000.75, -998.75, -248.1875, -249.6875])
+        output[:4, 0], torch.tensor([1000.75, -998.75, -248.1875, -249.6875])
     )
     values = torch.tensor([1000.75, -998.75, 4, -8, 0])
     torch.testing.assert_close(
         output[:, 0], (values[ids] * scales).sum(1), rtol=0, atol=0
     )
-    expected_calls = [min(limit, 16 - start) for start in range(0, 16, limit)]
+    expected_calls = [8192, 12]
     assert calls == expected_calls
     assert output[0, 0] + output[1, 0] == 2
     assert output[:2, 0].bfloat16().float().sum() == 0
