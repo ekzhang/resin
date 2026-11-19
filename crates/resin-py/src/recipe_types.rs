@@ -803,6 +803,8 @@ impl RenderOptions {
         let Value::Object(mut value) = serde_json::to_value(Self::default()).unwrap() else {
             unreachable!()
         };
+        // HTTP request structs flatten undeclared wire fields into `extra`.
+        // Both representations use the same RenderOptions field whitelist.
         let root_kwargs = template_kwargs(request)?;
         let extra_kwargs = template_kwargs(&request["extra"])?;
         for (key, field) in &mut value {
@@ -848,10 +850,9 @@ fn template_kwargs(source: &Value) -> PyResult<Option<&Map<String, Value>>> {
     match source.get("chat_template_kwargs") {
         None | Some(Value::Null) => Ok(None),
         Some(Value::Object(map)) => {
-            let mut checked = map.clone();
-            checked.retain(|_, value| !value.is_null());
-            let parsed: RenderOptions = serde_path_to_error::deserialize(Value::Object(checked))
-                .map_err(|error| PyValueError::new_err(error.to_string()))?;
+            let parsed: RenderOptions =
+                serde_path_to_error::deserialize(Value::Object(map.clone()))
+                    .map_err(|error| PyValueError::new_err(error.to_string()))?;
             parsed.validate()?;
             Ok(Some(map))
         }

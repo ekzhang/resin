@@ -477,6 +477,8 @@ def test_http_chat_template_kwargs_apply_and_respect_explicit_overrides():
         for bad_kwargs, expected_error in [
             ("bad", "chat_template_kwargs must be an object"),
             ({"unknown_option": True}, "unknown field"),
+            ({"unknown_option": None}, "unknown field"),
+            ({"temperature": 0.5}, "unknown field"),
         ]:
             with pytest.raises(urllib.error.HTTPError) as failure:
                 send(
