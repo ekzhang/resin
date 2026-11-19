@@ -697,6 +697,13 @@ class Inkling2CudaRunner(CudaRunner):
             scores=score_completion(logits, acceptance, plan),
         ).result()
 
+    def _before_cuda_graph_capture(self) -> None:
+        from resin.backend.cuda.state_triton import compile_state_checkpoint
+
+        compile_state_checkpoint(
+            self._cache.state_blocks[self.cache_geometry.state_group]
+        )
+
     def _after_cuda_graph_capture(self):
         self._cache.reset_null()
         torch.cuda.synchronize(self.device)

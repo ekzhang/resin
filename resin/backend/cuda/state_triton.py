@@ -6,6 +6,8 @@ import torch
 import triton
 import triton.language as tl
 
+_COPY_BLOCK = 4096
+
 
 @triton.jit
 def _copy_state(
@@ -48,6 +50,29 @@ def _copy_state(
     )
 
 
+def _copy_layout(storage: torch.Tensor) -> tuple[int, int, int]:
+    if storage.ndim != 3 or storage.stride(2) != 1:
+        raise ValueError("STATE storage must be [slab, slot, contiguous elements]")
+    return storage.stride(0), storage.stride(1), storage.shape[2]
+
+
+def compile_state_checkpoint(storage: torch.Tensor) -> None:
+    """Compile the checkpoint variant for this cache layout without launching it."""
+    layout = _copy_layout(storage)
+    with torch.cuda.device(storage.device):
+        cast(Any, _copy_state).warmup(
+            storage,
+            torch.int64,
+            torch.int64,
+            torch.int64,
+            torch.bool,
+            *layout,
+            True,
+            _COPY_BLOCK,
+            grid=(1, triton.cdiv(layout[2], _COPY_BLOCK)),
+        )
+
+
 def copy_state(
     storage: torch.Tensor,
     addresses: torch.Tensor,
@@ -55,20 +80,17 @@ def copy_state(
     candidates: torch.Tensor | None = None,
     ends: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    if storage.ndim != 3 or storage.stride(2) != 1:
-        raise ValueError("STATE storage must be [slab, slot, contiguous elements]")
-    count, width = len(addresses), storage.shape[2]
+    layout = _copy_layout(storage)
+    count = len(addresses)
     flags = torch.empty(count, dtype=torch.bool, device=storage.device)
-    cast(Any, _copy_state)[(count, triton.cdiv(width, 4096))](
+    cast(Any, _copy_state)[(count, triton.cdiv(layout[2], _COPY_BLOCK))](
         storage,
         addresses,
         candidates,
         ends,
         flags,
-        storage.stride(0),
-        storage.stride(1),
-        width,
+        *layout,
         candidates is not None,
-        4096,
+        _COPY_BLOCK,
     )
     return flags

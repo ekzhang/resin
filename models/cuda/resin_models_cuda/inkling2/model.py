@@ -574,13 +574,13 @@ class Inkling2Target(nn.Module):
                 GLOBAL_GROUP: config.global_layer_count,
                 LOCAL_GROUP: config.local_layer_count,
             },
+            # The scale is exactly one below the floor. Keep the same global
+            # attention specialization on both sides of that boundary.
             log_tau=log_scaling_tau(
                 positions,
                 n_floor=config.log_scaling_n_floor,
                 alpha=config.log_scaling_alpha,
-            )
-            if max_sequence_length > config.log_scaling_n_floor
-            else None,
+            ),
         )
         layers = cast(Sequence[DecoderLayer], self.layers)
         kv_width = layers[0].attn.kv_heads * config.head_dim
