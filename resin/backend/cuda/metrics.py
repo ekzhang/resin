@@ -69,7 +69,7 @@ class GraphPhaseTiming:
 
     def _bind(
         self,
-        graphs: Sequence[torch.cuda.CUDAGraph | None],
+        graph: torch.cuda.CUDAGraph,
         events: Sequence[torch.cuda.Event],
     ) -> None:
         from cuda.bindings import runtime
@@ -79,37 +79,30 @@ class GraphPhaseTiming:
                 event.cuda_event: index for index, event in enumerate(self.events)
             }
             self._nodes = []
-            for graph in graphs:
-                if graph is None:
+            raw = graph.raw_cuda_graph()
+            _, count = _cuda_result(runtime.cudaGraphGetNodes(raw, numNodes=0))
+            nodes, _ = _cuda_result(runtime.cudaGraphGetNodes(raw, numNodes=count))
+            for node in nodes:
+                (kind,) = _cuda_result(runtime.cudaGraphNodeGetType(node))
+                if kind != runtime.cudaGraphNodeType.cudaGraphNodeTypeEventRecord:
                     continue
-                raw = graph.raw_cuda_graph()
-                _, count = _cuda_result(runtime.cudaGraphGetNodes(raw, numNodes=0))
-                nodes, _ = _cuda_result(runtime.cudaGraphGetNodes(raw, numNodes=count))
-                for node in nodes:
-                    (kind,) = _cuda_result(runtime.cudaGraphNodeGetType(node))
-                    if kind != runtime.cudaGraphNodeType.cudaGraphNodeTypeEventRecord:
-                        continue
-                    (event,) = _cuda_result(
-                        runtime.cudaGraphEventRecordNodeGetEvent(node)
+                (event,) = _cuda_result(runtime.cudaGraphEventRecordNodeGetEvent(node))
+                if int(event) in indices:
+                    self._nodes.append(
+                        (graph.raw_cuda_graph_exec(), node, indices[int(event)])
                     )
-                    if int(event) in indices:
-                        self._nodes.append(
-                            (graph.raw_cuda_graph_exec(), node, indices[int(event)])
-                        )
             if len(self._nodes) != len(self.events):
                 raise RuntimeError(
                     "every timing boundary must be captured exactly once"
                 )
-        for graph, node, index in self._nodes:
+        for executable, node, index in self._nodes:
             _cuda_result(
                 runtime.cudaGraphExecEventRecordNodeSetEvent(
-                    graph, node, events[index].cuda_event
+                    executable, node, events[index].cuda_event
                 )
             )
 
-    def replay(
-        self, graphs: Sequence[torch.cuda.CUDAGraph | None]
-    ) -> _PhaseMeasurement:
+    def replay(self, graph: torch.cuda.CUDAGraph) -> _PhaseMeasurement:
         if self.available:
             events = self.available.pop()
         else:
@@ -118,18 +111,18 @@ class GraphPhaseTiming:
             # generation once; subsequent replays recycle completed generations.
             for event in events:
                 event.record(torch.cuda.current_stream(self.device))
-        self._bind(graphs, events)
+        self._bind(graph, events)
         return _PhaseMeasurement(self, events)
 
-    def prepare(self, graphs: Sequence[torch.cuda.CUDAGraph | None]) -> None:
+    def prepare(self, graph: torch.cuda.CUDAGraph) -> None:
         """Discover captured marker nodes during startup, outside inference."""
-        self._bind(graphs, self.events)
+        self._bind(graph, self.events)
 
-    def unobserved(self, graphs: Sequence[torch.cuda.CUDAGraph | None]) -> None:
+    def unobserved(self, graph: torch.cuda.CUDAGraph) -> None:
         # An unobserved launch must not overwrite the last observed generation,
         # which can still be pending when a benchmark calls a graph directly.
         if self._nodes is not None:
-            self._bind(graphs, self.events)
+            self._bind(graph, self.events)
 
 
 @dataclass(slots=True)

@@ -10,7 +10,7 @@ import torch
 from torch.nn import functional as F
 
 from resin import BatchPhase
-from resin.backend.cuda.graphs import CudaGraphMode, CudaGraphProgram, CudaGraphRegion
+from resin.backend.cuda.graphs import CudaGraphMode
 from resin.backend.cuda.runner import CudaRunner
 
 
@@ -19,10 +19,10 @@ def _unreachable(_shape) -> NoReturn:
     raise AssertionError("empty graph catalog must not build")
 
 
-def _runner(device="cpu", *, prefill="breakable", decode="full", decode_builder=None):
+def _runner(device="cpu", *, prefill="breakable"):
     runner = object.__new__(CudaRunner)
     runner.device = torch.device(device)
-    runner.cuda_graph_prefill, runner.cuda_graph_decode = prefill, decode
+    runner.cuda_graph_prefill, runner.cuda_graph_decode = prefill, "full"
     runner._prefill_graph_active = False
     runner._prefill_operations = ()
     runner._prefill_tensor_graphs = {}
@@ -31,7 +31,7 @@ def _runner(device="cpu", *, prefill="breakable", decode="full", decode_builder=
     runner._parallel_graph_groups = None
     setattr(runner, "_cuda_failure", lambda: torch.cuda.synchronize(runner.device))
     runner._configure_cuda_graphs(
-        {"decode": CudaGraphMode((), decode_builder or (_unreachable), lambda _: {})}
+        {"decode": CudaGraphMode((), _unreachable, lambda _: {})}
     )
     return runner
 
@@ -289,25 +289,6 @@ def test_exact_bucket_policy_preserves_eager_tensor_identity_and_graph_buffer(
     assert runner.cuda_graph_stats["prefill"]["fallback_counts"] == {"padding": 2}
 
 
-def test_full_decode_policy_rejects_eager_regions_before_capture():
-    program = CudaGraphProgram(
-        {},
-        torch.zeros(1),
-        (
-            CudaGraphRegion("compute", lambda: None),
-            CudaGraphRegion("dynamic", lambda: None, capture=False),
-        ),
-    )
-    for policy in ("full", "breakable"):
-        runner = _runner(decode=policy, decode_builder=lambda _: program)
-        build = runner._require_cuda_graph_executor().mode("decode")._build
-        if policy == "full":
-            with pytest.raises(ValueError, match="cannot contain eager regions"):
-                build((1, 1))
-        else:
-            assert build((1, 1)) is program
-
-
 @pytest.mark.parametrize("prefill", ["breakable", "disabled"])
 def test_prefill_readiness_is_checked_before_model_work(prefill):
     runner = _runner(prefill=prefill)
@@ -381,7 +362,9 @@ def test_cuda_prefill_regions_replay_dynamic_lengths_with_shared_memory(with_ids
     cache = runner._require_cuda_graph_executor().mode("prefill")
     assert cache._workspace is not None and cache._workspace.pool is not None
     assert {
-        graph.pool() for entry in cache._entries.values() for graph in entry.graphs
+        entry.graph.pool()
+        for entry in cache._entries.values()
+        if entry.graph is not None
     } == {cache._workspace.pool}
     assert (
         runner._require_cuda_graph_executor().mode("decode")._workspace

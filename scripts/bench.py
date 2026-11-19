@@ -939,12 +939,10 @@ def argument_parser() -> argparse.ArgumentParser:
         type=int,
         help="execution chunk size, separate from prompt length (default: model preset, at least 4096; subject to kernel limits)",
     )
-    for phase, default in (("prefill", "breakable"), ("decode", "full")):
-        parser.add_argument(
-            f"--{phase}-graph",
-            choices=("disabled", "breakable", "full"),
-            default=default,
-        )
+    parser.add_argument(
+        "--prefill-graph", choices=("disabled", "breakable"), default="breakable"
+    )
+    parser.add_argument("--decode-graph", choices=("disabled", "full"), default="full")
     parser.add_argument("--gpu-memory-utilization", type=float)
     parser.add_argument(
         "--expert-backend", choices=("flashinfer", "deepgemm", "triton", "cute-dsl")

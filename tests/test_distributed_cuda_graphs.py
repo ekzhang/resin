@@ -387,7 +387,7 @@ def _selection_worker(rank, rendezvous):
 
         policy = _CpuRunner(groups)
         if rank:
-            policy.cuda_graph_decode = "breakable"
+            policy.cuda_graph_decode = "disabled"
         policy._cuda_graph_executor.capture_all = lambda **_: launched.append(True)
         with pytest.raises((ValueError, RuntimeError), match="agree|policy|same"):
             policy.capture_cuda_graphs()

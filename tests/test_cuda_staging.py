@@ -188,9 +188,7 @@ def test_graph_cache_queued_replays_preserve_each_host_input(runtime, monkeypatc
     observed = []
 
     def capture(self, entry, _allocation_before):
-        entry.graphs = (
-            SimpleNamespace(replay=lambda: runtime.observe(target, observed)),
-        )
+        entry.graph = SimpleNamespace(replay=lambda: runtime.observe(target, observed))
         entry.captured = True
         runtime.drain()
 

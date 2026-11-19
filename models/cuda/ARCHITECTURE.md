@@ -44,12 +44,10 @@ actually shares its complete execution contract.
 ## Graph execution modes
 
 A `CudaRunner` configures one internal `CudaGraphExecutor` with semantic
-modes such as `prefill` and `decode`. Each `CudaGraphMode` supplies only its
-shape buckets, fixed-input factory, and program builder. The builder returns
-either one `CudaGraphStep` (a full graph) or a `CudaGraphProgram` containing
-captured and eager regions (a breakable graph). Capture, staging, replay,
-poisoning, validation, and metrics are shared by every model, every mode, and
-both graph styles.
+modes such as `prefill` and `decode`. Each `CudaGraphMode` supplies its shape
+buckets, fixed-input factory, and `CudaGraphStep` builder. Each step captures
+one graph. The executor shares capture, staging, replay, poisoning, validation,
+and metrics across models and modes.
 
 Phase code must keep the model operation separate from graph orchestration.
 Eager execution and graph builders call the same model/attention helpers; a
@@ -57,8 +55,7 @@ graph region is a capture boundary around those helpers, not a second
 implementation of the phase. Consequently, adding breakable prefill means
 registering a `prefill` mode and choosing its region boundaries. It must not
 add a second graph runner, duplicate the model forward pass, or fork cache and
-sampling semantics. Decode can independently remain full-graph or become
-breakable in the same runner.
+sampling semantics. Decode independently selects full graphs or eager execution.
 
 ## Deployment configuration
 

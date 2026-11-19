@@ -21,19 +21,14 @@ warms kernels, allocates fixed buffers, captures every configured shape, and
 checks replay against eager execution. A selected but uncaptured graph raises
 an error. The Modal harnesses perform capture before inference or HTTP startup.
 
-Both policies accept `"disabled"`. Decode also accepts `"breakable"`; prefill
-does not yet support `"full"`. For fully eager execution, disable both policies.
+Prefill accepts `"breakable"` or `"disabled"`. Decode accepts `"full"` or
+`"disabled"`. For fully eager execution, disable both policies.
 
 ## Scope
 
 Full decode captures the model's fixed-shape forward and sampling path. Models
 with tensor parallelism include their token broadcast. Input staging, attention
-planning, and Engine scheduling remain host work before replay. A full-decode
-program cannot contain an explicit eager region.
-
-Breakable decode permits explicit eager regions between captured regions. In
-DeepSeek's ordinary tensor-parallel decode, this keeps the token broadcast
-outside capture. Other paths currently use the same graph for both policies.
+planning, and Engine scheduling remain host work before replay.
 
 Breakable prefill captures **stateless tensor regions** within the existing
 model forward. Each layer calls the shared graph runner for its MLP or MoE;
@@ -52,7 +47,7 @@ DeepSeek passes token IDs into its hash-routed experts. Qwen3.5 and Inkling 2 ke
 their recurrent/convolution state outside these graphs.
 
 Prefill capture is bounded to these tensor regions. It uses the shared
-`CudaGraphStep`/`CudaGraphProgram` runtime and the model's ordinary forward
+`CudaGraphStep` runtime and the model's ordinary forward
 implementation. The policy names follow
 [SGLang's CUDA graph configuration](https://github.com/sgl-project/sglang/blob/main/python/sglang/srt/model_executor/cuda_graph_config.py),
 but Resin's captured regions and model coverage are its own.
@@ -104,8 +99,8 @@ another region overwrites the shared buffer. Concurrent replay on multiple
 streams is unsupported. Each current model consumes the output into a new
 attention/residual tensor or persistent state before the next region.
 
-Each program must initialize its temporary workspace on every replay. Persistent
-state, inputs, outputs, and values passed across graph breaks must live in
+Each graph must initialize its temporary workspace on every replay. Persistent
+state, inputs, outputs, and values passed between graphs must live in
 fixed-address storage allocated outside capture. This permits alternating modes
 and batch buckets without depending on another capture's temporary contents.
 Closing one mode releases its graphs without invalidating the remaining modes;
@@ -132,10 +127,9 @@ deltas are not total retained/reserved graph memory. Prefill
 includes `capture_scope="feed_forward_regions"`. GPT-OSS and DeepSeek also report
 `prefill_attention`, with `capture_scope="attention_projections"` and named
 `captured_operations`. Both modes use private shape keys
-`(token_bucket, one_based_region_index)`. Explicit graph-break counts describe
-eager regions inside a `CudaGraphProgram`; they do not count host/model work
-between separate tensor-region graph calls. In particular, eager attention
-between projection callbacks does not increment that counter.
+`(token_bucket, one_based_region_index)`. `graph_region_count` counts graph
+steps. The compatibility field `graph_break_count` is zero because each step
+captures a single graph.
 
 Projection graphs capture no request metadata or page tables. They consume the
 actual local rows selected by the ordinary CP path. Expert dispatch retains its

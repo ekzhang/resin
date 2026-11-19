@@ -16,8 +16,6 @@ from resin.backend.cuda.graphs import (
     DEFAULT_MAX_NUM_SEQS,
     CudaGraphExecutor,
     CudaGraphMode,
-    CudaGraphProgram,
-    CudaGraphRegion,
     CudaGraphStep,
     _CudaGraphCache,
     _graph_shapes,
@@ -459,7 +457,7 @@ class TestCudaGraph:
             with pytest.raises(ValueError, match=name):
                 default_decode_graph_shapes(speculative=True, **arguments)
 
-    @pytest.mark.parametrize("policy", ["disabled", "full", "breakable"])
+    @pytest.mark.parametrize("policy", ["disabled", "full"])
     def test_decode_policy_resolves_defaults_and_explicit_overrides(self, policy):
         arguments: _DecodeOptions = dict(
             policy=policy, width=128, speculative=True, max_batch_size=9
@@ -482,10 +480,11 @@ class TestCudaGraph:
         with pytest.raises(ValueError, match="duplicate"):
             resolve_decode_graph_shapes(((1, 128), (1, 128)), **arguments)
 
-    def test_decode_policy_rejects_unknown_names(self):
+    @pytest.mark.parametrize("policy", ["automatic", "breakable"])
+    def test_decode_policy_rejects_unsupported_names(self, policy):
         with pytest.raises(ValueError, match="policy"):
             resolve_decode_graph_shapes(
-                None, policy="automatic", width=128, speculative=False, max_batch_size=8
+                None, policy=policy, width=128, speculative=False, max_batch_size=8
             )
 
     def test_shapes_are_frozen_sorted_and_validated(self) -> None:
@@ -530,9 +529,8 @@ class TestCudaGraph:
         assert graphs.stats["replay_count"] == 1
         assert graphs.stats["captured_shapes"] == ((1, 4),)
 
-    @pytest.mark.parametrize("builder", [CudaGraphStep, CudaGraphProgram])
     def test_device_output_preserves_identity_without_host_conversion(
-        self, monkeypatch, graph_torch, builder
+        self, monkeypatch, graph_torch
     ):
         torch = graph_torch
         monkeypatch.setattr(
@@ -542,14 +540,9 @@ class TestCudaGraph:
             lambda _: pytest.fail("unexpected host conversion"),  # ty: ignore[invalid-argument-type]
         )
         output = _Tensor([0])
-        operation = (
-            (CudaGraphRegion("compute", lambda: None),)
-            if builder is CudaGraphProgram
-            else lambda: None
-        )
         graphs = _cache(
             ((1, 4),),
-            lambda _: builder({"value": output}, output, operation),
+            lambda _: CudaGraphStep({"value": output}, output, lambda: None),
         )
         assert graphs.capture((1, 4), {"value": _Tensor([7])}) is output
         assert graphs.run((1, 4), {"value": _Tensor([8])}) is output
@@ -598,14 +591,7 @@ class TestCudaGraph:
             def build(shape):
                 order.append((name, shape))
                 state = _Tensor([0])
-                return CudaGraphProgram(
-                    {"value": state},
-                    state,
-                    (
-                        CudaGraphRegion("first", lambda: None),
-                        CudaGraphRegion("last", lambda: None),
-                    ),
-                )
+                return CudaGraphStep({"value": state}, state, lambda: None)
 
             return CudaGraphMode(((1, 4), (4, 4)), build, lambda _: {"value": [1]})
 
@@ -626,7 +612,7 @@ class TestCudaGraph:
             for shape in ((4, 4), (1, 4))
         ]
         (pool,) = torch.cuda.pools
-        assert [graph.pool for graph in torch.cuda.graphs] == [pool] * 12
+        assert [graph.pool for graph in torch.cuda.graphs] == [pool] * 6
         assert len({graph.stream for graph in torch.cuda.graphs}) == 1
         graphs.capture_all()
         assert len(torch.cuda.pools) == 1
@@ -677,34 +663,24 @@ class TestCudaGraph:
         standalone.close()
         assert all(graph.reset_count == 1 for graph in torch.cuda.graphs)
 
-    def test_capture_warms_stream_local_kernel_state_and_preserves_breaks_and_pool(
-        self, graph_torch
-    ):
+    def test_capture_warms_stream_local_kernel_state_and_reuses_pool(self, graph_torch):
         torch = graph_torch
         caller = torch.cuda.current_stream("cuda:0")
         initialized, events = set(), []
 
-        def launch(name):
+        def launch():
             stream = torch.cuda.current_stream("cuda:0")
             if stream not in initialized:
                 assert not torch.cuda.capturing, (
                     "first kernel use cannot allocate in capture"
                 )
                 initialized.add(stream)
-            events.append((name, stream))
+            events.append((stream, torch.cuda.capturing))
 
         cache = _CudaGraphCache(
             "cuda:0",
             ((1, 4), (2, 4)),
-            build=lambda _: CudaGraphProgram(
-                {},
-                _Tensor([0]),
-                (
-                    CudaGraphRegion("first", lambda: launch("first")),
-                    CudaGraphRegion("break", lambda: launch("break"), capture=False),
-                    CudaGraphRegion("last", lambda: launch("last")),
-                ),
-            ),
+            build=lambda _: CudaGraphStep({}, _Tensor([0]), launch),
             synchronize_failure=lambda: None,
         )
         cache.capture_all(lambda _: {})
@@ -713,12 +689,7 @@ class TestCudaGraph:
         assert stream is not caller
         assert all(graph.stream is stream for graph in torch.cuda.graphs)
         assert all(graph.pool is torch.cuda.pools[0] for graph in torch.cuda.graphs)
-        # Three warmups, then capture in region order, then one eager break
-        # during parity replay. The fake graphs themselves record only replays.
-        assert [name for name, _ in events] == (
-            ["first", "break", "last"] * 4 + ["break"]
-        ) * 2
-        assert all(current is stream for _, current in events)
+        assert events == ([(stream, False)] * 3 + [(stream, True)]) * 2
         assert torch.cuda.current_stream("cuda:0") is caller
         cache.close()
         assert cache._workspace is None
@@ -730,15 +701,7 @@ class TestCudaGraph:
 
         def build(_shape):
             state = _Tensor([0])
-            return CudaGraphProgram(
-                {"value": state},
-                state,
-                (
-                    CudaGraphRegion("first", lambda: None),
-                    CudaGraphRegion("break", lambda: None, capture=False),
-                    CudaGraphRegion("last", lambda: None),
-                ),
-            )
+            return CudaGraphStep({"value": state}, state, lambda: None)
 
         cache = _CudaGraphCache(
             "cuda:0",
@@ -762,11 +725,11 @@ class TestCudaGraph:
         cache.close()
         cache.close()
 
-        assert events == ["sync", "reset", "reset", "reset", "reset"]
-        assert [graph.reset_count for graph in torch.cuda.graphs] == [1] * 4
+        assert events == ["sync", "reset", "reset"]
+        assert [graph.reset_count for graph in torch.cuda.graphs] == [1, 1]
         assert cache._workspace is None
         assert all(
-            not entry.graphs and entry.program is None and entry.staging is None
+            entry.graph is None and entry.step is None and entry.staging is None
             for entry in cache._entries.values()
         )
         assert cache.stats == stats
@@ -928,47 +891,6 @@ class TestCudaGraph:
         graphs.run((1, 4), {"value": [3]})
 
         assert torch.host_allocations == allocations_after_capture
-
-    def test_program_replays_captured_regions_around_an_eager_break(
-        self, graph_torch
-    ) -> None:
-        torch = graph_torch
-        events = []
-
-        def build(_shape):
-            state = _Tensor([0])
-            return CudaGraphProgram(
-                inputs={"value": state},
-                output=state,
-                regions=(
-                    CudaGraphRegion("before", lambda: events.append("before")),
-                    CudaGraphRegion(
-                        "unsupported",
-                        lambda: events.append("break"),
-                        capture=False,
-                    ),
-                    CudaGraphRegion("after", lambda: events.append("after")),
-                ),
-            )
-
-        graphs = _cache(((1, 4),), build)
-        assert graphs.capture((1, 4), {"value": [7]}).tolist() == [7]
-        assert len(torch.cuda.graphs) == 2
-        events.clear()
-
-        assert graphs.run((1, 4), {"value": [8]}).tolist() == [8]
-        assert events == ["break"]
-        assert [graph.replay_count for graph in torch.cuda.graphs] == [2, 2]
-        assert graphs.stats["graph_region_count"] == 2
-        assert graphs.stats["graph_break_count"] == 1
-
-    def test_program_requires_at_least_one_captured_region(self) -> None:
-        with pytest.raises(ValueError, match="capture at least one"):
-            CudaGraphProgram(
-                inputs={},
-                output=_Tensor([0]),
-                regions=(CudaGraphRegion("eager", lambda: None, capture=False),),
-            )
 
     def test_capture_can_prepare_mutable_state_before_each_parity_run(
         self, graph_torch

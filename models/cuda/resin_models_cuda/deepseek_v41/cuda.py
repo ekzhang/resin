@@ -28,14 +28,12 @@ from resin.backend.cuda.completion import (
 )
 from resin.backend.cuda.graphs import (
     CudaGraphMode,
-    CudaGraphProgram,
-    CudaGraphRegion,
     CudaGraphStep,
     GraphShape,
     resolve_decode_graph_shapes,
 )
 from resin.backend.cuda.metrics import observe_execution
-from resin.backend.cuda.parallel import TensorParallelContext, TensorParallelLayout
+from resin.backend.cuda.parallel import TensorParallelContext
 from resin.backend.cuda.runner import (
     CudaRunner,
     capture_sampling_inputs,
@@ -167,15 +165,7 @@ class DeepSeekV41CudaRunner(CudaRunner):
             self.parallelism_capabilities.validate(
                 parallel_groups.topology, model="DeepSeek-V4.1"
             )
-            tensor_parallel = TensorParallelContext(
-                TensorParallelLayout(
-                    rank=parallel_groups.attn_tp.local_rank,
-                    size=parallel_groups.attn_tp.size,
-                ),
-                parallel_groups.attn_tp.handle
-                if parallel_groups.attn_tp.size > 1
-                else None,
-            )
+            tensor_parallel = TensorParallelContext.from_group(parallel_groups.attn_tp)
         elif tensor_parallel is None:
             tensor_parallel = TensorParallelContext()
         if tensor_parallel.size != 1:
@@ -194,16 +184,6 @@ class DeepSeekV41CudaRunner(CudaRunner):
         torch.cuda.set_device(self.device)
         if torch.cuda.get_device_capability(self.device)[0] < 10:
             raise RuntimeError("the DeepSeek-V4.1 runner requires Blackwell")
-        if parallel_groups is None and self.tensor_parallel_size > 1:
-            if not dist.is_initialized():
-                raise RuntimeError(
-                    "DeepSeek-V4.1 TP requires an initialized process group"
-                )
-            if (
-                dist.get_world_size() != self.tensor_parallel_size
-                or dist.get_rank() != self.tensor_parallel_rank
-            ):
-                raise ValueError("the default process group does not match TP layout")
 
         self.model_path, self.config = self._checkpoint(model)
         self.config.validate_tensor_parallel(self.tensor_parallel_size)
@@ -307,16 +287,6 @@ class DeepSeekV41CudaRunner(CudaRunner):
                 capacity_tensor,
                 op=dist.ReduceOp.MIN,
                 group=parallel_groups.replica.handle,
-            )
-            local_capacity = int(capacity_tensor.item())
-        elif self.tensor_parallel.enabled:
-            capacity_tensor = torch.tensor(
-                local_capacity, dtype=torch.int64, device=self.device
-            )
-            dist.all_reduce(
-                capacity_tensor,
-                op=dist.ReduceOp.MIN,
-                group=self.tensor_parallel.process_group,
             )
             local_capacity = int(capacity_tensor.item())
         self.cache_capacity_plan = replace(
@@ -750,9 +720,7 @@ class DeepSeekV41CudaRunner(CudaRunner):
             inputs["ep_valid_rows"] = shape[0]
         return inputs
 
-    def _new_decode_graph_step(
-        self, shape: GraphShape
-    ) -> CudaGraphStep | CudaGraphProgram:
+    def _new_decode_graph_step(self, shape: GraphShape) -> CudaGraphStep:
         if self.speculative_draft_tokens:
             return self._new_dspark_graph_step(shape)
         batch_size, graph_seq_len = shape
@@ -785,43 +753,14 @@ class DeepSeekV41CudaRunner(CudaRunner):
                 if self.parallel_groups is not None:
                     self._broadcast_tokens(output_ids)
 
-        def broadcast() -> None:
-            dist.broadcast(
-                output_ids,
-                src=0,
-                group=self.tensor_parallel.process_group,
-            )
-
         inputs = {"token_ids": token_ids, "positions": positions}
         if valid_rows is not None:
             inputs["ep_valid_rows"] = valid_rows
         inputs.update(self._cache.graph_device_inputs(cache))
         inputs.update(self._sampler.graph_inputs(sampling))
         self._graph_inputs[shape] = inputs
-        if self.parallel_groups is not None or not self.tensor_parallel.enabled:
-            return CudaGraphStep(
-                launch=launch,
-                inputs=inputs,
-                output=output_ids,
-                prepare=self._reset_model_state,
-            )
-        if self.cuda_graph_decode == "full":
-
-            def full_launch() -> None:
-                launch()
-                broadcast()
-
-            return CudaGraphStep(
-                launch=full_launch,
-                inputs=inputs,
-                output=output_ids,
-                prepare=self._reset_model_state,
-            )
-        return CudaGraphProgram(
-            regions=(
-                CudaGraphRegion("model", launch),
-                CudaGraphRegion("broadcast", broadcast, capture=False),
-            ),
+        return CudaGraphStep(
+            launch=launch,
             inputs=inputs,
             output=output_ids,
             prepare=self._reset_model_state,
@@ -1211,12 +1150,6 @@ class DeepSeekV41CudaRunner(CudaRunner):
                     src=groups.device_replica.source,
                     group=groups.device_replica.handle,
                 )
-        elif self.tensor_parallel.enabled:
-            dist.broadcast(
-                token_ids,
-                src=0,
-                group=self.tensor_parallel.process_group,
-            )
         return token_ids
 
     def _sample_target(

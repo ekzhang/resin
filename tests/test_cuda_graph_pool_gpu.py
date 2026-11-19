@@ -8,8 +8,6 @@ import torch
 from resin.backend.cuda.graphs import (
     CudaGraphExecutor,
     CudaGraphMode,
-    CudaGraphProgram,
-    CudaGraphRegion,
     CudaGraphStep,
 )
 
@@ -33,13 +31,12 @@ def test_shared_pool_alternating_modes_buckets_state_and_delayed_outputs(mode_or
             rows = shape[0]
             value = torch.zeros(rows, device="cuda")
             active = torch.ones(rows, dtype=torch.bool, device="cuda")
-            intermediate = torch.zeros_like(value)
             output = torch.zeros_like(value)
             saved_buffers[name, rows] = output
 
-            def first():
-                # Substantial scratch, initialized on every launch and released
-                # before the next region. Other modes may reuse these addresses.
+            def launch():
+                # Substantial scratch initialized on every launch. Other modes
+                # may reuse these addresses.
                 temporary = value[:, None].expand(rows, width).contiguous()
                 squared = temporary.square()
                 if torch.cuda.is_current_stream_capturing():
@@ -47,26 +44,17 @@ def test_shared_pool_alternating_modes_buckets_state_and_delayed_outputs(mode_or
                         temporary.data_ptr(),
                         squared.data_ptr(),
                     )
-                intermediate.copy_(squared[:, 0] + offset + state[:rows])
-
-            def last():
+                intermediate = squared[:, 0] + offset + state[:rows] + 3
                 output.copy_(torch.where(active, intermediate * 2, -1))
                 state[:rows].copy_(torch.where(active, output, state[:rows]))
-
-            def graph_break():
-                intermediate.add_(3)
 
             def prepare():
                 state.zero_()
 
-            return CudaGraphProgram(
+            return CudaGraphStep(
                 inputs={"value": value, "active": active},
                 output=output,
-                regions=(
-                    CudaGraphRegion("first", first),
-                    CudaGraphRegion("break", graph_break, capture=False),
-                    CudaGraphRegion("last", last),
-                ),
+                launch=launch,
                 prepare=prepare,
             )
 
@@ -87,11 +75,10 @@ def test_shared_pool_alternating_modes_buckets_state_and_delayed_outputs(mode_or
     try:
         graphs.capture_all()
         pools = {
-            graph.pool()
+            entry.graph.pool()
             for name in mode_order
             for entry in graphs.mode(name)._entries.values()
-            for graph in entry.graphs
-            if graph is not None
+            if entry.graph is not None
         }
         assert len(pools) == 1
         # The test exercises actual reused storage, not just equal pool handles.
@@ -250,11 +237,10 @@ def test_fused_sampling_shared_pool_replays_policies_and_preserves_owned_outputs
     try:
         graphs.capture_all()
         pools = {
-            graph.pool()
+            entry.graph.pool()
             for name in mode_order
             for entry in graphs.mode(name)._entries.values()
-            for graph in entry.graphs
-            if graph is not None
+            if entry.graph is not None
         }
         assert len(pools) == 1
         assert all(graphs.mode(name).stats["replay_count"] == 0 for name in mode_order)

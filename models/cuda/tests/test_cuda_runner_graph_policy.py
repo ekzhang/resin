@@ -12,7 +12,6 @@ from resin import BatchPhase
 from resin.backend.cuda.graphs import (
     CudaGraphExecutor,
     CudaGraphMode,
-    CudaGraphProgram,
     CudaGraphStep,
 )
 from resin.backend.cuda.runner import CudaRunner
@@ -105,9 +104,9 @@ def test_model_runner_passes_graph_policies_to_shared_runtime(
             device="cuda",
             **kwargs,
             cuda_graph_prefill="disabled",
-            cuda_graph_decode="breakable",
+            cuda_graph_decode="full",
         )
-    assert received == [("disabled", "breakable")]
+    assert received == [("disabled", "full")]
 
 
 @pytest.mark.parametrize(
@@ -141,22 +140,12 @@ def test_model_prefill_rejects_uncaptured_graphs_before_accessing_model_state(
     assert not runner._cuda_graph_executor.stats["prefill"]["poisoned"]
 
 
-@pytest.mark.parametrize("policy", ["full", "breakable"])
 @pytest.mark.parametrize("parallel", [False, True])
-def test_deepseek_decode_policy_places_broadcast_inside_or_between_graphs(
-    monkeypatch, policy, parallel
-):
+def test_deepseek_full_decode_graph_includes_replica_sampling_broadcast(parallel):
     runner = object.__new__(DeepSeekV41CudaRunner)
     runner.speculative_draft_tokens = 0
-    runner.parallel_groups = None
     runner.vocab_size = 2
-    runner.cuda_graph_decode = policy
     runner.device = torch.device("cpu")
-    setattr(
-        runner,
-        "tensor_parallel",
-        SimpleNamespace(enabled=parallel, process_group=object()),
-    )
     runner._graph_device_caches = {}
     runner._graph_inputs = {}
     runner._graph_logits = {}
@@ -178,10 +167,23 @@ def test_deepseek_decode_policy_places_broadcast_inside_or_between_graphs(
         events.append("sample")
         out.copy_(logits.argmax(dim=1))
 
+    replica_handle = object()
+
     def broadcast(output, *, src, group):
         events.append("broadcast")
-        assert src == 0 and group is runner.tensor_parallel.process_group
+        assert src == 1 and group is replica_handle
         output.fill_(7)
+
+    setattr(
+        runner,
+        "parallel_groups",
+        SimpleNamespace(
+            device_replica=SimpleNamespace(size=2, source=1, handle=replica_handle),
+            distributed=SimpleNamespace(broadcast=broadcast),
+        )
+        if parallel
+        else None,
+    )
 
     setattr(runner, "_model", SimpleNamespace(forward_decode=forward))
     setattr(
@@ -193,23 +195,14 @@ def test_deepseek_decode_policy_places_broadcast_inside_or_between_graphs(
             graph_inputs=lambda _sampling: {},
         ),
     )
-    monkeypatch.setattr(torch.distributed, "broadcast", broadcast)
-    program = runner._new_decode_graph_step((2, 32))
-    program.inputs["token_ids"].zero_()
-    program.inputs["positions"].fill_(1)
-
-    if parallel and policy == "breakable":
-        assert isinstance(program, CudaGraphProgram)
-        assert [region.capture for region in program.regions] == [True, False]
-        program.regions[0].launch()
-        assert events == ["model", "sample"]
-        program.regions[1].launch()
-    else:
-        assert isinstance(program, CudaGraphStep)
-        program.launch()
+    step = runner._new_decode_graph_step((2, 32))
+    assert isinstance(step, CudaGraphStep)
+    step.inputs["token_ids"].zero_()
+    step.inputs["positions"].fill_(1)
+    step.launch()
 
     assert events == ["model", "sample", *(["broadcast"] if parallel else [])]
-    assert program.output.tolist() == ([7, 7] if parallel else [1, 1])
+    assert step.output.tolist() == ([7, 7] if parallel else [1, 1])
 
 
 def cpu_prefill_regions(

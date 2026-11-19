@@ -4,7 +4,6 @@ from __future__ import annotations
 
 from collections.abc import Callable, Generator, Mapping
 from contextlib import AbstractContextManager, contextmanager, nullcontext
-from dataclasses import replace
 from time import perf_counter
 from typing import Protocol, cast
 
@@ -22,7 +21,6 @@ from resin.backend.cuda.graphs import (
     CudaGraphCounts,
     CudaGraphExecutor,
     CudaGraphMode,
-    CudaGraphProgram,
     CudaGraphStats,
     GraphShape,
 )
@@ -88,10 +86,8 @@ class CudaRunner(Runner):
     ) -> None:
         if cuda_graph_prefill not in {"disabled", "breakable"}:
             raise ValueError("cuda_graph_prefill must be 'disabled' or 'breakable'")
-        if cuda_graph_decode not in {"disabled", "full", "breakable"}:
-            raise ValueError(
-                "cuda_graph_decode must be 'disabled', 'full', or 'breakable'"
-            )
+        if cuda_graph_decode not in {"disabled", "full"}:
+            raise ValueError("cuda_graph_decode must be 'disabled' or 'full'")
         self.cuda_graph_prefill = cuda_graph_prefill
         self.cuda_graph_decode = cuda_graph_decode
         self._prefill_graph_active = False
@@ -428,26 +424,9 @@ class CudaRunner(Runner):
             raise RuntimeError("CUDA graph modes are already configured")
         self._cuda_graph_executor = CudaGraphExecutor(
             self.device,
-            {
-                name: replace(mode, build=self._full_graph_builder(mode.build))
-                if name == "decode" and self.cuda_graph_decode == "full"
-                else mode
-                for name, mode in modes.items()
-            },
+            modes,
             synchronize_failure=self._cuda_failure,
         )
-
-    @staticmethod
-    def _full_graph_builder(build):
-        def checked(shape):
-            program = build(shape)
-            if isinstance(program, CudaGraphProgram) and any(
-                not region.capture for region in program.regions
-            ):
-                raise ValueError("full CUDA graph policy cannot contain eager regions")
-            return program
-
-        return checked
 
     def _configure_prefill_graphs(
         self,
