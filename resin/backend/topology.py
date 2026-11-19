@@ -84,7 +84,7 @@ class ParallelGroups:
         if not distributed.is_initialized():
             raise ValueError("initialize the default process group first")
         world_size, rank = distributed.get_world_size(), distributed.get_rank()
-        configs = [None] * world_size
+        configs: list[tuple[Parallelism, str] | None] = [None] * world_size
         distributed.all_gather_object(configs, (topology, device_backend))
         if (
             any(config != configs[0] for config in configs)
