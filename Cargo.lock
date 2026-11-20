@@ -1611,6 +1611,7 @@ dependencies = [
  "prometheus-client",
  "prost",
  "resin-core",
+ "resin-recipe",
  "serde",
  "serde_json",
  "tokio",
