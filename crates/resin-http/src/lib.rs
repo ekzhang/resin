@@ -29,8 +29,8 @@ pub use metrics::{
 };
 pub use metrics_encoder::{MetricsEncodeError, MetricsEncoder};
 pub use protocol::{
-    ConversationRequest, FinishReason, GeneratedTokenLogprob, GenerationEvent, GenerationJob,
-    TokenLogprob,
+    ChatTemplateKwargs, ConversationRequest, FinishReason, GeneratedTokenLogprob, GenerationEvent,
+    GenerationJob, TokenLogprob,
 };
 
 pub const EVENT_QUEUE_CAPACITY: usize = 64;
@@ -63,6 +63,10 @@ pub struct RouteConfig {
     /// Input types accepted by the configured recipe.
     pub input_modalities: Vec<String>,
 
+    /// Validate template arguments before admission. The default accepts any JSON object.
+    /// A host can enforce the options supported by its renderer.
+    pub validate_chat_template_kwargs: fn(&ChatTemplateKwargs) -> Result<(), String>,
+
     /// Maximum context length configured on the hosting engine.
     pub context_length: u32,
 }
@@ -77,6 +81,7 @@ impl Default for RouteConfig {
             routed_dp_size: 1,
             max_top_logprobs: DEFAULT_MAX_TOP_LOGPROBS,
             input_modalities: vec!["text".into()],
+            validate_chat_template_kwargs: |_| Ok(()),
             context_length: 32768,
         }
     }
@@ -92,6 +97,7 @@ struct AppState {
     enable_priority_scheduling: bool,
     max_top_logprobs: u32,
     input_modalities: Arc<[String]>,
+    validate_chat_template_kwargs: fn(&ChatTemplateKwargs) -> Result<(), String>,
     context_length: u32,
 }
 
@@ -172,6 +178,7 @@ pub fn router(
         enable_priority_scheduling: routes.enable_priority_scheduling,
         max_top_logprobs: routes.max_top_logprobs,
         input_modalities: routes.input_modalities.into(),
+        validate_chat_template_kwargs: routes.validate_chat_template_kwargs,
         context_length: routes.context_length,
     };
     let mut router = Router::new().route("/health", get(openai::health));

@@ -4,6 +4,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::sync::mpsc;
 
+pub type ChatTemplateKwargs = serde_json::Map<String, Value>;
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct ConversationRequest {
     pub id: String,
@@ -27,7 +29,7 @@ pub struct ConversationRequest {
     #[serde(default)]
     pub cache_salt: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub chat_template_kwargs: Option<resin_recipe::RenderOptions>,
+    pub chat_template_kwargs: Option<ChatTemplateKwargs>,
     pub extra: BTreeMap<String, Value>,
 }
 

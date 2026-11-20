@@ -14,13 +14,12 @@ use axum::{
         sse::{Event, KeepAlive, Sse},
     },
 };
-use resin_recipe::RenderOptions;
 use serde::Deserialize;
 use serde_json::{Value, json};
 use tokio::sync::{mpsc, oneshot};
 
 use crate::{
-    AppState, RequestError, RequestResult, ResponseMetadata,
+    AppState, ChatTemplateKwargs, RequestError, RequestResult, ResponseMetadata,
     protocol::{
         ConversationRequest, FinishReason, GenerationEvent, ResponseAccumulator, ResponseOutput,
         json_error,
@@ -79,8 +78,7 @@ pub(crate) struct ChatRequest {
     stream_options: StreamOptions,
     n: Option<u32>,
     cache_salt: Option<String>,
-    #[serde(default, deserialize_with = "deserialize_template_kwargs")]
-    chat_template_kwargs: Option<RenderOptions>,
+    chat_template_kwargs: Option<ChatTemplateKwargs>,
     #[serde(flatten)]
     extra: BTreeMap<String, Value>,
 }
@@ -112,23 +110,9 @@ pub(crate) struct ResponsesRequest {
     #[serde(default)]
     stream: bool,
     cache_salt: Option<String>,
-    #[serde(default, deserialize_with = "deserialize_template_kwargs")]
-    chat_template_kwargs: Option<RenderOptions>,
+    chat_template_kwargs: Option<ChatTemplateKwargs>,
     #[serde(flatten)]
     extra: BTreeMap<String, Value>,
-}
-
-// A JSON object is required here: serde also accepts positional arrays for structs.
-fn deserialize_template_kwargs<'de, D: serde::Deserializer<'de>>(
-    deserializer: D,
-) -> Result<Option<RenderOptions>, D::Error> {
-    Option::<serde_json::Map<String, Value>>::deserialize(deserializer)?
-        .map(|map| {
-            let options =
-                RenderOptions::deserialize(Value::Object(map)).map_err(serde::de::Error::custom)?;
-            options.validate().map_err(serde::de::Error::custom)
-        })
-        .transpose()
 }
 
 const fn default_temperature() -> f64 {
@@ -198,6 +182,7 @@ fn chat_request(
     validate_sampling(body.temperature, body.top_p, body.top_k, body.seed)?;
     validate_logprobs(body.top_logprobs, state.max_top_logprobs)?;
     validate_stops(body.stop.as_ref())?;
+    validate_template_kwargs(state, body.chat_template_kwargs.as_ref())?;
     if body.messages.is_empty() {
         return Err(invalid_request("messages must not be empty"));
     }
@@ -436,6 +421,7 @@ fn responses_request(
     validate_sampling(body.temperature, body.top_p, body.top_k, body.seed)?;
     validate_logprobs(body.top_logprobs, state.max_top_logprobs)?;
     validate_stops(body.stop.as_ref())?;
+    validate_template_kwargs(state, body.chat_template_kwargs.as_ref())?;
     body.logprobs = Some(
         body.logprobs.unwrap_or(false)
             || body
@@ -781,6 +767,22 @@ fn unix_seconds() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(0, |duration| duration.as_secs())
+}
+
+fn validate_template_kwargs(
+    state: &AppState,
+    kwargs: Option<&ChatTemplateKwargs>,
+) -> RequestResult<()> {
+    if let Some(kwargs) = kwargs {
+        (state.validate_chat_template_kwargs)(kwargs).map_err(|message| {
+            request_error(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                format!("chat_template_kwargs: {message}"),
+                "invalid_request_error",
+            )
+        })?;
+    }
+    Ok(())
 }
 
 fn validate_logprobs(top_logprobs: Option<u32>, maximum: u32) -> RequestResult<()> {

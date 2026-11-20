@@ -84,56 +84,6 @@ pub enum ReasoningEffort {
     Number(serde_json::Number),
 }
 
-// Shared by the Rust type and its Python bindings. Reasoning effort and response
-// format have custom Python conversions and are declared separately below.
-#[doc(hidden)]
-#[macro_export]
-macro_rules! with_render_option_fields {
-    ($declare:ident) => {
-        $declare! {
-            enable_thinking: bool,
-            preserve_thinking: bool,
-            clear_thinking: bool,
-            add_generation_prompt: bool,
-            add_vision_id: bool,
-            use_system_prompt: bool,
-            model_identity: String,
-            knowledge_cutoff: String,
-            conversation_start_date: String,
-            auto_drop_analysis: bool,
-            thinking_mode: String,
-        }
-    };
-}
-
-macro_rules! declare_render_options {
-    ($($field:ident: $ty:ty,)*) => {
-        /// Explicit rendering controls; absent fields inherit recipe defaults.
-        #[derive(Clone, Debug, Default, Deserialize, Serialize)]
-        #[serde(default, deny_unknown_fields)]
-        pub struct RenderOptions {
-            pub reasoning_effort: Option<ReasoningEffort>,
-            $(pub $field: Option<$ty>,)*
-            pub response_format: Option<Value>,
-        }
-    };
-}
-
-with_render_option_fields!(declare_render_options);
-
-impl RenderOptions {
-    pub fn validate(self) -> Result<Self, Error> {
-        if self
-            .thinking_mode
-            .as_deref()
-            .is_some_and(|mode| !matches!(mode, "thinking" | "chat"))
-        {
-            return Err(Error::new("thinking_mode must be thinking or chat"));
-        }
-        Ok(self)
-    }
-}
-
 pub(crate) fn params<T: DeserializeOwned>(value: Value) -> Result<T, Error> {
     serde_json::from_value(value).map_err(|error| Error::new(error.to_string()))
 }

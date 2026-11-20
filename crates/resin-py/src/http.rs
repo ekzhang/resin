@@ -19,6 +19,7 @@ use tokio::sync::{mpsc, oneshot, watch};
 
 use crate::Engine;
 use crate::http_session::{Session, count_tokens, render_pool, render_worker_count};
+use crate::recipe_types::RenderOptions;
 
 #[derive(Clone, Copy)]
 pub(crate) struct AdmissionConfig {
@@ -165,6 +166,7 @@ impl NativeHttpServer {
                 routed_dp_size,
                 max_top_logprobs,
                 input_modalities,
+                validate_chat_template_kwargs: |kwargs| RenderOptions::from_map(kwargs).map(drop),
                 context_length,
             },
             running: AtomicBool::new(false),
