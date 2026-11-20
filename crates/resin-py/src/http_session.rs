@@ -758,10 +758,7 @@ fn render_input(
         .iter()
         .map(|value| Py::new(py, Tool::from_wire(value)?))
         .collect::<PyResult<Vec<_>>>()?;
-    let options = RenderOptions::from_wire(&serde_json::json!({
-        "reasoning_effort": request.reasoning_effort,
-        "extra": request.extra,
-    }))?;
+    let options = RenderOptions::from_request(request)?;
     Ok(RenderInput {
         messages,
         tools,
