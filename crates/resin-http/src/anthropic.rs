@@ -142,7 +142,6 @@ fn conversation_request(
         routed_dp_rank,
         stop: body.stop_sequences,
         reasoning_effort: None,
-        chat_template_kwargs: None,
         cache_salt: body.cache_salt,
         extra: body.extra,
     })

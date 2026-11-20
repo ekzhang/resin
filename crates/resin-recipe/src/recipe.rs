@@ -84,38 +84,6 @@ pub enum ReasoningEffort {
     Number(serde_json::Number),
 }
 
-/// Explicit rendering controls; absent fields inherit recipe defaults.
-#[derive(Clone, Debug, Default, Deserialize, Serialize)]
-#[serde(default, deny_unknown_fields)]
-pub struct RenderOptions {
-    pub reasoning_effort: Option<ReasoningEffort>,
-    pub enable_thinking: Option<bool>,
-    pub preserve_thinking: Option<bool>,
-    pub clear_thinking: Option<bool>,
-    pub add_generation_prompt: Option<bool>,
-    pub add_vision_id: Option<bool>,
-    pub use_system_prompt: Option<bool>,
-    pub model_identity: Option<String>,
-    pub knowledge_cutoff: Option<String>,
-    pub conversation_start_date: Option<String>,
-    pub auto_drop_analysis: Option<bool>,
-    pub thinking_mode: Option<String>,
-    pub response_format: Option<Value>,
-}
-
-impl RenderOptions {
-    pub fn validate(self) -> Result<Self, Error> {
-        if self
-            .thinking_mode
-            .as_deref()
-            .is_some_and(|mode| !matches!(mode, "thinking" | "chat"))
-        {
-            return Err(Error::new("thinking_mode must be thinking or chat"));
-        }
-        Ok(self)
-    }
-}
-
 pub(crate) fn params<T: DeserializeOwned>(value: Value) -> Result<T, Error> {
     serde_json::from_value(value).map_err(|error| Error::new(error.to_string()))
 }

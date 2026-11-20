@@ -26,8 +26,6 @@ pub struct ConversationRequest {
     pub reasoning_effort: Option<String>,
     #[serde(default)]
     pub cache_salt: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub chat_template_kwargs: Option<resin_recipe::RenderOptions>,
     pub extra: BTreeMap<String, Value>,
 }
 

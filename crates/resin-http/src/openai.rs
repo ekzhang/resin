@@ -14,7 +14,6 @@ use axum::{
         sse::{Event, KeepAlive, Sse},
     },
 };
-use resin_recipe::RenderOptions;
 use serde::Deserialize;
 use serde_json::{Value, json};
 use tokio::sync::{mpsc, oneshot};
@@ -79,8 +78,6 @@ pub(crate) struct ChatRequest {
     stream_options: StreamOptions,
     n: Option<u32>,
     cache_salt: Option<String>,
-    #[serde(default, deserialize_with = "deserialize_template_kwargs")]
-    chat_template_kwargs: Option<RenderOptions>,
     #[serde(flatten)]
     extra: BTreeMap<String, Value>,
 }
@@ -112,23 +109,8 @@ pub(crate) struct ResponsesRequest {
     #[serde(default)]
     stream: bool,
     cache_salt: Option<String>,
-    #[serde(default, deserialize_with = "deserialize_template_kwargs")]
-    chat_template_kwargs: Option<RenderOptions>,
     #[serde(flatten)]
     extra: BTreeMap<String, Value>,
-}
-
-// A JSON object is required here: serde also accepts positional arrays for structs.
-fn deserialize_template_kwargs<'de, D: serde::Deserializer<'de>>(
-    deserializer: D,
-) -> Result<Option<RenderOptions>, D::Error> {
-    Option::<serde_json::Map<String, Value>>::deserialize(deserializer)?
-        .map(|map| {
-            let options =
-                RenderOptions::deserialize(Value::Object(map)).map_err(serde::de::Error::custom)?;
-            options.validate().map_err(serde::de::Error::custom)
-        })
-        .transpose()
 }
 
 const fn default_temperature() -> f64 {
@@ -228,7 +210,6 @@ fn chat_request(
         stop: body.stop.map_or_else(Vec::new, OneOrManyStrings::into_vec),
         reasoning_effort: body.reasoning_effort,
         cache_salt: body.cache_salt,
-        chat_template_kwargs: body.chat_template_kwargs,
         extra: body.extra,
     })
 }
@@ -483,7 +464,6 @@ fn responses_request(
         stop: body.stop.map_or_else(Vec::new, OneOrManyStrings::into_vec),
         reasoning_effort,
         cache_salt: body.cache_salt,
-        chat_template_kwargs: body.chat_template_kwargs,
         extra: body.extra,
     })
 }

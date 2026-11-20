@@ -8,8 +8,8 @@ use pyo3::{
     types::{PyBytes, PyTuple},
 };
 use pythonize::{depythonize, pythonize};
-use resin_http::ConversationRequest;
-use resin_recipe::{BlockKind, MessagePolicy, RenderOptions as RecipeOptions};
+use resin_recipe::{BlockKind, MessagePolicy, ReasoningEffort};
+use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 
 /// Conversation role. This enum is extensible: new roles may be added.
@@ -712,8 +712,34 @@ fn content_value(mut content: Vec<Value>) -> Value {
 
 /// Explicit rendering controls; absent fields inherit recipe defaults.
 #[pyclass(frozen, module = "resin._resin", skip_from_py_object)]
-#[derive(Clone)]
-pub(crate) struct RenderOptions(RecipeOptions);
+#[derive(Clone, Default, Deserialize, Serialize)]
+#[serde(default, deny_unknown_fields)]
+pub(crate) struct RenderOptions {
+    reasoning_effort: Option<ReasoningEffort>,
+    #[pyo3(get)]
+    enable_thinking: Option<bool>,
+    #[pyo3(get)]
+    preserve_thinking: Option<bool>,
+    #[pyo3(get)]
+    clear_thinking: Option<bool>,
+    #[pyo3(get)]
+    add_generation_prompt: Option<bool>,
+    #[pyo3(get)]
+    add_vision_id: Option<bool>,
+    #[pyo3(get)]
+    use_system_prompt: Option<bool>,
+    #[pyo3(get)]
+    model_identity: Option<String>,
+    #[pyo3(get)]
+    knowledge_cutoff: Option<String>,
+    #[pyo3(get)]
+    conversation_start_date: Option<String>,
+    #[pyo3(get)]
+    auto_drop_analysis: Option<bool>,
+    #[pyo3(get)]
+    thinking_mode: Option<String>,
+    response_format: Option<Value>,
+}
 #[pymethods]
 impl RenderOptions {
     #[new]
@@ -735,7 +761,7 @@ impl RenderOptions {
         response_format: Option<&Bound<'_, PyAny>>,
     ) -> PyResult<Self> {
         let response_format = json_value(response_format)?;
-        RecipeOptions {
+        Self {
             reasoning_effort: serde_json::from_value(json_value(reasoning_effort)?)
                 .map_err(|_| PyValueError::new_err("reasoning_effort must be a name or number"))?,
             enable_thinking,
@@ -752,60 +778,14 @@ impl RenderOptions {
             response_format: (!response_format.is_null()).then_some(response_format),
         }
         .validate()
-        .map(Self)
-        .map_err(|e| PyValueError::new_err(e.to_string()))
     }
     #[getter]
     fn reasoning_effort(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
-        Ok(pythonize(py, &self.0.reasoning_effort)?.unbind())
-    }
-    #[getter]
-    fn enable_thinking(&self) -> Option<bool> {
-        self.0.enable_thinking
-    }
-    #[getter]
-    fn preserve_thinking(&self) -> Option<bool> {
-        self.0.preserve_thinking
-    }
-    #[getter]
-    fn clear_thinking(&self) -> Option<bool> {
-        self.0.clear_thinking
-    }
-    #[getter]
-    fn add_generation_prompt(&self) -> Option<bool> {
-        self.0.add_generation_prompt
-    }
-    #[getter]
-    fn add_vision_id(&self) -> Option<bool> {
-        self.0.add_vision_id
-    }
-    #[getter]
-    fn use_system_prompt(&self) -> Option<bool> {
-        self.0.use_system_prompt
-    }
-    #[getter]
-    fn model_identity(&self) -> Option<&str> {
-        self.0.model_identity.as_deref()
-    }
-    #[getter]
-    fn knowledge_cutoff(&self) -> Option<&str> {
-        self.0.knowledge_cutoff.as_deref()
-    }
-    #[getter]
-    fn conversation_start_date(&self) -> Option<&str> {
-        self.0.conversation_start_date.as_deref()
-    }
-    #[getter]
-    fn auto_drop_analysis(&self) -> Option<bool> {
-        self.0.auto_drop_analysis
-    }
-    #[getter]
-    fn thinking_mode(&self) -> Option<&str> {
-        self.0.thinking_mode.as_deref()
+        Ok(pythonize(py, &self.reasoning_effort)?.unbind())
     }
     #[getter]
     fn response_format(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
-        Ok(pythonize(py, &self.0.response_format)?.unbind())
+        Ok(pythonize(py, &self.response_format)?.unbind())
     }
     fn __repr__(&self) -> String {
         format!("RenderOptions({})", Value::Object(self.to_map()))
@@ -813,39 +793,41 @@ impl RenderOptions {
 }
 impl RenderOptions {
     pub(crate) fn to_map(&self) -> Map<String, Value> {
-        let Value::Object(mut value) = serde_json::to_value(&self.0).unwrap() else {
+        let Value::Object(mut value) = serde_json::to_value(self).unwrap() else {
             unreachable!()
         };
         value.retain(|_, value| !value.is_null());
         value
     }
-    pub(crate) fn from_request(request: &ConversationRequest) -> PyResult<Self> {
-        let defaults = RecipeOptions::default();
-        let kwargs = request.chat_template_kwargs.as_ref().unwrap_or(&defaults);
-        let Value::Object(mut values) = serde_json::to_value(kwargs).unwrap() else {
+    pub(crate) fn from_wire(request: &Value) -> PyResult<Self> {
+        let Value::Object(mut value) = serde_json::to_value(Self::default()).unwrap() else {
             unreachable!()
         };
-        for (key, field) in &mut values {
-            if let Some(value) = request.extra.get(key).filter(|value| !value.is_null()) {
-                *field = value.clone();
-            }
+        for (key, field) in &mut value {
+            *field = request
+                .get(key)
+                .filter(|v| !v.is_null())
+                .or_else(|| request["extra"].get(key).filter(|v| !v.is_null()))
+                .cloned()
+                .unwrap_or(Value::Null);
         }
-        if let Some(effort) = &request.reasoning_effort {
-            values.insert("reasoning_effort".into(), json!(effort));
+        if value["thinking_mode"].is_null() && request["extra"]["thinking"]["type"] == "enabled" {
+            value.insert("thinking_mode".into(), json!("thinking"));
         }
-        if values["thinking_mode"].is_null()
-            && request
-                .extra
-                .get("thinking")
-                .is_some_and(|value| value["type"] == "enabled")
-        {
-            values.insert("thinking_mode".into(), json!("thinking"));
-        }
-        let options: RecipeOptions = serde_path_to_error::deserialize(Value::Object(values))
+        let options: Self = serde_path_to_error::deserialize(Value::Object(value))
             .map_err(|error| PyValueError::new_err(error.to_string()))?;
-        options
-            .validate()
-            .map(Self)
-            .map_err(|error| PyValueError::new_err(error.to_string()))
+        options.validate()
+    }
+    fn validate(self) -> PyResult<Self> {
+        if self
+            .thinking_mode
+            .as_deref()
+            .is_some_and(|mode| !matches!(mode, "thinking" | "chat"))
+        {
+            return Err(PyValueError::new_err(
+                "thinking_mode must be thinking or chat",
+            ));
+        }
+        Ok(self)
     }
 }
