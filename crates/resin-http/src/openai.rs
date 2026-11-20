@@ -15,7 +15,7 @@ use axum::{
     },
 };
 use serde::Deserialize;
-use serde_json::{Value, json};
+use serde_json::{Map, Value, json};
 use tokio::sync::{mpsc, oneshot};
 
 use crate::{
@@ -78,6 +78,7 @@ pub(crate) struct ChatRequest {
     stream_options: StreamOptions,
     n: Option<u32>,
     cache_salt: Option<String>,
+    chat_template_kwargs: Option<Map<String, Value>>,
     #[serde(flatten)]
     extra: BTreeMap<String, Value>,
 }
@@ -109,6 +110,7 @@ pub(crate) struct ResponsesRequest {
     #[serde(default)]
     stream: bool,
     cache_salt: Option<String>,
+    chat_template_kwargs: Option<Map<String, Value>>,
     #[serde(flatten)]
     extra: BTreeMap<String, Value>,
 }
@@ -210,6 +212,7 @@ fn chat_request(
         stop: body.stop.map_or_else(Vec::new, OneOrManyStrings::into_vec),
         reasoning_effort: body.reasoning_effort,
         cache_salt: body.cache_salt,
+        chat_template_kwargs: body.chat_template_kwargs,
         extra: body.extra,
     })
 }
@@ -464,6 +467,7 @@ fn responses_request(
         stop: body.stop.map_or_else(Vec::new, OneOrManyStrings::into_vec),
         reasoning_effort,
         cache_salt: body.cache_salt,
+        chat_template_kwargs: body.chat_template_kwargs,
         extra: body.extra,
     })
 }

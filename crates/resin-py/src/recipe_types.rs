@@ -8,6 +8,7 @@ use pyo3::{
     types::{PyBytes, PyTuple},
 };
 use pythonize::{depythonize, pythonize};
+use resin_http::ConversationRequest;
 use resin_recipe::{BlockKind, MessagePolicy, ReasoningEffort};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
@@ -799,22 +800,29 @@ impl RenderOptions {
         value.retain(|_, value| !value.is_null());
         value
     }
-    pub(crate) fn from_wire(request: &Value) -> PyResult<Self> {
-        let Value::Object(mut value) = serde_json::to_value(Self::default()).unwrap() else {
+    pub(crate) fn from_request(request: &ConversationRequest) -> PyResult<Self> {
+        let mut values = request.chat_template_kwargs.clone().unwrap_or_default();
+        // Existing top-level render options take precedence over template arguments.
+        let Value::Object(fields) = serde_json::to_value(Self::default()).unwrap() else {
             unreachable!()
         };
-        for (key, field) in &mut value {
-            *field = request
-                .get(key)
-                .filter(|v| !v.is_null())
-                .or_else(|| request["extra"].get(key).filter(|v| !v.is_null()))
-                .cloned()
-                .unwrap_or(Value::Null);
+        for key in fields.keys() {
+            if let Some(value) = request.extra.get(key).filter(|value| !value.is_null()) {
+                values.insert(key.clone(), value.clone());
+            }
         }
-        if value["thinking_mode"].is_null() && request["extra"]["thinking"]["type"] == "enabled" {
-            value.insert("thinking_mode".into(), json!("thinking"));
+        if let Some(effort) = &request.reasoning_effort {
+            values.insert("reasoning_effort".into(), json!(effort));
         }
-        let options: Self = serde_path_to_error::deserialize(Value::Object(value))
+        if values.get("thinking_mode").is_none_or(Value::is_null)
+            && request
+                .extra
+                .get("thinking")
+                .is_some_and(|value| value["type"] == "enabled")
+        {
+            values.insert("thinking_mode".into(), json!("thinking"));
+        }
+        let options: Self = serde_path_to_error::deserialize(values)
             .map_err(|error| PyValueError::new_err(error.to_string()))?;
         options.validate()
     }

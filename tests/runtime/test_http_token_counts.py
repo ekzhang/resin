@@ -35,6 +35,8 @@ class CountingRecipe:
             tuple(tool.name for tool in tools),
             options.reasoning_effort,
             options.thinking_mode,
+            options.enable_thinking,
+            options.preserve_thinking,
         )
         self.renders.append(signature)
         count = len(repr(signature))
@@ -130,6 +132,47 @@ def test_count_matches_generation_usage_without_inference(
         if isinstance(recipe, CountingRecipe):
             assert recipe.parsers == 1
             assert recipe.renders[0] == recipe.renders[1]
+        assert errors == []
+
+
+@pytest.mark.parametrize(
+    "path,body,enable_thinking",
+    [
+        (
+            "/v1/chat/completions",
+            {"messages": [{"role": "user", "content": "hello"}], "max_tokens": 1},
+            False,
+        ),
+        ("/v1/responses", {"input": "hello", "max_output_tokens": 1}, False),
+        (
+            "/v1/responses/input_tokens",
+            {"input": "hello", "enable_thinking": True},
+            True,
+        ),
+    ],
+)
+def test_openai_chat_template_kwargs(path, body, enable_thinking):
+    recipe = CountingRecipe()
+    request = {"model": "test", **body}
+    with running_server(Runner(), recipe) as (_, _, _, errors, base, _):
+        kwargs = {
+            "enable_thinking": False,
+            "preserve_thinking": True,
+            "reasoning_effort": "low",
+        }
+        with send(base, path, {**request, "chat_template_kwargs": kwargs}) as response:
+            assert response.status == 200
+        assert recipe.renders == [("hello", (), "low", None, enable_thinking, True)]
+
+        with pytest.raises(urllib.error.HTTPError) as failure:
+            send(base, path, {**request, "chat_template_kwargs": []})
+        assert failure.value.code == 422
+
+        for key, value in [("temperature", None), ("preserve_thinking", "yes")]:
+            with pytest.raises(urllib.error.HTTPError) as failure:
+                send(base, path, {**request, "chat_template_kwargs": {key: value}})
+            assert key in json.load(failure.value)["error"]["message"]
+        assert len(recipe.renders) == 1
         assert errors == []
 
 
