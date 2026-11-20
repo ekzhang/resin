@@ -84,24 +84,42 @@ pub enum ReasoningEffort {
     Number(serde_json::Number),
 }
 
-/// Explicit rendering controls; absent fields inherit recipe defaults.
-#[derive(Clone, Debug, Default, Deserialize, Serialize)]
-#[serde(default, deny_unknown_fields)]
-pub struct RenderOptions {
-    pub reasoning_effort: Option<ReasoningEffort>,
-    pub enable_thinking: Option<bool>,
-    pub preserve_thinking: Option<bool>,
-    pub clear_thinking: Option<bool>,
-    pub add_generation_prompt: Option<bool>,
-    pub add_vision_id: Option<bool>,
-    pub use_system_prompt: Option<bool>,
-    pub model_identity: Option<String>,
-    pub knowledge_cutoff: Option<String>,
-    pub conversation_start_date: Option<String>,
-    pub auto_drop_analysis: Option<bool>,
-    pub thinking_mode: Option<String>,
-    pub response_format: Option<Value>,
+// Shared by the Rust type and its Python bindings. Reasoning effort and response
+// format have custom Python conversions and are declared separately below.
+#[doc(hidden)]
+#[macro_export]
+macro_rules! with_render_option_fields {
+    ($declare:ident) => {
+        $declare! {
+            enable_thinking: bool,
+            preserve_thinking: bool,
+            clear_thinking: bool,
+            add_generation_prompt: bool,
+            add_vision_id: bool,
+            use_system_prompt: bool,
+            model_identity: String,
+            knowledge_cutoff: String,
+            conversation_start_date: String,
+            auto_drop_analysis: bool,
+            thinking_mode: String,
+        }
+    };
 }
+
+macro_rules! declare_render_options {
+    ($($field:ident: $ty:ty,)*) => {
+        /// Explicit rendering controls; absent fields inherit recipe defaults.
+        #[derive(Clone, Debug, Default, Deserialize, Serialize)]
+        #[serde(default, deny_unknown_fields)]
+        pub struct RenderOptions {
+            pub reasoning_effort: Option<ReasoningEffort>,
+            $(pub $field: Option<$ty>,)*
+            pub response_format: Option<Value>,
+        }
+    };
+}
+
+with_render_option_fields!(declare_render_options);
 
 impl RenderOptions {
     pub fn validate(self) -> Result<Self, Error> {
