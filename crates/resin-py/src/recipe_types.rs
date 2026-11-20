@@ -779,7 +779,6 @@ impl RenderOptions {
             response_format: (!response_format.is_null()).then_some(response_format),
         }
         .validate()
-        .map_err(PyValueError::new_err)
     }
     #[getter]
     fn reasoning_effort(&self, py: Python<'_>) -> PyResult<Py<PyAny>> {
@@ -800,11 +799,6 @@ impl RenderOptions {
         };
         value.retain(|_, value| !value.is_null());
         value
-    }
-    pub(crate) fn from_map(values: &Map<String, Value>) -> Result<Self, String> {
-        let options: Self =
-            serde_path_to_error::deserialize(values).map_err(|error| error.to_string())?;
-        options.validate().map_err(str::to_owned)
     }
     pub(crate) fn from_request(request: &ConversationRequest) -> PyResult<Self> {
         let mut values = request.chat_template_kwargs.clone().unwrap_or_default();
@@ -828,15 +822,19 @@ impl RenderOptions {
         {
             values.insert("thinking_mode".into(), json!("thinking"));
         }
-        Self::from_map(&values).map_err(PyValueError::new_err)
+        let options: Self = serde_path_to_error::deserialize(values)
+            .map_err(|error| PyValueError::new_err(error.to_string()))?;
+        options.validate()
     }
-    fn validate(self) -> Result<Self, &'static str> {
+    fn validate(self) -> PyResult<Self> {
         if self
             .thinking_mode
             .as_deref()
             .is_some_and(|mode| !matches!(mode, "thinking" | "chat"))
         {
-            return Err("thinking_mode must be thinking or chat");
+            return Err(PyValueError::new_err(
+                "thinking_mode must be thinking or chat",
+            ));
         }
         Ok(self)
     }

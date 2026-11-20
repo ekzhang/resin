@@ -15,11 +15,11 @@ use axum::{
     },
 };
 use serde::Deserialize;
-use serde_json::{Value, json};
+use serde_json::{Map, Value, json};
 use tokio::sync::{mpsc, oneshot};
 
 use crate::{
-    AppState, ChatTemplateKwargs, RequestError, RequestResult, ResponseMetadata,
+    AppState, RequestError, RequestResult, ResponseMetadata,
     protocol::{
         ConversationRequest, FinishReason, GenerationEvent, ResponseAccumulator, ResponseOutput,
         json_error,
@@ -78,7 +78,7 @@ pub(crate) struct ChatRequest {
     stream_options: StreamOptions,
     n: Option<u32>,
     cache_salt: Option<String>,
-    chat_template_kwargs: Option<ChatTemplateKwargs>,
+    chat_template_kwargs: Option<Map<String, Value>>,
     #[serde(flatten)]
     extra: BTreeMap<String, Value>,
 }
@@ -110,7 +110,7 @@ pub(crate) struct ResponsesRequest {
     #[serde(default)]
     stream: bool,
     cache_salt: Option<String>,
-    chat_template_kwargs: Option<ChatTemplateKwargs>,
+    chat_template_kwargs: Option<Map<String, Value>>,
     #[serde(flatten)]
     extra: BTreeMap<String, Value>,
 }
@@ -182,7 +182,6 @@ fn chat_request(
     validate_sampling(body.temperature, body.top_p, body.top_k, body.seed)?;
     validate_logprobs(body.top_logprobs, state.max_top_logprobs)?;
     validate_stops(body.stop.as_ref())?;
-    validate_template_kwargs(state, body.chat_template_kwargs.as_ref())?;
     if body.messages.is_empty() {
         return Err(invalid_request("messages must not be empty"));
     }
@@ -421,7 +420,6 @@ fn responses_request(
     validate_sampling(body.temperature, body.top_p, body.top_k, body.seed)?;
     validate_logprobs(body.top_logprobs, state.max_top_logprobs)?;
     validate_stops(body.stop.as_ref())?;
-    validate_template_kwargs(state, body.chat_template_kwargs.as_ref())?;
     body.logprobs = Some(
         body.logprobs.unwrap_or(false)
             || body
@@ -767,22 +765,6 @@ fn unix_seconds() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(0, |duration| duration.as_secs())
-}
-
-fn validate_template_kwargs(
-    state: &AppState,
-    kwargs: Option<&ChatTemplateKwargs>,
-) -> RequestResult<()> {
-    if let Some(kwargs) = kwargs {
-        (state.validate_chat_template_kwargs)(kwargs).map_err(|message| {
-            request_error(
-                StatusCode::UNPROCESSABLE_ENTITY,
-                format!("chat_template_kwargs: {message}"),
-                "invalid_request_error",
-            )
-        })?;
-    }
-    Ok(())
 }
 
 fn validate_logprobs(top_logprobs: Option<u32>, maximum: u32) -> RequestResult<()> {

@@ -164,10 +164,14 @@ def test_openai_chat_template_kwargs(path, body, enable_thinking):
             assert response.status == 200
         assert recipe.renders == [("hello", (), "low", None, enable_thinking, True)]
 
-        for invalid in [[], {"temperature": None}, {"preserve_thinking": "yes"}]:
+        with pytest.raises(urllib.error.HTTPError) as failure:
+            send(base, path, {**request, "chat_template_kwargs": []})
+        assert failure.value.code == 422
+
+        for key, value in [("temperature", None), ("preserve_thinking", "yes")]:
             with pytest.raises(urllib.error.HTTPError) as failure:
-                send(base, path, {**request, "chat_template_kwargs": invalid})
-            assert failure.value.code == 422
+                send(base, path, {**request, "chat_template_kwargs": {key: value}})
+            assert key in json.load(failure.value)["error"]["message"]
         assert len(recipe.renders) == 1
         assert errors == []
 
