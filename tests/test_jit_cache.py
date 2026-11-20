@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import os
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -88,3 +90,39 @@ def test_compiler_namespace_preparation_tolerates_concurrent_rank(
     trace_link = tmp_path / "home/.cache/flashinfer/trace_apply/solutions"
     assert trace_link.is_symlink()
     assert trace_link.resolve() == root / "flashinfer-trace-apply"
+
+
+def test_native_cache_key_uses_exposed_isa_even_with_generic_model_name():
+    from deploy.jit_cache import _host_cpu_cache_key
+
+    def key(flags):
+        return _host_cpu_cache_key(f"model name: unknown\nflags: {flags}\n", "x86_64")
+
+    assert key("avx2 fma") == key("fma avx2")
+    assert key("avx2 fma") != key("avx2 fma avx512f")
+    assert _host_cpu_cache_key("model name: unknown", "x86_64") is None
+
+
+def test_shared_native_objects_are_scoped_before_model_import(monkeypatch, tmp_path):
+    from deploy import jit_cache
+    from deploy.models import get_model, prepare_runtime
+
+    spec = replace(get_model("gemma4-e2b"), kernel_mount=str(tmp_path))
+    for backend in ("QUACK", "FLASH_ATTENTION_CUTE_DSL"):
+        monkeypatch.setenv(f"{backend}_CACHE_DIR", str(tmp_path / backend))
+        monkeypatch.setenv(f"{backend}_CACHE_ENABLED", "1")
+    monkeypatch.setenv("CUDA_CACHE_PATH", str(tmp_path / "cuda-driver"))
+
+    for cpu in ("avx512", "avx2", "avx2", None):
+        monkeypatch.setattr(
+            jit_cache, "_host_cpu_cache_key", lambda *args, key=cpu: key
+        )
+        prepare_runtime(spec)
+        for backend in ("QUACK", "FLASH_ATTENTION_CUTE_DSL"):
+            if cpu:
+                scoped = tmp_path / backend / "host-cpu-v1" / cpu
+                assert os.environ[f"{backend}_CACHE_DIR"] == str(scoped)
+                assert scoped.is_dir()
+            else:
+                assert os.environ[f"{backend}_CACHE_ENABLED"] == "0"
+        assert os.environ["CUDA_CACHE_PATH"] == str(tmp_path / "cuda-driver")

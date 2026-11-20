@@ -90,6 +90,13 @@ The CUDA scorer uses QuACK's persistent CuTe object cache. With
 `QUACK_CACHE_ENABLED=1`, compiled objects are exported under `QUACK_CACHE_DIR`
 and loaded directly on subsequent processes. Serving routes this directory into
 the shared kernel volume alongside the lower-level `CUTE_DSL_CACHE_DIR`.
+QuACK and FA4 export host-native launch code in their objects. Before importing
+these packages, deployment workers select a subdirectory keyed by the CPU
+architecture, model identifiers and exposed instruction-set flags. Workers
+with matching capabilities can reuse these objects across restarts. When the
+host does not expose its CPU features, the worker disables persistent reuse for
+those two packages. GPU driver caches and FlashInfer artifacts retain their
+existing namespaces.
 Scoring keys include its source digest, target architecture, compiler/runtime
 versions, and kernel configuration; batch size and requested top count remain
 runtime arguments. In-memory executors are isolated by CUDA context, while disk

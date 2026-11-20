@@ -566,6 +566,10 @@ def image_environment(model: str | ModelSpec) -> dict[str, str]:
 
 def prepare_runtime(model: str | ModelSpec) -> None:
     spec = get_model(model)
+    if spec.kernel_mount:
+        from deploy.jit_cache import scope_host_object_caches
+
+        scope_host_object_caches(spec.kernel_mount)
     if spec.family == "gpt_oss":
         from deploy.jit_cache import (
             ensure_kernel_cache_dirs,

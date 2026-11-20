@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import hashlib
 import os
+import platform
 from pathlib import Path
 
 KERNEL_CACHE_VOLUME_NAME = "resin-kernel-cache-v2"
@@ -71,6 +73,50 @@ _PATH_ENV_KEYS = (
     "KERNELS_CACHE",
 )
 _LOCAL_BUILD_PATH_ENV_KEYS = ("FLASHINFER_WORKSPACE_BASE",)
+
+
+def _host_cpu_cache_key(cpuinfo: str, machine: str) -> str | None:
+    """Identify the host instructions available to CuTe's native launcher."""
+    first_cpu = cpuinfo.partition("\n\n")[0]
+    fields = {}
+    for line in first_cpu.splitlines():
+        key, sep, value = line.partition(":")
+        if sep:
+            fields[key.strip().lower()] = value.strip()
+    features = fields.get("flags") or fields.get("features")
+    if not features:
+        return None
+    identity = [machine]
+    for key in ("vendor_id", "cpu family", "model", "cpu implementer", "cpu part"):
+        identity.append(fields.get(key, ""))
+    identity.extend(sorted(set(features.split())))
+    return hashlib.sha256("\n".join(identity).encode()).hexdigest()[:24]
+
+
+def scope_host_object_caches(mount: str) -> None:
+    """Select CPU-compatible QuACK and FA4 objects before importing either."""
+    try:
+        cpuinfo = Path("/proc/cpuinfo").read_text()
+    except OSError:
+        cpuinfo = ""
+    cpu_key = _host_cpu_cache_key(cpuinfo, platform.machine())
+    for backend in ("QUACK", "FLASH_ATTENTION_CUTE_DSL"):
+        setting = f"{backend}_CACHE_DIR"
+        value = os.environ.get(setting)
+        if not value:
+            continue
+        base = Path(value)
+        if not base.is_relative_to(mount):
+            continue
+        if cpu_key is None:
+            os.environ[f"{backend}_CACHE_ENABLED"] = "0"
+            continue
+        # Workers can inherit an already-scoped path from a launcher.
+        if base.parent.name == "host-cpu-v1":
+            base = base.parent.parent
+        target = base / "host-cpu-v1" / cpu_key
+        target.mkdir(parents=True, exist_ok=True)
+        os.environ[setting] = str(target)
 
 
 def ensure_kernel_cache_dirs() -> None:
