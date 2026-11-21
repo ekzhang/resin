@@ -75,10 +75,10 @@ class CacheGeometry:
         ):
             raise ValueError("Inkling 2 target and draft KV geometry must match")
         return cls(
-            global_layers=target.num_hidden_layers - len(target.local_layer_ids),
-            local_layers=len(target.local_layer_ids),
-            draft_global_layers=draft.num_hidden_layers - len(draft.local_layer_ids),
-            draft_local_layers=len(draft.local_layer_ids),
+            global_layers=target.execution_global_layer_count,
+            local_layers=target.execution_local_layer_count,
+            draft_global_layers=draft.global_layer_count,
+            draft_local_layers=draft.local_layer_count,
             kv_heads=target.num_key_value_heads // attn_tp,
             head_dim=target.head_dim,
             hidden_size=target.hidden_size,
@@ -230,8 +230,71 @@ class DeviceCache(SlabDeviceCache):
     def state_at(self, positions: Tensor) -> Tensor:
         return self.states[self._state_indices(positions)]
 
+    def _live_state_group(self) -> DevicePageGroup | None:
+        group = self.groups[self.geometry.state_group]
+        if (
+            self.states.is_cuda
+            and group.live_state
+            and group.slab_ids.shape[1] == 1
+            and self.states[0, 0].is_contiguous()
+        ):
+            return group
+        return None
+
+    def load_initial_state(
+        self, positions: Tensor, *, out: Tensor | None = None
+    ) -> Tensor | None:
+        group = self._live_state_group()
+        if (
+            group is None
+            or positions.device != self.states.device
+            or positions.shape != (group.slab_ids.shape[0],)
+            or not positions.numel()
+        ):
+            return None
+        shape = (positions.numel(), *self.states.shape[2:])
+        if out is None:
+            out = self.states.new_empty(shape)
+        elif (
+            out.shape != shape
+            or out.dtype != self.states.dtype
+            or out.device != self.states.device
+            or not out.is_contiguous()
+        ):
+            return None
+        from resin_models_cuda.inkling2.triton import transfer_live_state
+
+        transfer_live_state(self.states, group, positions, out, store=False)
+        return out
+
     def store_state(self, positions: Tensor, state: Tensor) -> None:
+        group = self._live_state_group()
+        if (
+            group is not None
+            and positions.device == state.device == self.states.device
+            and positions.shape == (group.slab_ids.shape[0], 1)
+            and state.shape == (*positions.shape, *self.states.shape[2:])
+            and state.is_contiguous()
+            and positions.numel()
+        ):
+            from resin_models_cuda.inkling2.triton import transfer_live_state
+
+            transfer_live_state(self.states, group, positions[:, 0], state, store=True)
+            return
         self.states[self._state_indices(positions)] = state
+
+    def store_accepted_state(
+        self, positions: Tensor, initial: Tensor, inputs: Tensor, accepted: Tensor
+    ) -> bool:
+        group = self._live_state_group()
+        if group is None or not initial.is_contiguous() or not inputs.is_contiguous():
+            return False
+        from resin_models_cuda.inkling2.triton import store_selected_convolution_state
+
+        store_selected_convolution_state(
+            self.states, group, positions, initial, inputs, accepted
+        )
+        return True
 
     def draft_features_at(self, positions: Tensor) -> Tensor:
         assert self.draft_features is not None

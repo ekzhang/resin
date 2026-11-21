@@ -49,13 +49,17 @@ def tiny_config() -> Inkling2Config:
 class DenseCache:
     def __init__(self, config, batch):
         self.page_tokens, self.slab_units = 128, 1
-        self.counts = {0: config.global_layer_count, 1: config.local_layer_count}
+        self.counts = {
+            0: config.execution_global_layer_count,
+            1: config.execution_local_layer_count,
+        }
+        self.writes = []
         self.groups = [
             SimpleNamespace(first_blocks=torch.zeros(batch, dtype=torch.int64))
             for _ in range(2)
         ]
         self.keys = torch.zeros(
-            batch * config.num_hidden_layers,
+            batch * config.execution_layer_count,
             self.page_tokens,
             config.num_key_value_heads,
             config.head_dim,
@@ -76,6 +80,8 @@ class DenseCache:
         ), positions
 
     def store_kv(self, keys, values, positions, *, group_index, layer, layer_count):
+        assert layer_count == self.counts[group_index]
+        self.writes.append((group_index, layer))
         pages, offsets = self.page_locations(
             group_index=group_index,
             layer=layer,
@@ -157,6 +163,10 @@ def checkpoint_tensors(config):
         "unembed.weight": (config.vocab_size, h),
         "attn_res.output_query": (h,),
     }
+    if loop := config.loop:
+        query_shape = (2 * (loop.core_end - loop.core_start), h)
+        shapes["middle_cycle_cross_pass_queries"] = query_shape
+        shapes["middle_cycle_cross_pass_kv_queries"] = query_shape
     for i in range(config.num_hidden_layers):
         local = i in config.local_layer_ids
         if i:
@@ -205,11 +215,18 @@ def checkpoint_tensors(config):
             h,
             config.intermediate_size,
         )
+        if loop and loop.core_start <= i < loop.core_end:
+            for stream in ("attn", "k", "v", "mlp"):
+                controller = prefix + f"controllers.{stream}."
+                shapes[controller + "down_weight"] = (loop.gate_rank, 2 * h)
+                shapes[controller + "gain_weight"] = (h, loop.gate_rank)
+                shapes[controller + "forget_weight"] = (h, loop.gate_rank)
     return {
         "model.llm." + name: torch.randn(
             shape,
             dtype=torch.float32
-            if name.startswith("attn_res.") or name.endswith("gate.bias")
+            if name.startswith(("attn_res.", "middle_cycle_cross_pass_"))
+            or name.endswith("gate.bias")
             else torch.bfloat16,
         )
         for name, shape in shapes.items()

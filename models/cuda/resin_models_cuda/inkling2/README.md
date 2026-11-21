@@ -1,14 +1,16 @@
 # Inkling 2 on Blackwell
 
-`Inkling2CudaRunner` runs **Inkling 2 Small**, including its bundled DSpark
-speculator and image encoder. The model family and deployment key are `inkling2`.
+`Inkling2CudaRunner` runs **Inkling 2 Small** and **Inkling 2 Mini**, including their
+bundled DSpark speculators and image encoders. The `inkling2` model family has two
+deployment presets, `inkling2-small` and `inkling2-mini`.
 
 The deployment registry pins
 [`thinkingmachines/Inkling-2-Small`](https://huggingface.co/thinkingmachines/Inkling-2-Small/tree/2ad1157016e1aac77b6ff1b770e7c05229403134)
-at `2ad1157016e1aac77b6ff1b770e7c05229403134`. The checkpoint mixes NVFP4 and
-MXFP8 expert matrices; attention, dense projections, recurrent state and KV use
-BF16. Loading follows each matrix's quantization metadata and materializes only
-the rank's experts and attention shards.
+and [`thinkingmachines/Inkling-2-Mini`](https://huggingface.co/thinkingmachines/Inkling-2-Mini/tree/ed40e7da625f594fc9c4990f5f66be24873c22d7).
+These checkpoints mix NVFP4 and MXFP8 expert matrices. Attention, dense
+projections, recurrent state, and KV use BF16. Both presets use the same h200k
+tokenizer. Loading follows each matrix's quantization metadata and materializes
+only the rank's experts and attention shards.
 
 ## Execution
 
@@ -20,15 +22,20 @@ DP2/EP2 and four-GPU TP2/DP2/EP4 are also supported configurations. Idle attenti
 replicas still participate in expert communication. Context parallelism is not
 implemented.
 
-The `inkling2` Modal preset uses two B300s with TP2/EP2, a 1,048,576-token
+The `inkling2-small` Modal preset uses two B300s with TP2/EP2, a 1,048,576-token
 context limit, up to 256 concurrent requests and seven DSpark proposals. It enables
 the CuTe expert backend and fused attention prologue.
+
+The `inkling2-mini` Modal preset uses one B300 and seven DSpark proposals.
+Mini executes 48 layer visits using 24 sets of weights. The 12 middle layers
+run three times, with message controllers injecting information from the
+preceding pass. Each visit has its own KV cache and convolution history.
 
 ETP preserves the full expert's activation scale and reduces W2 partial sums in
 FP32 before rounding each route to BF16. With EP1 and matching attention TP,
 both GPUs already have the inputs, so expert dispatch needs no all-to-all.
 
-The target has 48 layers: 40 use a 1,024-token attention window and eight use
+Of Small's 48 target layers, 40 use a 1,024-token attention window and eight use
 global attention. Attention uses the pinned FlashAttention 4 Blackwell kernel
 with an FP32 output accumulator, followed by Inkling's sink and channel gate.
 Short convolution and attention-residual operations use model-local fused
@@ -105,8 +112,9 @@ Use two ranks with `RESIN_TEST_ATTN_TP=1` or `2`, or four ranks with TP=2, and s
 `RESIN_TEST_CHECKPOINT` to the local checkpoint directory. Kernel tests require
 CUDA; the Engine smoke test requires Blackwell GPUs.
 
-Use the shared `deploy/modal_bench.py` qualification runner and
-`scripts/bench.py --model inkling2`. The [32K decode comparison](../../../../artifacts/inkling2-qualification/batched-final-pipeline/comparison/README.md)
+Use the shared `deploy/modal_bench.py` qualification runner and select
+`--model inkling2-small` or `--model inkling2-mini` in `scripts/bench.py`.
+The [32K Small decode comparison](../../../../artifacts/inkling2-qualification/batched-final-pipeline/comparison/README.md)
 records measured throughput, kernel controls and the final TP2/DP2/EP4 Engine
 regression. That study does not measure prefill or serving performance.
 Comparisons must match precision, topology, context, batch capacity and natural

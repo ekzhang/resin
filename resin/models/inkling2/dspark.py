@@ -1,4 +1,4 @@
-"""Geometry of the BF16 DSpark head bundled with Inkling-2-Small."""
+"""Geometry of the BF16 DSpark heads bundled with Inkling 2."""
 
 from __future__ import annotations
 
@@ -37,7 +37,8 @@ class Inkling2DSparkConfig:
 
     @classmethod
     def from_hugging_face(cls, values: dict[str, Any]) -> Self:
-        if values.get("model_type") != "inkling2":
+        model_type = values.get("model_type")
+        if model_type not in ("inkling2", "inkling2_loop"):
             raise ValueError("Inkling2 DSpark requires the bundled Inkling2 config")
         draft, text = values["mtp_config"], values["text_config"]
         require_options(
@@ -48,7 +49,7 @@ class Inkling2DSparkConfig:
                 "o_bias": False,
                 "markov_head_type": "rnn_hidden",
                 "block_size": 8,
-                "num_hidden_layers": 5,
+                "num_hidden_layers": 3 if model_type == "inkling2_loop" else 5,
             },
             "Inkling2 DSpark",
         )
@@ -86,8 +87,8 @@ class Inkling2DSparkConfig:
             target.hidden_size,
         ):
             raise ValueError("Inkling2 target and DSpark embedding geometries differ")
-        # The index equal to the layer count denotes the final normalized output.
-        if self.target_layer_ids[-1] > target.num_hidden_layers:
+        # Taps index layer visits. The final index denotes the normalized output.
+        if self.target_layer_ids[-1] > target.execution_layer_count:
             raise ValueError("DSpark target tap lies outside Inkling2")
 
     @property

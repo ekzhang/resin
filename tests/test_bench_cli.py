@@ -81,7 +81,7 @@ def test_capacity_only_probe_never_enters_capture_or_retained_cases(capsys):
 @pytest.mark.parametrize("value", [0, -1])
 def test_repeat_count_must_be_positive(value):
     args = bench.argument_parser().parse_args(
-        ["--model", "inkling2", "--repeats", str(value)]
+        ["--model", "inkling2-small", "--repeats", str(value)]
     )
     with pytest.raises(ValueError, match="repeats"):
         bench._configuration(args)
@@ -91,7 +91,7 @@ def test_resident_sweep_api_accepts_and_forwards_cli_repeat_options(monkeypatch)
     args = bench.argument_parser().parse_args(
         [
             "--model",
-            "inkling2",
+            "inkling2-small",
             "--repeats",
             "3",
             "--trace-after-sweep",
@@ -111,7 +111,7 @@ def test_resident_sweep_api_accepts_and_forwards_cli_repeat_options(monkeypatch)
     monkeypatch.setattr(bench, "_validate_configuration", validate)
     with pytest.raises(RuntimeError, match="CPU-only API boundary"):
         bench.run_benchmark(
-            "inkling2", "/unused", cases, parallelism=topology, **options
+            "inkling2-small", "/unused", cases, parallelism=topology, **options
         )
     assert checked[0]["repeats"] == 3
     assert checked[0]["trace_after_sweep"] is True
@@ -156,7 +156,7 @@ def test_paired_topologies_keep_allocation_and_independent_metadata(monkeypatch)
     monkeypatch.setattr(modal_bench, "_run_sweep", run)
     topology = dict(world_size=2, attn_tp=2, attn_dp=1, ep=2, cp=1)
     variants = [{"name": "EP2"}, {"name": "ETP2", "topology": {"ep": 1}}]
-    modal_bench.sweep_sequence.local("inkling2", [], topology, {}, variants)
+    modal_bench.sweep_sequence.local("inkling2-small", [], topology, {}, variants)
     assert [item[0]["ep"] for item in seen] == [2, 1]
     assert all(item[0]["attn_tp"] == 2 for item in seen)
     assert [item[1]["name"] for item in seen] == ["EP2", "ETP2"]
@@ -164,7 +164,7 @@ def test_paired_topologies_keep_allocation_and_independent_metadata(monkeypatch)
     assert topology["ep"] == 2
     with pytest.raises(ValueError, match="retain the GPU count"):
         modal_bench.sweep_sequence.local(
-            "inkling2",
+            "inkling2-small",
             [],
             topology,
             {},
@@ -177,7 +177,7 @@ def test_saved_custom_prompt_and_output_retention_are_forwarded():
     args = bench.argument_parser().parse_args(
         [
             "--model",
-            "inkling2",
+            "inkling2-small",
             "--prompt-source",
             "saved",
             "--prompt-corpus",
@@ -477,7 +477,10 @@ def test_modal_download_is_cpu_only_and_uses_shared_registry(monkeypatch, capsys
 @pytest.mark.parametrize(
     "arguments,fragment",
     [
-        (["--model", "inkling2", "--balanced-experts"], "balanced expert routing"),
+        (
+            ["--model", "inkling2-small", "--balanced-experts"],
+            "balanced expert routing",
+        ),
         (["--model", "qwen3_5", "--gpu", "B300"], "GPU-specific kernel"),
     ],
 )

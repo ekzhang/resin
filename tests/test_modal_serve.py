@@ -28,7 +28,7 @@ from resin.server import HttpServer
         ("glm-5.3-flash", 3, None),
         ("gemma4", 0, None),
         ("qwen3_5", 0, None),
-        ("inkling2", 0, None),
+        ("inkling2-small", 0, None),
         ("gpt-oss-20b", 0, "warmup"),
         ("deepseek-v41", 0, "serve"),
     ],

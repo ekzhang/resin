@@ -185,6 +185,7 @@ class Inkling2CudaRunner(CudaRunner):
         self.raw_config = read_config(self.model_path)
         self.config = Inkling2Config.from_hugging_face(self.raw_config)
         self.draft_config = Inkling2DSparkConfig.from_hugging_face(self.raw_config)
+        self.draft_config.validate_target(self.config)
         if max_seq_len > min(
             self.config.max_position_embeddings,
             self.draft_config.max_position_embeddings,
@@ -256,20 +257,36 @@ class Inkling2CudaRunner(CudaRunner):
             for module in self._draft.modules():
                 if isinstance(module, (DSparkAttention, DSparkLayer)):
                     module.allreduce = self._allreduce.sum
-        if fused_attention_prologue:
-            from resin_models_cuda.inkling2.fa4_bias import warm_native_bias
+        from resin_models_cuda.inkling2.fa4_bias import (
+            NARROW_PACKED_GROUP,
+            packed_decode_group,
+            warm_native_bias,
+        )
 
-            for kv_heads in sorted({layer.attn.kv_heads for layer in layers}):
-                warm_native_bias(kv_heads, self.device)
+        native_bias_geometries = {
+            (layer.attn.kv_heads, layer.attn.heads // layer.attn.kv_heads)
+            for layer in layers
+            if layer.attn.native_bias_padded_group is not None
+        }
+        if fused_attention_prologue and native_bias_geometries:
+            for kv_heads, heads_per_kv in sorted(native_bias_geometries):
+                warm_native_bias(kv_heads, self.device, heads_per_kv=heads_per_kv)
         self.benchmark_metadata["allreduce_backend"] = self._allreduce.backend
         self.benchmark_metadata["attention_prologue"] = (
             "fused" if fused_attention_prologue else "separate"
         )
-        self.benchmark_metadata["target_attention"] = (
-            "native-relative-bias"
-            if fused_attention_prologue and layers[0].attn.kv_heads in (2, 4, 8)
-            else "generic-fa4"
-        )
+        target_attention = "generic-fa4"
+        if fused_attention_prologue and native_bias_geometries:
+            target_attention = "native-relative-bias"
+        elif any(
+            layer.attn.head_dim == 128
+            and (group := packed_decode_group(layer.attn.heads, layer.attn.kv_heads))
+            is not None
+            and group <= NARROW_PACKED_GROUP
+            for layer in layers
+        ):
+            target_attention = "packed-fa4-decode"
+        self.benchmark_metadata["target_attention"] = target_attention
         self.benchmark_metadata["expert_allreduce_backend"] = (
             self._expert_allreduce.backend
             if self._expert_allreduce is not None
@@ -399,6 +416,10 @@ class Inkling2CudaRunner(CudaRunner):
         return self._speculation.snapshot(include_draft_tokens=True)
 
     def _initial_state(self, cache, positions, *, out=None):
+        if positions.is_cuda:
+            state = cache.load_initial_state(positions, out=out)
+            if state is not None:
+                return state
         state = cache.state_at((positions - 1).clamp_min(0)[:, None])[:, 0]
         return torch.where(
             (positions == 0)[:, None, None, None],
@@ -467,9 +488,9 @@ class Inkling2CudaRunner(CudaRunner):
         targets = sample(logits, None)
         acceptance = DeviceAcceptance.from_samples(drafts, targets, positions)
         accepted = acceptance.counts.long()
+        stored_state = False
         if self._draft is not None:
             assert conv_inputs is not None
-            final_state = select_convolution_state(initial, conv_inputs, accepted)
             features = self._draft.inject_target(taps, verify_positions, cache)
             self._checkpoint_inputs = initial, conv_inputs, features, positions
             selected = features[
@@ -478,7 +499,13 @@ class Inkling2CudaRunner(CudaRunner):
             cache.store_draft_features(
                 (positions + accepted - 1)[:, None], selected[:, None]
             )
-        cache.store_state((positions + accepted - 1)[:, None], final_state[:, None])
+            stored_state = cache.store_accepted_state(
+                positions, initial, conv_inputs, accepted
+            )
+            if not stored_state:
+                final_state = select_convolution_state(initial, conv_inputs, accepted)
+        if not stored_state:
+            cache.store_state((positions + accepted - 1)[:, None], final_state[:, None])
         if phase_timing is not None:
             phase_timing.mark(3)
         return acceptance, logits
@@ -590,10 +617,7 @@ class Inkling2CudaRunner(CudaRunner):
         logits, scores = [], []
         for row in range(count):
             if plan is None or row >= plan.num_sequences:
-                if self._prefill_graph_active:
-                    self._empty_prefill_regions()
-                else:
-                    self._model.forward_experts_empty()
+                self._model.forward_experts_empty()
                 continue
             start, end = map(int, plan.token_indptr[row : row + 2])
             row_cache, row_ids, row_positions = (

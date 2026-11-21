@@ -1,11 +1,12 @@
 """Fused Inkling 2 normalization, residual attention, convolution, and gating."""
 
+from functools import cache
 from typing import Any, cast
 
 import torch
 import triton
 import triton.language as tl
-from triton.language.extra import libdevice
+from triton.language.extra import cuda, libdevice
 
 
 @triton.jit
@@ -157,6 +158,24 @@ def store_kv(cache, keys, values, positions, group_index, layer, layer_count):
     )
 
 
+@triton.jit
+def _norm_row(
+    X,
+    W,
+    Y,
+    D: tl.constexpr,
+    EPS: tl.constexpr,
+    HAS_WEIGHT: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    cols = tl.arange(0, BLOCK)
+    x = tl.load(X + cols, cols < D, 0).to(tl.float32)
+    y = x * tl.rsqrt(tl.sum(x * x, 0) / D + EPS)
+    if HAS_WEIGHT:
+        y *= tl.load(W + cols, cols < D, 0).to(tl.float32)
+    tl.store(Y + cols, y, cols < D)
+
+
 @triton.jit(do_not_specialize=["stride"])
 def _norm(
     X,
@@ -169,12 +188,7 @@ def _norm(
     BLOCK: tl.constexpr,
 ):
     row = tl.program_id(0)
-    cols = tl.arange(0, BLOCK)
-    x = tl.load(X + row * stride + cols, cols < D, 0).to(tl.float32)
-    y = x * tl.rsqrt(tl.sum(x * x, 0) / D + EPS)
-    if HAS_WEIGHT:
-        y *= tl.load(W + cols, cols < D, 0).to(tl.float32)
-    tl.store(Y + row * D + cols, y, cols < D)
+    _norm_row(X + row * stride, W, Y + row * D, D, EPS, HAS_WEIGHT, BLOCK)
 
 
 def rms_norm(x, weight, eps, dtype):
@@ -192,6 +206,43 @@ def rms_norm(x, weight, eps, dtype):
         triton.next_power_of_2(x.shape[-1]),
     )
     return out
+
+
+@triton.jit(do_not_specialize=["rows"])
+def _attention_input_norm(
+    Inputs, Weights, Y, rows, D: tl.constexpr, EPS: tl.constexpr, BLOCK: tl.constexpr
+):
+    row, stream = tl.program_id(0), tl.program_id(1)
+    for index in tl.static_range(len(Inputs)):
+        if stream == index:
+            _norm_row(
+                Inputs[index] + row * D,
+                Weights[index],
+                Y + (stream * rows + row) * D,
+                D,
+                EPS,
+                True,
+                BLOCK,
+            )
+
+
+def attention_input_norm(streams, weights, eps):
+    """Normalize each source into adjacent BF16 rows for attention projections."""
+    batch, tokens, width = streams[0].shape
+    rows = batch * tokens
+    output = streams[0].new_empty(
+        (len(streams), batch, tokens, width), dtype=torch.bfloat16
+    )
+    cast(Any, _attention_input_norm)[(rows, len(streams))](
+        tuple(stream.contiguous() for stream in streams),
+        weights,
+        output,
+        rows,
+        width,
+        eps,
+        triton.next_power_of_2(width),
+    )
+    return output
 
 
 # Stable selection and the top-eight sum order follow SGLang e62ac627,
@@ -648,16 +699,25 @@ def _select(
     Inputs,
     Accepted,
     Y,
+    Positions,
+    Slabs,
+    Slots,
     T,
     L: tl.constexpr,
     D: tl.constexpr,
     BLOCK: tl.constexpr,
+    SLAB_STRIDE: tl.constexpr,
+    SLOT_STRIDE: tl.constexpr,
+    POSITION_ROW: tl.constexpr,
+    SLAB_ROW: tl.constexpr,
+    SLOT_ROW: tl.constexpr,
 ):
     batch, block = tl.program_id(0), tl.program_id(1)
     col = block * BLOCK + tl.arange(0, BLOCK)
     mask = col < L * 3 * D
     layer, position, channel = col // (3 * D), (col // D) % 3, col % D
-    source = tl.load(Accepted + batch) + position - 3
+    accepted = tl.load(Accepted + batch)
+    source = accepted + position - 3
     original = tl.load(
         Initial + batch * L * 3 * D + layer * 3 * D + (source + 3) * D + channel,
         mask & (source < 0),
@@ -668,7 +728,14 @@ def _select(
         mask & (source >= 0),
         0,
     )
-    tl.store(Y + batch * L * 3 * D + col, tl.where(source < 0, original, current), mask)
+    if Positions is None:
+        output = Y + batch * L * 3 * D
+    else:
+        end = tl.load(Positions + batch * POSITION_ROW) + accepted - 1
+        slab = tl.load(Slabs + batch * SLAB_ROW).to(tl.int64)
+        slot = tl.load(Slots + batch * SLOT_ROW).to(tl.int64)
+        output = Y + tl.where(end >= 0, slab * SLAB_STRIDE + slot * SLOT_STRIDE, 0)
+    tl.store(output + col, tl.where(source < 0, original, current), mask)
 
 
 def select_convolution_state(initial, inputs, accepted):
@@ -679,12 +746,45 @@ def select_convolution_state(initial, inputs, accepted):
         inputs.contiguous(),
         accepted,
         out,
+        None,
+        None,
+        None,
         inputs.shape[1],
         layers,
         width,
         512,
+        0,
+        0,
+        0,
+        0,
+        0,
     )
     return out
+
+
+def store_selected_convolution_state(
+    storage, group, positions, initial, inputs, accepted
+):
+    batch, layers, _, width = initial.shape
+    block = 2048
+    cast(Any, _select)[(batch, triton.cdiv(layers * 3 * width, block))](
+        initial,
+        inputs,
+        accepted,
+        storage,
+        positions,
+        group.slab_ids,
+        group.slotnums,
+        inputs.shape[1],
+        layers,
+        width,
+        block,
+        storage.stride(0),
+        storage.stride(1),
+        positions.stride(0),
+        group.slab_ids.stride(0),
+        group.slotnums.stride(0),
+    )
 
 
 @triton.jit(do_not_specialize=["T"])
@@ -765,3 +865,289 @@ def copy_state_checkpoints(
         512,
     )
     return flags
+
+
+# Loop controllers adapt SGLang PR 51926 under Apache-2.0,
+# commit 92e894ef904bfdb5c0cf2f2a541cbd4eec023573,
+# python/sglang/kernels/ops/elementwise/inkling2_loop.py.
+
+
+@triton.jit(do_not_specialize=["T", "DEST_STRIDE", "MESSAGE_STRIDE"])
+def _controller_norm(
+    Dest,
+    Message,
+    Normed,
+    T,
+    DEST_STRIDE,
+    MESSAGE_STRIDE,
+    eps,
+    W: tl.constexpr,
+    BLOCK: tl.constexpr,
+    USE_PDL: tl.constexpr,
+):
+    if USE_PDL:
+        cuda.gdc_wait()
+        cuda.gdc_launch_dependents()
+    t = tl.program_id(0).to(tl.int64)
+    m = tl.program_id(1).to(tl.int64)
+    cols = tl.arange(0, BLOCK)
+    valid = cols < W
+    dest = tl.load(Dest + m * DEST_STRIDE + t * W + cols, valid, other=0)
+    message = tl.load(Message + m * MESSAGE_STRIDE + t * W + cols, valid, other=0)
+    dest_rstd = libdevice.rsqrt(tl.div_rn(tl.sum(dest * dest), W) + eps)
+    message_rstd = libdevice.rsqrt(tl.div_rn(tl.sum(message * message), W) + eps)
+    out = Normed + (m * T + t) * (2 * W)
+    tl.store(out + cols, (dest * dest_rstd).to(tl.bfloat16), valid)
+    tl.store(out + W + cols, (message * message_rstd).to(tl.bfloat16), valid)
+
+
+@triton.jit(do_not_specialize=["T"])
+def _controller_down(
+    Normed,
+    Down,
+    Partials,
+    T,
+    R: tl.constexpr,
+    K: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+    USE_PDL: tl.constexpr,
+):
+    """Write the FP32 projection partial for one 1,024-column group."""
+    if USE_PDL:
+        cuda.gdc_wait()
+        cuda.gdc_launch_dependents()
+    GROUPS: tl.constexpr = (K + 1023) // 1024
+    rows = tl.program_id(0) * BLOCK_M + tl.arange(0, BLOCK_M)
+    cols = tl.program_id(1) * BLOCK_N + tl.arange(0, BLOCK_N)
+    z = tl.program_id(2)
+    m, group = z // GROUPS, z % GROUPS
+    out = Partials + (z.to(tl.int64) * T) * R
+    X = Normed + (m.to(tl.int64) * T) * K
+    Wd = Down + m.to(tl.int64) * R * K
+    ks = tl.arange(0, BLOCK_K)
+    partial = tl.zeros((BLOCK_M, BLOCK_N), tl.float32)
+    for tile in range(1024 // BLOCK_K):
+        k = group * 1024 + tile * BLOCK_K + ks
+        x = tl.load(
+            X + rows[:, None].to(tl.int64) * K + k[None, :],
+            (rows[:, None] < T) & (k[None, :] < K),
+            other=0,
+        )
+        w = tl.load(
+            Wd + cols[None, :] * K + k[:, None],
+            (cols[None, :] < R) & (k[:, None] < K),
+            other=0,
+        )
+        partial = tl.dot(x, w, partial)
+    tl.store(
+        out + rows[:, None].to(tl.int64) * R + cols[None, :],
+        partial,
+        (rows[:, None] < T) & (cols[None, :] < R),
+    )
+
+
+@triton.jit(do_not_specialize=["T", "DEST_STRIDE", "MESSAGE_STRIDE"])
+def _controller_mix(
+    Partials,
+    Gain,
+    Forget,
+    Dest,
+    Message,
+    Out,
+    T,
+    DEST_STRIDE,
+    MESSAGE_STRIDE,
+    W: tl.constexpr,
+    R: tl.constexpr,
+    BLOCK_R: tl.constexpr,
+    GROUPS: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    USE_PDL: tl.constexpr,
+):
+    """Merge the BF16 low-rank features with the FP32 destination and message."""
+    if USE_PDL:
+        cuda.gdc_wait()
+        cuda.gdc_launch_dependents()
+    rows = tl.program_id(0) * BLOCK_M + tl.arange(0, BLOCK_M)
+    m = tl.program_id(1).to(tl.int64)
+    rank = tl.arange(0, BLOCK_R)
+    row_ok = rows[:, None] < T
+    hidden_ok = row_ok & (rank[None, :] < R)
+    p = Partials + (m * GROUPS * T + rows[:, None]) * R + rank[None, :]
+    hidden = tl.load(p, hidden_ok, other=0)
+    for group in tl.static_range(1, GROUPS):
+        hidden = hidden + tl.load(p + group * T * R, hidden_ok, other=0)
+    hidden = hidden.to(tl.bfloat16)
+    cols = tl.program_id(2) * BLOCK_N + tl.arange(0, BLOCK_N)
+    col_ok = cols[None, :] < W
+    weight_ok = col_ok & (rank[:, None] < R)
+    weights = m * W * R + cols[None, :] * R + rank[:, None]
+    offsets = rows[:, None].to(tl.int64) * W + cols[None, :]
+    mask = row_ok & col_ok
+    dest = tl.load(Dest + m * DEST_STRIDE + offsets, mask, other=0)
+    message = tl.load(Message + m * MESSAGE_STRIDE + offsets, mask, other=0)
+    gain = tl.dot(hidden, tl.load(Gain + weights, weight_ok, other=0))
+    forget = tl.dot(hidden, tl.load(Forget + weights, weight_ok, other=0))
+    output = (1.0 - libdevice.tanh(forget)) * dest + libdevice.tanh(gain) * message
+    tl.store(Out + m * T * W + offsets, output, mask)
+
+
+def _controller_rows(rows: tuple[torch.Tensor, ...]) -> tuple[torch.Tensor, int]:
+    base = rows[0]
+    if len(rows) == 1:
+        return base, 0
+    storage = base.untyped_storage().data_ptr()
+    start = base.storage_offset()
+    stride = int(rows[1].storage_offset() - start)
+    if all(
+        row.untyped_storage().data_ptr() == storage
+        and row.storage_offset() == start + index * stride
+        for index, row in enumerate(rows[1:], 1)
+    ):
+        return base, stride
+    return torch.stack(rows), base.numel()
+
+
+@cache
+def _controller_wide_block_k(device_index: int) -> int:
+    props = cast(Any, triton.runtime.driver.active).utils.get_device_properties(
+        device_index
+    )
+    # The 64-by-64 projection's wide K tiles need 128 KiB of shared memory.
+    return 256 if props["max_shared_mem"] >= 128 * 1024 else 128
+
+
+def mix_loop_messages(dests, messages, down, gain, forget):
+    """Blend one MLP stream or all three attention streams in three launches."""
+    dest, dest_stride = _controller_rows(dests)
+    message, message_stride = _controller_rows(messages)
+    tokens, width = dests[0].shape
+    streams, rank, pair_width = down.shape
+    pdl = torch.cuda.get_device_capability(dest.device)[0] >= 9
+    launch = {"launch_pdl": True} if pdl else {}
+    normalized = torch.empty(
+        (streams, tokens, pair_width), dtype=torch.bfloat16, device=dest.device
+    )
+    cast(Any, _controller_norm)[(tokens, streams)](
+        dest,
+        message,
+        normalized,
+        tokens,
+        dest_stride,
+        message_stride,
+        1e-6,
+        width,
+        triton.next_power_of_2(width),
+        pdl,
+        num_warps=8,
+        enable_fp_fusion=False,
+        **launch,
+    )
+    groups = triton.cdiv(pair_width, 1024)
+    small = tokens <= 16
+    down_m, down_n = (16, 16) if small else (64, 64)
+    down_k = 256 if small else _controller_wide_block_k(dest.device.index)
+    partials = dest.new_empty((streams, groups, tokens, rank))
+    cast(Any, _controller_down)[
+        (triton.cdiv(tokens, down_m), triton.cdiv(rank, down_n), streams * groups)
+    ](
+        normalized,
+        down,
+        partials,
+        tokens,
+        rank,
+        pair_width,
+        down_m,
+        down_n,
+        down_k,
+        pdl,
+        num_warps=4,
+        num_stages=3,
+        enable_fp_fusion=False,
+        **launch,
+    )
+    output = dest.new_empty((streams, tokens, width))
+    mix_m = 16 if small else 32
+    cast(Any, _controller_mix)[
+        (triton.cdiv(tokens, mix_m), streams, triton.cdiv(width, 64))
+    ](
+        partials,
+        gain,
+        forget,
+        dest,
+        message,
+        output,
+        tokens,
+        dest_stride,
+        message_stride,
+        width,
+        rank,
+        max(16, triton.next_power_of_2(rank)),
+        groups,
+        mix_m,
+        64,
+        pdl,
+        num_warps=4 if small else 8,
+        enable_fp_fusion=False,
+        **launch,
+    )
+    return output
+
+
+@triton.jit
+def _transfer_live_state(
+    Cache,
+    Slabs,
+    Slots,
+    Positions,
+    State,
+    SLAB_STRIDE: tl.constexpr,
+    SLOT_STRIDE: tl.constexpr,
+    SLAB_ROW: tl.constexpr,
+    SLOT_ROW: tl.constexpr,
+    POSITION_ROW: tl.constexpr,
+    WIDTH: tl.constexpr,
+    STORE: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    row, tile = tl.program_id(0), tl.program_id(1)
+    slab = tl.load(Slabs + row * SLAB_ROW).to(tl.int64)
+    slot = tl.load(Slots + row * SLOT_ROW).to(tl.int64)
+    position = tl.load(Positions + row * POSITION_ROW)
+    offset = tile * BLOCK + tl.arange(0, BLOCK)
+    mask = offset < WIDTH
+    if STORE:
+        slab, slot = tl.where(position >= 0, slab, 0), tl.where(position >= 0, slot, 0)
+    cache_row = Cache + slab * SLAB_STRIDE + slot * SLOT_STRIDE
+    state_row = State + row.to(tl.int64) * WIDTH
+    if STORE:
+        value = tl.load(state_row + offset, mask, 0)
+        tl.store(cache_row + offset, value, mask)
+    else:
+        value = tl.load(cache_row + offset, mask & (position != 0), 0)
+        tl.store(state_row + offset, value, mask)
+
+
+def transfer_live_state(storage, group, positions, state, *, store):
+    """Copy a contiguous state field between per-request rows and live slots."""
+    rows = positions.numel()
+    width = state.numel() // rows
+    block = 4096
+    cast(Any, _transfer_live_state)[(rows, triton.cdiv(width, block))](
+        storage,
+        group.slab_ids,
+        group.slotnums,
+        positions,
+        state,
+        storage.stride(0),
+        storage.stride(1),
+        group.slab_ids.stride(0),
+        group.slotnums.stride(0),
+        positions.stride(0),
+        width,
+        store,
+        block,
+    )

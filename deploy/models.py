@@ -6,6 +6,7 @@ live here; launchers share checkpoint handling and runtime lifecycle code.
 
 from __future__ import annotations
 
+import json
 import os
 import time
 from dataclasses import dataclass
@@ -77,6 +78,17 @@ class ModelSpec:
     @property
     def revision(self) -> str:
         return self.checkpoint.revision
+
+    @property
+    def prompt_tokenizer_revisions(self) -> tuple[str, ...]:
+        if self.family == "inkling2":
+            # Inkling 2 Small and Mini share the h200k token IDs.
+            return (self.revision,) + tuple(
+                spec.revision
+                for spec in MODEL_SPECS.values()
+                if spec.family == self.family and spec.revision != self.revision
+            )
+        return (self.revision,)
 
     @property
     def mount(self) -> Path:
@@ -337,8 +349,8 @@ MODEL_SPECS.update(
             recipe="ornith",
             text_only=True,
         ),
-        "inkling2": ModelSpec(
-            name="inkling2",
+        "inkling2-small": ModelSpec(
+            name="inkling2-small",
             family="inkling2",
             checkpoint=Checkpoint(
                 repo_id="thinkingmachines/Inkling-2-Small",
@@ -370,6 +382,35 @@ MODEL_SPECS.update(
             attn_tp=2,
             ep=2,
             label="inkling2-small",
+            expert_backend="cute-dsl",
+            context_length=1_048_576,
+            max_batch_size=256,
+            draft_tokens=7,
+            image_warmup=True,
+        ),
+        "inkling2-mini": ModelSpec(
+            name="inkling2-mini",
+            family="inkling2",
+            checkpoint=Checkpoint(
+                repo_id="thinkingmachines/Inkling-2-Mini",
+                revision="ed40e7da625f594fc9c4990f5f66be24873c22d7",
+                directory="mini",
+                required_files=(
+                    "config.json",
+                    "model.safetensors.index.json",
+                    "hf_quant_config.json",
+                    "tokenizer.json",
+                    "processor_config.json",
+                    "mtp.safetensors",
+                ),
+                patterns=(*Checkpoint.patterns, "mtp.safetensors"),
+            ),
+            model_mount="/models/resin-inkling2",
+            model_volume="resin-inkling2-models-v1",
+            kernel_mount="/kernel-cache/resin-inkling2",
+            kernel_volume="resin-inkling2-kernels-v1",
+            gpu="B300",
+            label="inkling2-mini",
             expert_backend="cute-dsl",
             context_length=1_048_576,
             max_batch_size=256,
@@ -768,6 +809,20 @@ def create_recipe(
 
         return get_native_recipe(
             spec.family, Tokenizer.from_file(str(path / "tokenizer.json"))
+        )
+    if spec.family == "inkling2":
+        from tokenizers import Tokenizer
+
+        # The native recipe takes the checkpoint's image settings directly.
+        processor_config = path / "processor_config.json"
+        options = {}
+        if processor_config.is_file():
+            config = json.loads(processor_config.read_text())
+            options["media_config"] = config["image_processor"]
+        return get_native_recipe(
+            spec.family,
+            Tokenizer.from_file(str(path / "tokenizer.json")),
+            **options,
         )
     if spec.family == "gpt_oss":
         from transformers import AutoTokenizer

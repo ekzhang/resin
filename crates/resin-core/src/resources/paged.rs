@@ -1025,15 +1025,15 @@ impl CachePool {
     }
 
     /// Install fresh private live-state pages while retaining immutable restore
-    /// inputs in a separate owner. Both owners are idle and authenticated before
-    /// the first mutation; no shared snapshot is ever made writable.
+    /// inputs in a separate owner. Concurrent readers of the snapshot retain
+    /// their leases while we move its immutable page references.
     pub(crate) fn exchange_state_restore_pages(
         &mut self,
         request: &mut RequestPages,
         restore: &mut RequestPages,
         state_groups: &[bool],
     ) -> Result<(), CachePoolError> {
-        self.validate_request_idle(request)?;
+        self.validate_request(request)?;
         self.validate_request_idle(restore)?;
         if request.groups.len() != restore.groups.len()
             || request.groups.len() != state_groups.len()
@@ -1042,11 +1042,9 @@ impl CachePool {
         }
         for ((live, fresh), &state) in request.groups.iter().zip(&restore.groups).zip(state_groups)
         {
-            if state
-                && (live.pages.len() != 1
-                    || fresh.pages.len() != 1
-                    || live.pages[0].writable
-                    || !fresh.pages[0].writable)
+            if live.pages.iter().any(|page| page.writable)
+                || state
+                    && (live.pages.len() != 1 || fresh.pages.len() != 1 || !fresh.pages[0].writable)
             {
                 return Err(CachePoolError::StaleHandle);
             }
@@ -1797,6 +1795,48 @@ mod tests {
         assert_eq!(pool.occupied_block_count(), 3);
         pool.retire_request(request).unwrap();
         assert_eq!(pool.occupied_block_count(), 0);
+    }
+
+    #[test]
+    fn restore_state_while_shared_prefix_has_active_readers() {
+        let mut pool = CachePool::new(3, &[nz(1), nz(1)]).unwrap();
+        let history = GroupId::new(0);
+        let state = GroupId::new(1);
+        let demands = [GroupDemand::new(history, 1), GroupDemand::new(state, 1)];
+        let mut source = pool.allocate_request(sequence(1), &demands).unwrap();
+        let cached = pool.share_request_prefix(&mut source, &demands).unwrap();
+        let source_handles = request_handles(&source);
+        let reader = pool.acquire_writer_access(writer_claims(&source)).unwrap();
+
+        let mut request = pool
+            .allocate_request(
+                sequence(2),
+                &[GroupDemand::new(history, 0), GroupDemand::new(state, 0)],
+            )
+            .unwrap();
+        let mut restore = pool
+            .allocate_request(
+                sequence(2),
+                &[GroupDemand::new(history, 0), GroupDemand::new(state, 1)],
+            )
+            .unwrap();
+        let live_state = request_handles(&restore)[0];
+        pool.attach_shared_prefix(&mut request, &cached).unwrap();
+        pool.exchange_state_restore_pages(&mut request, &mut restore, &[false, true])
+            .unwrap();
+
+        assert_eq!(request_handles(&request), [source_handles[0], live_state]);
+        assert_eq!(request_handles(&restore), [source_handles[1]]);
+        assert!(request.groups()[1].pages()[0].is_writable());
+        assert!(!restore.groups()[1].pages()[0].is_writable());
+        let writer = pool.acquire_writer_access(writer_claims(&request)).unwrap();
+        pool.release_writer_access(writer);
+        pool.release_writer_access(reader);
+        pool.retire_request(restore).unwrap();
+        pool.retire_request(request).unwrap();
+        pool.retire_request(source).unwrap();
+        pool.retire_cached_prefix(cached).unwrap();
+        assert_eq!(pool.free_parent_count(), 3);
     }
 
     #[test]

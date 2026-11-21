@@ -54,8 +54,17 @@ def target_weight_slices(target: Inkling2Target) -> dict[str, WeightSlice]:
         add(name, tensor)
     for name, parameter in target.attn_res.named_parameters():
         add("attn_res." + name, parameter)
+    if target.middle_cycle_cross_pass_queries is not None:
+        add("middle_cycle_cross_pass_queries", target.middle_cycle_cross_pass_queries)
+        add(
+            "middle_cycle_cross_pass_kv_queries",
+            target.middle_cycle_cross_pass_kv_queries,
+        )
     for index, layer in enumerate(cast(Sequence[DecoderLayer], target.layers)):
         prefix, attention = f"layers.{index}.", layer.attn
+        if layer.controllers is not None:
+            for name, parameter in layer.controllers.named_parameters():
+                add(prefix + "controllers." + name, parameter)
         names = (
             ("attn_norm",)
             if layer.local

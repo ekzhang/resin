@@ -28,20 +28,22 @@ def _corrected_logits(
     row = tl.program_id(0)
     cols = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
     base = tl.load(Base + row * BASE_STRIDE + cols, cols < VOCAB, 0).to(tl.float32)
-    bias = tl.load(Bias + row * BIAS_STRIDE + cols, cols < VOCAB, 0).to(tl.float32)
-    # The checkpoint adds in BF16 before applying its FP32 logit soft cap.
-    value = (
-        tl.inline_asm_elementwise(
-            "add.rn.f32 $0, $1, $2;",
-            "=f,f,f",
-            [base, bias],
-            dtype=tl.float32,
-            is_pure=True,
-            pack=1,
+    value = base
+    if Bias is not None:
+        bias = tl.load(Bias + row * BIAS_STRIDE + cols, cols < VOCAB, 0).to(tl.float32)
+        # The checkpoint adds in BF16 before applying its FP32 logit soft cap.
+        value = (
+            tl.inline_asm_elementwise(
+                "add.rn.f32 $0, $1, $2;",
+                "=f,f,f",
+                [base, bias],
+                dtype=tl.float32,
+                is_pure=True,
+                pack=1,
+            )
+            .to(Base.dtype.element_ty)
+            .to(tl.float32)
         )
-        .to(Base.dtype.element_ty)
-        .to(tl.float32)
-    )
     scaled = tl.inline_asm_elementwise(
         "mul.rn.f32 $0, $1, $2;",
         "=f,f,f",
@@ -72,13 +74,18 @@ def corrected_logits(base, bias, cap):
         bias,
         output,
         base.stride(0),
-        bias.stride(0),
+        bias.stride(0) if bias is not None else 0,
         vocab,
         cap,
         1024,
         enable_fp_fusion=False,
     )
     return output
+
+
+def softcap_logits(values, cap):
+    logits = corrected_logits(values.reshape(-1, values.shape[-1]), None, cap)
+    return logits.view(values.shape)
 
 
 @triton.jit(

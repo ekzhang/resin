@@ -73,7 +73,9 @@ def _fixture(runner_type, *, scored=False):
     return runner, plan, logits, drafts, targets
 
 
-def _inkling_fixture(monkeypatch, runner, logits, drafts, counts, stored):
+def _inkling_fixture(
+    monkeypatch, runner, logits, drafts, counts, stored, *, direct_commit=False
+):
     monkeypatch.setattr(
         inkling_runtime,
         "TensorStager",
@@ -94,10 +96,21 @@ def _inkling_fixture(monkeypatch, runner, logits, drafts, counts, stored):
         inject_target=lambda *a: torch.arange(12).view(2, 3, 2).float(),
     )
     runner._model = lambda *a, **kw: (logits, object(), torch.zeros(2, 1, 3, 4), None)
+
+    def store_accepted_state(positions, initial, inputs, accepted):
+        assert initial.data_ptr() == runner._checkpoint_buffers[0].data_ptr()
+        assert inputs.data_ptr() == runner._checkpoint_buffers[1].data_ptr()
+        if not direct_commit:
+            return False
+        counts.append(accepted.tolist())
+        stored.append(positions + accepted - 1)
+        return True
+
     cache = SimpleNamespace(
         state_at=lambda positions: torch.zeros(2, 1, 1, 3, 4, dtype=torch.bfloat16),
         draft_features_at=lambda positions: torch.zeros(2, 1, 2),
         store_draft_features=lambda *a: None,
+        store_accepted_state=store_accepted_state,
         store_state=lambda positions, state: stored.append(positions.flatten().clone()),
     )
     runner._cache = SimpleNamespace(
@@ -108,6 +121,7 @@ def _inkling_fixture(monkeypatch, runner, logits, drafts, counts, stored):
     )
 
     def rollback(initial, _inputs, accepted):
+        assert not direct_commit
         counts.append(accepted.tolist())
         return initial
 
@@ -181,7 +195,8 @@ def test_eager_verification_routes_scores_and_rolls_back_accepted_state(
     )
     expected = [1, 1] if all_rejected else [2, 3]
     assert counts == [expected]
-    if stored:
+    if runner_type is Inkling2CudaRunner:
+        assert len(stored) == 1
         torch.testing.assert_close(stored[0], positions + torch.tensor(expected) - 1)
     if scored:
         assert output is result
@@ -266,7 +281,15 @@ def test_inkling2_graph_keeps_target_logits_and_one_device_acceptance(
         targets[:, 0].fill_(9)
     runner._graph_device_caches = {}
     state_positions, state_counts = [], []
-    _inkling_fixture(monkeypatch, runner, logits, drafts, state_counts, state_positions)
+    _inkling_fixture(
+        monkeypatch,
+        runner,
+        logits,
+        drafts,
+        state_counts,
+        state_positions,
+        direct_commit=True,
+    )
     shape = (2, 128, 2)
     step = runner._new_decode_graph_step(shape)
     step.inputs["token_ids"].copy_(
@@ -279,7 +302,8 @@ def test_inkling2_graph_keeps_target_logits_and_one_device_acceptance(
     acceptance = runner._graph_acceptance[shape]
     expected = [1, 1] if all_rejected else [2, 3]
     assert acceptance.counts.tolist() == expected
-    assert state_counts[0] == expected
+    assert state_counts == [expected]
+    assert len(state_positions) == 1
     torch.testing.assert_close(state_positions[0], positions + acceptance.counts - 1)
     assert runner._graph_logits[shape] is logits
     assert runner._sampler.calls == [(2, 3, 10)]

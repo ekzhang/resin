@@ -17,6 +17,11 @@ from resin_models_cuda.inkling2.attention import (
     prepare_paged_attention_batch,
 )
 from resin_models_cuda.inkling2.cache import GLOBAL_GROUP, LOCAL_GROUP, DeviceCache
+from resin_models_cuda.inkling2.fa4_bias import (
+    DECODE_TOKENS,
+    packed_decode_batch_supported,
+    packed_decode_group,
+)
 from resin_models_cuda.inkling2.kernels import (
     block_attention_residual,
     convolution_residual,
@@ -126,6 +131,7 @@ class Inkling2Attention(nn.Module):
             self.wv_dv = nn.Linear(
                 config.hidden_size, kv * d, bias=False, dtype=torch.bfloat16
             )
+        self.kv_input_weight: Tensor | None = None
         self.wo_ud = nn.Linear(
             h * d, config.hidden_size, bias=False, dtype=torch.bfloat16
         )
@@ -138,6 +144,11 @@ class Inkling2Attention(nn.Module):
         self.rel_extent = (
             config.sliding_window_size if self.local else config.rel_extent
         )
+        self.native_bias_padded_group = (
+            packed_decode_group(h, kv)
+            if d == 128 and r == 16 and self.rel_extent == 1024
+            else None
+        )
         self.rel_proj = nn.Parameter(
             torch.empty(r, self.rel_extent, dtype=torch.bfloat16), requires_grad=False
         )
@@ -146,9 +157,22 @@ class Inkling2Attention(nn.Module):
             ShortConvolution(kv * d, **conv),
             ShortConvolution(kv * d, **conv),
         )
-        ids = config.local_layer_ids if self.local else config.global_layer_ids
         self.group = LOCAL_GROUP if self.local else GLOBAL_GROUP
-        self.cache_layer, self.cache_layers = ids.index(layer_id), len(ids)
+        self.cache_layers = (
+            config.execution_local_layer_count
+            if self.local
+            else config.execution_global_layer_count
+        )
+
+    def prepare_input_projection(self) -> None:
+        if self.local or self.config.loop is None or self.kv_input_weight is not None:
+            return
+        self.kv_input_weight = torch.stack(
+            (
+                torch.cat((self.wk_dv.weight, self.k_sconv.weight_proj)),
+                torch.cat((self.wv_dv.weight, self.v_sconv.weight_proj)),
+            )
+        ).transpose(1, 2)
 
     def forward(
         self,
@@ -160,28 +184,74 @@ class Inkling2Attention(nn.Module):
         attention_batch,
         state,
         *,
+        cache_layer,
         state_out=None,
         inputs_out=None,
     ):
-        q_source, k_source, v_source = sources
+        stacked = sources if isinstance(sources, Tensor) else None
+        q_source, k_source, v_source = sources if stacked is None else stacked.unbind(0)
         batch, tokens, _ = q_source.shape
+        width = self.kv_heads * self.head_dim
+        k_dynamic = v_dynamic = None
         if self.local:
-            q, k_input, v_input, relative, gate, sinks = self.qkvr(q_source).split(
+            if stacked is None:
+                q_projection = self.qkvr(q_source)
+            else:
+                # All streams share the projection weights, so one GEMM can
+                # reuse them and expose the Q, K, and V slices for each input.
+                q_projection, k_projection, v_projection = (
+                    self.qkvr(stacked.flatten(0, 2))
+                    .view(3, batch, tokens, -1)
+                    .unbind(0)
+                )
+            q, k_input, v_input, relative, gate, sinks = q_projection.split(
                 self.split_sizes, dim=-1
             )
+            if stacked is not None:
+                q_size, k_size, v_size = self.split_sizes[:3]
+                k_input = k_projection[..., q_size : q_size + k_size]
+                v_input = v_projection[..., q_size + k_size : q_size + k_size + v_size]
+            elif k_source is not q_source:
+                q_size, k_size, v_size = self.split_sizes[:3]
+                k_weight, v_weight = self.qkvr.weight[
+                    q_size : q_size + k_size + v_size
+                ].split((k_size, v_size), dim=0)
+                k_input, v_input = (
+                    linear(k_source, k_weight),
+                    linear(v_source, v_weight),
+                )
         else:
             q, relative, gate, sinks = self.qkvr(q_source).split(
                 (self.split_sizes[0], *self.split_sizes[3:]), dim=-1
             )
-            k_input, v_input = self.wk_dv(k_source), self.wv_dv(v_source)
-        width = self.kv_heads * self.head_dim
+            if (
+                stacked is not None
+                and self.kv_input_weight is not None
+                and self.fused_prologue
+            ):
+                k_projection, v_projection = (
+                    torch.bmm(stacked[1:].flatten(1, 2), self.kv_input_weight)
+                    .view(2, batch, tokens, -1)
+                    .unbind(0)
+                )
+                k_input, k_coefficients = k_projection.split(
+                    (width, self.kv_heads * 4), dim=-1
+                )
+                v_input, v_coefficients = v_projection.split(
+                    (width, self.kv_heads * 4), dim=-1
+                )
+                k_dynamic = k_coefficients.view(batch, tokens, self.kv_heads, 4)
+                v_dynamic = v_coefficients.view(batch, tokens, self.kv_heads, 4)
+            else:
+                k_input, v_input = self.wk_dv(k_source), self.wv_dv(v_source)
         tau = None if self.local else attention_batch.log_tau
+        native_group = self.native_bias_padded_group
         projected = (
             self.fused_prologue
             and q.is_cuda
-            and tokens in (1, 8)
-            and self.kv_heads in (2, 4, 8)
-            and self.heads == 6 * self.kv_heads
+            and tokens in DECODE_TOKENS
+            and native_group is not None
+            and packed_decode_batch_supported(native_group, batch, inputs_padded=True)
         )
         if self.fused_prologue and q.is_cuda:
             from resin_models_cuda.inkling2.attention_prologue import attention_prologue
@@ -189,15 +259,15 @@ class Inkling2Attention(nn.Module):
             if self.local:
                 k_weight = self.k_sconv.weight.view(-1, 4)
                 v_weight = self.v_sconv.weight.view(-1, 4)
-                k_dynamic = v_dynamic = None
             else:
                 k_weight, v_weight = self.k_sconv.static_w, self.v_sconv.static_w
-                k_dynamic = linear(k_source, self.k_sconv.weight_proj).view(
-                    batch, tokens, self.kv_heads, 4
-                )
-                v_dynamic = linear(v_source, self.v_sconv.weight_proj).view(
-                    batch, tokens, self.kv_heads, 4
-                )
+                if k_dynamic is None:
+                    k_dynamic = linear(k_source, self.k_sconv.weight_proj).view(
+                        batch, tokens, self.kv_heads, 4
+                    )
+                    v_dynamic = linear(v_source, self.v_sconv.weight_proj).view(
+                        batch, tokens, self.kv_heads, 4
+                    )
             q, relative, k_state, v_state = attention_prologue(
                 q,
                 k_input,
@@ -220,7 +290,7 @@ class Inkling2Attention(nn.Module):
                 cache=cache,
                 positions=positions,
                 group_index=self.group,
-                layer=self.cache_layer,
+                layer=cache_layer,
                 layer_count=self.cache_layers,
                 k_dynamic=k_dynamic,
                 v_dynamic=v_dynamic,
@@ -246,6 +316,7 @@ class Inkling2Attention(nn.Module):
                 cache,
                 positions,
                 tau,
+                cache_layer=cache_layer,
                 state_out=state_out,
                 inputs_out=inputs_out,
             )
@@ -257,7 +328,7 @@ class Inkling2Attention(nn.Module):
             sinks,
             cache=cache,
             group_index=self.group,
-            layer=self.cache_layer,
+            layer=cache_layer,
             layer_count=self.cache_layers,
             positions=positions,
             sequence_lengths=sequence_lengths,
@@ -284,6 +355,7 @@ class Inkling2Attention(nn.Module):
         positions,
         tau,
         *,
+        cache_layer,
         state_out=None,
         inputs_out=None,
     ):
@@ -332,7 +404,7 @@ class Inkling2Attention(nn.Module):
             v,
             positions,
             group_index=self.group,
-            layer=self.cache_layer,
+            layer=cache_layer,
             layer_count=self.cache_layers,
         )
         return q, relative, k_state, v_state
@@ -388,6 +460,28 @@ class SparseMlp(nn.Module):
         return (result if defer_rounding else result.to(x.dtype)).view(x.shape)
 
 
+class MessageController(nn.Module):
+    def __init__(self, width: int, rank: int) -> None:
+        super().__init__()
+        self.down_weight = nn.Parameter(
+            torch.empty(rank, 2 * width, dtype=torch.bfloat16), requires_grad=False
+        )
+        self.gain_weight = nn.Parameter(
+            torch.empty(width, rank, dtype=torch.bfloat16), requires_grad=False
+        )
+        self.forget_weight = nn.Parameter(
+            torch.empty(width, rank, dtype=torch.bfloat16), requires_grad=False
+        )
+
+    def forward(self, destination: Tensor, message: Tensor) -> Tensor:
+        pair = torch.stack((destination, message), dim=-2)
+        normalized = rms_norm(pair, None, 1e-6, dtype=torch.bfloat16).flatten(-2)
+        hidden = linear(normalized, self.down_weight)
+        gain = linear(hidden, self.gain_weight, fp32=True).tanh()
+        forget = linear(hidden, self.forget_weight, fp32=True).tanh()
+        return (1 - forget) * destination + gain * message
+
+
 class DecoderLayer(nn.Module):
     attn_norm: RMSNorm
     q_input_norm: RMSNorm
@@ -420,6 +514,18 @@ class DecoderLayer(nn.Module):
             ShortConvolution(config.hidden_size),
             ShortConvolution(config.hidden_size),
         )
+        loop = config.loop
+        self.controllers = (
+            nn.ModuleDict(
+                {
+                    name: MessageController(config.hidden_size, loop.gate_rank)
+                    for name in ("attn", "k", "v", "mlp")
+                }
+            )
+            if loop is not None and loop.core_start <= layer_id < loop.core_end
+            else None
+        )
+        self.controller_weights: tuple[Tensor, ...] | None = None
         self.mlp = SparseMlp(
             config,
             precision=precision,
@@ -430,6 +536,47 @@ class DecoderLayer(nn.Module):
 
     def feed_forward(self, hidden, token_ids=None):
         return self.mlp(hidden)
+
+    def prepare_controllers(self) -> None:
+        if self.controllers is None or self.controller_weights is not None:
+            return
+        packed = []
+        for name in ("down_weight", "gain_weight", "forget_weight"):
+            parameters = [
+                module.get_parameter(name) for module in self.controllers.values()
+            ]
+            weight = torch.stack(tuple(parameters))
+            for parameter, row in zip(parameters, weight, strict=True):
+                parameter.data = row
+            packed.append(weight)
+        self.controller_weights = tuple(packed)
+
+    def mix_loop_messages(self, streams, messages, *, mlp=False):
+        assert self.controllers is not None
+        shape = streams[0].shape
+        # Wide controller tiles cover up to 64 eight-position verify blocks.
+        max_rows = 512 if shape[1] in (1, 8) else 16
+        if (
+            self.controller_weights is not None
+            and streams[0].is_cuda
+            and 0 < shape[0] * shape[1] <= max_rows
+            and shape[-1] == 2304
+            and self.controller_weights[0].shape[1] == 64
+        ):
+            from resin_models_cuda.inkling2.triton import mix_loop_messages
+
+            selected = slice(3, 4) if mlp else slice(3)
+            output = mix_loop_messages(
+                tuple(value.flatten(0, 1) for value in streams),
+                tuple(value.flatten(0, 1) for value in messages),
+                *(weight[selected] for weight in self.controller_weights),
+            )
+            return output.view(-1, *shape).unbind(0)
+        names = ("mlp",) if mlp else ("attn", "k", "v")
+        return tuple(
+            self.controllers[name](stream, message)
+            for name, stream, message in zip(names, streams, messages, strict=True)
+        )
 
 
 class AttentionResidual(nn.Module):
@@ -499,6 +646,29 @@ class Inkling2Target(nn.Module):
             for i in range(config.num_hidden_layers)
         )
         self.attn_res = AttentionResidual(config)
+        self.register_parameter("middle_cycle_cross_pass_queries", None)
+        self.register_parameter("middle_cycle_cross_pass_kv_queries", None)
+        self.loop_message_queries: Tensor | None = None
+        if config.loop is not None:
+            core_length = config.loop.core_end - config.loop.core_start
+            shape = (2 * core_length, config.hidden_size)
+            self.middle_cycle_cross_pass_queries = nn.Parameter(
+                torch.empty(shape, dtype=torch.float32), requires_grad=False
+            )
+            self.middle_cycle_cross_pass_kv_queries = nn.Parameter(
+                torch.empty(shape, dtype=torch.float32), requires_grad=False
+            )
+        layer_order = config.layer_order
+        cache_layers = {}
+        for group in (
+            config.execution_local_layer_ids,
+            config.execution_global_layer_ids,
+        ):
+            cache_layers.update((visit, slot) for slot, visit in enumerate(group))
+        self.layer_visits = tuple(
+            (layer_id, cache_layers[visit])
+            for visit, layer_id in enumerate(layer_order)
+        )
         self.norm = RMSNorm(config.hidden_size, config.rms_norm_eps)
         self.unembed = nn.Linear(
             config.hidden_size,
@@ -507,20 +677,40 @@ class Inkling2Target(nn.Module):
             dtype=torch.bfloat16,
         )
 
+    @torch.no_grad()
     def prepare(self):
         for layer in cast(Sequence[DecoderLayer], self.layers):
             layer.mlp.experts.prepare()
+            if self.embed_tokens.weight.is_cuda:
+                layer.attn.prepare_input_projection()
+                layer.prepare_controllers()
+        if (
+            self.middle_cycle_cross_pass_queries is not None
+            and self.embed_tokens.weight.is_cuda
+        ):
+            queries = cast(Tensor, self.middle_cycle_cross_pass_queries)
+            kv_queries = cast(Tensor, self.middle_cycle_cross_pass_kv_queries)
+            self.loop_message_queries = torch.stack(
+                (queries[::2], kv_queries[::2], kv_queries[1::2], queries[1::2]), dim=1
+            )
 
     def forward_experts_empty(self):
         hidden = self.embed_tokens.weight.new_empty((0, self.config.hidden_size))
-        for layer in cast(Sequence[DecoderLayer], self.layers):
+        layers = cast(Sequence[DecoderLayer], self.layers)
+        for layer_id, _ in self.layer_visits:
+            layer = layers[layer_id]
             callback = layer.prefill_ffn or layer.feed_forward
             callback(hidden)
 
     def logits(self, hidden):
         values = linear(hidden, self.unembed.weight, fp32=True)
         cap = self.config.final_logit_softcapping
-        return (cap * torch.tanh(values / cap))[..., : self.config.unpadded_vocab_size]
+        values = values[..., : self.config.unpadded_vocab_size]
+        if values.is_cuda:
+            from resin_models_cuda.inkling2.dspark_kernels import softcap_logits
+
+            return softcap_logits(values, cap)
+        return cap * torch.tanh(values / cap)
 
     def forward(
         self,
@@ -539,19 +729,23 @@ class Inkling2Target(nn.Module):
     ):
         batch, tokens = token_ids.shape
         config = self.config
+        rows = batch * tokens
         fused_tail = (
             token_ids.is_cuda
             and not prefill
-            and batch * tokens <= 16
+            and (
+                rows <= 16
+                or (config.loop is not None and tokens in DECODE_TOKENS and rows <= 512)
+            )
             and state.dtype == torch.bfloat16
         )
         width = config.state_width(self.tensor_parallel.size)
-        if state.shape != (batch, config.num_hidden_layers, 3, width):
+        if state.shape != (batch, config.execution_layer_count, 3, width):
             raise ValueError("Inkling 2 target received malformed convolution state")
         if state_inputs_out is not None and state_inputs_out.shape != (
             batch,
             tokens,
-            config.num_hidden_layers,
+            config.execution_layer_count,
             width,
         ):
             raise ValueError("Inkling 2 convolution input buffer has the wrong shape")
@@ -560,7 +754,11 @@ class Inkling2Target(nn.Module):
             if input_embeddings is None
             else input_embeddings
         )
-        blocks, taps = [], []
+        blocks: list[Tensor] = []
+        taps: list[Tensor] = []
+        loop = config.loop
+        prelude: tuple[list[Tensor], Tensor] | None = None
+        message_bank: list[Tensor] = []
         # Each producer fills its own channel range without mutating the state
         # needed to roll back to a partially accepted speculative prefix.
         next_state = torch.empty_like(state, memory_format=torch.contiguous_format)
@@ -571,8 +769,8 @@ class Inkling2Target(nn.Module):
             batch=batch,
             tokens=tokens,
             layer_counts={
-                GLOBAL_GROUP: config.global_layer_count,
-                LOCAL_GROUP: config.local_layer_count,
+                GLOBAL_GROUP: config.execution_global_layer_count,
+                LOCAL_GROUP: config.execution_local_layer_count,
             },
             global_prefill_relative_extent=config.rel_extent if prefill else None,
             # The scale is exactly one below the floor. Keep the same global
@@ -585,29 +783,78 @@ class Inkling2Target(nn.Module):
         )
         layers = cast(Sequence[DecoderLayer], self.layers)
         kv_width = layers[0].attn.kv_heads * config.head_dim
-        for i, layer in enumerate(layers):
-            if i in self.tap_layer_ids:
+        for visit, (i, cache_layer) in enumerate(self.layer_visits):
+            layer = layers[i]
+            if loop is not None:
+                if i == loop.core_start:
+                    if prelude is None:
+                        prelude = (blocks.copy(), partial)
+                    else:
+                        prelude_blocks, prelude_partial = prelude
+                        # The first core layer closes the prelude's last block.
+                        # Only blocks produced inside the previous pass carry messages.
+                        message_bank = [*blocks[len(prelude_blocks) + 1 :], partial]
+                        blocks, partial = prelude_blocks.copy(), prelude_partial
+                elif i == loop.core_end:
+                    message_bank = []
+            if visit in self.tap_layer_ids:
                 taps.append(partial)
             streams = (
                 self.attn_res.mix([*blocks, partial], self.attn_res.attn_queries[i - 1])
                 if blocks
                 else (partial,) * (1 if layer.local else 3)
             )
-            if layer.local:
+            messages = None
+            if message_bank:
+                assert loop is not None and layer.controllers is not None
+                if self.loop_message_queries is None:
+                    queries = cast(Tensor, self.middle_cycle_cross_pass_queries)
+                    kv_queries = cast(Tensor, self.middle_cycle_cross_pass_kv_queries)
+                    start = 2 * (i - loop.core_start)
+                    query = torch.cat(
+                        (
+                            queries[start : start + 1],
+                            kv_queries[start : start + 2],
+                            queries[start + 1 : start + 2],
+                        )
+                    )
+                else:
+                    query = self.loop_message_queries[i - loop.core_start]
+                messages = block_attention_residual(
+                    message_bank, query, normalize_values=True
+                )
+                streams = layer.mix_loop_messages(
+                    streams * 3 if layer.local else streams, messages[:3]
+                )
+            if layer.local and messages is None:
                 q = layer.attn_norm(streams[0])
                 sources = (q, q, q)
             else:
-                sources = tuple(
-                    norm(x)
-                    for norm, x in zip(
-                        (layer.q_input_norm, layer.k_input_norm, layer.v_input_norm),
-                        streams,
-                        strict=True,
-                    )
+                norms = (
+                    (layer.attn_norm,) * 3
+                    if layer.local
+                    else (layer.q_input_norm, layer.k_input_norm, layer.v_input_norm)
                 )
-            layer_state = next_state[:, i]
+                if (
+                    loop is not None
+                    and not prefill
+                    and layer.attn.fused_prologue
+                    and token_ids.is_cuda
+                ):
+                    from resin_models_cuda.inkling2.triton import attention_input_norm
+
+                    sources = attention_input_norm(
+                        streams,
+                        tuple(norm.weight for norm in norms),
+                        config.rms_norm_eps,
+                    )
+                else:
+                    sources = tuple(
+                        norm(x) for norm, x in zip(norms, streams, strict=True)
+                    )
+            layer_state = next_state[:, visit]
             layer_inputs = (
-                None if state_inputs_out is None else state_inputs_out[:, :, i]
+                None if state_inputs_out is None else state_inputs_out[:, :, visit]
             )
             attention, _, _, _, _ = layer.attn(
                 sources,
@@ -616,14 +863,15 @@ class Inkling2Target(nn.Module):
                 max_sequence_length,
                 cache,
                 attention_batch,
-                state[:, i],
+                state[:, visit],
+                cache_layer=cache_layer,
                 state_out=layer_state,
                 inputs_out=layer_inputs,
             )
             attention_slice = slice(2 * kv_width, 2 * kv_width + config.hidden_size)
             attention, _ = layer.attn_sconv(
                 attention,
-                state[:, i, :, attention_slice],
+                state[:, visit, :, attention_slice],
                 state_out=layer_state[..., attention_slice],
                 inputs_out=None
                 if layer_inputs is None
@@ -638,6 +886,10 @@ class Inkling2Target(nn.Module):
                 self.attn_res.mlp_queries[i],
                 None if boundary else attention,
             )[0]
+            if messages is not None:
+                (mlp_input,) = layer.mix_loop_messages(
+                    (mlp_input,), messages[3:], mlp=True
+                )
             callback = layer.prefill_ffn or layer.feed_forward
             normalized = layer.mlp_norm(mlp_input).reshape(-1, config.hidden_size)
             # Existing prefill callbacks keep their output dtype. Direct decode
@@ -647,7 +899,7 @@ class Inkling2Target(nn.Module):
                 if fused_tail
                 else callback(normalized)
             ).view(batch, tokens, config.hidden_size)
-            history = state[:, i, :, -config.hidden_size :]
+            history = state[:, visit, :, -config.hidden_size :]
             destination = layer_state[..., -config.hidden_size :]
             raw = (
                 None
@@ -681,7 +933,7 @@ class Inkling2Target(nn.Module):
         hidden = self.norm(
             self.attn_res.mix([*blocks, partial], self.attn_res.output_query)[0]
         )
-        if config.num_hidden_layers in self.tap_layer_ids:
+        if config.execution_layer_count in self.tap_layer_ids:
             taps.append(hidden)
         selected = hidden if full_logits else hidden[:, -1:]
         result = selected if return_hidden else self.logits(selected)

@@ -47,7 +47,7 @@ def supports(module, hidden, ids, weights):
         and module.expert_count <= 1024  # kMaxExperts in expert_native.cu
         and set(module.precision.values()) == {"nvfp4"}
         and hidden.shape[1] in (128, 256, 2304, 4608)
-        and module.intermediate in (128, 256, 2304, 4608)
+        and module.intermediate in (128, 256, 1152, 2304, 4608)
         and hidden.dtype == torch.bfloat16
         and weights.dtype == torch.float32
         and hidden.is_contiguous()
@@ -141,8 +141,9 @@ def local_experts(module, hidden, ids, weights, *, pdl=True, max_rows_per_expert
         )
 
     values, scales, amax = buffers(hidden.shape[1])
+    quant_grid = 4 * sms if ids.numel() >= 4 * sms else sms
     native().quantize(
-        hidden, permutation, values, scales, amax, offsets, top_k, sms, pdl
+        hidden, permutation, values, scales, amax, offsets, top_k, quant_grid, pdl
     )
     accumulator = torch.empty(
         (ids.numel(), 2 * module.intermediate),
@@ -176,7 +177,7 @@ def local_experts(module, hidden, ids, weights, *, pdl=True, max_rows_per_expert
         offsets,
         module.gate_cap,
         module.up_cap,
-        sms,
+        quant_grid,
         pdl,
     )
     accumulator2 = torch.empty(

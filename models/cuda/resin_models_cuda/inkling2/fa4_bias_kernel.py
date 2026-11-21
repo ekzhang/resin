@@ -3,7 +3,7 @@
 # Copyright (c) 2026, Colfax International. (modifications)
 
 # Specialized from SGLang e62ac6279646c686d3b328f58d9b5c2c2d5927dc.
-# Only BF16 Q/K/V, FP32 output, head/page128, packed GQA8, split-KV,
+# Only BF16 Q/K/V, FP32 output, head/page128, packed GQA, split-KV,
 # and pre-sheared1280-column bias are retained. See LICENSE.flash-attention.
 # Original upstream features:
 # - BF16 & FP16 dtype
@@ -61,6 +61,7 @@ from flash_attn.cute.utils import AuxData
 from quack import copy_utils, layout_utils
 from quack.cute_dsl_utils import ParamsBase
 
+from resin_models_cuda.inkling2.fa4_bias import MAX_BIAS_TILE_ROWS, MIN_BIAS_TILE_ROWS
 from resin_models_cuda.inkling2.fa4_bias_utils import BlockInfo, NamedBarrierFwdSm100
 
 _TUNING_CONFIG = {
@@ -82,9 +83,19 @@ _TUNING_CONFIG = {
 # Reuse the pinned FA4 MMA, correction, and output pipeline unchanged.
 # Only the pre-sheared relative-bias producer/softmax path lives here.
 class FlashAttentionForwardSm100(FA4Forward):
-    def __init__(self, *, is_causal: bool, is_local: bool, bias_block_size: int):
-        """Paged BF16 attention with GQA8 and pre-sheared relative bias."""
-        assert bias_block_size in (8, 64)
+    def __init__(
+        self,
+        *,
+        is_causal: bool,
+        is_local: bool,
+        qhead_per_kvhead: int,
+        bias_block_size: int,
+    ):
+        """Paged BF16 attention with packed GQA and pre-sheared relative bias."""
+        assert qhead_per_kvhead > 0 and qhead_per_kvhead & (qhead_per_kvhead - 1) == 0
+        assert MIN_BIAS_TILE_ROWS <= bias_block_size <= MAX_BIAS_TILE_ROWS
+        assert bias_block_size % MIN_BIAS_TILE_ROWS == 0
+        assert bias_block_size % qhead_per_kvhead == 0
         assert is_causal != is_local
         self.head_dim_padded = self.head_dim_v_padded = 128
         self.epi_head_dim_v = self.head_dim_v_padded
@@ -105,7 +116,7 @@ class FlashAttentionForwardSm100(FA4Forward):
         self.cluster_shape_mn = (1, 1)
         self.is_causal = is_causal
         self.is_local = is_local
-        self.qhead_per_kvhead = 8
+        self.qhead_per_kvhead = qhead_per_kvhead
         self.is_split_kv = self.pack_gqa = self.has_bias = True
         self.is_persistent = self.use_2cta_instrs = False
         self.use_tma_Q = self.use_tma_KV = True

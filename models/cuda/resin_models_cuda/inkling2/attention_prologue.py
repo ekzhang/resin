@@ -6,6 +6,7 @@ import torch
 import triton
 import triton.language as tl
 
+from resin_models_cuda.inkling2.fa4_bias import packed_decode_group
 from resin_models_cuda.inkling2.triton import (
     _convolution_input,
     _convolution_value,
@@ -129,6 +130,8 @@ def _attention_prologue(
     VID,
     HEADS: tl.constexpr,
     KV_HEADS: tl.constexpr,
+    HEADS_PER_KV: tl.constexpr,
+    PADDED_GROUP: tl.constexpr,
     D: tl.constexpr,
     R_DIM: tl.constexpr,
     EXTENT: tl.constexpr,
@@ -169,8 +172,12 @@ def _attention_prologue(
     batch, token = row // T, row % T
     cols = tl.arange(0, D)
     if head < OUT_HEADS:
-        source_head = head // 8 * 6 + head % 8 if PROJECT else head
-        valid = head % 8 < 6 if PROJECT else True
+        source_head = (
+            head // PADDED_GROUP * HEADS_PER_KV + head % PADDED_GROUP
+            if PROJECT
+            else head
+        )
+        valid = head % PADDED_GROUP < HEADS_PER_KV if PROJECT else True
         q = tl.load(
             Q + batch * QS[0] + token * QS[1] + (source_head * D + cols) * QS[2],
             valid,
@@ -284,8 +291,10 @@ def _attention_prologue(
         # Each worker projects every padded query head for one range of bias
         # columns. The K=16 tensor-core dot retains the BF16 clip/tau boundary.
         padded_head = tl.arange(0, OUT_HEADS_P)
-        source_head = padded_head // 8 * 6 + padded_head % 8
-        valid = (padded_head < OUT_HEADS) & (padded_head % 8 < 6)
+        source_head = (
+            padded_head // PADDED_GROUP * HEADS_PER_KV + padded_head % PADDED_GROUP
+        )
+        valid = (padded_head < OUT_HEADS) & (padded_head % PADDED_GROUP < HEADS_PER_KV)
         rel_cols = tl.arange(0, R_DIM)
         r = tl.load(
             R
@@ -312,7 +321,9 @@ def _attention_prologue(
             used = tl.load(Used + batch * US)
             n_right = token + 1 + used - T
             values = tl.minimum(n_right, EXTENT)
-            block_max = tl.minimum(tl.cdiv(used, 128), tl.cdiv(16 + used - T, 128))
+            block_max = tl.minimum(
+                tl.cdiv(used, 128), tl.cdiv(128 // PADDED_GROUP + used - T, 128)
+            )
             right = tl.where(
                 values > 0,
                 tl.maximum(OUT_EXTENT // 128 - (block_max - (n_right - 1) // 128), 0)
@@ -403,21 +414,25 @@ def attention_prologue(
     heads, dim = q_scale.shape
     rel_dim, kv_heads = rel_scale.shape[-1], cache.keys.shape[-2]
     kv_width = kv_heads * dim
-    out_heads = kv_heads * 8 if rel_proj is not None else heads
+    heads_per_kv = heads // kv_heads
+    padded_group = triton.next_power_of_2(heads_per_kv)
+    out_heads = kv_heads * padded_group if rel_proj is not None else heads
     extent = rel_proj.shape[-1] if rel_proj is not None else rel_dim
     if seqused_k is not None and (
         rel_proj is None or extent != 1024 or seqused_k.shape != (batch,)
     ):
         raise ValueError(
-            "presheared producer requires projected1024 bias and retained lengths"
+            "presheared producer requires 1024 projected bias values and retained lengths"
         )
     out_extent = 1280 if seqused_k is not None else extent
     workers = 5 if seqused_k is not None else 4
     if rel_proj is not None and (
-        heads != kv_heads * 6 or rel_proj.shape[0] != 16 or extent % 128
+        packed_decode_group(heads, kv_heads) is None
+        or rel_proj.shape[0] != 16
+        or extent % 128
     ):
         raise ValueError(
-            "projected prologue requires six query heads and 128-aligned extent"
+            "projected prologue requires a supported packed head group and a 128-aligned extent"
         )
     if (
         width != heads * dim
@@ -545,6 +560,8 @@ def attention_prologue(
         *(v_inputs_out.stride() if v_inputs_out is not None else (0, 0, 0)),
         heads,
         kv_heads,
+        heads_per_kv,
+        padded_group,
         dim,
         rel_dim,
         extent,
@@ -552,7 +569,7 @@ def attention_prologue(
         seqused_k is not None,
         local,
         out_heads,
-        triton.next_power_of_2(out_heads),
+        max(16, triton.next_power_of_2(out_heads)),
         workers,
         rel_proj is not None,
         qk_threshold,

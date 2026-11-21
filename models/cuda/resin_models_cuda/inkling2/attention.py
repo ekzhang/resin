@@ -260,13 +260,17 @@ def paged_attention(
         return (output, lse) if return_lse else output
     if output_dtype is not None and output_dtype != queries.dtype:
         raise ValueError("unsupported Inkling 2 attention output precision")
-    # Pack each draft block's grouped queries; batch size supplies more KV
-    # parallelism as split counts shrink. History lengths stay out of JIT policy.
+    # A complete draft block fits one packed query tile.
+    query_heads, head_dim = queries.shape[2:]
+    kv_heads = cache.keys.shape[-2]
+    heads_per_kv = query_heads // kv_heads
     packed_draft = (
         not causal
         and relative_logits is None
-        and (tokens, queries.shape[2], cache.keys.shape[-2], queries.shape[-1])
-        in ((8, 24, 4, 128), (8, 12, 2, 128))
+        and head_dim == 128
+        and tokens == 8
+        and query_heads % kv_heads == 0
+        and tokens * heads_per_kv <= 128
     )
     output = flash_attn_varlen_func(
         queries.reshape(batch * tokens, *queries.shape[2:]),
@@ -282,7 +286,7 @@ def paged_attention(
         causal=causal,
         window_size=(tile_window_left, None),
         num_splits=max(1, 16 // batch) if packed_draft else 1,
-        pack_gqa=packed_draft or 128 % (queries.shape[2] // cache.keys.shape[-2]) == 0,
+        pack_gqa=packed_draft or 128 % heads_per_kv == 0,
         return_lse=return_lse,
         **kwargs,
     )
@@ -311,26 +315,39 @@ def gated_attention(
 ) -> Tensor:
     """Target attention with the FP32 sink/gate boundary and packed decode."""
 
+    from resin_models_cuda.inkling2.fa4_bias import (
+        DECODE_TOKENS,
+        native_bias_attention,
+        packed_decode_batch_supported,
+        packed_decode_group,
+        packed_decode_splits,
+    )
     from resin_models_cuda.inkling2.kernels import gate_sink
 
     batch, tokens, query_heads, dim = queries.shape
     heads = sinks.shape[-1]
     kv_heads = cache.keys.shape[-2]
+    padded_group = packed_decode_group(heads, kv_heads)
     if (
         queries.is_cuda
-        and (batch == 1 or inputs_padded)
-        and tokens in (1, 8)
-        and kv_heads in (2, 4, 8)
-        and heads == 6 * kv_heads
-        and query_heads == (8 * kv_heads if inputs_padded else heads)
+        and tokens in DECODE_TOKENS
+        and padded_group is not None
+        and packed_decode_batch_supported(
+            padded_group, batch, inputs_padded=inputs_padded
+        )
+        and query_heads == (padded_group * kv_heads if inputs_padded else heads)
         and dim == 128
     ):
-        from resin_models_cuda.inkling2.fa4_bias import decode_splits
-
-        splits = decode_splits(batch, kv_heads, window_left)
-        if inputs_padded and relative_logits.shape[-1] == 1280:
-            from resin_models_cuda.inkling2.fa4_bias import native_bias_attention
-
+        page_table = prepared_batch.page_tables[group_index][layer]
+        native_bias = inputs_padded and relative_logits.shape[-1] == 1280
+        splits = packed_decode_splits(
+            batch,
+            kv_heads,
+            padded_group,
+            window_left,
+            page_capacity=page_table.shape[1] if native_bias else None,
+        )
+        if native_bias:
             return native_bias_attention(
                 queries.flatten(0, 1),
                 cache.keys,
@@ -338,7 +355,7 @@ def gated_attention(
                 relative_logits,
                 gate.reshape(batch * tokens, heads, dim),
                 sinks.reshape(batch * tokens, heads),
-                page_table=prepared_batch.page_tables[group_index][layer],
+                page_table=page_table,
                 seqused_k=prepared_batch.used_lengths[group_index],
                 cu_seqlens_q=prepared_batch.cu_query_lengths,
                 tokens=tokens,
@@ -356,7 +373,7 @@ def gated_attention(
             relative_logits,
             gate.reshape(batch * tokens, heads, dim),
             sinks.reshape(batch * tokens, heads),
-            page_table=prepared_batch.page_tables[group_index][layer],
+            page_table=page_table,
             seqused_k=prepared_batch.used_lengths[group_index],
             cu_seqlens_q=prepared_batch.cu_query_lengths,
             tokens=tokens,

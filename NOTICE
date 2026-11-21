@@ -102,6 +102,11 @@ Copied kernels retain their source attribution. The model-local FP32 attention
 launcher adapts FlashAttention 4.0.0b26's BSD-3-Clause launch preparation; its
 license is retained in inkling2/LICENSE.flash-attention. FlashAttention's
 Blackwell kernel implementation is supplied by the pinned dependency.
+Inkling 2 Mini's middle-layer execution and message controller kernels
+(`python/sglang/kernels/ops/elementwise/inkling2_loop.py`) follow SGLang's
+Apache-2.0 integration at revision
+92e894ef904bfdb5c0cf2f2a541cbd4eec023573.
+https://github.com/sgl-project/sglang/pull/51926
 
 The shared-expert scale layout in resin/backend/cuda/mega_moe.py and the
 validation reference code in tests/test_mega_moe.py and

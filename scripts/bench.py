@@ -1144,9 +1144,12 @@ def main(argv=None) -> None:
                 artifact.cohort(
                     case["context_length"], case["batch_size"] * topology.attn_dp
                 )
-            if artifact.metadata["tokenizer"]["revision"] != spec.revision:
+            if (
+                artifact.metadata["tokenizer"]["revision"]
+                not in spec.prompt_tokenizer_revisions
+            ):
                 raise ValueError(
-                    "prompt artifact must use the pinned checkpoint tokenizer revision"
+                    "prompt artifact must use a tokenizer revision supported by this model"
                 )
         except (OSError, KeyError, ValueError) as error:
             parser.error(str(error))

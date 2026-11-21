@@ -1,4 +1,4 @@
-"""Checkpoint geometry for Inkling 2 Small."""
+"""Checkpoint geometry for Inkling 2 Small and Mini."""
 
 from __future__ import annotations
 
@@ -12,6 +12,14 @@ from resin.models.hf_config import (
     parse_hf_config,
     require_options,
 )
+
+
+@dataclass(frozen=True, slots=True)
+class Inkling2LoopConfig:
+    core_start: int
+    core_end: int
+    num_passes: int
+    gate_rank: int
 
 
 @dataclass(frozen=True, slots=True)
@@ -47,26 +55,43 @@ class Inkling2Config:
     log_scaling_alpha: float
     final_logit_softcapping: PositiveFloat
     eos_token_id: int
+    loop: Inkling2LoopConfig | None = None
 
     @classmethod
     def from_hugging_face(cls, values: dict[str, Any]) -> Self:
-        if values.get("model_type") != "inkling2" or values.get("architectures") != [
-            "Inkling2ForConditionalGeneration"
-        ]:
-            raise ValueError(
-                "Inkling 2 requires an Inkling2ForConditionalGeneration checkpoint"
-            )
+        model_type = values.get("model_type")
+        looped = model_type == "inkling2_loop"
+        architecture = (
+            "Inkling2LoopForConditionalGeneration"
+            if looped
+            else "Inkling2ForConditionalGeneration"
+        )
+        if model_type not in ("inkling2", "inkling2_loop") or values.get(
+            "architectures"
+        ) != [architecture]:
+            raise ValueError("unsupported Inkling 2 checkpoint architecture")
         text = values.get("text_config")
         if not isinstance(text, dict):
             raise ValueError("Inkling 2 text_config must be an object")
+        loop = None
+        if looped:
+            loop_values = text.get("loop_config")
+            if not isinstance(loop_values, dict):
+                raise ValueError("Inkling 2 Mini loop_config must be an object")
+            if loop_values.get("is_varloop", False) is not False:
+                raise ValueError("Inkling 2 supports fixed loops only")
+            loop = parse_hf_config(Inkling2LoopConfig, loop_values)
+        pre_affine_options = {
+            "pre_norm_pre_affine": False,
+            "final_norm_pre_affine": False,
+        }
         require_options(
-            text,
+            pre_affine_options | text if looped else text,
             {
                 "torch_dtype": "bfloat16",
                 "q_bias": False,
                 "o_bias": False,
-                "pre_norm_pre_affine": False,
-                "final_norm_pre_affine": False,
+                **pre_affine_options,
                 "use_value_norm_no_gamma": True,
                 "n_shared_experts": 0,
                 "use_gate_bias": True,
@@ -82,6 +107,7 @@ class Inkling2Config:
             experts_per_token=int(text["num_experts_per_tok"]),
             max_position_embeddings=int(text["model_max_length"]),
             eos_token_id=int(values["eos_token_id"]),
+            loop=loop,
         )
         result.validate()
         return result
@@ -117,6 +143,28 @@ class Inkling2Config:
             raise ValueError("Inkling 2 kernels require four convolution taps")
         if self.n_layers_per_attn_res_block > self.num_hidden_layers:
             raise ValueError("Inkling 2 residual blocks exceed the layer count")
+        if (loop := self.loop) is not None:
+            if any(
+                type(value) is not int
+                for value in (
+                    loop.core_start,
+                    loop.core_end,
+                    loop.num_passes,
+                    loop.gate_rank,
+                )
+            ) or not (
+                0 < loop.core_start < loop.core_end < self.num_hidden_layers
+                and loop.num_passes >= 2
+                and loop.gate_rank > 0
+            ):
+                raise ValueError("invalid Inkling 2 middle-layer loop geometry")
+            if (
+                loop.core_start % self.n_layers_per_attn_res_block
+                or loop.core_end % self.n_layers_per_attn_res_block
+            ):
+                raise ValueError(
+                    "Inkling 2 loop must align to residual block boundaries"
+                )
 
     @property
     def local_layer_count(self) -> int:
@@ -132,6 +180,48 @@ class Inkling2Config:
     def global_layer_count(self) -> int:
         return self.num_hidden_layers - self.local_layer_count
 
+    @property
+    def layer_order(self) -> tuple[int, ...]:
+        """Checkpoint layer IDs in execution order, including repeated visits."""
+        layers = tuple(range(self.num_hidden_layers))
+        if (loop := self.loop) is None:
+            return layers
+        start, end = loop.core_start, loop.core_end
+        return layers[:start] + layers[start:end] * loop.num_passes + layers[end:]
+
+    @property
+    def execution_layer_count(self) -> int:
+        return len(self.layer_order)
+
+    @property
+    def execution_local_layer_ids(self) -> tuple[int, ...]:
+        """Execution indices of visits using sliding-window attention."""
+        if self.loop is None:
+            return self.local_layer_ids
+        return tuple(
+            i
+            for i, layer in enumerate(self.layer_order)
+            if layer in self.local_layer_ids
+        )
+
+    @property
+    def execution_global_layer_ids(self) -> tuple[int, ...]:
+        if self.loop is None:
+            return self.global_layer_ids
+        return tuple(
+            i
+            for i, layer in enumerate(self.layer_order)
+            if layer not in self.local_layer_ids
+        )
+
+    @property
+    def execution_local_layer_count(self) -> int:
+        return len(self.execution_local_layer_ids)
+
+    @property
+    def execution_global_layer_count(self) -> int:
+        return self.execution_layer_count - self.execution_local_layer_count
+
     def state_width(self, attention_tp_size: int = 1) -> int:
         if (
             type(attention_tp_size) is not int
@@ -145,4 +235,4 @@ class Inkling2Config:
         )
 
 
-__all__ = ["Inkling2Config"]
+__all__ = ["Inkling2Config", "Inkling2LoopConfig"]

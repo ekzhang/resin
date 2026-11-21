@@ -13,11 +13,49 @@ from typing import Any
 import torch
 
 compile_count = 0
+DECODE_TOKENS = (1, 8)
+MIN_BIAS_TILE_ROWS = 8
+MAX_BIAS_TILE_ROWS = 64
+NARROW_PACKED_GROUP = 4
+
+
+def packed_decode_group(heads: int, kv_heads: int) -> int | None:
+    """Return the packed query group when it fits the decode bias tile."""
+    if kv_heads not in (2, 4, 8) or heads <= 0 or heads % kv_heads:
+        return None
+    padded_group = 1 << ((heads // kv_heads) - 1).bit_length()
+    return (
+        padded_group
+        if padded_group * max(DECODE_TOKENS) <= MAX_BIAS_TILE_ROWS
+        else None
+    )
+
+
+def packed_decode_batch_supported(
+    padded_group: int, batch: int, *, inputs_padded: bool
+):
+    if padded_group <= NARROW_PACKED_GROUP:
+        return batch <= 64
+    return inputs_padded or batch == 1
 
 
 def decode_splits(batch, kv_heads, window_left):
     """Keep enough independent KV tiles as the request batch supplies more CTAs."""
     return max(1, (16 if window_left is not None or kv_heads == 8 else 32) // batch)
+
+
+def packed_decode_splits(
+    batch, kv_heads, padded_group, window_left, *, page_capacity=None
+):
+    if padded_group > NARROW_PACKED_GROUP:
+        return decode_splits(batch, kv_heads, window_left)
+    # Local decode visits at most ten retained pages. Give global decode more
+    # CTAs for long contexts, bounded by the prepared table capacity.
+    if window_left is not None:
+        return max(1, 8 // batch)
+    if page_capacity is None:
+        return max(1, 16 // batch)
+    return max(1, min(32, 72 // batch, page_capacity))
 
 
 @cache
@@ -58,15 +96,17 @@ def native_bias_attention(
 
     batch, kv_heads = seqused_k.numel(), k.shape[2]
     rows = batch * tokens
+    heads = sinks.shape[-1]
+    padded_group = packed_decode_group(heads, kv_heads)
     if (
         not batch
-        or tokens not in (1, 8)
-        or kv_heads not in (2, 4, 8)
-        or q.shape != (rows, kv_heads * 8, 128)
-        or bias.shape != (rows, kv_heads * 8, 1280)
+        or tokens not in DECODE_TOKENS
+        or padded_group is None
+        or q.shape != (rows, kv_heads * padded_group, 128)
+        or bias.shape != (rows, kv_heads * padded_group, 1280)
         or k.shape[1] != 128
         or k.shape != v.shape
-        or gate.shape != (rows, kv_heads * 6, 128)
+        or gate.shape != (rows, heads, 128)
         or sinks.shape != gate.shape[:2]
         or seqused_k.shape != (batch,)
         or cu_seqlens_q.shape != (batch + 1,)
@@ -112,6 +152,7 @@ def native_bias_attention(
         torch.cuda.get_device_capability(q.device),
         tokens,
         kv_heads,
+        padded_group,
         window_left is not None,
         tuple(get_broadcast_dims(arg) for arg in args if isinstance(arg, torch.Tensor)),
     )
@@ -120,7 +161,8 @@ def native_bias_attention(
         kernel = FlashAttentionForwardSm100(
             is_causal=window_left is None,
             is_local=window_left is not None,
-            bias_block_size=tokens * 8,
+            qhead_per_kvhead=padded_group,
+            bias_block_size=max(MIN_BIAS_TILE_ROWS, tokens * padded_group),
         )
         converted = [
             to_cute_tensor(
@@ -142,24 +184,27 @@ def native_bias_attention(
         )
     launch: Any = kernels[key]
     launch(*args[:-2])
-    return combine_gate_sink(partials, lse, gate, sinks, padded=True)
+    return combine_gate_sink(
+        partials, lse, gate, sinks, padded=True, heads_per_kv=heads // kv_heads
+    )
 
 
 @torch.inference_mode()
-def warm_native_bias(kv_heads, device):
+def warm_native_bias(kv_heads, device, *, heads_per_kv=6):
     """Compile query and broadcast-layout regimes before graph capture."""
-    if kv_heads not in (2, 4, 8):
+    padded_group = packed_decode_group(kv_heads * heads_per_kv, kv_heads)
+    if padded_group is None:
         return
     keys = torch.zeros((3, 128, kv_heads, 128), device=device, dtype=torch.bfloat16)
     values = torch.zeros_like(keys)
     for batch in (1, 2):
         pages = torch.arange(3, device=device, dtype=torch.int32).repeat(batch, 1)
         used = torch.full((batch,), 128, device=device, dtype=torch.int32)
-        for tokens in (1, 8):
-            query = keys.new_zeros((batch * tokens, kv_heads * 8, 128))
-            bias = keys.new_zeros((batch * tokens, kv_heads * 8, 1280))
-            gate = keys.new_zeros((batch * tokens, kv_heads * 6, 128))
-            sinks = keys.new_zeros((batch * tokens, kv_heads * 6))
+        for tokens in DECODE_TOKENS:
+            query = keys.new_zeros((batch * tokens, kv_heads * padded_group, 128))
+            bias = keys.new_zeros((batch * tokens, kv_heads * padded_group, 1280))
+            gate = keys.new_zeros((batch * tokens, kv_heads * heads_per_kv, 128))
+            sinks = keys.new_zeros((batch * tokens, kv_heads * heads_per_kv))
             cu_query = (
                 torch.arange(batch + 1, device=device, dtype=torch.int32) * tokens
             )

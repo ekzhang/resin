@@ -1,6 +1,7 @@
 """Shared serving/benchmark configuration preserves runner and checkpoint contracts."""
 
 import importlib
+import json
 from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
@@ -157,7 +158,12 @@ def make_checkpoint(path, required_files):
     for name in required_files:
         target = path / name
         target.parent.mkdir(parents=True, exist_ok=True)
-        target.write_text("{}")
+        contents = (
+            {"weight_map": {"weight": "model.safetensors"}}
+            if name == "model.safetensors.index.json"
+            else {}
+        )
+        target.write_text(json.dumps(contents))
     (path / "model.safetensors").write_bytes(b"weights")
 
 
@@ -199,7 +205,7 @@ def test_local_checkpoint_override_needs_no_volume_marker(monkeypatch, tmp_path)
 def test_inkling2_rejects_unsupported_runtime_options(draft, groups):
     with pytest.raises(ValueError, match="target-only or seven-token"):
         create_runner(
-            "inkling2",
+            "inkling2-small",
             device="cuda:0",
             groups=groups,
             context_length=1024,
@@ -214,7 +220,7 @@ def test_inkling2_factory_enables_qualified_attention_prologue(monkeypatch):
 
     monkeypatch.setattr(cuda, "Inkling2CudaRunner", lambda *args, **kwargs: kwargs)
     options = create_runner(
-        "inkling2",
+        "inkling2-small",
         device="cuda:0",
         context_length=1024,
         max_batch_size=1,
@@ -226,12 +232,47 @@ def test_inkling2_factory_enables_qualified_attention_prologue(monkeypatch):
     assert options["expert_backend"] == "cute-dsl"
 
 
+def test_inkling2_recipe_uses_checkpoint_tokenizer_and_image_settings(tmp_path):
+    import numpy as np
+    from tokenizers import Tokenizer
+    from tokenizers.models import WordLevel
+
+    from resin.recipe import Image, Message, Role, Text
+
+    tokenizer = Tokenizer(WordLevel({"[UNK]": 0}, unk_token="[UNK]"))
+    tokenizer.add_special_tokens(
+        [
+            "<|message_system|>",
+            "<|message_user|>",
+            "<|message_model|>",
+            "<|content_text|>",
+            "<|content_image|>",
+            "<|content_thinking|>",
+            "<|content_model_end_sampling|>",
+            "<|end_message|>",
+            "<|unused_200054|>",
+        ]
+    )
+    tokenizer.save(str(tmp_path / "tokenizer.json"))
+    (tmp_path / "processor_config.json").write_text(
+        json.dumps({"image_processor": {"size": {"height": 8, "width": 8}}})
+    )
+
+    recipe = create_recipe("inkling2-small", tmp_path)
+    image = Image.from_rgb(np.zeros((9, 2, 3), dtype=np.float32))
+    prompt = recipe.render([Message(Role.USER, [image, Text("Describe this.")])])
+    image_token = tokenizer.token_to_id("<|unused_200054|>")
+    assert prompt.token_ids.tolist().count(image_token) == 2
+    assert len(prompt.media) == 1
+    assert prompt.media[0].image.shape == (16, 8, 3)
+
+
 @pytest.mark.parametrize(
     "model,gpu",
     [
         ("gemma4", "B200"),
         ("qwen3_5", "B300"),
-        ("inkling2", "H200"),
+        ("inkling2-small", "H200"),
         ("deepseek-v41", "H100"),
     ],
 )

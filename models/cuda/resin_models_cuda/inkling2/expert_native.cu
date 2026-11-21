@@ -399,6 +399,7 @@ void BridgeDispatch(TensorView acc, TensorView acc_amax, TensorView w_amax, Tens
   switch(acc.size(1)/2) {
     case 128: BRIDGE(128); break;
     case 256: BRIDGE(256); break;
+    case 1152: BRIDGE(1152); break;
     case 2304: BRIDGE(2304); break;
     case 4608: BRIDGE(4608); break;
     default: TVM_FFI_ICHECK(false) << "Unsupported fixed Inkling2 intermediate";
