@@ -50,6 +50,7 @@
     details[open] > summary::before { transform:translateY(-2px) rotate(45deg) }
     details.pending summary { animation:pulse 1.4s ease-in-out infinite }
     details .markdown { padding:7px 3px 2px }
+    details + .assistant { padding-top:8px }
     .assistant:empty { display:none }
     footer { min-width:0; position:sticky; bottom:0; z-index:2; margin-bottom:-18px; padding:9px 0 18px; background:Canvas }
     #stats { min-height:24px; margin:0 3px 8px; font-size:13px }
@@ -268,7 +269,7 @@ form.addEventListener('submit',async e=>{
   const requestStartedAt=performance.now();
   const updatePending=()=>{if(thinking.isConnected&&thinking.classList.contains('pending'))summary.textContent=`Waiting for first token… ${((performance.now()-requestStartedAt)/1000).toFixed(1)}s`};
   updatePending();const statusTimer=setInterval(updatePending,250);
-  let answer='',reason='',generationStartedAt=null,finishReason=null;
+  let answer='',reason='',answerStarted=false,generationStartedAt=null,finishReason=null;
   try {
     const request={model:modelEl.textContent,messages:history,temperature:Number(temperature.value),top_p:Number(topP.value),stream:true,stream_options:{include_usage:true}};
     const maxOutput=Number(maxOutputTokens.value);if(maxOutput>0)request.max_completion_tokens=maxOutput;
@@ -282,8 +283,14 @@ form.addEventListener('submit',async e=>{
       if(data==='[DONE]'){completed=true;return}const event=JSON.parse(data);if(event.error)throw new Error(event.error.message||'The inference request failed');const delta=event.choices?.[0]?.delta||{};
       finishReason=event.choices?.[0]?.finish_reason||finishReason;
       if(delta.reasoning_content||delta.content)generationStartedAt??=performance.now();
-      if(delta.reasoning_content){reason+=delta.reasoning_content;summary.textContent='Reasoning';thinking.classList.remove('pending');renderRich(reasonBox,reason);thinking.open=true}
-      if(delta.content){if(!reason)thinking.remove();answer+=delta.content;renderRich(box,answer)}
+      if(delta.reasoning_content){reason+=delta.reasoning_content;summary.textContent='Reasoning';thinking.classList.remove('pending');renderRich(reasonBox,reason)}
+      if(delta.content){
+        if(!answerStarted&&delta.content.trim()){
+          answerStarted=true;
+          if(reason)thinking.open=false;else thinking.remove();
+        }
+        answer+=delta.content;renderRich(box,answer);
+      }
       if(event.resin){const r=event.resin,now=performance.now();if(!reason&&!answer)thinking.remove();const generationMs=r.generation_elapsed_ms>0?r.generation_elapsed_ms:(generationStartedAt===null?r.elapsed_ms:now-generationStartedAt);const observedTtftMs=generationStartedAt===null?r.time_to_first_token_ms:generationStartedAt-requestStartedAt;const rate=generationMs>0?r.completion_tokens*1000/generationMs:0;const stopNote=finishReason==='length'?' · max output reached':'';stats.textContent=`${r.prompt_tokens} prompt + ${r.completion_tokens} generated tokens · ${rate.toFixed(1)} tok/s · ${(generationMs/1000).toFixed(2)} s generation · ${(observedTtftMs/1000).toFixed(2)} s TTFT${stopNote}`}
     });if(done)break}
     if(!completed)throw new Error('The inference stream ended before completion');
