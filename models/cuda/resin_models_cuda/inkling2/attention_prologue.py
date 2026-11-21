@@ -22,6 +22,7 @@ def _clip_value(value, threshold: tl.constexpr):
 
 
 # Flat scalar arguments avoid Triton's recursive specialization of tuple strides.
+# Prefill row slices can change the alignment of scalar cache metadata loads.
 @triton.jit(
     do_not_specialize=(
         "T layer WIDTH RP0 RP1 US QB QT QD RB RT RD KB KT KD VB VT VD "
@@ -29,7 +30,8 @@ def _clip_value(value, threshold: tl.constexpr):
         "KDB KDT KDH KDD VDB VDT VDH VDD QSH QSD RSH RSD "
         "TB TT PB PT GSB GSC GOB GOC GFB CKP CKT CKH CKD CVP CVT CVH CVD "
         "KNB KNT KND VNB VNT VND KIB KIT KID VIB VIT VID"
-    ).split()
+    ).split(),
+    do_not_specialize_on_alignment=["Positions", "Slabs", "Slots", "First"],
 )
 def _attention_prologue(
     Q,

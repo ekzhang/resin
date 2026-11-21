@@ -1097,7 +1097,10 @@ def mix_loop_messages(dests, messages, down, gain, forget):
     return output
 
 
-@triton.jit
+@triton.jit(
+    do_not_specialize=["SlabRow", "SlotRow", "PositionRow"],
+    do_not_specialize_on_alignment=["Slabs", "Slots", "Positions"],
+)
 def _transfer_live_state(
     Cache,
     Slabs,
@@ -1106,17 +1109,17 @@ def _transfer_live_state(
     State,
     SLAB_STRIDE: tl.constexpr,
     SLOT_STRIDE: tl.constexpr,
-    SLAB_ROW: tl.constexpr,
-    SLOT_ROW: tl.constexpr,
-    POSITION_ROW: tl.constexpr,
+    SlabRow,
+    SlotRow,
+    PositionRow,
     WIDTH: tl.constexpr,
     STORE: tl.constexpr,
     BLOCK: tl.constexpr,
 ):
     row, tile = tl.program_id(0), tl.program_id(1)
-    slab = tl.load(Slabs + row * SLAB_ROW).to(tl.int64)
-    slot = tl.load(Slots + row * SLOT_ROW).to(tl.int64)
-    position = tl.load(Positions + row * POSITION_ROW)
+    slab = tl.load(Slabs + row * SlabRow).to(tl.int64)
+    slot = tl.load(Slots + row * SlotRow).to(tl.int64)
+    position = tl.load(Positions + row * PositionRow)
     offset = tile * BLOCK + tl.arange(0, BLOCK)
     mask = offset < WIDTH
     if STORE:

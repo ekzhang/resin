@@ -96,7 +96,8 @@ def softcap_logits(values, cap):
         "head_stride",
         "position_batch_stride",
         "position_token_stride",
-    ]
+    ],
+    do_not_specialize_on_alignment=["Positions"],
 )
 def _norm_neox_rope(
     X,
