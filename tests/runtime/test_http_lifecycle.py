@@ -13,7 +13,7 @@ from output_helpers import forward_output
 from test_recipe import _byte_tokenizer, _FastTokenizer, _token_ids
 
 import resin
-from resin import BatchPhase, Engine
+from resin import BatchPhase, CacheGroupLayout, CacheLayout, Engine, RunnerConfig
 from resin.backend.cuda.failures import PostAcceptCudaError
 from resin.recipe import RenderedPrompt, Tokenizer, get_native_recipe
 from resin.server import HttpServer
@@ -390,6 +390,42 @@ def test_configured_admissions_limit_bounds_new_requests_between_steps():
                 assert response.read().decode().endswith("data: [DONE]\n\n")
         assert sum(admissions) == 6
         assert max(admissions) == 1
+        assert errors == []
+
+
+@pytest.mark.parametrize("stream", [False, True])
+def test_kv_cache_exhaustion_only_fails_the_affected_request(stream):
+    class SmallCacheRunner(Runner):
+        runner_config = RunnerConfig(
+            cache_layout=CacheLayout(parent_capacity=1, groups=[CacheGroupLayout(2)])
+        )
+
+        def bind_resources(self, binding):
+            assert binding.cache_layout == self.runner_config.cache_layout
+
+    runner = SmallCacheRunner()
+    with running_server(runner) as (_server, engine, thread, errors, base, _port):
+        # The one-token prompt fills the cache during decode, not at submission.
+        body = request_body(stream=stream, max_tokens=3)
+        if stream:
+            with post(base, body) as response:
+                payloads = [
+                    line.removeprefix("data: ")
+                    for line in response.read().decode().splitlines()
+                    if line.startswith("data: ")
+                ]
+            assert payloads[-1] == "[DONE]"
+            failure = json.loads(payloads[-2])
+        else:
+            with pytest.raises(urllib.error.HTTPError) as caught:
+                post(base, body)
+            failure = json.load(caught.value)
+        assert "not enough KV cache" in failure["error"]["message"]
+        assert list(runner.counts.values()) == [2]
+        assert not engine.poisoned
+        assert thread.is_alive()
+        with post(base, request_body(max_tokens=2)) as response:
+            assert json.load(response)["choices"][0]["finish_reason"] == "length"
         assert errors == []
 
 

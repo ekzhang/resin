@@ -20,9 +20,8 @@ uv run scripts/mlx_serve.py --model qwen3.5-0.8b-mlx --checkpoint "$QWEN_CHECKPO
 This uses Hugging Face's normal cache, respecting `HF_HOME` and `HF_HUB_CACHE`.
 The 1.00 GB safetensors file contains packed affine language weights and BF16
 vision weights. Loading preserves the packed weights and metadata; it does not
-require a BF16 language checkpoint or startup requantization. The preset uses an
-8,192-token context and at most four requests; `--context-length` and
-`--max-batch-size` override those limits.
+require a BF16 language checkpoint or startup requantization. The preset allows
+at most four concurrent requests; `--max-batch-size` overrides this limit.
 
 The loader also accepts original BF16 Hugging Face checkpoints, including
 per-expert or fused MoE tensors, and quantizes language weights to 8-bit affine
@@ -31,6 +30,10 @@ weights with group size 64. For
 use revision `5df2ed3f675c7beaa490328cc70bb573b65fb660` and the
 `ornith-1.0-35b` preset. That preset serves text only and requires substantially
 more memory than the 0.8B model.
+
+Both presets default to the checkpoint's 262,144-token context ceiling;
+`--context-length` can lower it. The device's cache budget determines how much
+context can actually be served.
 
 Building the native extension requires Xcode's C++ and Metal command-line tools
 and CMake 3.25 or newer. Build and runtime use MLX 0.32.4 because the extension

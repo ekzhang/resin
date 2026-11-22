@@ -229,6 +229,11 @@ remaining gap is the dispatch of many small per-visit operations.
 - Prompt logprobs project 128 prompt rows in about 60 ms (four rows per GEMV
   launch), adding about 4 seconds per 8,192-token chunk when requested.
 
+The preset defaults to the checkpoint's 1,048,576-token context ceiling, not a
+reservation of that much cache. Actual capacity depends on the device's cache
+budget. If the Engine cannot free enough cache to keep a request going, it
+fails that request without stopping the server.
+
 ## Source references
 
 - The CUDA runner `models/cuda/resin_models_cuda/inkling2`, which follows
