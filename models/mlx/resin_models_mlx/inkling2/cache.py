@@ -17,7 +17,7 @@ from __future__ import annotations
 
 import math
 from collections.abc import Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import mlx.core as mx
 import numpy as np
@@ -25,14 +25,14 @@ import numpy as np
 from resin import CacheGroupFamily, CacheGroupLayout, CacheLayout, CacheRetention
 from resin.backend.plans import PagedCachePlan
 from resin.models.inkling2.config import Inkling2Config
-from resin_models_mlx.cache_arena import ByteArena, KVPage
+from resin_models_mlx.cache_arena import ByteArena, KVPage, SlabGeometry
 
 PAGE_TOKENS = 128
 GLOBAL_GROUP, LOCAL_GROUP, STATE_GROUP = 0, 1, 2
 
 
 @dataclass(frozen=True, slots=True)
-class CacheGeometry:
+class CacheGeometry(SlabGeometry):
     global_layers: int
     local_layers: int
     kv_heads: int
@@ -40,6 +40,18 @@ class CacheGeometry:
     state_shape: tuple[int, int, int]
     window_tokens: int
     prefill_chunk_size: int
+    kv_page: KVPage = field(init=False)
+    slab_units: int = field(init=False)
+    state_units: int = field(init=False)
+    page_tokens = PAGE_TOKENS
+
+    def __post_init__(self) -> None:
+        page = KVPage(PAGE_TOKENS, self.kv_heads * self.head_dim, mx.bfloat16)
+        state_units = math.ceil(self.state_elements * mx.bfloat16.size / page.nbytes)
+        slab_units = math.lcm(self.global_layers, self.local_layers, state_units)
+        object.__setattr__(self, "state_units", state_units)
+        object.__setattr__(self, "slab_units", slab_units)
+        object.__setattr__(self, "kv_page", page)
 
     @classmethod
     def from_config(
@@ -64,37 +76,8 @@ class CacheGeometry:
         )
 
     @property
-    def kv_width(self) -> int:
-        return self.kv_heads * self.head_dim
-
-    @property
-    def page_tokens(self) -> int:
-        return PAGE_TOKENS
-
-    @property
-    def kv_page(self) -> KVPage:
-        return KVPage(PAGE_TOKENS, self.kv_width, mx.bfloat16)
-
-    @property
     def state_elements(self) -> int:
         return math.prod(self.state_shape)
-
-    @property
-    def state_units(self) -> int:
-        return math.ceil(self.state_elements * mx.bfloat16.size / self.kv_page.nbytes)
-
-    @property
-    def slab_units(self) -> int:
-        # The smallest slab holding whole blocks of every group.
-        return math.lcm(self.global_layers, self.local_layers, self.state_units)
-
-    @property
-    def slab_bytes(self) -> int:
-        return self.slab_units * self.kv_page.nbytes
-
-    @property
-    def state_bytes(self) -> int:
-        return self.state_units * self.kv_page.nbytes
 
     def layers(self, group: int) -> int:
         return self.global_layers if group == GLOBAL_GROUP else self.local_layers
@@ -179,17 +162,10 @@ class History:
         return keys, values, mx.array(positions.astype(np.int32)), valid
 
 
-class CacheArena(ByteArena):
+class CacheArena(ByteArena[CacheGeometry]):
     """Engine-addressed mutable storage, ordered by an MLX dependency epoch."""
 
-    def __init__(self, layout: CacheLayout, geometry: CacheGeometry) -> None:
-        self.geometry = geometry
-        self.page = geometry.kv_page
-        super().__init__(
-            layout,
-            slab_shape=(geometry.slab_units, self.page.nbytes),
-            resource="Inkling 2 MLX cache",
-        )
+    resource = "Inkling 2 MLX cache"
 
     def units(self) -> mx.array:
         return self.page.view(self)
@@ -208,40 +184,20 @@ class CacheArena(ByteArena):
 
         ``earliest`` optionally skips whole blocks before that position.
         """
-        cache_group = plan.groups[group]
         geometry = self.geometry
-        stride = geometry.blocks_per_slab(group)
-        starts = np.zeros(len(rows), dtype=np.int64)
-        tables = []
-        for index, row in enumerate(rows.tolist()):
-            first = int(cache_group.block_table_start_indices[row])
-            end = math.ceil(int(contexts[index]) / PAGE_TOKENS)
-            skip = 0
-            if earliest is not None:
-                skip = max(0, int(earliest[index]) // PAGE_TOKENS - first)
-            slabs = cache_group.block_slabs(row).astype(np.int64)
-            slots = cache_group.block_slots(row).astype(np.int64)
-            count = max(0, end - first)
-            selected = slice(min(skip, count), count)
-            tables.append(slabs[selected] * geometry.slab_units + slots[selected])
-            starts[index] = first + min(skip, count)
-        width = max((len(table) for table in tables), default=0)
-        if width == 0:
+        bases, starts = self.page.retained_table(
+            plan.groups[group], rows, contexts, geometry.slab_units, earliest=earliest
+        )
+        if bases.shape[1] == 0:
             return None
-        bases = np.zeros((len(rows), width), dtype=np.int64)
-        for index, table in enumerate(tables):
-            bases[index, : len(table)] = table
         return History(
             self.units(),
             bases,
             starts,
             contexts.astype(np.int64),
-            stride,
+            geometry.blocks_per_slab(group),
             geometry.kv_heads,
         )
-
-    def state_start(self, slab: int, slot: int) -> int:
-        return slab * self.geometry.slab_bytes + slot * self.geometry.state_bytes
 
     def read_states(self, starts: np.ndarray) -> mx.array:
         geometry = self.geometry

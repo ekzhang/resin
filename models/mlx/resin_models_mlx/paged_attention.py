@@ -16,9 +16,11 @@ size are runtime data; only the model geometry selects a compiled kernel.
 from __future__ import annotations
 
 from functools import cache, partial
+from math import prod
 from pathlib import Path
 
 import mlx.core as mx
+import numpy as np
 
 PARTITION_TOKENS = 512
 # Below this many rows, half-size partitions keep more GPU cores busy.
@@ -37,6 +39,20 @@ _THREADGROUP_BYTES = 32 * 1024
 # the same body inside it; the native metallib includes this header too.
 _HEADER = (Path(__file__).parent / "_native/attention_kernel.h").read_text()
 _SOURCE = "#define RESIN_ATTENTION_BODY\n" + _HEADER + "\n#undef RESIN_ATTENTION_BODY\n"
+
+
+def decode_metadata(values: np.ndarray) -> mx.array:
+    """Keep page tables and row metadata in MLX's device address space.
+
+    MLX 0.32.4 uses constant arguments below eight elements. Pad only rows
+    so the page-table width and the partition count stay unchanged.
+    """
+    if values.size < 8:
+        width = prod(values.shape[1:])
+        padded = np.zeros(((8 + width - 1) // width, *values.shape[1:]), np.int32)
+        padded[: len(values)] = values
+        values = padded
+    return mx.array(values.astype(np.int32, copy=False))
 
 
 @cache
@@ -222,7 +238,7 @@ def _merge(outputs: mx.array, maxima: mx.array, sums: mx.array, *, return_lse=Fa
     return output
 
 
-__all__ = ["PARTITION_TOKENS", "paged_decode_attention"]
+__all__ = ["PARTITION_TOKENS", "decode_metadata", "paged_decode_attention"]
 
 
 # MLX v0.32.4's small-column reduction order, Apple Inc., MIT (see NOTICE).

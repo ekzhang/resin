@@ -20,7 +20,7 @@ from __future__ import annotations
 
 import math
 from collections.abc import Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import mlx.core as mx
 import numpy as np
@@ -28,7 +28,8 @@ import numpy as np
 from resin import CacheGroupFamily, CacheGroupLayout, CacheLayout
 from resin.backend.plans import PagedCachePlan
 from resin.models.qwen3_5.config import Qwen35Config
-from resin_models_mlx.cache_arena import ByteArena, KVPage
+from resin_models_mlx.cache_arena import ByteArena, KVPage, SlabGeometry
+from resin_models_mlx.paged_attention import decode_metadata
 from resin_models_mlx.qwen3_5.model import (
     AttentionHistory,
     LinearState,
@@ -40,13 +41,9 @@ STATE_BLOCK_TOKENS = 4096
 KV_GROUP = 0
 STATE_GROUP = 1
 
-# MLX 0.32.4 uses constant-address-space kernel arguments below this size.
-# Keep metadata in device buffers so new lengths/batches do not change the ABI.
-_MIN_DEVICE_ELEMENTS = 8
-
 
 @dataclass(frozen=True, slots=True)
-class CacheGeometry:
+class CacheGeometry(SlabGeometry):
     """Shared slab capacity with layer-major KV and contiguous STATE units.
 
     KV unit ``(slab, layer, slot)`` is ``slab * slab_units +
@@ -61,6 +58,7 @@ class CacheGeometry:
     convolution_shape: tuple[int, int, int]
     slab_units: int
     state_units: int
+    kv_page: KVPage = field(init=False)
 
     @classmethod
     def from_config(cls, config: Qwen35Config) -> CacheGeometry:
@@ -99,23 +97,9 @@ class CacheGeometry:
             state_units=state_units,
         )
 
-    @property
-    def kv_width(self) -> int:
-        return self.kv_heads * self.head_dim
-
-    @property
-    def kv_page(self) -> KVPage:
-        return KVPage(PAGE_TOKENS, self.kv_width, mx.bfloat16)
-
-    @property
-    def slab_bytes(self) -> int:
-        return self.slab_units * self.kv_page.nbytes
-
-    @property
-    def state_bytes(self) -> int:
-        """Bytes of one DeltaNet STATE block."""
-
-        return self.state_units * self.kv_page.nbytes
+    def __post_init__(self) -> None:
+        page = KVPage(PAGE_TOKENS, self.kv_heads * self.head_dim, mx.bfloat16)
+        object.__setattr__(self, "kv_page", page)
 
     @property
     def kv_blocks_per_slab(self) -> int:
@@ -143,21 +127,14 @@ class CacheGeometry:
         )
 
 
-class CacheArena(ByteArena):
+class CacheArena(ByteArena[CacheGeometry]):
     """Engine-addressed mutable storage, ordered by an MLX dependency epoch.
 
     Private read views are consumed by model graphs. Retained, immutable values
     must be obtained through ``snapshot`` instead of exposing the allocation.
     """
 
-    def __init__(self, layout: CacheLayout, geometry: CacheGeometry) -> None:
-        self.geometry = geometry
-        self.page = geometry.kv_page
-        super().__init__(
-            layout,
-            slab_shape=(geometry.slab_units, self.page.nbytes),
-            resource="Qwen3.5 MLX cache",
-        )
+    resource = "Qwen3.5 MLX cache"
 
     def snapshot(self) -> mx.array:
         """Return an independent, immutable copy, ordered before later writes."""
@@ -175,16 +152,9 @@ class CacheArena(ByteArena):
     ) -> np.ndarray:
         """Layer-zero unit per block covering ``lengths[i]`` tokens; 0 pads."""
 
-        group = plan.groups[KV_GROUP]
-        width = max(1, math.ceil(int(lengths.max(initial=0)) / PAGE_TOKENS))
-        bases = np.zeros((len(rows), width), dtype=np.int64)
-        for index, row in enumerate(rows.tolist()):
-            blocks = math.ceil(int(lengths[index]) / PAGE_TOKENS)
-            slabs = group.block_slabs(row)[:blocks]
-            slots = group.block_slots(row)[:blocks]
-            bases[index, :blocks] = (
-                slabs.astype(np.int64) * self.geometry.slab_units + slots
-            )
+        bases, _ = self.page.retained_table(
+            plan.groups[KV_GROUP], rows, lengths, self.geometry.slab_units, min_width=1
+        )
         return bases
 
     def history(
@@ -204,26 +174,12 @@ class CacheArena(ByteArena):
         """Page tables for attending to history in place during decode."""
 
         bases = self._kv_bases(plan, rows, lengths)
-        if bases.size < _MIN_DEVICE_ELEMENTS:
-            # Pad rows, preserving the logical page-table width and therefore
-            # the attention partition count. Only queries select live rows.
-            capacity = max(len(rows), math.ceil(_MIN_DEVICE_ELEMENTS / bases.shape[1]))
-            pages = np.zeros((capacity, bases.shape[1]), dtype=np.int32)
-            pages[: len(rows)] = bases
-        else:
-            pages = bases.astype(np.int32)
-        history_lengths = np.zeros(max(_MIN_DEVICE_ELEMENTS, len(rows)), dtype=np.int32)
-        history_lengths[: len(rows)] = lengths
         return PagedHistory(
             self.page.view(self),
-            mx.array(pages),
-            mx.array(history_lengths),
+            decode_metadata(bases),
+            decode_metadata(lengths),
             layer_stride=self.geometry.kv_blocks_per_slab,
         )
-
-    def state_start(self, slab: int, slot: int) -> int:
-        """Byte offset of the STATE block at ``(slab, slot)``."""
-        return slab * self.geometry.slab_bytes + slot * self.geometry.state_bytes
 
     def read_states(self, starts: np.ndarray) -> LinearState:
         """Restore each layer's FP32 recurrent state and BF16 convolution tail."""

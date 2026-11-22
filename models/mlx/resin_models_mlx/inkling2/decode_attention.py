@@ -38,6 +38,7 @@ def decode_attention(
     if dim % 32 or heads % kv_heads:
         raise ValueError("unsupported Inkling 2 decode attention geometry")
     partitions = max(1, -(-longest // PARTITION_TOKENS))
+    # The Engine pads these tables once per group. Direct callers can pass raw rows.
     partials = _paged_partitions(
         queries,
         current_keys,

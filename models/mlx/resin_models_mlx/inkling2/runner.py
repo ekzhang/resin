@@ -31,6 +31,7 @@ from resin_models_mlx.inkling2.checkpoint import load_model
 from resin_models_mlx.inkling2.decode_attention import decode_attention
 from resin_models_mlx.inkling2.model import Inkling2Model, Inkling2Weights, logits
 from resin_models_mlx.live_state import LiveStates
+from resin_models_mlx.paged_attention import decode_metadata
 from resin_models_mlx.sampling import MlxSampler
 
 if TYPE_CHECKING:
@@ -93,15 +94,15 @@ class _StepStore:
                     starts = firsts // geometry.page_tokens
                     stride = geometry.blocks_per_slab(group)
                 else:
-                    pages = history.bases.astype(np.int32)
+                    pages = history.bases
                     starts = history.starts
                     stride = history.layer_stride
-                meta = np.stack([contexts, firsts, starts], axis=1).astype(np.int32)
+                meta = np.stack([contexts, firsts, starts], axis=1)
                 longest = int(np.max(contexts + 1 - firsts))
                 self.paged[group] = (
                     units,
-                    mx.array(pages),
-                    mx.array(meta),
+                    decode_metadata(pages),
+                    decode_metadata(meta),
                     longest,
                     stride,
                 )

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 from dataclasses import dataclass
+from typing import Generic, TypeVar
 
 import mlx.core as mx
 import numpy as np
@@ -14,18 +15,45 @@ from resin.backend.resources import CachePoolBinding
 from resin_models_mlx.cache_packing import pack_key_values
 
 
-class ByteArena:
+class SlabGeometry:
+    """Physical byte layout shared by the model's KV and STATE cache groups."""
+
+    __slots__ = ()
+    kv_page: KVPage
+    slab_units: int
+    state_units: int
+
+    @property
+    def slab_bytes(self) -> int:
+        return self.slab_units * self.kv_page.nbytes
+
+    @property
+    def state_bytes(self) -> int:
+        return self.state_units * self.kv_page.nbytes
+
+    @property
+    def kv_width(self) -> int:
+        return self.kv_page.width
+
+
+_Geometry = TypeVar("_Geometry", bound=SlabGeometry)
+
+
+class ByteArena(Generic[_Geometry]):
     """One mutable allocation. A reader's output must precede its next mutation."""
 
-    def __init__(
-        self, layout: CacheLayout, *, slab_shape: tuple[int, ...], resource: str
-    ) -> None:
+    resource: str
+
+    def __init__(self, layout: CacheLayout, geometry: _Geometry) -> None:
         from resin_models_mlx._native import CacheStorage
 
         self.layout = layout
-        self.binding = CachePoolBinding(layout, resource=resource)
+        self.geometry = geometry
+        self.page = geometry.kv_page
+        self.binding = CachePoolBinding(layout, resource=self.resource)
         self.slabs = layout.parent_capacity + 1  # Includes the reserved zero slab.
-        self._storage = CacheStorage([self.slabs, *slab_shape])
+        shape = (self.slabs, geometry.slab_units, self.page.nbytes)
+        self._storage = CacheStorage(shape)
         self._epoch = self._storage.initial_epoch()
         self._readers: list[mx.array] = []
 
@@ -40,6 +68,9 @@ class ByteArena:
     @property
     def epoch(self) -> mx.array:
         return self._epoch
+
+    def state_start(self, slab: int, slot: int) -> int:
+        return slab * self.geometry.slab_bytes + slot * self.geometry.state_bytes
 
     def order_after(self, reads: Sequence[mx.array]) -> None:
         self._readers.extend(reads)
@@ -87,6 +118,37 @@ class KVPage:
 
     def view(self, arena: ByteArena) -> mx.array:
         return arena.view(self.dtype, (-1, 2, self.tokens, self.width))
+
+    def retained_table(
+        self,
+        group: CacheGroupView,
+        rows: np.ndarray,
+        lengths: np.ndarray,
+        slab_units: int,
+        *,
+        earliest: np.ndarray | None = None,
+        min_width: int = 0,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """Layer-zero page IDs and absolute first block per row, omitting new tokens."""
+        first = group.block_table_start_indices[rows].astype(np.int64)
+        offsets = group.block_indptr[rows].astype(np.int64)
+        available = group.block_indptr[rows + 1] - offsets
+        ends = (lengths.astype(np.int64) + self.tokens - 1) // self.tokens
+        counts = np.clip(ends - first, 0, available)
+        starts = first
+        if earliest is not None:
+            skips = np.clip(earliest // self.tokens - first, 0, counts)
+            starts = first + skips
+            offsets += skips
+            counts -= skips
+
+        width = int(counts.max(initial=min_width))
+        bases = np.zeros((len(rows), width), np.int64)
+        for index, (offset, count) in enumerate(zip(offsets, counts, strict=True)):
+            selected = slice(offset, offset + count)
+            slabs = group.block_slab_ids[selected].astype(np.int64)
+            bases[index, :count] = slabs * slab_units + group.block_slotnums[selected]
+        return bases, starts
 
     def write(
         self,
