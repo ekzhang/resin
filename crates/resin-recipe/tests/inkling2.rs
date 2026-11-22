@@ -338,3 +338,18 @@ fn pinned_inkling2_template_handles_named_headers_images_and_empty_content() {
         assert!(Inkling2Recipe::default().render(&request).is_err());
     }
 }
+
+#[test]
+fn text_only_recipe_rejects_media() {
+    use resin_recipe::{Recipe, inkling2::Inkling2Recipe};
+
+    assert_eq!(
+        (&Inkling2Recipe::default() as &dyn Recipe).input_modalities(),
+        &["text", "image"]
+    );
+    let recipe = Inkling2Recipe {
+        text_only: true,
+        ..Default::default()
+    };
+    assert_eq!((&recipe as &dyn Recipe).input_modalities(), &["text"]);
+}

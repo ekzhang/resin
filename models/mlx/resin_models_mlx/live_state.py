@@ -1,0 +1,160 @@
+"""Per-request model state kept on the GPU between steps.
+
+Each running request's state stays in the MLX arrays the model returned for its
+last step, so an unchanged decode batch feeds them straight back without
+touching the cache arena. The Engine's STATE group still decides when state is
+restored from a prefix snapshot, and where snapshots are published; only those
+transitions copy through the arena. Requests leave when the Engine releases
+them.
+
+State is any MLX pytree whose leaves share a leading batch axis.
+"""
+
+from __future__ import annotations
+
+from collections.abc import Callable, Iterable, Sequence
+from typing import Any, Protocol, cast
+
+import mlx.core as mx
+import numpy as np
+from mlx.utils import tree_flatten, tree_map
+
+from resin.backend.plans import PagedCachePlan
+
+
+class StateArena(Protocol):
+    def state_start(self, slab: int, slot: int) -> int: ...
+
+    def read_states(self, starts: np.ndarray) -> Any: ...
+
+    def write_states(self, starts: Sequence[int], state: Any) -> None: ...
+
+
+def _batch(state: Any) -> int:
+    leaves = cast(list[tuple[str, mx.array]], tree_flatten(state))
+    return leaves[0][1].shape[0]
+
+
+def take_rows(state: Any, indices: list[int]) -> Any:
+    if indices == list(range(_batch(state))):
+        return state
+    selected = mx.array(indices)
+    return tree_map(lambda value: mx.take(value, selected, axis=0), state)
+
+
+def _concatenate(parts: list[Any]) -> Any:
+    if len(parts) == 1:
+        return parts[0]
+    return tree_map(lambda *values: mx.concatenate(list(values)), *parts)
+
+
+class LiveStates:
+    """Per-request state, indexed into the batch arrays that hold it."""
+
+    def __init__(
+        self,
+        arena: StateArena,
+        initial_state: Callable[[int], Any],
+        state_group: int,
+    ) -> None:
+        self._arena = arena
+        self._initial_state = initial_state
+        self._group = state_group
+        # sequence ID -> (tokens processed, batch state, row in that batch)
+        self._rows: dict[int, tuple[int, Any, int]] = {}
+
+    def __len__(self) -> int:
+        return len(self._rows)
+
+    def gather(self, plan: PagedCachePlan, rows: np.ndarray) -> Any:
+        """State before each of ``rows`` runs, in plan row order."""
+
+        batch = plan.batch
+        restore = plan.groups[self._group].state
+        sources = {
+            int(row): (int(slab), int(slot))
+            for row, slab, slot in (restore.restore_copies if restore else ())
+        }
+        # Source slab zero is the Engine's explicit immutable zero state.
+        # Preserve every real restore and mixed/held path below.
+        if len(rows) and all(
+            int(batch.context_lengths[row]) == 0 and sources.get(int(row)) == (0, 0)
+            for row in rows
+        ):
+            return self._initial_state(len(rows))
+        snapshots, fresh = [], []
+        held: dict[int, tuple[Any, list[int], list[int]]] = {}
+        for position, row in enumerate(rows.tolist()):
+            context = int(batch.context_lengths[row])
+            if row in sources:
+                snapshots.append((position, *sources[row]))
+            elif context == 0:
+                fresh.append(position)
+            else:
+                sequence = int(batch.sequence_ids[row])
+                entry = self._rows.get(sequence)
+                if entry is None or entry[0] != context:
+                    raise RuntimeError(
+                        f"sequence {sequence} has no live state at position {context}"
+                    )
+                _, state, index = entry
+                group = held.setdefault(id(state), (state, [], []))
+                group[1].append(position)
+                group[2].append(index)
+
+        parts, order = [], []
+        for state, positions, indices in held.values():
+            parts.append(take_rows(state, indices))
+            order += positions
+        if snapshots:
+            parts.append(
+                self._arena.read_states(
+                    np.array([self._arena.state_start(s, t) for _, s, t in snapshots])
+                )
+            )
+            order += [position for position, *_ in snapshots]
+        if fresh:
+            parts.append(self._initial_state(len(fresh)))
+            order += fresh
+        state = _concatenate(parts)
+        if order != list(range(len(order))):
+            state = take_rows(state, np.argsort(order).tolist())
+        return state
+
+    def commit(
+        self,
+        plan: PagedCachePlan,
+        rows: np.ndarray,
+        ends: np.ndarray,
+        state: Any,
+    ) -> tuple[int, ...]:
+        """Hold each row's state after ``ends`` tokens and publish due snapshots.
+
+        Returns the reservation IDs of the snapshots written.
+        """
+
+        sequences = plan.batch.sequence_ids
+        for index, row in enumerate(rows.tolist()):
+            self._rows[int(sequences[row])] = (int(ends[index]), state, index)
+        checkpoints = plan.groups[self._group].state
+        positions = {row: index for index, row in enumerate(rows.tolist())}
+        written, starts, indices = [], [], []
+        for reservation, row, prefix, slab, slot in (
+            checkpoints.checkpoint_slots if checkpoints else ()
+        ):
+            index = positions.get(int(row))
+            # A snapshot is valid only at its exact prefix.
+            if index is not None and int(ends[index]) == int(prefix):
+                written.append(int(reservation))
+                starts.append(self._arena.state_start(int(slab), int(slot)))
+                indices.append(index)
+        if written:
+            self._arena.write_states(starts, take_rows(state, indices))
+        return tuple(written)
+
+    def release(self, sequence_ids: Iterable[int]) -> None:
+        for sequence in sequence_ids:
+            self._rows.pop(int(sequence), None)
+
+
+__all__ = ["LiveStates", "StateArena", "take_rows"]

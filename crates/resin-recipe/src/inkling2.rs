@@ -138,6 +138,9 @@ impl Grammar for Inkling2Grammar {
 pub struct Inkling2Recipe {
     pub add_generation_prompt: Option<bool>,
     pub reasoning_effort: Option<crate::ReasoningEffort>,
+    /// Rejects media for runners that serve only the language model.
+    #[serde(skip_serializing)]
+    pub text_only: bool,
     #[serde(skip_serializing, deserialize_with = "crate::recipe::default_if_null")]
     pub media_config: media::Config,
 }
