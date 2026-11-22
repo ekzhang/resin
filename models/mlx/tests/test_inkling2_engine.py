@@ -246,10 +246,17 @@ def test_image_prompt_with_vision_checkpoint(tmp_path):
         json.dumps({**raw_config, "vision_config": tiny_vision_config()})
     )
 
-    options = dict(max_seq_len=CHUNK, max_batch_size=1, prefill_chunk_size=CHUNK)
-    text_runner = Inkling2MlxRunner(tmp_path, include_vision=False, **options)
+    text_runner = Inkling2MlxRunner(
+        tmp_path,
+        max_seq_len=CHUNK,
+        max_batch_size=1,
+        prefill_chunk_size=CHUNK,
+        include_vision=False,
+    )
     assert text_runner._media is None
-    runner = Inkling2MlxRunner(tmp_path, **options)
+    runner = Inkling2MlxRunner(
+        tmp_path, max_seq_len=CHUNK, max_batch_size=1, prefill_chunk_size=CHUNK
+    )
     assert runner._media is not None
     image = np.ones((4, 8, 3), dtype=np.float32)
     prompt = _prompt(8, seed=14)
