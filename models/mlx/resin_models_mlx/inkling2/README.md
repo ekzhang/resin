@@ -33,8 +33,9 @@ kernel does, rather than through MLX's global scale.
 
 The checkpoint requires quantized expert activations. A Metal kernel reproduces
 the CUDA quantizer bit for bit (NVFP4's four-or-six block scale chosen by summed
-reconstruction error; MXFP8's power-of-two scale) and emits the dequantized
-codes, which are exact in BF16. The one exception is an MXFP8 block whose
+reconstruction error and MXFP8's power-of-two scale) and emits FP32 inputs
+for the expert GEMMs. The NVFP4 row maximum stays in the activation dtype
+until the FP32 output scaling step. The one exception to quantizer parity is an MXFP8 block whose
 largest value is below 448 · 2⁻¹²⁷, which becomes zero where CUDA keeps
 denormals. The packed GEMM therefore forms the same products as CUDA's
 W4A4/W8A8 MMA, up to FP32 summation order. Attention and dense projection
@@ -56,16 +57,16 @@ The Engine owns three cache groups, mirroring the CUDA runner without DSpark:
   tokens plus one prefill chunk of writes;
 - convolution history (`48 × 3 × 6656` BF16) for prefix snapshots.
 
-Live convolution history stays on the GPU between steps; prefix hits restore a
-snapshot. Decode reads KV pages in place with a flash-decoding kernel that adds
-Inkling's relative bias, applies each row's window bound and returns the
-log-sum-exp for the attention sink. Context lengths, bounds and page-table
-widths are runtime data. Prefill gathers retained history per visit, attends in
-query blocks, reads only each block's window band or causal prefix, and skips
-bias work for global keys more than 1,024 positions back.
+Live convolution history stays on the GPU between steps, and prefix hits restore
+a snapshot. Both prefill and decode read retained BF16 KV directly from the
+page table and new KV from the current chunk. The prefill kernel streams tiles
+of visible keys through an online softmax, applies the learned relative bias
+to the most recent 1,024 positions, and restricts local visits to their window.
+Both paths return FP32 attention outputs and log-sum-exp for the sink.
 
 Decode overlaps through the Engine's enqueue contract. Fused Metal kernels cover
-short convolutions, depth mixes, RMS norms, expert routing, the capped SwiGLU
+four-tap convolutions over independent 16-token tiles, depth mixes, RMS norms,
+expert routing, the capped SwiGLU
 with its output scale, the route combine and the BF16 vocabulary projection
 with FP32 output. Decode also compiles small FP32 helpers with `mx.compile`;
 their shapes depend only on the batch size. Prefill runs uncompiled, and chunks
@@ -103,8 +104,8 @@ tests' independent NVFP4/MXFP8 arithmetic.
   synchronous decode.
 - `scripts/check_server.py --stress` passes chat, logprobs, concurrency, prefix
   reuse, stress, robustness and recovery, and context checks up to 2,048 tokens.
-  The 8,192-token check exceeds its default 10-second TTFT limit (15 seconds at
-  this prefill rate). Image requests are rejected at admission.
+  The original runner took 15 seconds on the 8,192-token check, exceeding its
+  default 10-second TTFT limit. Image requests are rejected at admission.
 - On 100 MMLU questions (`cais/mmlu` revision `c30699e8`, 50 subjects × 2,
   seed 1017; default reasoning, 4,096-token cap, eight concurrent), 86 answers
   are correct. Of the 14 others, 4 are wrong, 2 reached the token cap and 8
@@ -128,8 +129,33 @@ RESIN_TEST_CHECKPOINT="$INKLING_CHECKPOINT" \
 
 ## Measured performance
 
-November 22, 2026, 14-inch MacBook Pro with M4 Max and 128 GiB, MLX 0.32.4,
-ShareGPT prompts tokenized for Inkling and greedy sampling. Prefill figures are
+### Prefill attention on M1 Pro
+
+Each cell shows the time for one attention visit, from the old dense path to
+the integrated paged kernel. The two implementations ran in separate sessions
+on the same 16 GiB M1 Pro with MLX 0.32.4, identical synthetic BF16 inputs and
+Mini's head geometry. Each time is the median of three calls after warmup.
+
+| Prior tokens | New tokens | Global, dense → paged (ms) | Local, dense → paged (ms) |
+| -----------: | ---------: | ------------------------: | -----------------------: |
+|            0 |        128 |               0.96 → 0.73 |              0.68 → 0.70 |
+|            0 |      2,048 |             56.83 → 14.75 |            42.18 → 11.60 |
+|        8,193 |        128 |              16.64 → 7.36 |              3.46 → 1.29 |
+|            0 |      8,192 |         1,093.39 → 208.42 |           236.09 → 53.31 |
+|        8,192 |      8,192 |         3,039.08 → 637.95 |           224.47 → 57.32 |
+
+Dense timings include gathering retained KV. For 8,192-token chunks, the
+benchmark synchronized after each dense query block to bound memory. Paged
+attention used one dispatch per visit. In all ten cases the integrated
+kernel matched the prototype bit for bit. Compared with the dense reference,
+the maximum absolute error was 3.34 × 10⁻⁶ for the output and 2.86 × 10⁻⁶
+for log-sum-exp.
+
+### Historical full-model throughput on M4 Max
+
+The original runner (`e2f020b`) was benchmarked on November 22, 2026 on a
+14-inch MacBook Pro with M4 Max and 128 GiB, using MLX 0.32.4, ShareGPT
+prompts tokenized for Inkling and greedy sampling. Prefill figures are
 medians of three cohorts; decode figures are medians of 20 overlapped steps after
 five warmup steps. This laptop throttles under sustained load.
 
@@ -199,9 +225,7 @@ remaining gap is the dispatch of many small per-visit operations.
 - No image input.
 - One GPU; no tensor or expert parallelism.
 - Prefill expert GEMMs reach about 7.8 TFLOPS (versus 13.5 for one dense GEMM)
-  because each expert sees about 128 rows per 2,048 tokens. Prefill attention
-  uses FP32 MLX matmuls rather than a flash kernel, so long prompts slow down:
-  316 tokens/s at 32K.
+  because each expert sees about 128 rows per 2,048 tokens.
 - Prompt logprobs project 128 prompt rows in about 60 ms (four rows per GEMV
   launch), adding about 4 seconds per 8,192-token chunk when requested.
 
@@ -211,5 +235,6 @@ remaining gap is the dispatch of many small per-visit operations.
   [SGLang's Inkling 2 integration](https://github.com/sgl-project/sglang/tree/e62ac6279646c686d3b328f58d9b5c2c2d5927dc),
   defines the arithmetic and supplies the CPU reference. The activation
   quantizer adapts SGLang's Apache-2.0 kernel.
-- The routing and activation kernels reuse MLX v0.32.4's sigmoid formula
-  (MIT; notice in this directory's LICENSE).
+- The routing and activation kernels reuse MLX v0.32.4's sigmoid formula.
+  Prefill uses its Steel SIMD fragment coordinates. The MIT notice is in
+  this directory's LICENSE.

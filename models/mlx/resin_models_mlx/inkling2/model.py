@@ -10,19 +10,19 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from functools import update_wrapper
+from itertools import pairwise
 from typing import Protocol
 
 import mlx.core as mx
 import numpy as np
 
 from resin.models.inkling2.config import Inkling2Config
+from resin_models_mlx.fused_norm import rms_norm
 from resin_models_mlx.inkling2.kernels import depth_mix as fused_depth_mix
 from resin_models_mlx.inkling2.kernels import (
     expert_activation,
     expert_combine,
     gemv_f32,
-    pad_to_device,
-    rms_norm,
     route_experts,
     short_convolution,
 )
@@ -175,12 +175,14 @@ def depth_mix(
 def l2_clip(
     x: mx.array, scale: mx.array | None, threshold: float, tau: mx.array | None
 ) -> mx.array:
-    values = x.astype(F32) if scale is None else x.astype(F32) * scale.astype(F32)
+    values = x.astype(F32)
+    if scale is not None:
+        values = values * scale
     norm = mx.sqrt(mx.sum(values * values, axis=-1, keepdims=True))
     values = values * mx.minimum(threshold / (norm + 1e-6), 1.0)
     values = values.astype(x.dtype)
     if tau is not None:
-        values = (values.astype(F32) * tau[..., None, None]).astype(x.dtype)
+        values = (values * tau[..., None, None]).astype(x.dtype)
     return values
 
 
@@ -245,18 +247,20 @@ def _expert_matmul(
             )
             parts.append(routed[start:stop] @ dense.T)
         output = mx.concatenate(parts) if len(parts) > 1 else parts[0]
-    if activation_amax is not None:
-        activation_amax = pad_to_device(activation_amax)
+    if activation_amax is not None and activation_amax.size < 8:
+        # Keep the Metal device-array binding even at batch one.
+        activation_amax = mx.pad(activation_amax, (0, 8 - activation_amax.size))
     return output, activation_amax
 
 
 def _segments(sorted_ids: mx.array, experts: int) -> list[tuple[int, int, int]]:
     """Route ranges per expert; reading the routing back waits for the router."""
-    counts = np.bincount(np.array(sorted_ids), minlength=experts)
-    stops = np.cumsum(counts)
+    ids = np.asarray(sorted_ids)
+    bounds = np.searchsorted(ids, np.arange(experts + 1, dtype=ids.dtype)).tolist()
     return [
-        (expert, int(stops[expert] - counts[expert]), int(stops[expert]))
-        for expert in np.flatnonzero(counts).tolist()
+        (expert, start, stop)
+        for expert, (start, stop) in enumerate(pairwise(bounds))
+        if start < stop
     ]
 
 
@@ -485,11 +489,9 @@ class Inkling2Model:
             )
             if boundary:
                 blocks.append(partial)
-                partial = (attention.astype(F32) + mlp.astype(F32)).astype(BF16)
+                partial = attention + mlp
             else:
-                partial = (
-                    partial.astype(F32) + attention.astype(F32) + mlp.astype(F32)
-                ).astype(BF16)
+                partial = (partial.astype(F32) + attention + mlp).astype(BF16)
             next_states.append(
                 mx.concatenate(
                     [k_history, v_history, attention_history, mlp_history], axis=-1
@@ -520,7 +522,6 @@ class Inkling2Model:
                 config.swa_num_key_value_heads,
             )
         d, r, width = config.head_dim, config.d_rel, self.kv_width
-        query_sizes = (heads * d, heads * r, heads * d)
         k_dynamic = v_dynamic = None
         if layer.local:
             if k_source is q_source and v_source is q_source:
@@ -544,7 +545,7 @@ class Inkling2Model:
             v_dynamic = v_packed[..., width:].reshape(batch, tokens, kv_heads, 4)
         q, relative, gate, sink = mx.split(
             query,
-            [sum(query_sizes[:1]), sum(query_sizes[:2]), sum(query_sizes)],
+            [heads * d, heads * (d + r), heads * (2 * d + r)],
             axis=-1,
         )
         k, k_history = short_convolution(

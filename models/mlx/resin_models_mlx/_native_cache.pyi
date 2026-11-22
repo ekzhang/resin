@@ -3,7 +3,7 @@ from collections.abc import Sequence
 import mlx.core
 
 class CacheStorage:
-    def __init__(self, shape: Sequence[int], dtype: mlx.core.Dtype) -> None: ...
+    def __init__(self, byte_shape: Sequence[int]) -> None: ...
     def initial_epoch(self) -> mlx.core.array: ...
     def read_epoch(self, epoch: mlx.core.array) -> mlx.core.array: ...
     def scatter_rows(
@@ -12,12 +12,13 @@ class CacheStorage:
         row_indices: mlx.core.array,
         updates: mlx.core.array,
         *,
+        row_bytes: int,
         after: Sequence[mlx.core.array] = [],
     ) -> mlx.core.array: ...
     def write_slice(
         self,
         epoch: mlx.core.array,
-        flat_start: int,
+        byte_start: int,
         updates: mlx.core.array,
         *,
         after: Sequence[mlx.core.array] = [],

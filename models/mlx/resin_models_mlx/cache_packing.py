@@ -34,7 +34,11 @@ def _kernel(layers):
 
 def pack_key_values(keys, values, count, width):
     layers = len(keys)
-    inputs = [value for pair in zip(keys, values, strict=True) for value in pair]
+    inputs = [
+        value.reshape(-1, *value.shape[2:]) if value.ndim == 4 else value
+        for pair in zip(keys, values, strict=True)
+        for value in pair
+    ]
     # Two data/stride pairs per layer fit Metal's 31 buffer slots up to seven.
     if (
         1 <= layers <= 7
@@ -59,10 +63,6 @@ def pack_key_values(keys, values, count, width):
             output_shapes=[(count, layers, 2, width)],
             output_dtypes=[mx.bfloat16],
         )[0]
-    return mx.stack(
-        [
-            mx.stack([k.reshape(count, -1), v.reshape(count, -1)], axis=1)
-            for k, v in zip(keys, values, strict=True)
-        ],
-        axis=1,
+    return mx.stack([v.reshape(count, -1) for v in inputs], axis=1).reshape(
+        count, layers, 2, -1
     )

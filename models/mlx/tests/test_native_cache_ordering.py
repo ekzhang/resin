@@ -9,9 +9,8 @@ from resin_models_mlx._native_cache import _paged_attention_partials
 
 
 def _assert_bits(actual, expected):
-    integer = mx.uint16 if actual.dtype == mx.bfloat16 else mx.uint32
     np.testing.assert_array_equal(
-        np.asarray(actual.view(integer)), np.asarray(expected.view(integer))
+        np.asarray(actual.view(mx.uint8)), np.asarray(expected.view(mx.uint8))
     )
 
 
@@ -36,32 +35,28 @@ def test_cross_stream_attention_readers_precede_mutation(write):
 
     expected_before, expected_after = read(initial), read(changed)
     mx.eval(expected_before, expected_after)
-    owner = CacheStorage((10 * 256, 512), mx.bfloat16)
+    row_bytes = 512 * initial.itemsize
+    owner = CacheStorage((10 * 256, row_bytes))
     a, b = mx.new_stream(mx.gpu), mx.new_stream(mx.gpu)
     with mx.stream(a):
         epoch = owner.write_slice(owner.initial_epoch(), 0, initial)
-        units = owner.read_epoch(epoch).reshape(initial.shape)
+        units = owner.read_epoch(epoch).view(mx.bfloat16).reshape(initial.shape)
         old_a = read(units)
     with mx.stream(b):
         old_b = read(units)
     with mx.stream(a):
         roots = [*old_a, *old_b]
         ordered = mx.depends(epoch, roots)
+        row = 5 * 256
+        zero = mx.zeros(512, mx.bfloat16)
         if write == "rows":
+            index = mx.array([row], mx.int64)
             epoch = owner.scatter_rows(
-                ordered,
-                mx.array([5 * 256], mx.int64),
-                mx.zeros((1, 512), mx.bfloat16),
-                after=roots,
+                ordered, index, zero, row_bytes=row_bytes, after=roots
             )
         else:
-            epoch = owner.write_slice(
-                ordered,
-                5 * 256 * 512,
-                mx.zeros(512, mx.bfloat16),
-                after=roots,
-            )
-        current = owner.read_epoch(epoch).reshape(initial.shape)
+            epoch = owner.write_slice(ordered, row * row_bytes, zero, after=roots)
+        current = owner.read_epoch(epoch).view(mx.bfloat16).reshape(initial.shape)
         new_a = read(current)
     with mx.stream(b):
         new_b = read(current)

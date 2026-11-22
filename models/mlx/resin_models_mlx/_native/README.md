@@ -1,10 +1,9 @@
 # Private Metal cache storage
 
 `CacheStorage` owns one MLX-allocated buffer for an Engine cache arena. It is a
-mutable inference resource, rather than an immutable tensor value. BF16 and
-FP32 storage are supported; writes copy their raw bits without floating-point
-conversion. The Qwen adapter converts checkpoint values to the arena's BF16
-storage format before writing.
+mutable inference resource. Its dimensions describe a contiguous `uint8` array.
+The model selects the representation of each KV or state payload. Writes copy
+the raw bytes of the supplied array, preserving its bit patterns.
 
 ## Ordering contract
 
@@ -28,10 +27,10 @@ continuations and drains writes before releasing or reassigning cache ownership.
 copies raw integer words to preserve NaN payloads and adds the copy to the
 same reader list as attention. Subsequent writes wait for pending reads.
 
-`scatter_rows` treats the arena as rows of `shape[-1]` elements. Indices must be
-rank-one `int32` or `int64`, and valid target rows must be unique. Negative and
-out-of-range device indices are ignored by guards. `write_slice` addresses a
-contiguous flat interval, checked on the host. Both accept strided updates by
+`scatter_rows(..., row_bytes=n)` copies `n` bytes per input row to byte address
+`row_index * n`. Indices must be rank-one `int32` or `int64`, and valid target
+rows must be unique. Negative and out-of-range device indices are ignored by
+guards. `write_slice` takes a flat byte offset, checked on the host. Both accept strided updates by
 constructing a lazy contiguous input; neither evaluates inputs on the CPU.
 
 ## GPU lifetime and synchronization
@@ -73,9 +72,9 @@ and column; both axes fit uint32 because MLX dimensions are int32. Other
 dispatches above 1,048,576 elements use a bounded two-dimensional grid and guard
 the padded tail. Shape and byte counts are checked for `size_t` overflow;
 allocation remains subject to Metal's buffer and memory limits. Construction
-warms three fixed pipelines for the owner's byte width: slice and row scatter
-with each index width. Batch size, context length and runtime addresses do not
-select new cache pipelines.
+warms fixed pipelines for aligned 32-bit copies and byte copies, including both
+row index widths. A write uses the word path only when its source, destination
+and payload length support it.
 
 ## Build and scope
 

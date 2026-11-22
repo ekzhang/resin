@@ -1,6 +1,7 @@
 #pragma once
 #include <nanobind/nanobind.h>
 #include <mlx/array.h>
+#include <mlx/backend/metal/device.h>
 #include <mlx/ops.h>
 #include <dlfcn.h>
 #include <filesystem>
@@ -24,12 +25,16 @@ inline mlx::core::Stream checked_stream() {
   }
   return stream;
 }
-inline std::string library_directory() {
-  Dl_info info;
-  if (!dladdr(reinterpret_cast<void*>(&library_directory), &info)) {
-    throw std::runtime_error("Cannot locate native cache Metal library");
-  }
-  return std::filesystem::path(info.dli_fname).parent_path().string();
+inline MTL::ComputePipelineState* load_kernel(mlx::core::Stream stream, const std::string& name) {
+  static const std::string directory = [] {
+    Dl_info info;
+    if (!dladdr(reinterpret_cast<void*>(&load_kernel), &info)) {
+      throw std::runtime_error("Cannot locate native cache Metal library");
+    }
+    return std::filesystem::path(info.dli_fname).parent_path().string();
+  }();
+  auto& device = mlx::core::metal::device(stream.device);
+  return device.get_kernel(name, device.get_library(MLX_METAL_LIBRARY_NAME, directory));
 }
 void bind_paged_attention(nanobind::module_& module);
 }  // namespace resin_models_mlx::native

@@ -13,7 +13,6 @@ import math
 import sys
 from dataclasses import asdict
 from pathlib import Path
-from types import SimpleNamespace
 from typing import Any
 
 import mlx.core as mx
@@ -24,7 +23,10 @@ torch = pytest.importorskip("torch")
 safetensors_torch = pytest.importorskip("safetensors.torch")
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "cuda" / "tests"))
+from _attention_pages import dense_reference  # noqa: E402
 from _inkling2_expert_reference import dequant, nvfp4_reference  # noqa: E402
+from _inkling2_model import DenseCache as ReferenceCache  # noqa: E402
+from _inkling2_model import dense_attention as reference_attention  # noqa: E402
 
 from resin.models.inkling2.config import (  # noqa: E402
     Inkling2Config,
@@ -313,76 +315,6 @@ def reference_experts(module, hidden, ids, weights):
     return result
 
 
-class ReferenceCache:
-    """One contiguous page per (row, visit): the reference reads keys [0, length)."""
-
-    def __init__(self, config, batch, capacity):
-        self.page_tokens, self.slab_units = capacity, 1
-        self.counts = {
-            0: config.execution_global_layer_count,
-            1: config.execution_local_layer_count,
-        }
-        self.groups = [
-            SimpleNamespace(first_blocks=torch.zeros(batch, dtype=torch.int64))
-            for _ in range(2)
-        ]
-        shape = (
-            batch * config.execution_layer_count,
-            capacity,
-            config.num_key_value_heads,
-            config.head_dim,
-        )
-        self.keys = torch.zeros(shape, dtype=torch.bfloat16)
-        self.values = torch.zeros_like(self.keys)
-        self.batch = batch
-
-    def pages(self, group, layer, count):
-        base = 0 if group == 0 else self.batch * self.counts[0]
-        return (base + torch.arange(self.batch) * count + layer)[:, None]
-
-    def store_kv(self, keys, values, positions, *, group_index, layer, layer_count):
-        pages = self.pages(group_index, layer, layer_count).expand_as(positions)
-        self.keys[pages, positions], self.values[pages, positions] = keys, values
-
-
-def reference_attention(
-    q,
-    *,
-    cache,
-    group_index,
-    layer,
-    layer_count,
-    positions,
-    sequence_lengths,
-    softmax_scale,
-    window_left,
-    relative_logits,
-    **_,
-):
-    outputs, statistics = [], []
-    for row in range(q.shape[0]):
-        page = cache.pages(group_index, layer, layer_count)[row, 0]
-        length = int(sequence_lengths[row])
-        k = cache.keys[page, :length].float()
-        v = cache.values[page, :length].float()
-        groups = q.shape[2] // k.shape[1]
-        k, v = k.repeat_interleave(groups, 1), v.repeat_interleave(groups, 1)
-        logits = torch.einsum("thd,shd->ths", q[row].float(), k) * softmax_scale
-        distance = positions[row, :, None] - torch.arange(length)[None]
-        rel = relative_logits.view(*q.shape[:3], -1)[row]
-        bias = rel.gather(
-            2, distance.clamp(0, rel.shape[-1] - 1)[:, None].expand(-1, q.shape[2], -1)
-        )
-        logits += bias * ((distance >= 0) & (distance < rel.shape[-1]))[:, None]
-        mask = distance >= 0
-        if window_left is not None:
-            mask &= distance <= window_left
-        logits.masked_fill_(~mask[:, None], float("-inf"))
-        outputs.append(torch.einsum("ths,shd->thd", logits.softmax(-1), v))
-        statistics.append(logits.logsumexp(-1))
-    return torch.stack(outputs), torch.cat(statistics, 0).t()
-
-
 def reference_target(root: Path, config: Inkling2Config, monkeypatch):
     from resin_models_cuda.inkling2 import attention
     from resin_models_cuda.inkling2.model import Inkling2Target
@@ -436,32 +368,15 @@ class DenseStore:
         keys[rows, positions] = k
         values[rows, positions] = v
         length = int(np.array(positions).max()) + 1
-        keys, values = (
-            keys[:, :length].astype(mx.float32),
-            values[:, :length].astype(mx.float32),
+        return dense_reference(
+            q,
+            keys[:, :length],
+            values[:, :length],
+            positions,
+            bias,
+            scale,
+            window if local else None,
         )
-        groups = q.shape[2] // keys.shape[2]
-        keys = mx.repeat(keys, groups, axis=2)
-        values = mx.repeat(values, groups, axis=2)
-        logits = mx.einsum("bthd,bshd->bths", q.astype(mx.float32), keys) * scale
-        distance = positions[:, :, None] - mx.arange(length)[None, None]
-        extent = bias.shape[-1]
-        index = mx.clip(distance, 0, extent - 1)
-        gathered = mx.take_along_axis(
-            bias.astype(mx.float32),
-            mx.broadcast_to(index[:, :, None, :], (*bias.shape[:3], length)),
-            axis=-1,
-        )
-        inside = (distance >= 0) & (distance < extent)
-        logits = logits + mx.where(inside[:, :, None, :], gathered, 0.0)
-        mask = distance >= 0
-        if local:
-            mask = mask & (distance <= window - 1)
-        logits = mx.where(mask[:, :, None, :], logits, -mx.inf)
-        lse = mx.logsumexp(logits, axis=-1)
-        probabilities = mx.exp(logits - lse[..., None])
-        output = mx.einsum("bths,bshd->bthd", probabilities, values)
-        return output, lse
 
 
 def _relative(actual: mx.array, expected) -> float:

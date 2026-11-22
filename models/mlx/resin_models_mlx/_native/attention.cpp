@@ -4,16 +4,13 @@
 #include <nanobind/stl/vector.h>
 #include <mlx/allocator.h>
 #include <mlx/array.h>
-#include <mlx/backend/metal/device.h>
 #include <mlx/ops.h>
 #include <mlx/primitives.h>
 #include <array>
 #include <cmath>
 #include <cstdint>
-#include <limits>
 #include <memory>
 #include <stdexcept>
-#include <string>
 #include <vector>
 
 namespace nb = nanobind;
@@ -23,12 +20,6 @@ using namespace nb::literals;
 namespace resin_models_mlx::native::attention {
 constexpr int kHeads = 8, kKVHeads = 2, kHeadDim = 256;
 constexpr int kPage = 128, kPartition = 512, kHeadGroups = 2;
-
-bool supported_units(const mx::array& units) {
-  return units.ndim() == 4 && units.shape(0) > 0 && units.shape(1) == 2 &&
-         units.shape(2) == kPage && units.shape(3) == kKVHeads * kHeadDim &&
-         units.dtype() == mx::bfloat16;
-}
 
 class AttentionPartitions : public mx::Primitive {
  public:
@@ -44,9 +35,7 @@ class AttentionPartitions : public mx::Primitive {
 
   void eval_gpu(const std::vector<mx::array>& inputs,
                 std::vector<mx::array>& outputs) override {
-    auto& device = mx::metal::device(stream().device);
-    auto library = device.get_library(MLX_METAL_LIBRARY_NAME, library_directory());
-    auto kernel = device.get_kernel("resin_attention_partition_bf16", library);
+    auto kernel = load_kernel(stream(), "resin_attention_partition_bf16");
     if (kernel->maxTotalThreadsPerThreadgroup() < 128) {
       throw std::runtime_error("Native paged attention needs a 128-thread group");
     }
@@ -100,13 +89,12 @@ std::vector<mx::array> attention_partials(
   auto stream = checked_stream();
   if (queries.ndim() != 3 || queries.shape(0) < 1 ||
       queries.shape(1) != kHeads || queries.shape(2) != kHeadDim ||
-      current_keys.ndim() != 3 || current_values.ndim() != 3 ||
-      current_keys.shape() != current_values.shape() ||
-      current_keys.shape(0) != queries.shape(0) ||
-      current_keys.shape(1) != kKVHeads || current_keys.shape(2) != kHeadDim) {
+      current_keys.shape() != mx::Shape{queries.shape(0), kKVHeads, kHeadDim} ||
+      current_values.shape() != current_keys.shape()) {
     throw std::invalid_argument("Native paged attention requires Q[B,8,256], K/V[B,2,256]");
   }
-  if (!supported_units(units)) {
+  if (units.ndim() != 4 || units.shape(0) < 1 || units.shape(1) != 2 ||
+      units.shape(2) != kPage || units.shape(3) != kKVHeads * kHeadDim) {
     throw std::invalid_argument("Native paged attention needs UNITS[units,2,128,512]");
   }
   if (queries.dtype() != mx::bfloat16 || current_keys.dtype() != mx::bfloat16 ||
@@ -129,13 +117,10 @@ std::vector<mx::array> attention_partials(
   // Layout flags of lazy slices are not final. Contiguous is a no-copy alias
   // for the Engine arena, while unsupported strided values materialize before
   // this primitive, matching the canonical Metal adapter. Shape stays honest.
-  std::vector<mx::array> inputs = {
-      mx::contiguous(queries, false, stream),
-      mx::contiguous(current_keys, false, stream),
-      mx::contiguous(current_values, false, stream),
-      mx::contiguous(units, false, stream),
-      mx::contiguous(pages, false, stream),
-      mx::contiguous(lengths, false, stream)};
+  std::vector<mx::array> inputs{queries, current_keys, current_values, units, pages, lengths};
+  for (auto& input : inputs) {
+    input = mx::contiguous(input, false, stream);
+  }
   const int count = int(partitions);
   return mx::array::make_arrays(
       {{rows, kHeads, count, kHeadDim}, {rows, kHeads, count},
@@ -146,13 +131,7 @@ std::vector<mx::array> attention_partials(
 void warm_paged_attention() {
   // Warm a device-wide pipeline on the caller's current GPU stream. No
   // arrays, graph nodes, stream objects or request geometry are retained.
-  auto stream = mx::to_stream({});
-  if (stream.device != mx::Device::gpu) {
-    throw std::invalid_argument("Native attention warmup requires the current GPU stream");
-  }
-  auto& device = mx::metal::device(stream.device);
-  auto library = device.get_library(MLX_METAL_LIBRARY_NAME, library_directory());
-  device.get_kernel("resin_attention_partition_bf16", library);
+  load_kernel(checked_stream(), "resin_attention_partition_bf16");
 }
 }  // namespace resin_models_mlx::native::attention
 
