@@ -249,17 +249,21 @@ hardware, and serving limits.
 ## MLX runner (Apple Silicon)
 
 Model runners are not tied to CUDA. `resin_models_mlx` runs
-[dense and MoE Qwen3.5 models](models/mlx/resin_models_mlx/qwen3_5/README.md)
-and [Inkling 2 Mini text](models/mlx/resin_models_mlx/inkling2/README.md)
+[Qwen3.5 models](models/mlx/resin_models_mlx/qwen3_5/README.md)
+and [Inkling 2 Mini](models/mlx/resin_models_mlx/inkling2/README.md)
 on Apple Silicon with MLX, on the same core engine. For a small local model:
 
 ```bash
-QWEN_CHECKPOINT="$(uv run hf download mlx-community/Qwen3.5-0.8B-8bit \
-  --revision 87e768fbfa03994095f3d14527c80c5ae70c5758 --quiet)"
-uv run scripts/mlx_serve.py --model qwen3.5-0.8b-mlx --checkpoint "$QWEN_CHECKPOINT"
+CHECKPOINT="$(uv run hf download mlx-community/Qwen3.5-0.8B-8bit --quiet)"
+uv run scripts/mlx_serve.py --model qwen3.5-0.8b-mlx --checkpoint "$CHECKPOINT"
 ```
 
-The download uses Hugging Face's normal cache and returns its snapshot path.
+For Inkling 2 Mini:
+
+```bash
+CHECKPOINT="$(uv run hf download thinkingmachines/Inkling-2-Mini --quiet)"
+uv run scripts/mlx_serve.py --model inkling2-mini-mlx --checkpoint "$CHECKPOINT"
+```
 
 ## Checks
 
