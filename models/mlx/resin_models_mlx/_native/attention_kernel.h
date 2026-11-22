@@ -17,9 +17,23 @@
     const int row = work / (PARTITIONS * HEAD_GROUPS * KV_HEADS);
     const int first_head = kv_head * (HEADS / KV_HEADS) + head_group * GROUP;
 
+    // A retained table can begin in the middle of a sequence. The relative
+    // variant receives (history, first visible position, first retained page).
+#ifdef RESIN_RELATIVE_BIAS
+    constexpr bool biased = true;
+    const int history = lengths[3 * row];
+    const int first_position = lengths[3 * row + 1];
+    const int first_block = lengths[3 * row + 2];
+    const int extent = geometry[3];
+    const auto head_bias = bias + ((row * HEADS) + first_head) * extent;
+#else
+    constexpr bool biased = false;
     const int history = lengths[row];
+    constexpr int first_position = 0, first_block = 0, extent = 0;
+    const auto head_bias = units;  // Unused in the unbiased specialization.
+#endif
     const int total = history + 1;
-    const int start = partition * PART;
+    const int start = first_position + partition * PART;
     const int stop = min(start + PART, total);
 
     float q[GROUP][LANE_DIMS];
@@ -48,22 +62,27 @@
     int p = first;
     while (p < cached) {
         const int page_end = min(cached, (p / PAGE + 1) * PAGE);
-        const long unit = long(pages[row * PAGES + p / PAGE]) + layer;
+        const long unit = long(pages[row * PAGES + (p / PAGE - first_block)]) + layer;
         const device T* key = units + (unit * 2 * PAGE + p % PAGE) * width
                               + kv_head * D + lane * LANE_DIMS;
         const device T* value = key + long(PAGE) * width;
-        for (; p + PREFETCH <= page_end; p += PREFETCH) {
-            float k[PREFETCH][LANE_DIMS];
-            float v[PREFETCH][LANE_DIMS];
-            for (int t = 0; t < PREFETCH; ++t) {
-                for (int i = 0; i < LANE_DIMS; ++i) k[t][i] = float(key[t * width + i]);
+        // Relative attention scans one key at a time. Keep the existing
+        // prefetch loop for the tuned unbiased kernels (including D256).
+        if (!biased || PREFETCH > 1) {
+            for (; p + PREFETCH <= page_end; p += PREFETCH) {
+                float k[PREFETCH][LANE_DIMS];
+                float v[PREFETCH][LANE_DIMS];
+                for (int t = 0; t < PREFETCH; ++t) {
+                    for (int i = 0; i < LANE_DIMS; ++i) k[t][i] = float(key[t * width + i]);
+                }
+                for (int t = 0; t < PREFETCH; ++t) {
+                    for (int i = 0; i < LANE_DIMS; ++i) v[t][i] = float(value[t * width + i]);
+                }
+                for (int t = 0; t < PREFETCH; ++t)
+                    attend<biased>(q, k[t], v[t], head_bias, extent, history - (p + t), m, l, acc);
+                key += PREFETCH * width;
+                value += PREFETCH * width;
             }
-            for (int t = 0; t < PREFETCH; ++t) {
-                for (int i = 0; i < LANE_DIMS; ++i) v[t][i] = float(value[t * width + i]);
-            }
-            for (int t = 0; t < PREFETCH; ++t) attend(q, k[t], v[t], m, l, acc);
-            key += PREFETCH * width;
-            value += PREFETCH * width;
         }
         for (; p < page_end; ++p) {
             float k[LANE_DIMS];
@@ -72,7 +91,7 @@
                 k[i] = float(key[i]);
                 v[i] = float(value[i]);
             }
-            attend(q, k, v, m, l, acc);
+            attend<biased>(q, k, v, head_bias, extent, history - p, m, l, acc);
             key += width;
             value += width;
         }
@@ -86,7 +105,7 @@
             k[i] = float(current_keys[base + i]);
             v[i] = float(current_values[base + i]);
         }
-        attend(q, k, v, m, l, acc);
+        attend<biased>(q, k, v, head_bias, extent, 0, m, l, acc);
     }
 
     threadgroup float shared_m[SIMDGROUPS][GROUP];
@@ -127,18 +146,22 @@
 
 #else
 
-template <int GROUP, int LANE_DIMS>
+template <bool biased, int GROUP, int LANE_DIMS, typename BiasPointer>
 inline void attend(
     thread const float (&q)[GROUP][LANE_DIMS],
     thread const float (&k)[LANE_DIMS],
     thread const float (&v)[LANE_DIMS],
+    BiasPointer head_bias, int extent, int distance,
     thread float (&m)[GROUP],
     thread float (&l)[GROUP],
     thread float (&acc)[GROUP][LANE_DIMS]) {
     for (int h = 0; h < GROUP; ++h) {
         float dot = 0.0f;
         for (int i = 0; i < LANE_DIMS; ++i) dot += q[h][i] * k[i];
-        const float score = simd_sum(dot);
+        float score = simd_sum(dot);
+        if (biased) {
+            score += distance < extent ? float(head_bias[h * extent + distance]) : 0.0f;
+        }
         const float peak = max(m[h], score);
         const float correction = fast::exp(m[h] - peak);
         const float weight = fast::exp(score - peak);

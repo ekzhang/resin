@@ -346,11 +346,12 @@ def test_padded_vocabulary_ids_and_small_caches_are_rejected(weights):
 
 
 def test_unseen_lengths_and_sampling_reuse_compiled_kernels(weights, monkeypatch):
-    from resin_models_mlx.inkling2 import decode_attention, kernels, quantization
+    from resin_models_mlx import paged_attention
+    from resin_models_mlx.inkling2 import kernels, quantization
 
     # Record every custom Metal kernel variant: its factory, template and dtypes.
     variants: set = set()
-    for module in (kernels, quantization, decode_attention):
+    for module in (kernels, quantization, paged_attention):
         for name in dir(module):
             factory = getattr(module, name)
             if not (

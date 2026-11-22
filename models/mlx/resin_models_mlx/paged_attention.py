@@ -40,9 +40,9 @@ _SOURCE = "#define RESIN_ATTENTION_BODY\n" + _HEADER + "\n#undef RESIN_ATTENTION
 
 
 @cache
-def _kernel():
+def _kernel(relative_bias: bool):
     return mx.fast.metal_kernel(
-        name="resin_paged_decode_attention",
+        name="resin_paged_decode_attention" + ("_relative" if relative_bias else ""),
         input_names=[
             "queries",
             "current_keys",
@@ -50,11 +50,12 @@ def _kernel():
             "units",
             "pages",
             "lengths",
+            *(["bias"] if relative_bias else []),
             "geometry",
             "scale",
         ],
         output_names=["partial", "maxima", "sums"],
-        source=_SOURCE,
+        source=("#define RESIN_RELATIVE_BIAS\n" if relative_bias else "") + _SOURCE,
         header=_HEADER,
     )
 
@@ -130,13 +131,49 @@ def paged_decode_attention(
     if not fits:
         raise ValueError(f"head_dim {head_dim} exceeds paged decode threadgroup memory")
     group = max(fits)
-    head_groups = shared // group
     longest = pages.shape[1] * page + 1
     wide_head = head_dim >= 256
     part = PARTITION_TOKENS // (2 if rows < SMALL_BATCH_ROWS and not wide_head else 1)
     prefetch = 1 if wide_head else PREFETCH
     partitions = -(-longest // part)
-    outputs, maxima, sums = _kernel()(
+    partials = _paged_partitions(
+        queries,
+        current_keys,
+        current_values,
+        units,
+        pages,
+        lengths,
+        mx.array([pages.shape[1], partitions, layer], dtype=mx.int32),
+        mx.array([scale], dtype=mx.float32),
+        partitions=partitions,
+        part=part,
+        group=group,
+        prefetch=prefetch,
+    )
+    return _merge_output(*partials, dtype=queries.dtype)
+
+
+def _paged_partitions(
+    queries,
+    current_keys,
+    current_values,
+    units,
+    pages,
+    lengths,
+    geometry,
+    scale,
+    *,
+    partitions,
+    part,
+    group,
+    prefetch,
+    bias=None,
+):
+    """Score paged KV with the caller's partition size and head grouping."""
+    rows, heads, head_dim = queries.shape
+    kv_heads = current_keys.shape[1]
+    head_groups = heads // (kv_heads * group)
+    return _kernel(bias is not None)(
         inputs=[
             queries,
             current_keys,
@@ -144,8 +181,9 @@ def paged_decode_attention(
             units,
             pages,
             lengths,
-            mx.array([pages.shape[1], partitions, layer], dtype=mx.int32),
-            mx.array([scale], dtype=mx.float32),
+            *([bias] if bias is not None else []),
+            geometry,
+            scale,
         ],
         template=[
             ("D", head_dim),
@@ -153,7 +191,7 @@ def paged_decode_attention(
             ("KV_HEADS", kv_heads),
             ("GROUP", group),
             ("HEAD_GROUPS", head_groups),
-            ("PAGE", page),
+            ("PAGE", units.shape[2]),
             ("PART", part),
             ("SIMDGROUPS", SIMDGROUPS),
             ("PREFETCH", prefetch),
@@ -168,18 +206,20 @@ def paged_decode_attention(
         ],
         output_dtypes=[mx.float32, mx.float32, mx.float32],
     )
-    return _merge_output(outputs, maxima, sums, dtype=queries.dtype)
 
 
 @partial(mx.compile, shapeless=True)
-def _merge(outputs: mx.array, maxima: mx.array, sums: mx.array) -> mx.array:
+def _merge(outputs: mx.array, maxima: mx.array, sums: mx.array, *, return_lse=False):
     """Combine partitions by their log-sum-exp; empty partitions weigh zero."""
 
     peak = maxima.max(axis=-1, keepdims=True)
     weights = mx.where(maxima == -mx.inf, 0.0, mx.exp(maxima - peak))
     numerator = (outputs * weights[..., None]).sum(axis=2)
-    denominator = (sums * weights).sum(axis=-1)[..., None]
-    return numerator / denominator
+    denominator = (sums * weights).sum(axis=-1)
+    output = numerator / denominator[..., None]
+    if return_lse:
+        return output, peak[..., 0] + mx.log(denominator)
+    return output
 
 
 __all__ = ["PARTITION_TOKENS", "paged_decode_attention"]
