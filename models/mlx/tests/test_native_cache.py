@@ -79,6 +79,7 @@ def test_kv_append_preserves_plan_addresses_and_lazy_snapshot(arena, input_dtype
     slots = np.array([0, 0, 1], np.int32)
     offsets = np.array([127, 0, 1], np.int32)
     group = SimpleNamespace(
+        blocks_per_slab=geometry.kv_blocks_per_slab,
         append_slab_ids=slabs,
         append_slotnums=slots,
         append_block_offsets=offsets,

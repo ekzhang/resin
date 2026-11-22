@@ -15,12 +15,16 @@ import pytest
 
 pytest.importorskip("torch")
 
+from _attention_pages import dense_reference  # noqa: E402
 from test_inkling2_model import tiny_config, write_checkpoint  # noqa: E402
 
 from resin import Engine, SamplingParams  # noqa: E402
 from resin_models_mlx.inkling2 import runner as runner_module  # noqa: E402
-from resin_models_mlx.inkling2.attention import dense_attention  # noqa: E402
-from resin_models_mlx.inkling2.cache import GLOBAL_GROUP, LOCAL_GROUP  # noqa: E402
+from resin_models_mlx.inkling2.cache import (  # noqa: E402
+    GLOBAL_GROUP,
+    LOCAL_GROUP,
+    PAGE_TOKENS,
+)
 from resin_models_mlx.inkling2.checkpoint import load_model  # noqa: E402
 from resin_models_mlx.inkling2.runner import Inkling2MlxRunner  # noqa: E402
 
@@ -73,6 +77,8 @@ class _Mirror:
 
     def start_step(self, plan, rows, tokens):
         batch = plan.batch
+        self.positions = batch.positions[tokens]
+        self.sequence_ids = batch.sequence_ids[rows].tolist()
         for index, row in enumerate(rows.tolist()):
             sequence = int(batch.sequence_ids[row])
             context = int(batch.context_lengths[row])
@@ -94,70 +100,56 @@ class _Mirror:
 
     def check(self, store, group, slot, k, v):
         history = store.history[group]
-        contexts = store.contexts
-        if history is not None:
-            keys, values, key_positions, key_valid = history.gather(slot)
-            hk = np.array(keys.view(mx.uint16))
-            hv = np.array(values.view(mx.uint16))
-            positions, valid = np.array(key_positions), np.array(key_valid)
-            for row, sequence in enumerate(store.sequence_ids.tolist()):
-                present = {}
-                for column in np.flatnonzero(valid[row]):
-                    present[int(positions[row, column])] = column
-                context = int(contexts[row])
-                first = (
-                    max(0, context - (self.window - 1)) if group == LOCAL_GROUP else 0
-                )
-                needed = range(first, context)
-                assert set(needed) <= present.keys(), (group, slot, context)
-                for position in needed:
-                    expected = self.own.get((int(sequence), position, group, slot))
-                    if expected is None:
-                        expected = self.shared[
-                            self.key(int(sequence), position, group, slot)
-                        ]
-                    column = present[position]
-                    assert np.array_equal(hk[row, column], expected[0]), position
-                    assert np.array_equal(hv[row, column], expected[1]), position
-                    self.checked += 1
+        for row, sequence in enumerate(self.sequence_ids):
+            context = int(self.positions[row, 0])
+            first = max(0, context - (self.window - 1)) if group == LOCAL_GROUP else 0
+            if first == context:
+                continue
+            keys, values = history.gather(slot, row)
+            hk = np.array(keys.view(mx.uint16))[0]
+            hv = np.array(values.view(mx.uint16))[0]
+            start = int(history.starts[row]) * PAGE_TOKENS
+            assert start <= first and start + len(hk) == context
+            for position in range(first, context):
+                expected = self.own.get((sequence, position, group, slot))
+                if expected is None:
+                    expected = self.shared[self.key(sequence, position, group, slot)]
+                assert np.array_equal(hk[position - start], expected[0]), position
+                assert np.array_equal(hv[position - start], expected[1]), position
+                self.checked += 1
         k_rows = np.array(k.astype(mx.bfloat16).view(mx.uint16))
         v_rows = np.array(v.astype(mx.bfloat16).view(mx.uint16))
-        positions = np.array(store.positions)
-        for row, sequence in enumerate(store.sequence_ids.tolist()):
-            for column, position in enumerate(positions[row].tolist()):
+        for row, sequence in enumerate(self.sequence_ids):
+            for column, position in enumerate(self.positions[row].tolist()):
                 written = (k_rows[row, column], v_rows[row, column])
                 self.own[int(sequence), position, group, slot] = written
                 self.shared.setdefault(
                     self.key(int(sequence), position, group, slot), written
                 )
 
-    def reference(self_, store, group, slot, q, k, v, bias, scale, window):
+    def reference(self, group, slot, q, k, v, bias, scale, window):
         """Unsliced dense attention over every mirrored key of each row."""
-        positions = np.array(store.positions)
+        positions = self.positions
         rows, tokens = positions.shape
         longest = int(positions.max()) + 1
         kv_heads, dim = k.shape[2], k.shape[3]
         keys = np.zeros((rows, longest, kv_heads * dim), np.uint16)
         values = np.zeros_like(keys)
-        valid = np.zeros((rows, longest), bool)
-        for row, sequence in enumerate(store.sequence_ids.tolist()):
+        for row, sequence in enumerate(self.sequence_ids):
             for position in range(int(positions[row, -1]) + 1):
-                written = self_.own.get((int(sequence), position, group, slot))
+                written = self.own.get((int(sequence), position, group, slot))
                 if written is None:
-                    written = self_.shared[
-                        self_.key(int(sequence), position, group, slot)
+                    written = self.shared[
+                        self.key(int(sequence), position, group, slot)
                     ]
                 keys[row, position] = written[0].reshape(-1)
                 values[row, position] = written[1].reshape(-1)
-                valid[row, position] = True
         shape = (rows, longest, kv_heads, dim)
-        return dense_attention(
+        return dense_reference(
             q,
             mx.array(keys).view(mx.bfloat16).reshape(shape),
             mx.array(values).view(mx.bfloat16).reshape(shape),
-            mx.broadcast_to(mx.arange(longest)[None], (rows, longest)).astype(mx.int32),
-            mx.array(valid),
-            store.positions,
+            mx.array(positions, mx.int32),
             bias,
             scale,
             window if group == LOCAL_GROUP else None,
@@ -180,7 +172,7 @@ def _instrument(monkeypatch, runner, mirror):
         mirror.check(self, group, slot, k, v)
         output, lse = attend(self, local, slot, q, k, v, bias, scale, window)
         expected, expected_lse = mirror.reference(
-            self, group, slot, q, k, v, bias, scale, window
+            group, slot, q, k, v, bias, scale, window
         )
         np.testing.assert_allclose(
             np.array(output), np.array(expected), rtol=1e-4, atol=1e-4

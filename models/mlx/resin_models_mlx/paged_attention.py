@@ -16,11 +16,11 @@ size are runtime data; only the model geometry selects a compiled kernel.
 from __future__ import annotations
 
 from functools import cache, partial
-from math import prod
 from pathlib import Path
 
 import mlx.core as mx
-import numpy as np
+
+from resin_models_mlx.metal import constant
 
 PARTITION_TOKENS = 512
 # Below this many rows, half-size partitions keep more GPU cores busy.
@@ -39,20 +39,6 @@ _THREADGROUP_BYTES = 32 * 1024
 # the same body inside it; the native metallib includes this header too.
 _HEADER = (Path(__file__).parent / "_native/attention_kernel.h").read_text()
 _SOURCE = "#define RESIN_ATTENTION_BODY\n" + _HEADER + "\n#undef RESIN_ATTENTION_BODY\n"
-
-
-def decode_metadata(values: np.ndarray) -> mx.array:
-    """Keep page tables and row metadata in MLX's device address space.
-
-    MLX 0.32.4 uses constant arguments below eight elements. Pad only rows
-    so the page-table width and the partition count stay unchanged.
-    """
-    if values.size < 8:
-        width = prod(values.shape[1:])
-        padded = np.zeros(((8 + width - 1) // width, *values.shape[1:]), np.int32)
-        padded[: len(values)] = values
-        values = padded
-    return mx.array(values.astype(np.int32, copy=False))
 
 
 @cache
@@ -95,19 +81,12 @@ def paged_decode_attention(
     int32 history length of each row. Returns ``[rows, heads, head_dim]``.
     """
 
-    rows, heads, head_dim = queries.shape
-    kv_heads = current_keys.shape[1]
-    page = units.shape[2]
-    if heads % kv_heads:
-        raise ValueError("query heads must be a multiple of KV heads")
-    if head_dim % 32:
-        raise ValueError("paged decode attention needs head_dim divisible by 32")
     # Bind sparse cache reads without charging the entire arena to MLX's
     # command-buffer packing heuristic. Other geometries retain the same body.
     if (
-        rows > 0
-        and (heads, kv_heads, head_dim, page) == (8, 2, 256, 128)
-        and units.ndim == 4
+        queries.shape[0] > 0
+        and queries.shape[1:] == (8, 256)
+        and current_keys.shape[1] == 2
         and units.shape[0] > 0
         and units.shape[1:] == (2, 128, 512)
         and queries.dtype
@@ -119,21 +98,23 @@ def paged_decode_attention(
         and mx.default_device() == mx.gpu
         and mx.metal.is_available()
     ):
-        from resin_models_mlx._native_cache import _paged_attention_partials
-
-        return _merge_output(
-            *_paged_attention_partials(
-                queries,
-                current_keys,
-                current_values,
-                units,
-                pages,
-                lengths,
-                layer,
-                scale,
-            ),
-            dtype=queries.dtype,
+        from resin_models_mlx._native_cache import (
+            _paged_attention_partials as partition,
         )
+    else:
+        partition = _paged_partitions
+    partials = partition(
+        queries, current_keys, current_values, units, pages, lengths, layer, scale
+    )
+    return _merge_output(*partials, dtype=queries.dtype)
+
+
+@cache
+def _head_group(heads: int, kv_heads: int, head_dim: int) -> int:
+    if heads % kv_heads:
+        raise ValueError("query heads must be a multiple of KV heads")
+    if head_dim % 32:
+        raise ValueError("paged decode attention needs head_dim divisible by 32")
     # Each threadgroup serves an equal share of the query heads of a KV head.
     shared = heads // kv_heads
     # The cross-simdgroup reduction stores float maxima, sums and outputs.
@@ -146,27 +127,7 @@ def paged_decode_attention(
     ]
     if not fits:
         raise ValueError(f"head_dim {head_dim} exceeds paged decode threadgroup memory")
-    group = max(fits)
-    longest = pages.shape[1] * page + 1
-    wide_head = head_dim >= 256
-    part = PARTITION_TOKENS // (2 if rows < SMALL_BATCH_ROWS and not wide_head else 1)
-    prefetch = 1 if wide_head else PREFETCH
-    partitions = -(-longest // part)
-    partials = _paged_partitions(
-        queries,
-        current_keys,
-        current_values,
-        units,
-        pages,
-        lengths,
-        mx.array([pages.shape[1], partitions, layer], dtype=mx.int32),
-        mx.array([scale], dtype=mx.float32),
-        partitions=partitions,
-        part=part,
-        group=group,
-        prefetch=prefetch,
-    )
-    return _merge_output(*partials, dtype=queries.dtype)
+    return max(fits)
 
 
 def _paged_partitions(
@@ -176,18 +137,28 @@ def _paged_partitions(
     units,
     pages,
     lengths,
-    geometry,
+    layer,
     scale,
     *,
-    partitions,
-    part,
-    group,
-    prefetch,
     bias=None,
+    longest=None,
 ):
-    """Score paged KV with the caller's partition size and head grouping."""
     rows, heads, head_dim = queries.shape
     kv_heads = current_keys.shape[1]
+    group = _head_group(heads, kv_heads, head_dim)
+    if bias is None:
+        wide_head = head_dim >= 256
+        part = PARTITION_TOKENS // (
+            2 if rows < SMALL_BATCH_ROWS and not wide_head else 1
+        )
+        prefetch = 1 if wide_head else PREFETCH
+        longest = pages.shape[1] * units.shape[2] + 1
+    else:
+        # Relative attention reads only the retained window, one key at a time.
+        part, prefetch = 256, 1
+        assert longest is not None
+    partitions = max(1, -(-longest // part))
+    extent = bias.shape[-1] if bias is not None else 0
     head_groups = heads // (kv_heads * group)
     return _kernel(bias is not None)(
         inputs=[
@@ -198,8 +169,8 @@ def _paged_partitions(
             pages,
             lengths,
             *([bias] if bias is not None else []),
-            geometry,
-            scale,
+            constant((pages.shape[1], partitions, layer, extent), "int32"),
+            constant((float(scale),), "float32"),
         ],
         template=[
             ("D", head_dim),
@@ -238,7 +209,7 @@ def _merge(outputs: mx.array, maxima: mx.array, sums: mx.array, *, return_lse=Fa
     return output
 
 
-__all__ = ["PARTITION_TOKENS", "decode_metadata", "paged_decode_attention"]
+__all__ = ["PARTITION_TOKENS", "paged_decode_attention"]
 
 
 # MLX v0.32.4's small-column reduction order, Apple Inc., MIT (see NOTICE).

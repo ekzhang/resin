@@ -1,7 +1,8 @@
-"""Engine-owned MLX byte storage and the page layout used by paged attention."""
+"""Engine-owned MLX byte storage with layer-major KV pages."""
 
 from __future__ import annotations
 
+import math
 from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Generic, TypeVar
@@ -10,30 +11,62 @@ import mlx.core as mx
 import numpy as np
 
 from resin import CacheLayout
-from resin.backend.plans import CacheGroupView
+from resin.backend.plans import PagedCachePlan
 from resin.backend.resources import CachePoolBinding
 from resin_models_mlx.cache_packing import pack_key_values
 
+PAGE_TOKENS = 128
+
 
 class SlabGeometry:
-    """Physical byte layout shared by the model's KV and STATE cache groups."""
+    """One unit holds a single layer's keys followed by its values for a page."""
 
     __slots__ = ()
-    kv_page: KVPage
+    kv_heads: int
+    head_dim: int
     slab_units: int
     state_units: int
-
-    @property
-    def slab_bytes(self) -> int:
-        return self.slab_units * self.kv_page.nbytes
-
-    @property
-    def state_bytes(self) -> int:
-        return self.state_units * self.kv_page.nbytes
+    page_tokens = PAGE_TOKENS
+    kv_dtype = mx.bfloat16
 
     @property
     def kv_width(self) -> int:
-        return self.kv_page.width
+        return self.kv_heads * self.head_dim
+
+    @property
+    def unit_bytes(self) -> int:
+        return 2 * self.page_tokens * self.kv_width * self.kv_dtype.size
+
+    @property
+    def slab_bytes(self) -> int:
+        return self.slab_units * self.unit_bytes
+
+    @property
+    def state_bytes(self) -> int:
+        return self.state_units * self.unit_bytes
+
+
+@dataclass(frozen=True, slots=True)
+class KVHistory:
+    """Layer-zero page IDs and absolute first block of each retained history."""
+
+    units: mx.array
+    bases: np.ndarray
+    starts: np.ndarray
+    lengths: np.ndarray
+    layer_stride: int
+    kv_heads: int
+
+    def gather(self, layer: int, row: int = 0) -> tuple[mx.array, mx.array]:
+        """One row's unpadded keys and values, both [1, tokens, KV heads, dim]."""
+        page, width = self.units.shape[2:]
+        length = max(0, int(self.lengths[row] - self.starts[row] * page))
+        bases = self.bases[row, : -(-length // page)]
+        pages = mx.take(self.units, mx.array(bases + layer * self.layer_stride), axis=0)
+        shape = (1, -1, self.kv_heads, width // self.kv_heads)
+        keys = pages[:, 0].reshape(shape)[:, :length]
+        values = pages[:, 1].reshape(shape)[:, :length]
+        return keys, values
 
 
 _Geometry = TypeVar("_Geometry", bound=SlabGeometry)
@@ -49,11 +82,11 @@ class ByteArena(Generic[_Geometry]):
 
         self.layout = layout
         self.geometry = geometry
-        self.page = geometry.kv_page
         self.binding = CachePoolBinding(layout, resource=self.resource)
         self.slabs = layout.parent_capacity + 1  # Includes the reserved zero slab.
-        shape = (self.slabs, geometry.slab_units, self.page.nbytes)
-        self._storage = CacheStorage(shape)
+        self._storage = CacheStorage(
+            (self.slabs, geometry.slab_units, geometry.unit_bytes)
+        )
         self._epoch = self._storage.initial_epoch()
         self._readers: list[mx.array] = []
 
@@ -79,100 +112,96 @@ class ByteArena(Generic[_Geometry]):
         """Alias the contiguous allocation after its last write, without conversion."""
         return self._storage.read_epoch(self._epoch).view(dtype).reshape(shape)
 
-    def gather_units(
-        self, starts: np.ndarray, count: int, unit_bytes: int, dtype: mx.Dtype
+    def read_state_part(
+        self, starts: np.ndarray, shape: tuple[int, ...], dtype: mx.Dtype
     ) -> mx.array:
-        """Gather `count` whole contiguous units at each unit-aligned byte start."""
+        """Gather a unit-aligned payload per row, trimming its padding."""
+        unit_bytes = self.geometry.unit_bytes
+        elements = math.prod(shape)
+        count = math.ceil(elements * dtype.size / unit_bytes)
         units = starts[:, None] // unit_bytes + np.arange(count)
         storage = self.view(dtype, (-1, unit_bytes // dtype.size))
-        return mx.take(storage, mx.array(units.astype(np.int32)), axis=0)
-
-    def write_slice(self, byte_start: int, value: mx.array) -> None:
-        self._epoch = self._storage.write_slice(
-            self._epoch, byte_start, value, after=self._readers
+        values = mx.take(storage, mx.array(units.astype(np.int32)), axis=0)
+        return values.reshape(len(starts), -1)[:, :elements].reshape(
+            len(starts), *shape
         )
-        self._readers.clear()
 
-    def scatter_rows(self, rows: mx.array, values: mx.array, *, row_bytes: int) -> None:
-        self._epoch = self._storage.scatter_rows(
-            self._epoch, rows, values, row_bytes=row_bytes, after=self._readers
-        )
-        self._readers.clear()
+    def write_state_part(
+        self, starts: Sequence[int], values: mx.array, *, offset: int = 0
+    ) -> None:
+        for index, start in enumerate(starts):
+            self._epoch = self._storage.write_slice(
+                self._epoch, start + offset, values[index], after=self._readers
+            )
+            self._readers.clear()
 
-
-@dataclass(frozen=True, slots=True)
-class KVPage:
-    """One layer's keys followed by its values, each stored in token order."""
-
-    tokens: int
-    width: int
-    dtype: mx.Dtype
-
-    @property
-    def row_bytes(self) -> int:
-        return self.width * self.dtype.size
-
-    @property
-    def nbytes(self) -> int:
-        return 2 * self.tokens * self.row_bytes
-
-    def view(self, arena: ByteArena) -> mx.array:
-        return arena.view(self.dtype, (-1, 2, self.tokens, self.width))
-
-    def retained_table(
+    def retained_pages(
         self,
-        group: CacheGroupView,
+        plan: PagedCachePlan,
+        group: int,
         rows: np.ndarray,
         lengths: np.ndarray,
-        slab_units: int,
         *,
         earliest: np.ndarray | None = None,
-        min_width: int = 0,
-    ) -> tuple[np.ndarray, np.ndarray]:
-        """Layer-zero page IDs and absolute first block per row, omitting new tokens."""
-        first = group.block_table_start_indices[rows].astype(np.int64)
-        offsets = group.block_indptr[rows].astype(np.int64)
-        available = group.block_indptr[rows + 1] - offsets
-        ends = (lengths.astype(np.int64) + self.tokens - 1) // self.tokens
+    ) -> KVHistory:
+        """Cover the retained history with pages. Zero pads shorter and empty rows."""
+        table = plan.groups[group]
+        first = table.block_table_start_indices[rows].astype(np.int64)
+        offsets = table.block_indptr[rows].astype(np.int64)
+        available = table.block_indptr[rows + 1] - offsets
+        geometry = self.geometry
+        lengths = lengths.astype(np.int64, copy=False)
+        ends = -(-lengths // geometry.page_tokens)
         counts = np.clip(ends - first, 0, available)
-        starts = first
         if earliest is not None:
-            skips = np.clip(earliest // self.tokens - first, 0, counts)
-            starts = first + skips
+            skips = np.clip(earliest // geometry.page_tokens - first, 0, counts)
+            first += skips
             offsets += skips
             counts -= skips
 
-        width = int(counts.max(initial=min_width))
-        bases = np.zeros((len(rows), width), np.int64)
+        bases = np.zeros((len(rows), int(counts.max(initial=1))), np.int64)
         for index, (offset, count) in enumerate(zip(offsets, counts, strict=True)):
             selected = slice(offset, offset + count)
-            slabs = group.block_slab_ids[selected].astype(np.int64)
-            bases[index, :count] = slabs * slab_units + group.block_slotnums[selected]
-        return bases, starts
+            slabs = table.block_slab_ids[selected].astype(np.int64)
+            bases[index, :count] = (
+                slabs * geometry.slab_units + table.block_slotnums[selected]
+            )
+        units = self.view(
+            geometry.kv_dtype, (-1, 2, geometry.page_tokens, geometry.kv_width)
+        )
+        return KVHistory(
+            units, bases, first, lengths, table.blocks_per_slab, geometry.kv_heads
+        )
 
-    def write(
+    def write_tokens(
         self,
-        arena: ByteArena,
-        group: CacheGroupView,
+        plan: PagedCachePlan,
         keys: Sequence[mx.array],
         values: Sequence[mx.array],
         tokens: np.ndarray,
         *,
-        slab_units: int,
-        layer_stride: int,
+        group: int = 0,
     ) -> None:
-        slabs = group.append_slab_ids[tokens].astype(np.int64)
-        slots = group.append_slotnums[tokens].astype(np.int64)
-        offsets = group.append_block_offsets[tokens].astype(np.int64)
-        bases = slabs * slab_units + slots
-        units = bases[:, None] + np.arange(len(keys)) * layer_stride
-        rows = units[:, :, None] * (2 * self.tokens)
-        rows = rows + np.arange(2) * self.tokens + offsets[:, None, None]
-        # Row IDs can outgrow int32 when a large allocation holds narrow rows.
-        index_dtype = np.int64 if arena.nbytes // self.row_bytes > 2**31 else np.int32
-        packed = pack_key_values(keys, values, len(tokens), self.width)
-        arena.scatter_rows(
-            mx.array(rows.reshape(-1).astype(index_dtype, copy=False)),
-            packed.astype(self.dtype),
-            row_bytes=self.row_bytes,
+        """Write each step's K/V at its validated append addresses, across layers."""
+        tokens = tokens.reshape(-1)
+        table = plan.groups[group]
+        geometry = self.geometry
+        slabs = table.append_slab_ids[tokens].astype(np.int64)
+        bases = slabs * geometry.slab_units + table.append_slotnums[tokens]
+        units = bases[:, None] + np.arange(len(keys)) * table.blocks_per_slab
+        rows = (
+            units[:, :, None] * (2 * geometry.page_tokens)
+            + np.arange(2) * geometry.page_tokens
         )
+        rows += table.append_block_offsets[tokens, None, None]
+        row_bytes = geometry.kv_width * geometry.kv_dtype.size
+        index_dtype = np.int64 if self.nbytes // row_bytes > 2**31 else np.int32
+        packed = pack_key_values(keys, values, len(tokens), geometry.kv_width)
+        self._epoch = self._storage.scatter_rows(
+            self._epoch,
+            mx.array(rows.reshape(-1).astype(index_dtype)),
+            packed.astype(geometry.kv_dtype),
+            row_bytes=row_bytes,
+            after=self._readers,
+        )
+        self._readers.clear()

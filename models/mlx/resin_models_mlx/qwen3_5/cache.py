@@ -13,14 +13,14 @@ Reads gather with ``take`` or use a private view for paged attention. Keys and
 values scatter single rows; DeltaNet snapshots use contiguous slice updates.
 Native resource operations order every write after prior readers on the GPU,
 without rebinding an immutable MLX arena value or requiring buffer donation.
-Live DeltaNet state stays outside the arena between steps (see ``state.py``).
+Live DeltaNet state stays outside the arena between steps (see ``live_state.py``).
 """
 
 from __future__ import annotations
 
 import math
-from collections.abc import Sequence
-from dataclasses import dataclass, field
+from collections.abc import Iterable, Sequence
+from dataclasses import dataclass
 
 import mlx.core as mx
 import numpy as np
@@ -28,15 +28,14 @@ import numpy as np
 from resin import CacheGroupFamily, CacheGroupLayout, CacheLayout
 from resin.backend.plans import PagedCachePlan
 from resin.models.qwen3_5.config import Qwen35Config
-from resin_models_mlx.cache_arena import ByteArena, KVPage, SlabGeometry
-from resin_models_mlx.paged_attention import decode_metadata
+from resin_models_mlx.cache_arena import PAGE_TOKENS, ByteArena, SlabGeometry
+from resin_models_mlx.metal import device_array
 from resin_models_mlx.qwen3_5.model import (
     AttentionHistory,
     LinearState,
     PagedHistory,
 )
 
-PAGE_TOKENS = 128
 STATE_BLOCK_TOKENS = 4096
 KV_GROUP = 0
 STATE_GROUP = 1
@@ -58,7 +57,6 @@ class CacheGeometry(SlabGeometry):
     convolution_shape: tuple[int, int, int]
     slab_units: int
     state_units: int
-    kv_page: KVPage = field(init=False)
 
     @classmethod
     def from_config(cls, config: Qwen35Config) -> CacheGeometry:
@@ -74,7 +72,7 @@ class CacheGeometry(SlabGeometry):
             config.linear_conv_dim,
         )
         kv_width = config.num_key_value_heads * config.head_dim
-        unit_bytes = KVPage(PAGE_TOKENS, kv_width, mx.bfloat16).nbytes
+        unit_bytes = 2 * PAGE_TOKENS * kv_width * cls.kv_dtype.size
         recurrent_layer_bytes = math.prod(recurrent_shape[1:]) * mx.float32.size
         if (
             recurrent_layer_bytes % unit_bytes
@@ -97,10 +95,6 @@ class CacheGeometry(SlabGeometry):
             state_units=state_units,
         )
 
-    def __post_init__(self) -> None:
-        page = KVPage(PAGE_TOKENS, self.kv_heads * self.head_dim, mx.bfloat16)
-        object.__setattr__(self, "kv_page", page)
-
     @property
     def kv_blocks_per_slab(self) -> int:
         return self.slab_units // self.full_layers
@@ -110,8 +104,8 @@ class CacheGeometry(SlabGeometry):
         return self.slab_units // self.state_units
 
     @property
-    def convolution_elements(self) -> int:
-        return math.prod(self.convolution_shape)
+    def recurrent_layer_bytes(self) -> int:
+        return math.prod(self.recurrent_shape[1:]) * mx.float32.size
 
     def layout(self, slab_capacity: int) -> CacheLayout:
         return CacheLayout(
@@ -140,99 +134,53 @@ class CacheArena(ByteArena[CacheGeometry]):
         """Return an independent, immutable copy, ordered before later writes."""
         # Copy raw words so NaNs retain their payloads. The copy is a reader
         # of the arena, just like attention, until the next ordered write.
-        words = self.view(mx.uint16, (-1, 2 * PAGE_TOKENS, self.page.width))
-        result = mx.full(words.shape, words, dtype=mx.uint16).view(self.page.dtype)
+        words = self.view(mx.uint16, (-1, 2 * PAGE_TOKENS, self.geometry.kv_width))
+        result = mx.full(words.shape, words, dtype=mx.uint16).view(
+            self.geometry.kv_dtype
+        )
         self.order_after([result])
         return result
 
-    # Reads ---------------------------------------------------------------
-
-    def _kv_bases(
-        self, plan: PagedCachePlan, rows: np.ndarray, lengths: np.ndarray
-    ) -> np.ndarray:
-        """Layer-zero unit per block covering ``lengths[i]`` tokens; 0 pads."""
-
-        bases, _ = self.page.retained_table(
-            plan.groups[KV_GROUP], rows, lengths, self.geometry.slab_units, min_width=1
-        )
-        return bases
-
     def history(
-        self, plan: PagedCachePlan, row: int, length: int
-    ) -> Sequence[AttentionHistory | None]:
-        """One row's earlier tokens, gathered per layer only when it is read."""
-
+        self,
+        plan: PagedCachePlan,
+        rows: np.ndarray,
+        lengths: np.ndarray,
+        *,
+        decode: bool,
+    ) -> Iterable[AttentionHistory | None] | PagedHistory:
+        """Decode reads in place. Prefill gathers one row, one layer at a time."""
         layers = self.geometry.full_layers
-        if length == 0:
+        if not decode and lengths[0] == 0:
             return (None,) * layers
-        bases = self._kv_bases(plan, np.array([row]), np.array([length]))[0]
-        return _GatheredHistory(self.page.view(self), bases, length, self.geometry)
-
-    def paged_history(
-        self, plan: PagedCachePlan, rows: np.ndarray, lengths: np.ndarray
-    ) -> PagedHistory:
-        """Page tables for attending to history in place during decode."""
-
-        bases = self._kv_bases(plan, rows, lengths)
-        return PagedHistory(
-            self.page.view(self),
-            decode_metadata(bases),
-            decode_metadata(lengths),
-            layer_stride=self.geometry.kv_blocks_per_slab,
-        )
+        history = self.retained_pages(plan, KV_GROUP, rows, lengths)
+        if decode:
+            return PagedHistory(
+                history.units,
+                device_array(history.bases),
+                device_array(lengths),
+                history.layer_stride,
+            )
+        return (AttentionHistory(*history.gather(layer)) for layer in range(layers))
 
     def read_states(self, starts: np.ndarray) -> LinearState:
         """Restore each layer's FP32 recurrent state and BF16 convolution tail."""
         geometry = self.geometry
-        count = len(starts)
         layers = geometry.recurrent_shape[0]
-        layer_bytes = math.prod(geometry.recurrent_shape[1:]) * mx.float32.size
-        unit_bytes = self.page.nbytes
-        recurrent = []
-        for layer in range(layers):
-            values = self.gather_units(
-                starts + layer * layer_bytes,
-                layer_bytes // unit_bytes,
-                unit_bytes,
+        recurrent = tuple(
+            self.read_state_part(
+                starts + layer * geometry.recurrent_layer_bytes,
+                geometry.recurrent_shape[1:],
                 mx.float32,
             )
-            recurrent.append(values.reshape(count, *geometry.recurrent_shape[1:]))
-        tail_start = layers * layer_bytes
-        tails = self.gather_units(
-            starts + tail_start,
-            (geometry.state_bytes - tail_start) // unit_bytes,
-            unit_bytes,
+            for layer in range(layers)
+        )
+        tails = self.read_state_part(
+            starts + layers * geometry.recurrent_layer_bytes,
+            geometry.convolution_shape,
             mx.bfloat16,
         )
-        tails = tails.reshape(count, -1)[:, : geometry.convolution_elements]
-        tails = tails.reshape(count, layers, *geometry.convolution_shape[1:])
-        convolution = [tails[:, layer] for layer in range(layers)]
-        return LinearState(tuple(recurrent), tuple(convolution))
-
-    # Writes --------------------------------------------------------------
-
-    def write_tokens(
-        self,
-        plan: PagedCachePlan,
-        keys: tuple[mx.array, ...],
-        values: tuple[mx.array, ...],
-        tokens: np.ndarray,
-    ) -> None:
-        """Scatter K/V rows of every layer for flattened plan ``tokens``.
-
-        Targets are the plan's validated append addresses. Each layer writes
-        its slot in the layer's contiguous within-slab page range.
-        """
-
-        self.page.write(
-            self,
-            plan.groups[KV_GROUP],
-            keys,
-            values,
-            tokens,
-            slab_units=self.geometry.slab_units,
-            layer_stride=self.geometry.kv_blocks_per_slab,
-        )
+        return LinearState(recurrent, tuple(tails[:, layer] for layer in range(layers)))
 
     def write_states(self, starts: Sequence[int], state: LinearState) -> None:
         """Store row ``i`` of ``state`` in the STATE block at byte offset ``starts[i]``.
@@ -244,53 +192,18 @@ class CacheArena(ByteArena[CacheGeometry]):
         """
 
         geometry = self.geometry
-        count = len(starts)
-        layer_bytes = math.prod(geometry.recurrent_shape[1:]) * mx.float32.size
         for layer, value in enumerate(state.recurrent):
-            values = value.astype(mx.float32)
-            for index, start in enumerate(starts):
-                self.write_slice(start + layer * layer_bytes, values[index])
-        tail_start = geometry.recurrent_shape[0] * layer_bytes
-        tails = [
-            value.astype(mx.bfloat16).reshape(count, -1) for value in state.convolution
-        ]
-        tail_elements = (geometry.state_bytes - tail_start) // mx.bfloat16.size
-        padding = tail_elements - geometry.convolution_elements
-        tails.append(mx.zeros((count, padding), dtype=mx.bfloat16))
-        packed_tails = mx.concatenate(tails, axis=1)
-        for index, start in enumerate(starts):
-            self.write_slice(start + tail_start, packed_tails[index])
-
-
-@dataclass(frozen=True, slots=True)
-class _GatheredHistory(Sequence[AttentionHistory | None]):
-    """Gather a layer's pages using their within-slab layer stride.
-
-    Nothing holds a layer's gathered keys and values beyond the attention that
-    consumes them, so MLX can free each layer's copy before the next.
-    """
-
-    units: mx.array
-    bases: np.ndarray
-    length: int
-    geometry: CacheGeometry
-
-    def __len__(self) -> int:
-        return self.geometry.full_layers
-
-    def __getitem__(self, layer):  # type: ignore[override]
-        if not isinstance(layer, int) or not 0 <= layer < len(self):
-            raise IndexError(layer)
-        geometry = self.geometry
-        pages = mx.take(
-            self.units,
-            mx.array(self.bases + layer * geometry.kv_blocks_per_slab),
-            axis=0,
+            self.write_state_part(
+                starts,
+                value.astype(mx.float32),
+                offset=layer * geometry.recurrent_layer_bytes,
+            )
+        tails = mx.stack(
+            [value.astype(mx.bfloat16) for value in state.convolution], axis=1
         )
-        shape = (1, len(self.bases) * PAGE_TOKENS, geometry.kv_heads, -1)
-        keys = pages[:, 0].reshape(shape)[:, : self.length]
-        values = pages[:, 1].reshape(shape)[:, : self.length]
-        return AttentionHistory(keys, values)
+        self.write_state_part(
+            starts, tails, offset=len(state.recurrent) * geometry.recurrent_layer_bytes
+        )
 
 
 __all__ = [

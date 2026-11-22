@@ -21,7 +21,6 @@ from resin_models_mlx.inkling2.kernels import (
     expert_activation,
     expert_combine,
     gemv_f32,
-    pad_to_device,
     rms_norm,
     route_experts,
     short_convolution,
@@ -245,8 +244,9 @@ def _expert_matmul(
             )
             parts.append(routed[start:stop] @ dense.T)
         output = mx.concatenate(parts) if len(parts) > 1 else parts[0]
-    if activation_amax is not None:
-        activation_amax = pad_to_device(activation_amax)
+    if activation_amax is not None and activation_amax.size < 8:
+        # Keep the Metal device-array binding even at batch one.
+        activation_amax = mx.pad(activation_amax, (0, 8 - activation_amax.size))
     return output, activation_amax
 
 

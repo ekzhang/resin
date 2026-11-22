@@ -23,11 +23,9 @@ import mlx.core as mx
 import numpy as np
 
 from resin import CacheGroupFamily, CacheGroupLayout, CacheLayout, CacheRetention
-from resin.backend.plans import PagedCachePlan
 from resin.models.inkling2.config import Inkling2Config
-from resin_models_mlx.cache_arena import ByteArena, KVPage, SlabGeometry
+from resin_models_mlx.cache_arena import PAGE_TOKENS, ByteArena, SlabGeometry
 
-PAGE_TOKENS = 128
 GLOBAL_GROUP, LOCAL_GROUP, STATE_GROUP = 0, 1, 2
 
 
@@ -40,18 +38,16 @@ class CacheGeometry(SlabGeometry):
     state_shape: tuple[int, int, int]
     window_tokens: int
     prefill_chunk_size: int
-    kv_page: KVPage = field(init=False)
     slab_units: int = field(init=False)
     state_units: int = field(init=False)
-    page_tokens = PAGE_TOKENS
 
     def __post_init__(self) -> None:
-        page = KVPage(PAGE_TOKENS, self.kv_heads * self.head_dim, mx.bfloat16)
-        state_units = math.ceil(self.state_elements * mx.bfloat16.size / page.nbytes)
+        state_units = math.ceil(
+            math.prod(self.state_shape) * mx.bfloat16.size / self.unit_bytes
+        )
         slab_units = math.lcm(self.global_layers, self.local_layers, state_units)
         object.__setattr__(self, "state_units", state_units)
         object.__setattr__(self, "slab_units", slab_units)
-        object.__setattr__(self, "kv_page", page)
 
     @classmethod
     def from_config(
@@ -74,10 +70,6 @@ class CacheGeometry(SlabGeometry):
             window_tokens=config.sliding_window_size,
             prefill_chunk_size=prefill_chunk_size,
         )
-
-    @property
-    def state_elements(self) -> int:
-        return math.prod(self.state_shape)
 
     def layers(self, group: int) -> int:
         return self.global_layers if group == GLOBAL_GROUP else self.local_layers
@@ -126,119 +118,14 @@ class CacheGeometry(SlabGeometry):
         )
 
 
-@dataclass(frozen=True, slots=True)
-class History:
-    """One group's retained earlier tokens for a set of rows.
-
-    ``bases[r, j]`` is the visit-zero unit of row ``r``'s ``j``th retained block,
-    whose first token is at ``(starts[r] + j) * 128``. ``lengths[r]`` is the
-    row's context; entries at or beyond it are not history.
-    """
-
-    units: mx.array
-    bases: np.ndarray
-    starts: np.ndarray
-    lengths: np.ndarray
-    layer_stride: int
-    kv_heads: int
-
-    def gather(self, layer: int) -> tuple[mx.array, mx.array, mx.array, mx.array]:
-        """Keys, values ``[R, L, KV, D]``, absolute positions and validity ``[R, L]``."""
-        rows, width = self.bases.shape
-        pages = mx.take(
-            self.units,
-            mx.array((self.bases + layer * self.layer_stride).reshape(-1)),
-            axis=0,
-        )
-        pages = pages.reshape(rows, width, 2, PAGE_TOKENS, self.kv_heads, -1)
-        keys = pages[:, :, 0].reshape(rows, width * PAGE_TOKENS, self.kv_heads, -1)
-        values = pages[:, :, 1].reshape(rows, width * PAGE_TOKENS, self.kv_heads, -1)
-        positions = (self.starts[:, None] * PAGE_TOKENS) + np.arange(
-            width * PAGE_TOKENS
-        )[None]
-        counts = self.lengths - self.starts * PAGE_TOKENS
-        offsets = mx.arange(width * PAGE_TOKENS)[None]
-        valid = offsets < mx.array(counts.astype(np.int32))[:, None]
-        return keys, values, mx.array(positions.astype(np.int32)), valid
-
-
 class CacheArena(ByteArena[CacheGeometry]):
-    """Engine-addressed mutable storage, ordered by an MLX dependency epoch."""
-
     resource = "Inkling 2 MLX cache"
 
-    def units(self) -> mx.array:
-        return self.page.view(self)
-
-    # Reads ---------------------------------------------------------------
-
-    def history(
-        self,
-        plan: PagedCachePlan,
-        group: int,
-        rows: np.ndarray,
-        contexts: np.ndarray,
-        earliest: np.ndarray | None = None,
-    ) -> History | None:
-        """Retained blocks holding tokens before ``contexts``; ``None`` if empty.
-
-        ``earliest`` optionally skips whole blocks before that position.
-        """
-        geometry = self.geometry
-        bases, starts = self.page.retained_table(
-            plan.groups[group], rows, contexts, geometry.slab_units, earliest=earliest
-        )
-        if bases.shape[1] == 0:
-            return None
-        return History(
-            self.units(),
-            bases,
-            starts,
-            contexts.astype(np.int64),
-            geometry.blocks_per_slab(group),
-            geometry.kv_heads,
-        )
-
     def read_states(self, starts: np.ndarray) -> mx.array:
-        geometry = self.geometry
-        values = self.gather_units(
-            starts, geometry.state_units, self.page.nbytes, mx.bfloat16
-        )
-        values = values.reshape(len(starts), -1)[:, : geometry.state_elements]
-        return values.reshape(len(starts), *geometry.state_shape)
-
-    # Writes --------------------------------------------------------------
-
-    def write_tokens(
-        self,
-        plan: PagedCachePlan,
-        group: int,
-        keys: Sequence[mx.array],
-        values: Sequence[mx.array],
-        tokens: np.ndarray,
-    ) -> None:
-        """Scatter every visit's K/V rows for flattened plan ``tokens`` into ``group``."""
-        self.page.write(
-            self,
-            plan.groups[group],
-            keys,
-            values,
-            tokens,
-            slab_units=self.geometry.slab_units,
-            layer_stride=self.geometry.blocks_per_slab(group),
-        )
+        return self.read_state_part(starts, self.geometry.state_shape, mx.bfloat16)
 
     def write_states(self, starts: Sequence[int], state: mx.array) -> None:
-        geometry = self.geometry
-        count = len(starts)
-        padding = geometry.state_bytes // mx.bfloat16.size - geometry.state_elements
-        flat = state.astype(mx.bfloat16).reshape(count, -1)
-        if padding:
-            flat = mx.concatenate(
-                [flat, mx.zeros((count, padding), dtype=mx.bfloat16)], axis=1
-            )
-        for index, start in enumerate(starts):
-            self.write_slice(start, flat[index])
+        self.write_state_part(starts, state.astype(mx.bfloat16))
 
 
 __all__ = [
@@ -248,5 +135,4 @@ __all__ = [
     "STATE_GROUP",
     "CacheArena",
     "CacheGeometry",
-    "History",
 ]

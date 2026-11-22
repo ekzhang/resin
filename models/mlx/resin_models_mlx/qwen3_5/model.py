@@ -7,11 +7,11 @@ keys and values. The runner owns writing them back into the Engine's slabs.
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Iterable
 from copy import copy
 from dataclasses import dataclass
 from functools import partial
-from itertools import accumulate
+from itertools import accumulate, repeat
 from typing import NamedTuple, cast
 
 import mlx.core as mx
@@ -498,7 +498,7 @@ class Qwen35Model(nn.Module):
         token_ids: mx.array,
         offsets: mx.array,
         state: LinearState,
-        history: Sequence[AttentionHistory | None] | PagedHistory,
+        history: Iterable[AttentionHistory | None] | PagedHistory,
         *,
         input_embeddings=None,
         rotary_positions=None,
@@ -511,6 +511,9 @@ class Qwen35Model(nn.Module):
             else input_embeddings
         )
         keys, values, recurrent, convolution = [], [], [], []
+        histories = (
+            repeat(history) if isinstance(history, PagedHistory) else iter(history)
+        )
         linear_index = full_index = 0
         pending = None
         for layer in self.layers:
@@ -530,15 +533,10 @@ class Qwen35Model(nn.Module):
                 convolution.append(layer_convolution)
                 linear_index += 1
             else:
-                layer_history = (
-                    history
-                    if isinstance(history, PagedHistory)
-                    else history[full_index]
-                )
                 mixed, key, value = layer.self_attn(
                     normed,
                     offsets,
-                    layer_history,
+                    next(histories),
                     full_index,
                     rotary_positions=rotary_positions,
                 )

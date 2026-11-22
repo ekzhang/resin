@@ -58,7 +58,7 @@ def test_rms_norm(generator, dtype):
         _within_bf16_step(_torch(actual), expected)
 
 
-@pytest.mark.parametrize("tokens", [1, 5])
+@pytest.mark.parametrize("tokens", [1, 2, 5, 16, 17, 35])
 def test_short_convolution(generator, tokens):
     x = (torch.randn(3, tokens, HIDDEN, generator=generator) * 2).bfloat16()
     state = torch.randn(3, 3, HIDDEN, generator=generator).bfloat16()

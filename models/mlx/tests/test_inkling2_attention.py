@@ -5,10 +5,9 @@ from __future__ import annotations
 import mlx.core as mx
 import numpy as np
 import pytest
-from _attention_pages import PAGE, attention_pages, bf16
+from _attention_pages import PAGE, attention_pages, bf16, dense_reference
 
-from resin_models_mlx.inkling2.attention import dense_attention
-from resin_models_mlx.inkling2.decode_attention import decode_attention
+from resin_models_mlx.inkling2.attention import decode_attention
 
 
 @pytest.mark.parametrize(
@@ -55,13 +54,10 @@ def test_decode_attention_matches_dense(contexts, window, geometry):
         int(max(lengths + 1 - firsts)),
     )
     positions = mx.array(lengths)[:, None]
-    key_positions = mx.broadcast_to(mx.arange(keys.shape[1]), (rows, keys.shape[1]))
-    expected, expected_lse = dense_attention(
+    expected, expected_lse = dense_reference(
         queries[:, None],
         keys,
         values,
-        key_positions,
-        key_positions <= positions,
         positions,
         bias[:, None],
         scale,

@@ -25,8 +25,10 @@ def test_packed_cache_matches_original_layout(layers, dtype):
         backing = mx.array(packed)
         if dtype == "bfloat16":
             backing = backing.view(mx.bfloat16)
-        keys.append(backing[:, 16 : 16 + width].reshape(rows, 2, 256))
-        values.append(backing[:, 16 + width : 16 + 2 * width].reshape(rows, 2, 256))
+        keys.append(backing[:, 16 : 16 + width].reshape(8, rows // 8, 2, 256))
+        values.append(
+            backing[:, 16 + width : 16 + 2 * width].reshape(8, rows // 8, 2, 256)
+        )
         expected.append(np.stack([key, value], axis=1))
     result = pack_key_values(keys, values, rows, width)
     expected = np.stack(expected, axis=1)
