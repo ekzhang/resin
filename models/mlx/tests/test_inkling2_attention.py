@@ -1,4 +1,4 @@
-"""Inkling 2 paged decode attention against the dense reference attention."""
+"""Inkling 2 paged attention against an independent dense reference."""
 
 from __future__ import annotations
 
@@ -7,7 +7,8 @@ import numpy as np
 import pytest
 from _attention_pages import PAGE, attention_pages, bf16, dense_reference
 
-from resin_models_mlx.inkling2.attention import decode_attention
+from resin_models_mlx.inkling2.attention import decode_attention, paged_prefill
+from resin_models_mlx.metal import device_array
 
 
 @pytest.mark.parametrize(
@@ -69,3 +70,41 @@ def test_decode_attention_matches_dense(contexts, window, geometry):
     np.testing.assert_allclose(
         np.array(lse), np.array(expected_lse[:, 0]), rtol=2e-4, atol=2e-4
     )
+
+
+@pytest.mark.parametrize(("window", "dim"), [(None, 128), (147, 128), (147, 269)])
+def test_paged_prefill_matches_dense_across_page_and_tile_boundaries(window, dim):
+    context, tokens, layer = 3 * PAGE + 5, 35, 2
+    heads, kv_heads = 6, 2
+    scale = dim**-0.5
+    first_visible = 0 if window is None else max(0, context - window + 1)
+    first_block = first_visible // PAGE
+    meta = device_array([[context, first_visible, first_block]])
+    rng = np.random.default_rng(0)
+    (past_k, past_v), _, units, pages = attention_pages(
+        rng,
+        [context],
+        kv_heads,
+        dim,
+        starts=np.array([first_block]),
+        layers=3,
+        layer=layer,
+    )
+    k, v = bf16(rng.standard_normal((2, 1, tokens, kv_heads, dim), np.float32))
+    q = bf16(rng.standard_normal((1, tokens, heads, dim), np.float32))
+    bias = bf16(rng.standard_normal((1, tokens, heads, 21), np.float32))
+    actual = paged_prefill(q, k, v, bias, units, pages, meta, layer, scale, window)
+    expected = dense_reference(
+        q,
+        mx.concatenate([past_k[:, :context], k], axis=1),
+        mx.concatenate([past_v[:, :context], v], axis=1),
+        mx.arange(context, context + tokens)[None],
+        bias,
+        scale,
+        window,
+    )
+    for output, reference in zip(actual, expected, strict=True):
+        assert output.dtype == mx.float32 and output.shape == reference.shape
+        np.testing.assert_allclose(
+            np.asarray(output), np.asarray(reference), rtol=2e-5, atol=2e-5
+        )

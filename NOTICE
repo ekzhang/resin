@@ -225,7 +225,9 @@ quantization, as that CUDA module does:
   https://github.com/sgl-project/sglang/tree/e62ac6279646c686d3b328f58d9b5c2c2d5927dc
 
 Its fused routing and expert-activation kernels (kernels.py) reuse MLX v0.32.4's
-sigmoid formula from mlx/backend/metal/kernels/unary_ops.h:
+sigmoid formula from mlx/backend/metal/kernels/unary_ops.h. Its prefill attention
+kernel (attention.py) uses the SIMD fragment coordinates from
+mlx/backend/metal/kernels/steel/gemm/mma.h.
 
   Copyright 2023-2024 Apple Inc.
   https://github.com/ml-explore/mlx/tree/v0.32.4/mlx/backend/metal/kernels

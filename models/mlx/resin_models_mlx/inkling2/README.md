@@ -57,13 +57,12 @@ The Engine owns three cache groups, mirroring the CUDA runner without DSpark:
   tokens plus one prefill chunk of writes;
 - convolution history (`48 × 3 × 6656` BF16) for prefix snapshots.
 
-Live convolution history stays on the GPU between steps; prefix hits restore a
-snapshot. Decode reads KV pages in place with a flash-decoding kernel that adds
-Inkling's relative bias, applies each row's window bound and returns the
-log-sum-exp for the attention sink. Context lengths, bounds and page-table
-widths are runtime data. Prefill gathers retained history per visit, attends in
-query blocks, reads only each block's window band or causal prefix, and skips
-bias work for global keys more than 1,024 positions back.
+Live convolution history stays on the GPU between steps, and prefix hits restore
+a snapshot. Both prefill and decode read retained BF16 KV directly from the
+page table and new KV from the current chunk. The prefill kernel streams tiles
+of visible keys through an online softmax, applies the learned relative bias
+to the most recent 1,024 positions, and restricts local visits to their window.
+Both paths return FP32 attention outputs and log-sum-exp for the sink.
 
 Decode overlaps through the Engine's enqueue contract. Fused Metal kernels cover
 four-tap convolutions over independent 16-token tiles, depth mixes, RMS norms,
@@ -105,8 +104,8 @@ tests' independent NVFP4/MXFP8 arithmetic.
   synchronous decode.
 - `scripts/check_server.py --stress` passes chat, logprobs, concurrency, prefix
   reuse, stress, robustness and recovery, and context checks up to 2,048 tokens.
-  The 8,192-token check exceeds its default 10-second TTFT limit (15 seconds at
-  this prefill rate). Image requests are rejected at admission.
+  The original runner took 15 seconds on the 8,192-token check, exceeding its
+  default 10-second TTFT limit. Image requests are rejected at admission.
 - On 100 MMLU questions (`cais/mmlu` revision `c30699e8`, 50 subjects × 2,
   seed 1017; default reasoning, 4,096-token cap, eight concurrent), 86 answers
   are correct. Of the 14 others, 4 are wrong, 2 reached the token cap and 8
@@ -129,6 +128,37 @@ RESIN_TEST_CHECKPOINT="$INKLING_CHECKPOINT" \
 ```
 
 ## Measured performance
+
+### Prefill attention on M1 Pro
+
+The table times one attention visit on a 16 GiB M1 Pro using MLX 0.32.4 and
+synthetic BF16 inputs with Mini's head geometry. Each time is the median of
+three synchronized calls after warmup. The dense baseline includes gathering
+retained KV. Across all six cases the maximum absolute differences were
+2.62 × 10⁻⁶ for the output and 1.91 × 10⁻⁶ for log-sum-exp.
+
+| Prior tokens | New tokens | Attention | Dense, ms | Paged, ms | Speedup |
+| -----------: | ---------: | --------- | --------: | --------: | ------: |
+|            0 |        128 | Global    |      0.96 |      0.62 |   1.55× |
+|            0 |        128 | Local     |      0.68 |      0.42 |   1.62× |
+|            0 |      2,048 | Global    |     56.83 |     15.18 |   3.75× |
+|            0 |      2,048 | Local     |     42.18 |     12.19 |   3.46× |
+|        8,193 |        128 | Global    |     16.64 |      6.90 |   2.41× |
+|        8,193 |        128 | Local     |      3.46 |      1.33 |   2.60× |
+
+With the runner's full 8,192-token chunk, the benchmark synchronized after each
+dense query block to bound memory on this machine. Paged attention used one
+dispatch per visit. All four cases passed with maximum absolute errors of
+3.34 × 10⁻⁶ for the output and 2.86 × 10⁻⁶ for log-sum-exp.
+
+| Prior tokens | Attention | Dense, ms | Paged, ms | Speedup |
+| -----------: | --------- | --------: | --------: | ------: |
+|            0 | Global    |   1093.39 |    212.59 |   5.14× |
+|            0 | Local     |    236.09 |     56.74 |   4.16× |
+|        8,192 | Global    |   3039.08 |    604.84 |   5.02× |
+|        8,192 | Local     |    224.47 |     58.96 |   3.81× |
+
+### Historical full-model throughput on M4 Max
 
 The original runner (`e2f020b`) was benchmarked on November 22, 2026 on a
 14-inch MacBook Pro with M4 Max and 128 GiB, using MLX 0.32.4, ShareGPT
@@ -202,9 +232,7 @@ remaining gap is the dispatch of many small per-visit operations.
 - No image input.
 - One GPU; no tensor or expert parallelism.
 - Prefill expert GEMMs reach about 7.8 TFLOPS (versus 13.5 for one dense GEMM)
-  because each expert sees about 128 rows per 2,048 tokens. Prefill attention
-  uses FP32 MLX matmuls rather than a flash kernel, so long prompts slow down:
-  316 tokens/s at 32K.
+  because each expert sees about 128 rows per 2,048 tokens.
 - Prompt logprobs project 128 prompt rows in about 60 ms (four rows per GEMV
   launch), adding about 4 seconds per 8,192-token chunk when requested.
 
@@ -214,5 +242,6 @@ remaining gap is the dispatch of many small per-visit operations.
   [SGLang's Inkling 2 integration](https://github.com/sgl-project/sglang/tree/e62ac6279646c686d3b328f58d9b5c2c2d5927dc),
   defines the arithmetic and supplies the CPU reference. The activation
   quantizer adapts SGLang's Apache-2.0 kernel.
-- The routing and activation kernels reuse MLX v0.32.4's sigmoid formula
-  (MIT; notice in this directory's LICENSE).
+- The routing and activation kernels reuse MLX v0.32.4's sigmoid formula.
+  Prefill uses its Steel SIMD fragment coordinates. The MIT notice is in
+  this directory's LICENSE.

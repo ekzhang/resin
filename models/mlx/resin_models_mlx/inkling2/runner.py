@@ -12,7 +12,7 @@ import numpy as np
 from resin.backend.plans import PagedCachePlan
 from resin.models.inkling2.config import Inkling2Config
 from resin_models_mlx.cache_arena import KVHistory
-from resin_models_mlx.inkling2.attention import decode_attention, dense_attention
+from resin_models_mlx.inkling2.attention import decode_attention, paged_prefill
 from resin_models_mlx.inkling2.cache import (
     GLOBAL_GROUP,
     LOCAL_GROUP,
@@ -48,7 +48,6 @@ class _StepStore:
         plan: PagedCachePlan,
         rows: np.ndarray,
         contexts: np.ndarray,
-        tokens_per_row: int,
         window: int,
     ) -> None:
         self.geometry = arena.geometry
@@ -66,20 +65,20 @@ class _StepStore:
             )
             history = arena.retained_pages(plan, group, rows, contexts, earliest=firsts)
             self.history[group] = history
-            if tokens_per_row == 1:
-                meta = np.stack([contexts, firsts, history.starts], axis=1)
-                self.paged[group] = (
-                    device_array(history.bases),
-                    device_array(meta),
-                    int(np.max(contexts + 1 - firsts)),
-                )
+            meta = np.stack([contexts, firsts, history.starts], axis=1)
+            self.paged[group] = (
+                device_array(history.bases),
+                device_array(meta),
+                int(np.max(contexts + 1 - firsts)),
+            )
 
     def attend(self, local, slot, q, k, v, bias, scale, window):
         group = LOCAL_GROUP if local else GLOBAL_GROUP
         self.visits[group][slot] = (k, v)
         history = self.history[group]
-        if group in self.paged:
-            pages, meta, longest = self.paged[group]
+        pages, meta, longest = self.paged[group]
+        layer = slot * history.layer_stride
+        if q.shape[1] == 1:
             output, lse = decode_attention(
                 q[:, 0],
                 k[:, 0],
@@ -88,18 +87,23 @@ class _StepStore:
                 pages,
                 meta,
                 bias[:, 0],
-                slot * history.layer_stride,
+                layer,
                 scale,
                 longest,
             )
             return output[:, None], lse[:, None]
-        # Multi-token prefill runs one row at a time. The retained prefix ends
-        # immediately before this chunk, even when the local window starts mid-page.
-        if history.lengths[0] > history.starts[0] * self.geometry.page_tokens:
-            previous_k, previous_v = history.gather(slot)
-            k = mx.concatenate([previous_k, k], axis=1)
-            v = mx.concatenate([previous_v, v], axis=1)
-        return dense_attention(q, k, v, bias, scale, window if local else None)
+        return paged_prefill(
+            q,
+            k,
+            v,
+            bias,
+            history.units,
+            pages,
+            meta,
+            layer,
+            scale,
+            window if local else None,
+        )
 
     @property
     def writes(self):
@@ -190,7 +194,6 @@ class Inkling2MlxRunner(MlxRunner[CacheArena]):
             plan,
             rows,
             contexts,
-            tokens.shape[1],
             self.config.sliding_window_size,
         )
         hidden, state = self._model.hidden(
