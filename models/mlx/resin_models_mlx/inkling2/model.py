@@ -396,14 +396,14 @@ class Inkling2Model:
         last_only: bool = True,
     ) -> tuple[mx.array, mx.array]:
         """Return softcapped FP32 logits and the next convolution state."""
-        hidden, next_state = self.hidden(token_ids, positions, state, store)
+        hidden, next_state = self.hidden(self.embed(token_ids), positions, state, store)
         if last_only:
             hidden = hidden[:, -1:]
         return logits(hidden, self.weights, self.config), next_state
 
     def hidden(
         self,
-        token_ids: mx.array,
+        embeddings: mx.array,
         positions: mx.array,
         state: mx.array,
         store: AttentionStore,
@@ -413,7 +413,7 @@ class Inkling2Model:
         tau = log_scaling_tau(
             positions, config.log_scaling_n_floor, config.log_scaling_alpha
         )
-        partial = self.embed(token_ids)
+        partial = embeddings
         blocks: list[mx.array] = []
         loop = config.loop
         prelude: tuple[list[mx.array], mx.array] | None = None

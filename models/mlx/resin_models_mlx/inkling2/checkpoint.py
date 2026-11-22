@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import json
+from collections import defaultdict
 from pathlib import Path
 
 import mlx.core as mx
 
+from resin.backend.safetensors import indexed_tensor_files
 from resin.models.inkling2.config import Inkling2Config
 from resin_models_mlx.inkling2.model import (
     Controller,
@@ -14,6 +16,7 @@ from resin_models_mlx.inkling2.model import (
     Inkling2Weights,
     Layer,
 )
+from resin_models_mlx.inkling2.vision import Inkling2VisionEncoder
 
 PREFIX = "model.llm."
 
@@ -124,17 +127,37 @@ def expected_tensors(config: Inkling2Config, precision: dict[str, str]) -> set[s
     return {PREFIX + name for name in names}
 
 
-def _load_tensors(root: Path) -> dict[str, mx.array]:
-    index = json.loads((root / "model.safetensors.index.json").read_text())
-    files = sorted({str(name) for name in index["weight_map"].values()})
+def _load_tensors(root: Path, prefix: str) -> dict[str, mx.array]:
+    shards: dict[Path, list[str]] = defaultdict(list)
+    for name, shard in indexed_tensor_files(root, require_index=True).items():
+        if name.startswith(prefix):
+            shards[shard].append(name)
     tensors: dict[str, mx.array] = {}
-    for name in files:
-        loaded = mx.load(str(root / name))
+    for shard, names in shards.items():
+        # Safetensor loads are lazy. Only the indexed arrays below are retained.
+        loaded = mx.load(str(shard))
         assert isinstance(loaded, dict)
-        tensors.update(
-            (key, value) for key, value in loaded.items() if key.startswith(PREFIX)
-        )
+        for name in names:
+            if name not in loaded:
+                raise ValueError(f"Missing indexed weight {name} in {shard.name}")
+            tensors[name] = loaded[name]
     return tensors
+
+
+def load_vision_model(
+    root: Path, vision_config: dict, text_hidden_size: int
+) -> Inkling2VisionEncoder:
+    model = Inkling2VisionEncoder(vision_config, text_hidden_size)
+    prefix = "model.visual."
+    weights = []
+    for name, tensor in _load_tensors(root, prefix).items():
+        if tensor.dtype != mx.bfloat16:
+            raise ValueError(f"{name} must use bfloat16, found {tensor.dtype}")
+        weights.append((name.removeprefix(prefix), tensor))
+    model.load_weights(weights, strict=True)
+    model.eval()
+    mx.eval(model.parameters())
+    return model
 
 
 def _experts(tensors: dict[str, mx.array], prefix: str, mode: str) -> Experts:
@@ -160,7 +183,7 @@ def _experts(tensors: dict[str, mx.array], prefix: str, mode: str) -> Experts:
 
 def load_weights(root: Path, config: Inkling2Config) -> Inkling2Weights:
     precision = expert_precision(root)
-    tensors = _load_tensors(root)
+    tensors = _load_tensors(root, PREFIX)
     expected = expected_tensors(config, precision)
     if missing := expected - tensors.keys():
         raise ValueError(
@@ -330,6 +353,7 @@ __all__ = [
     "expected_tensors",
     "expert_precision",
     "load_model",
+    "load_vision_model",
     "load_weights",
     "read_config",
 ]

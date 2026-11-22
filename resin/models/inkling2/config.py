@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 from typing import Any, Self
 
@@ -235,4 +236,40 @@ class Inkling2Config:
         )
 
 
-__all__ = ["Inkling2Config", "Inkling2LoopConfig"]
+def validate_vision_config(vision_config: dict, text_hidden_size: int) -> None:
+    """Validate the native Inkling vision tower and its text projection."""
+    for key in (
+        "temporal_patch_size",
+        "native_patch_size",
+        "adapter_merge_size",
+        "projection_hidden_dim",
+        "hidden_size",
+        "num_hidden_layers",
+        "num_attention_heads",
+        "posemb_grid_size",
+    ):
+        value = vision_config[key]
+        if type(value) is not int or value <= 0:
+            raise ValueError(f"vision_config.{key} must be a positive integer")
+    if type(text_hidden_size) is not int or text_hidden_size <= 0:
+        raise ValueError("text_hidden_size must be a positive integer")
+    for key in ("mlp_ratio", "layer_norm_eps"):
+        value = vision_config[key]
+        if type(value) not in (float, int) or not math.isfinite(value) or value <= 0:
+            raise ValueError(f"vision_config.{key} must be finite and positive")
+    width, heads = (
+        vision_config["hidden_size"],
+        vision_config["num_attention_heads"],
+    )
+    if width % heads or width // heads not in (4, 8, 16, 32, 64, 128):
+        raise ValueError("Vision head dimension must be one of 4, 8, 16, 32, 64, 128")
+    intermediate_size = width * vision_config["mlp_ratio"]
+    if not math.isfinite(intermediate_size) or intermediate_size != int(
+        intermediate_size
+    ):
+        raise ValueError("Vision MLP intermediate size must be an integer")
+    if type(vision_config["projector_bias"]) is not bool:
+        raise ValueError("vision_config.projector_bias must be a boolean")
+
+
+__all__ = ["Inkling2Config", "Inkling2LoopConfig", "validate_vision_config"]

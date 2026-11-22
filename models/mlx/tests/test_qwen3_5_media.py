@@ -102,3 +102,26 @@ def test_media_chunks_merge_features_and_keep_decode_rotary_delta():
     malformed = (Media(span=(1, 3), image=media[0].image),)
     with pytest.raises(ValueError, match="geometry"):
         encoder.features(malformed)
+
+
+def test_shifted_images_reuse_features_at_the_current_spans():
+    calls = []
+
+    def visual(pixels, grid):
+        # Each image has two patches; read the first channel from each.
+        calls.append(grid.tolist())
+        return pixels[:, :1]
+
+    encoder = MediaEncoder(visual, 1, patch_size=2, merge_size=1, temporal_patch_size=1)
+    first = np.arange(24, dtype=np.float32).reshape(2, 4, 3)
+    second = first + 100
+
+    def media(shift):
+        return (Media((2 + shift, 2), image=first), Media((6 + shift, 2), image=second))
+
+    # Start inside image one, cross intervening text, and end inside image two.
+    chunk = encoder.insert(mx.zeros((1, 4, 1)), media(0), 3)
+    np.testing.assert_array_equal(np.array(chunk).ravel(), [6, 0, 0, 100])
+    shifted = encoder.insert(mx.zeros((1, 2, 1)), media(9), 15)
+    np.testing.assert_array_equal(np.array(shifted).ravel(), [100, 106])
+    assert calls == [[[1, 1, 2], [1, 1, 2]]]
