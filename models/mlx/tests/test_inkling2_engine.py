@@ -251,11 +251,18 @@ def test_image_prompt_with_vision_checkpoint(tmp_path):
         max_seq_len=CHUNK,
         max_batch_size=1,
         prefill_chunk_size=CHUNK,
+        cache_slab_capacity=8,
+        workspace_bytes=64 << 20,
         include_vision=False,
     )
     assert text_runner._media is None
     runner = Inkling2MlxRunner(
-        tmp_path, max_seq_len=CHUNK, max_batch_size=1, prefill_chunk_size=CHUNK
+        tmp_path,
+        max_seq_len=CHUNK,
+        max_batch_size=1,
+        prefill_chunk_size=CHUNK,
+        cache_slab_capacity=8,
+        workspace_bytes=64 << 20,
     )
     assert runner._media is not None
     image = np.ones((4, 8, 3), dtype=np.float32)
