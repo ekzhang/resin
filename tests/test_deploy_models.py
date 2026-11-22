@@ -49,8 +49,6 @@ def test_runtime_prepares_persistent_cute_cache(tmp_path, name):
     [
         ("ornith-1.0-35b", "qwen3_5", "Qwen35MlxRunner"),
         ("qwen3.5-0.8b-mlx", "qwen3_5", "Qwen35MlxRunner"),
-        ("qwen3.5-0.8b-mtp-mlx", "qwen3_5", "Qwen35MlxRunner"),
-        ("qwen3.8-27b-mlx", "qwen3_5", "Qwen35MlxRunner"),
         ("inkling2-mini-mlx", "inkling2", "Inkling2MlxRunner"),
     ],
 )
@@ -72,17 +70,12 @@ def test_mlx_factory_constructs_single_device_runner(
             context_length=8192,
             max_batch_size=8,
             prefill_chunk_size=spec.prefill_chunk_size,
-            draft_tokens=spec.draft_tokens,
+            draft_tokens=0,
         )
         return create_runner(model, checkpoint, **(options | overrides))
 
     checkpoint = tmp_path / spec.name
     create()
-    draft_options = (
-        {"speculative_draft_tokens": spec.draft_tokens}
-        if module_name == "qwen3_5"
-        else {}
-    )
     assert calls == [
         (
             (checkpoint,),
@@ -92,19 +85,14 @@ def test_mlx_factory_constructs_single_device_runner(
                 "max_batch_size": 8,
                 "prefill_chunk_size": 8192,
                 "include_vision": not spec.text_only,
-                **draft_options,
             },
         )
     ]
     create(model=replace(spec, text_only=True))
     assert calls[-1][1]["include_vision"] is False
-    if module_name == "inkling2":
-        with pytest.raises(ValueError, match="requires draft_tokens=0"):
-            create(draft_tokens=4)
-    else:
-        create(draft_tokens=0)
-        assert calls[-1][1]["speculative_draft_tokens"] == 0
-    with pytest.raises(ValueError, match="no separate assistant checkpoint"):
+    with pytest.raises(ValueError, match="use draft_tokens=0"):
+        create(draft_tokens=4)
+    with pytest.raises(ValueError, match="use draft_tokens=0"):
         create(draft_tokens=1, assistant_checkpoint=tmp_path / "mtp")
     with pytest.raises(ValueError, match="one Apple Silicon device"):
         create(groups=object())

@@ -3,12 +3,10 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import TYPE_CHECKING
 
 import mlx.core as mx
 import numpy as np
 
-from resin import BatchPhase
 from resin.backend.plans import PagedCachePlan
 from resin.models.qwen3_5.config import Qwen35Config
 from resin_models_mlx.live_state import LiveStates
@@ -20,18 +18,12 @@ from resin_models_mlx.qwen3_5.cache import (
 )
 from resin_models_mlx.qwen3_5.checkpoint import checkpoint_quantization, load_model
 from resin_models_mlx.qwen3_5.model import Qwen35Model
-from resin_models_mlx.qwen3_5.speculation import MtpDecode, SpeculativeFeedback
 from resin_models_mlx.runner import (
     DEFAULT_WORKSPACE_BYTES,
-    MlxCompletion,
     MlxRunner,
     ModelStep,
     context_limit,
 )
-
-if TYPE_CHECKING:
-    from resin import BatchPlan, ForwardOutput
-    from resin_models_mlx.runner import _Launch
 
 
 class Qwen35MlxRunner(MlxRunner[CacheArena]):
@@ -53,20 +45,13 @@ class Qwen35MlxRunner(MlxRunner[CacheArena]):
         workspace_bytes: int = DEFAULT_WORKSPACE_BYTES,
         include_vision: bool = True,
         compile_vision: bool = True,
-        speculative_draft_tokens: int = 0,
     ) -> None:
         if type(prefill_chunk_size) is not int or prefill_chunk_size <= 0:
             raise ValueError("prefill_chunk_size must be a positive integer")
         self._media = None
         if workspace_bytes < 0:
             raise ValueError("workspace_bytes must be non-negative")
-        if type(speculative_draft_tokens) is not int or speculative_draft_tokens < 0:
-            raise ValueError("speculative_draft_tokens must be a non-negative integer")
-        self.speculative_draft_tokens = speculative_draft_tokens
-        include_mtp = speculative_draft_tokens > 0
         if isinstance(model, Qwen35Model):
-            if include_mtp and not model.has_mtp:
-                raise ValueError("MTP decoding requires a model with its MTP head")
             self._model = model
             self.config: Qwen35Config = model.config
             self.model_path = None
@@ -78,7 +63,6 @@ class Qwen35MlxRunner(MlxRunner[CacheArena]):
                 self.model_path,
                 bits=weight_bits,
                 group_size=group_size,
-                include_mtp=include_mtp,
             )
             packed = checkpoint_quantization(raw_config)
             bits, group = (
@@ -119,7 +103,7 @@ class Qwen35MlxRunner(MlxRunner[CacheArena]):
             max_seq_len, self.config.max_position_embeddings
         )
         # Describes how this runner executes for benchmark records.
-        self.benchmark_metadata: dict[str, object] = {
+        self.benchmark_metadata = {
             "quant": quantization,
             "weight_source": weight_source,
             "expert_backend": "mlx-gather-qmm" if self.config.is_moe else "none",
@@ -127,12 +111,7 @@ class Qwen35MlxRunner(MlxRunner[CacheArena]):
         }
         self.vocab_size = self.config.vocab_size
         self.eos_token_id = self.config.eos_token_id
-        self.cache_geometry = CacheGeometry.from_config(
-            self.config, include_mtp=include_mtp
-        )
-        if include_mtp:
-            # The verified block holds its replayed state beside input and output.
-            workspace_bytes += max_batch_size * self.cache_geometry.state_bytes
+        self.cache_geometry = CacheGeometry.from_config(self.config)
         slab_capacity = self._slab_capacity(
             self.cache_geometry,
             memory_utilization,
@@ -160,60 +139,7 @@ class Qwen35MlxRunner(MlxRunner[CacheArena]):
             LiveStates(cache, self._model.initial_state, STATE_GROUP),
             self._model.logits,
             prefill_chunk_size,
-            max_accepted_per_step=speculative_draft_tokens + 1,
         )
-        self._mtp_decode = None
-        if include_mtp:
-            self._mtp_decode = MtpDecode(
-                self._model,
-                self._cache,
-                self._states,
-                self._sampler,
-                self._media,
-                speculative_draft_tokens,
-                self.max_seq_len,
-            )
-            self.benchmark_metadata["speculative"] = {
-                "method": "mtp",
-                "draft_tokens": speculative_draft_tokens,
-            }
-
-    def speculative_stats(self) -> dict[str, int | float]:
-        return self._mtp_decode.stats.snapshot() if self._mtp_decode is not None else {}
-
-    def release(self, sequence_ids: list[int]) -> None:
-        super().release(sequence_ids)
-        if self._mtp_decode is not None:
-            self._mtp_decode.release(sequence_ids)
-
-    def _write(self, launch: _Launch) -> None:
-        super()._write(launch)
-        if (
-            self._mtp_decode is not None
-            and launch.plan.batch.phase == BatchPhase.PREFILL
-        ):
-            self._mtp_decode.prefill(launch)
-
-    def forward(self, plan: BatchPlan) -> ForwardOutput:
-        if self._mtp_decode is not None and plan.phase == BatchPhase.DECODE:
-            return self._mtp_decode.forward(self._cache_plan(plan))
-        return super().forward(plan)
-
-    def enqueue(
-        self,
-        plan: BatchPlan,
-        *,
-        feedback: mx.array | SpeculativeFeedback | None = None,
-    ) -> MlxCompletion | ForwardOutput:
-        if self._mtp_decode is not None and plan.phase == BatchPhase.DECODE:
-            if feedback is not None and not isinstance(feedback, SpeculativeFeedback):
-                raise RuntimeError(
-                    "a speculative continuation needs speculative feedback"
-                )
-            return self._mtp_decode.enqueue(self._cache_plan(plan), feedback)
-        if isinstance(feedback, SpeculativeFeedback):
-            raise RuntimeError("target-only decode received speculative feedback")
-        return super().enqueue(plan, feedback=feedback)
 
     def _step(
         self,

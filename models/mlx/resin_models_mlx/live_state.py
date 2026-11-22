@@ -61,15 +61,13 @@ class LiveStates:
         self._initial_state = initial_state
         self._group = state_group
         # sequence ID -> (tokens processed, batch state, row in that batch)
-        self._rows: dict[int, tuple[int | mx.array, Any, int]] = {}
+        self._rows: dict[int, tuple[int, Any, int]] = {}
 
     def __len__(self) -> int:
         return len(self._rows)
 
-    def gather(
-        self, plan: PagedCachePlan, rows: np.ndarray, *, exact: bool = True
-    ) -> Any:
-        """Gather state without reading GPU positions when a continuation owns them."""
+    def gather(self, plan: PagedCachePlan, rows: np.ndarray) -> Any:
+        """State before each of ``rows`` runs, in plan row order."""
 
         batch = plan.batch
         restore = plan.groups[self._group].state
@@ -95,7 +93,7 @@ class LiveStates:
             else:
                 sequence = int(batch.sequence_ids[row])
                 entry = self._rows.get(sequence)
-                if entry is None or (exact and int(entry[0]) != context):
+                if entry is None or entry[0] != context:
                     raise RuntimeError(
                         f"sequence {sequence} has no live state at position {context}"
                     )
@@ -127,7 +125,7 @@ class LiveStates:
         self,
         plan: PagedCachePlan,
         rows: np.ndarray,
-        ends: np.ndarray | mx.array,
+        ends: np.ndarray,
         state: Any,
     ) -> tuple[int, ...]:
         """Hold each row's state after ``ends`` tokens and publish due snapshots.
@@ -136,21 +134,14 @@ class LiveStates:
         """
 
         sequences = plan.batch.sequence_ids
-        checkpoints = plan.groups[self._group].state
-        if (
-            isinstance(ends, mx.array)
-            and checkpoints
-            and len(checkpoints.checkpoint_slots)
-        ):
-            ends = np.array(ends)
         for index, row in enumerate(rows.tolist()):
-            end = ends[index] if isinstance(ends, mx.array) else int(ends[index])
-            self._rows[int(sequences[row])] = (end, state, index)
-        if not checkpoints or not len(checkpoints.checkpoint_slots):
-            return ()
+            self._rows[int(sequences[row])] = (int(ends[index]), state, index)
+        checkpoints = plan.groups[self._group].state
         positions = {row: index for index, row in enumerate(rows.tolist())}
         written, starts, indices = [], [], []
-        for reservation, row, prefix, slab, slot in checkpoints.checkpoint_slots:
+        for reservation, row, prefix, slab, slot in (
+            checkpoints.checkpoint_slots if checkpoints else ()
+        ):
             index = positions.get(int(row))
             # A snapshot is valid only at its exact prefix.
             if index is not None and int(ends[index]) == int(prefix):

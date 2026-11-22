@@ -5,7 +5,7 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any, Generic, NamedTuple, Protocol, TypeVar
+from typing import TYPE_CHECKING, Any, Generic, NamedTuple, TypeVar
 
 import mlx.core as mx
 import numpy as np
@@ -63,13 +63,6 @@ class _Launch:
     receipts: tuple[int, ...] | None = None
 
 
-class MlxCompletion(Protocol):
-    @property
-    def feedback(self) -> object | None: ...
-
-    def result(self) -> ForwardOutput: ...
-
-
 @dataclass(slots=True)
 class _Completion:
     """One overlapped decode step, collected after the next one is launched."""
@@ -118,8 +111,6 @@ class MlxRunner(Generic[_Arena], ABC):
         states: LiveStates,
         logits: Callable[[mx.array], mx.array],
         prefill_chunk_size: int,
-        *,
-        max_accepted_per_step: int = 1,
     ) -> None:
         self._cache = cache
         self._states = states
@@ -130,7 +121,6 @@ class MlxRunner(Generic[_Arena], ABC):
             max_batch_tokens=prefill_chunk_size,
             prefill_chunk_size=prefill_chunk_size,
             continuation_prefill=True,
-            max_accepted_per_step=max_accepted_per_step,
             cache_layout=self.cache_layout,
         )
         self._sampler = MlxSampler()
@@ -278,11 +268,7 @@ class MlxRunner(Generic[_Arena], ABC):
         ).with_state_checkpoints(receipts)
 
     def _cache_plan(self, plan: BatchPlan) -> PagedCachePlan:
-        lookahead = self.runner_config.max_accepted_per_step - 1
-        lookahead += self.cache_layout.decode_write_extra_tokens
-        cache_plan = PagedCachePlan.from_plan(
-            plan, self.cache_layout, decode_lookahead=lookahead
-        )
+        cache_plan = PagedCachePlan.from_plan(plan, self.cache_layout)
         if np.any(cache_plan.token_ids >= self.vocab_size):
             raise ValueError(f"token id is out of range for {self.model_name}")
         if int(np.max(cache_plan.batch.post_lengths)) > self.max_seq_len:
@@ -293,7 +279,7 @@ class MlxRunner(Generic[_Arena], ABC):
 
     def enqueue(
         self, plan: BatchPlan, *, feedback: mx.array | None = None
-    ) -> MlxCompletion | ForwardOutput:
+    ) -> _Completion | ForwardOutput:
         """Launch a decode step while the previous one still runs on the GPU.
 
         ``feedback`` holds the previous step's sampled tokens, which replace

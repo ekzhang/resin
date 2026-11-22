@@ -322,58 +322,6 @@ MODEL_SPECS.update(
             gpu_memory_utilization=0.60,
             recipe="qwen3_5",
         ),
-        "qwen3.5-0.8b-mtp-mlx": ModelSpec(
-            name="qwen3.5-0.8b-mtp-mlx",
-            family="qwen3_5",
-            checkpoint=Checkpoint(
-                repo_id="Qwen/Qwen3.5-0.8B",
-                revision="2fc06364715b967f1860aea9cf38778875588b17",
-                directory="",
-                required_files=(
-                    "config.json",
-                    "chat_template.jinja",
-                    "tokenizer.json",
-                    "tokenizer_config.json",
-                    "preprocessor_config.json",
-                    "video_preprocessor_config.json",
-                ),
-            ),
-            backend="mlx",
-            gpu="Apple-Silicon",
-            label="qwen3.5-0.8b-mtp-mlx",
-            expert_backend="none",
-            context_length=262_144,
-            max_batch_size=4,
-            draft_tokens=1,
-            gpu_memory_utilization=0.60,
-            recipe="qwen3_5",
-        ),
-        "qwen3.8-27b-mlx": ModelSpec(
-            name="qwen3.8-27b-mlx",
-            family="qwen3_5",
-            checkpoint=Checkpoint(
-                repo_id="Qwen/Qwen3.8-27B",
-                revision="1d4bf0f2ff6012fd82039f2fa52739d0dd7c60c0",
-                directory="",
-                required_files=(
-                    "config.json",
-                    "chat_template.jinja",
-                    "tokenizer.json",
-                    "tokenizer_config.json",
-                    "preprocessor_config.json",
-                    "video_preprocessor_config.json",
-                ),
-            ),
-            backend="mlx",
-            gpu="M4-Max",
-            label="qwen3.8-27b-mlx",
-            expert_backend="none",
-            context_length=262_144,
-            max_batch_size=16,
-            draft_tokens=2,
-            gpu_memory_utilization=0.70,
-            recipe="qwen3_5",
-        ),
         "ornith-1.0-35b": ModelSpec(
             name="ornith-1.0-35b",
             family="qwen3_5_moe",
@@ -733,36 +681,33 @@ def create_runner(
         else gpu_memory_utilization
     )
     if spec.backend == "mlx":
-        if assistant_checkpoint is not None:
-            raise ValueError("MLX takes no separate assistant checkpoint")
+        if draft_tokens:
+            raise ValueError(
+                f"the MLX {spec.family} runner does not support draft decoding; "
+                "use draft_tokens=0"
+            )
         if groups is not None:
             raise ValueError("the MLX runner executes on one Apple Silicon device")
         if expert_backend not in (None, spec.expert_backend):
             raise ValueError(f"{spec.name} uses expert_backend={spec.expert_backend!r}")
         # MLX has no CUDA graphs or graph batch catalog; graph options and
         # decode_batch_sizes do not apply. The batch limit sizes live state.
-        mlx_options: dict[str, Any] = dict(
+        match spec.family:
+            case "inkling2":
+                from resin_models_mlx.inkling2 import Inkling2MlxRunner as MlxRunner
+            case "qwen3_5" | "qwen3_5_moe":
+                from resin_models_mlx.qwen3_5 import Qwen35MlxRunner as MlxRunner
+            case _:
+                raise ValueError(f"unsupported MLX model family: {spec.family}")
+
+        return MlxRunner(
+            checkpoint,
             memory_utilization=memory,
             max_seq_len=context_length,
             max_batch_size=max_batch_size,
             prefill_chunk_size=prefill_chunk_size,
             include_vision=not spec.text_only,
         )
-        match spec.family:
-            case "inkling2":
-                if draft_tokens:
-                    raise ValueError("the Inkling MLX runner requires draft_tokens=0")
-                from resin_models_mlx.inkling2 import Inkling2MlxRunner
-
-                return Inkling2MlxRunner(checkpoint, **mlx_options)
-            case "qwen3_5" | "qwen3_5_moe":
-                from resin_models_mlx.qwen3_5 import Qwen35MlxRunner
-
-                return Qwen35MlxRunner(
-                    checkpoint, speculative_draft_tokens=draft_tokens, **mlx_options
-                )
-            case _:
-                raise ValueError(f"unsupported MLX model family: {spec.family}")
     common: dict[str, Any] = dict(
         device=device, cuda_graph_prefill=prefill_graph, cuda_graph_decode=decode_graph
     )
