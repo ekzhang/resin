@@ -36,11 +36,12 @@ def test_cross_stream_attention_readers_precede_mutation(write):
 
     expected_before, expected_after = read(initial), read(changed)
     mx.eval(expected_before, expected_after)
-    owner = CacheStorage((10 * 256, 512), mx.bfloat16)
+    row_bytes = 512 * initial.itemsize
+    owner = CacheStorage((10 * 256, row_bytes))
     a, b = mx.new_stream(mx.gpu), mx.new_stream(mx.gpu)
     with mx.stream(a):
         epoch = owner.write_slice(owner.initial_epoch(), 0, initial)
-        units = owner.read_epoch(epoch).reshape(initial.shape)
+        units = owner.read_epoch(epoch).view(mx.bfloat16).reshape(initial.shape)
         old_a = read(units)
     with mx.stream(b):
         old_b = read(units)
@@ -52,16 +53,17 @@ def test_cross_stream_attention_readers_precede_mutation(write):
                 ordered,
                 mx.array([5 * 256], mx.int64),
                 mx.zeros((1, 512), mx.bfloat16),
+                row_bytes=row_bytes,
                 after=roots,
             )
         else:
             epoch = owner.write_slice(
                 ordered,
-                5 * 256 * 512,
+                5 * 256 * row_bytes,
                 mx.zeros(512, mx.bfloat16),
                 after=roots,
             )
-        current = owner.read_epoch(epoch).reshape(initial.shape)
+        current = owner.read_epoch(epoch).view(mx.bfloat16).reshape(initial.shape)
         new_a = read(current)
     with mx.stream(b):
         new_b = read(current)

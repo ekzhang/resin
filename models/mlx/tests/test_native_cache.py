@@ -36,15 +36,20 @@ def test_cache_writes_preserve_bits_and_owner_lifetime(dtype, index_dtype):
         1,
         infinity - 1,
     ]
-    storage = CacheStorage((6, 512), dtype)
+    row_bytes = raw.shape[1] * raw.itemsize
+    storage = CacheStorage((6, row_bytes))
+    assert storage.nbytes == 6 * row_bytes
     epoch = storage.initial_epoch()
-    epoch = storage.write_slice(epoch, 3, mx.array(raw).view(dtype))
-    before = _bits(storage.read_epoch(epoch)).copy()
+    epoch = storage.write_slice(epoch, 3 * raw.itemsize, mx.array(raw).view(dtype))
+    before = _bits(storage.read_epoch(epoch).view(dtype)).copy()
     updates = np.stack([raw[0], raw[1], raw[0], raw[0]])
     epoch = storage.scatter_rows(
-        epoch, mx.array([-1, 1, 6, 4], index_dtype), mx.array(updates).view(dtype)
+        epoch,
+        mx.array([-1, 1, 6, 4], index_dtype),
+        mx.array(updates).view(dtype),
+        row_bytes=row_bytes,
     )
-    after = _bits(storage.read_epoch(epoch)).copy()
+    after = _bits(storage.read_epoch(epoch).view(dtype)).copy()
     expected = np.zeros(6 * 512, unsigned)
     expected[3 : 3 + raw.size] = raw.reshape(-1)
     expected = expected.reshape(6, 512)
@@ -53,14 +58,47 @@ def test_cache_writes_preserve_bits_and_owner_lifetime(dtype, index_dtype):
     np.testing.assert_array_equal(after, expected)
     np.testing.assert_array_equal(np.asarray(epoch), np.full(8, 2, np.uint32))
     pointer = storage.buffer_identity
-    epoch = storage.write_slice(epoch, 11, mx.zeros(7, dtype))
-    latest = storage.read_epoch(epoch)
+    epoch = storage.write_slice(epoch, 11 * raw.itemsize, mx.zeros(7, dtype))
+    latest = storage.read_epoch(epoch).view(dtype)
     mx.async_eval(latest)
     assert storage.buffer_identity == pointer != 0
     del storage, epoch
     gc.collect()
     expected.reshape(-1)[11:18] = 0
     np.testing.assert_array_equal(_bits(latest), expected)
+
+
+def test_arena_accepts_mixed_payloads_and_unaligned_byte_offsets():
+    storage = CacheStorage((4, 15))
+    expected = np.zeros(storage.nbytes, dtype=np.uint8)
+    epoch = storage.initial_epoch()
+
+    # Three-byte rows start at arbitrary byte addresses in the same buffer.
+    payload = np.arange(12, dtype=np.uint8).reshape(2, 6)[:, ::2]
+    epoch = storage.scatter_rows(
+        epoch,
+        mx.array([2, 7]),
+        mx.array(np.arange(12).reshape(2, 6), mx.uint8)[:, ::2],
+        row_bytes=3,
+    )
+    expected[6:9], expected[21:24] = payload
+
+    bits = np.array([0x7FC00001, 0x80000000], np.uint32)
+    epoch = storage.write_slice(epoch, 13, mx.array(bits).view(mx.float32))
+    expected[13:21] = bits.view(np.uint8)
+
+    # A contiguous input slice can still have an unaligned buffer offset.
+    source = mx.arange(5, dtype=mx.uint8)[1:]
+    epoch = storage.scatter_rows(epoch, mx.array([8]), source, row_bytes=4)
+    expected[32:36] = np.arange(1, 5, dtype=np.uint8)
+    result = storage.read_epoch(epoch)
+    assert result.dtype == mx.uint8
+    np.testing.assert_array_equal(np.asarray(result).ravel(), expected)
+
+    with pytest.raises(ValueError, match="row_bytes"):
+        storage.scatter_rows(epoch, mx.array([0]), source, row_bytes=3)
+    with pytest.raises(ValueError, match="outside the allocation"):
+        storage.write_slice(epoch, storage.nbytes - 3, source)
 
 
 def _cache_geometry():

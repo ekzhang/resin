@@ -38,5 +38,5 @@ kernel void cache_slice(device T* arena [[buffer(0)]],
   template [[host_name("resin_cache_slice_" #SUFFIX)]] kernel void cache_slice<T>(device T*, device const uint*, device uint*, device const T*, constant ulong&, constant ulong&, uint3, uint3); \
   template [[host_name("resin_cache_rows_" #SUFFIX "_i4")]] kernel void cache_rows<T,int>(device T*, device const uint*, device uint*, device const int*, device const T*, constant ulong&, constant ulong&, constant ulong&, uint3, uint3); \
   template [[host_name("resin_cache_rows_" #SUFFIX "_i8")]] kernel void cache_rows<T,long>(device T*, device const uint*, device uint*, device const long*, device const T*, constant ulong&, constant ulong&, constant ulong&, uint3, uint3);
-INSTANTIATE(ushort, b2)
+INSTANTIATE(uchar, b1)
 INSTANTIATE(uint, b4)

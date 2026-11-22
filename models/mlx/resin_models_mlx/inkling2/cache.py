@@ -1,6 +1,6 @@
 """Inkling 2 global KV, sliding-window KV and convolution history in one MLX arena.
 
-The arena is one BF16 array of *units* shaped ``[units, 2 * page, kv_width]``.
+The byte arena has a BF16 KV view shaped ``[units, 2 * page, kv_width]``.
 A unit holds the keys, then the values, of one 128-token page of one layer
 visit. A slab belongs to one cache group at a time. Within a KV slab, units are
 arranged as ``[layers, blocks_per_slab]``: a visit's pages are consecutive, and
@@ -24,13 +24,11 @@ import numpy as np
 
 from resin import CacheGroupFamily, CacheGroupLayout, CacheLayout, CacheRetention
 from resin.backend.plans import PagedCachePlan
-from resin.backend.resources import CachePoolBinding
 from resin.models.inkling2.config import Inkling2Config
-from resin_models_mlx.cache_packing import pack_key_values
+from resin_models_mlx.cache_arena import ByteArena, KVPage
 
 PAGE_TOKENS = 128
 GLOBAL_GROUP, LOCAL_GROUP, STATE_GROUP = 0, 1, 2
-BF16_BYTES = 2
 
 
 @dataclass(frozen=True, slots=True)
@@ -74,8 +72,8 @@ class CacheGeometry:
         return PAGE_TOKENS
 
     @property
-    def unit_elements(self) -> int:
-        return 2 * PAGE_TOKENS * self.kv_width
+    def kv_page(self) -> KVPage:
+        return KVPage(PAGE_TOKENS, self.kv_width, mx.bfloat16)
 
     @property
     def state_elements(self) -> int:
@@ -83,7 +81,7 @@ class CacheGeometry:
 
     @property
     def state_units(self) -> int:
-        return math.ceil(self.state_elements / self.unit_elements)
+        return math.ceil(self.state_elements * mx.bfloat16.size / self.kv_page.nbytes)
 
     @property
     def slab_units(self) -> int:
@@ -92,11 +90,11 @@ class CacheGeometry:
 
     @property
     def slab_bytes(self) -> int:
-        return self.slab_units * self.unit_elements * BF16_BYTES
+        return self.slab_units * self.kv_page.nbytes
 
     @property
     def state_bytes(self) -> int:
-        return self.state_units * self.unit_elements * BF16_BYTES
+        return self.state_units * self.kv_page.nbytes
 
     def layers(self, group: int) -> int:
         return self.global_layers if group == GLOBAL_GROUP else self.local_layers
@@ -181,42 +179,20 @@ class History:
         return keys, values, mx.array(positions.astype(np.int32)), valid
 
 
-class CacheArena:
+class CacheArena(ByteArena):
     """Engine-addressed mutable storage, ordered by an MLX dependency epoch."""
 
     def __init__(self, layout: CacheLayout, geometry: CacheGeometry) -> None:
-        self.layout = layout
         self.geometry = geometry
-        self.binding = CachePoolBinding(layout, resource="Inkling 2 MLX cache")
-        self.slabs = layout.parent_capacity + 1
-        from resin_models_mlx._native import CacheStorage
-
-        self._storage = CacheStorage(
-            [self.slabs * geometry.slab_units, 2 * PAGE_TOKENS, geometry.kv_width],
-            mx.bfloat16,
+        self.page = geometry.kv_page
+        super().__init__(
+            layout,
+            slab_shape=(geometry.slab_units, self.page.nbytes),
+            resource="Inkling 2 MLX cache",
         )
-        self._epoch = self._storage.initial_epoch()
-        self._readers: list[mx.array] = []
-        mx.eval(self._epoch)
-
-    @property
-    def nbytes(self) -> int:
-        return self._storage.nbytes
-
-    @property
-    def epoch(self) -> mx.array:
-        return self._epoch
-
-    def order_after(self, reads: Sequence[mx.array]) -> None:
-        """Queue later mutation after every consumer of the preceding view."""
-        self._readers.extend(reads)
-
-    def _read(self) -> mx.array:
-        return self._storage.read_epoch(self._epoch)
 
     def units(self) -> mx.array:
-        """The arena as ``[units, 2, page, kv_width]``, ordered after prior writes."""
-        return self._read().reshape(-1, 2, PAGE_TOKENS, self.geometry.kv_width)
+        return self.page.view(self)
 
     # Reads ---------------------------------------------------------------
 
@@ -265,13 +241,13 @@ class CacheArena:
         )
 
     def state_start(self, slab: int, slot: int) -> int:
-        return slab * self.geometry.slab_units + slot * self.geometry.state_units
+        return slab * self.geometry.slab_bytes + slot * self.geometry.state_bytes
 
     def read_states(self, starts: np.ndarray) -> mx.array:
         geometry = self.geometry
-        units = starts[:, None] + np.arange(geometry.state_units)[None]
-        storage = self._read()
-        values = mx.take(storage, mx.array(units.reshape(-1).astype(np.int32)), 0)
+        values = self.gather_units(
+            starts, geometry.state_units, self.page.nbytes, mx.bfloat16
+        )
         values = values.reshape(len(starts), -1)[:, : geometry.state_elements]
         return values.reshape(len(starts), *geometry.state_shape)
 
@@ -286,50 +262,27 @@ class CacheArena:
         tokens: np.ndarray,
     ) -> None:
         """Scatter every visit's K/V rows for flattened plan ``tokens`` into ``group``."""
-        cache_group = plan.groups[group]
-        geometry = self.geometry
-        slab = cache_group.append_slab_ids[tokens].astype(np.int64)
-        slot = cache_group.append_slotnums[tokens].astype(np.int64)
-        offset = cache_group.append_block_offsets[tokens].astype(np.int64)
-        layers = len(keys)
-        units = slab[:, None] * geometry.slab_units + (
-            slot[:, None] + np.arange(layers) * geometry.blocks_per_slab(group)
+        self.page.write(
+            self,
+            plan.groups[group],
+            keys,
+            values,
+            tokens,
+            slab_units=self.geometry.slab_units,
+            layer_stride=self.geometry.blocks_per_slab(group),
         )
-        rows = np.arange(2)[None, None, :] * PAGE_TOKENS + offset[:, None, None]
-        update = pack_key_values(
-            tuple(keys), tuple(values), len(tokens), geometry.kv_width
-        )
-        indices = units[:, :, None] * (2 * PAGE_TOKENS) + rows
-        self._epoch = self._storage.scatter_rows(
-            self._epoch,
-            mx.array(indices.reshape(-1).astype(np.int32)),
-            update.reshape(-1, geometry.kv_width).astype(mx.bfloat16),
-            after=self._readers,
-        )
-        self._readers.clear()
 
     def write_states(self, starts: Sequence[int], state: mx.array) -> None:
         geometry = self.geometry
         count = len(starts)
-        padding = (
-            geometry.state_units * geometry.unit_elements - geometry.state_elements
-        )
+        padding = geometry.state_bytes // mx.bfloat16.size - geometry.state_elements
         flat = state.astype(mx.bfloat16).reshape(count, -1)
         if padding:
             flat = mx.concatenate(
                 [flat, mx.zeros((count, padding), dtype=mx.bfloat16)], axis=1
             )
-        units = flat.reshape(
-            count, geometry.state_units, 2 * PAGE_TOKENS, geometry.kv_width
-        )
         for index, start in enumerate(starts):
-            self._epoch = self._storage.write_slice(
-                self._epoch,
-                start * geometry.unit_elements,
-                units[index],
-                after=self._readers,
-            )
-            self._readers.clear()
+            self.write_slice(start, flat[index])
 
 
 __all__ = [

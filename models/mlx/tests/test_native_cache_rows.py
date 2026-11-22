@@ -14,9 +14,13 @@ def test_real_prefill_49152_rows_preserves_every_row_and_column():
     rows = np.arange(count, dtype=np.uint16)
     payload = np.bitwise_xor(rows[:, None], np.arange(width, dtype=np.uint16))
     indices = np.arange(count, dtype=np.int32)[::-1].copy()
-    storage = CacheStorage((count + 1, width), mx.bfloat16)
+    row_bytes = width * payload.itemsize
+    storage = CacheStorage((count + 1, row_bytes))
     epoch = storage.scatter_rows(
-        storage.initial_epoch(), mx.array(indices), mx.array(payload).view(mx.bfloat16)
+        storage.initial_epoch(),
+        mx.array(indices),
+        mx.array(payload).view(mx.bfloat16),
+        row_bytes=row_bytes,
     )
     actual = np.asarray(storage.read_epoch(epoch).view(mx.uint16))
     np.testing.assert_array_equal(actual[:count], payload[::-1])

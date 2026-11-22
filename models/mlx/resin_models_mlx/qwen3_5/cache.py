@@ -1,6 +1,6 @@
 """Fungible full-attention and DeltaNet-state slabs in one MLX arena.
 
-The arena is one BF16 array of *units* shaped ``[units, 2 * page, kv_width]``.
+The byte arena has a BF16 KV view shaped ``[units, 2 * page, kv_width]``.
 A unit holds the keys, then the values, of one 128-token page of one
 full-attention layer. Within a KV slab, units are arranged as
 ``[full_layers, kv_blocks_per_slab]``: each layer's pages are consecutive,
@@ -27,9 +27,8 @@ import numpy as np
 
 from resin import CacheGroupFamily, CacheGroupLayout, CacheLayout
 from resin.backend.plans import PagedCachePlan
-from resin.backend.resources import CachePoolBinding
 from resin.models.qwen3_5.config import Qwen35Config
-from resin_models_mlx.cache_packing import pack_key_values
+from resin_models_mlx.cache_arena import ByteArena, KVPage
 from resin_models_mlx.qwen3_5.model import (
     AttentionHistory,
     LinearState,
@@ -41,8 +40,6 @@ STATE_BLOCK_TOKENS = 4096
 KV_GROUP = 0
 STATE_GROUP = 1
 
-BF16_BYTES = 2
-FP32_BYTES = 4
 # MLX 0.32.4 uses constant-address-space kernel arguments below this size.
 # Keep metadata in device buffers so new lengths/batches do not change the ABI.
 _MIN_DEVICE_ELEMENTS = 8
@@ -67,7 +64,6 @@ class CacheGeometry:
 
     @classmethod
     def from_config(cls, config: Qwen35Config) -> CacheGeometry:
-        unit_elements = 2 * PAGE_TOKENS * config.num_key_value_heads * config.head_dim
         recurrent_shape = (
             config.linear_layer_count,
             config.linear_num_value_heads,
@@ -80,14 +76,18 @@ class CacheGeometry:
             config.linear_conv_dim,
         )
         kv_width = config.num_key_value_heads * config.head_dim
+        unit_bytes = KVPage(PAGE_TOKENS, kv_width, mx.bfloat16).nbytes
+        recurrent_layer_bytes = math.prod(recurrent_shape[1:]) * mx.float32.size
         if (
-            math.prod(recurrent_shape[1:]) * FP32_BYTES // BF16_BYTES
-        ) % unit_elements or (math.prod(convolution_shape[1:]) % kv_width):
+            recurrent_layer_bytes % unit_bytes
+            or math.prod(convolution_shape[1:]) % kv_width
+        ):
             raise ValueError("each layer's DeltaNet state must align to cache units")
-        state_elements = math.prod(
-            recurrent_shape
-        ) * FP32_BYTES // BF16_BYTES + math.prod(convolution_shape)
-        state_units = math.ceil(state_elements / unit_elements)
+        state_bytes = (
+            math.prod(recurrent_shape) * mx.float32.size
+            + math.prod(convolution_shape) * mx.bfloat16.size
+        )
+        state_units = math.ceil(state_bytes / unit_bytes)
         layers = config.full_layer_count
         return cls(
             full_layers=layers,
@@ -104,18 +104,18 @@ class CacheGeometry:
         return self.kv_heads * self.head_dim
 
     @property
-    def unit_elements(self) -> int:
-        return 2 * PAGE_TOKENS * self.kv_width
+    def kv_page(self) -> KVPage:
+        return KVPage(PAGE_TOKENS, self.kv_width, mx.bfloat16)
 
     @property
     def slab_bytes(self) -> int:
-        return self.slab_units * self.unit_elements * BF16_BYTES
+        return self.slab_units * self.kv_page.nbytes
 
     @property
     def state_bytes(self) -> int:
         """Bytes of one DeltaNet STATE block."""
 
-        return self.state_units * self.unit_elements * BF16_BYTES
+        return self.state_units * self.kv_page.nbytes
 
     @property
     def kv_blocks_per_slab(self) -> int:
@@ -143,7 +143,7 @@ class CacheGeometry:
         )
 
 
-class CacheArena:
+class CacheArena(ByteArena):
     """Engine-addressed mutable storage, ordered by an MLX dependency epoch.
 
     Private read views are consumed by model graphs. Retained, immutable values
@@ -151,58 +151,22 @@ class CacheArena:
     """
 
     def __init__(self, layout: CacheLayout, geometry: CacheGeometry) -> None:
-        self.layout = layout
         self.geometry = geometry
-        self.binding = CachePoolBinding(layout, resource="Qwen3.5 MLX cache")
-        self.slabs = layout.parent_capacity + 1
-        # Import only when constructing an Apple GPU runner. The package can
-        # still be imported on platforms which do not build the Metal extension.
-        from resin_models_mlx._native import CacheStorage
-
-        self._storage = CacheStorage(
-            [self.slabs * geometry.slab_units, 2 * PAGE_TOKENS, geometry.kv_width],
-            mx.bfloat16,
+        self.page = geometry.kv_page
+        super().__init__(
+            layout,
+            slab_shape=(geometry.slab_units, self.page.nbytes),
+            resource="Qwen3.5 MLX cache",
         )
-        self._epoch = self._storage.initial_epoch()
-        self._readers: list[mx.array] = []
-        # Finish one-time allocation/zeroing before a native serving actor can
-        # use the runner from a different thread.
-        mx.eval(self._epoch)
-
-    @property
-    def nbytes(self) -> int:
-        return self._storage.nbytes
-
-    @property
-    def epoch(self) -> mx.array:
-        """Completion dependency for all cache writes issued so far."""
-        return self._epoch
-
-    @property
-    def buffer_identity(self) -> int:
-        return self._storage.buffer_identity
-
-    def order_after(self, reads: Sequence[mx.array]) -> None:
-        """Queue later mutation after every consumer of the preceding view."""
-        self._readers.extend(reads)
 
     def snapshot(self) -> mx.array:
         """Return an independent, immutable copy, ordered before later writes."""
         # Copy raw words so NaNs retain their payloads. The copy is a reader
         # of the arena, just like attention, until the next ordered write.
-        words = self._read().view(mx.uint16)
-        result = mx.full(words.shape, words, dtype=mx.uint16).view(mx.bfloat16)
-        self._readers.append(result)
+        words = self.view(mx.uint16, (-1, 2 * PAGE_TOKENS, self.page.width))
+        result = mx.full(words.shape, words, dtype=mx.uint16).view(self.page.dtype)
+        self.order_after([result])
         return result
-
-    def _read(self) -> mx.array:
-        return self._storage.read_epoch(self._epoch)
-
-    def _units(self) -> mx.array:
-        return self._read().reshape(-1, 2, PAGE_TOKENS, self.geometry.kv_width)
-
-    def _unit(self, slabs: np.ndarray, units: np.ndarray) -> np.ndarray:
-        return slabs.astype(np.int64) * self.geometry.slab_units + units
 
     # Reads ---------------------------------------------------------------
 
@@ -218,7 +182,9 @@ class CacheArena:
             blocks = math.ceil(int(lengths[index]) / PAGE_TOKENS)
             slabs = group.block_slabs(row)[:blocks]
             slots = group.block_slots(row)[:blocks]
-            bases[index, :blocks] = self._unit(slabs, slots.astype(np.int64))
+            bases[index, :blocks] = (
+                slabs.astype(np.int64) * self.geometry.slab_units + slots
+            )
         return bases
 
     def history(
@@ -230,7 +196,7 @@ class CacheArena:
         if length == 0:
             return (None,) * layers
         bases = self._kv_bases(plan, np.array([row]), np.array([length]))[0]
-        return _GatheredHistory(self._units(), bases, length, self.geometry)
+        return _GatheredHistory(self.page.view(self), bases, length, self.geometry)
 
     def paged_history(
         self, plan: PagedCachePlan, rows: np.ndarray, lengths: np.ndarray
@@ -249,49 +215,39 @@ class CacheArena:
         history_lengths = np.zeros(max(_MIN_DEVICE_ELEMENTS, len(rows)), dtype=np.int32)
         history_lengths[: len(rows)] = lengths
         return PagedHistory(
-            self._units(),
+            self.page.view(self),
             mx.array(pages),
             mx.array(history_lengths),
             layer_stride=self.geometry.kv_blocks_per_slab,
         )
 
     def state_start(self, slab: int, slot: int) -> int:
-        """First unit of the STATE block at ``(slab, slot)``."""
-
-        return slab * self.geometry.slab_units + slot * self.geometry.state_units
-
-    @property
-    def _recurrent_units(self) -> int:
-        """Units holding one linear layer's recurrent state."""
-
-        geometry = self.geometry
-        return (
-            math.prod(geometry.recurrent_shape[1:])
-            * FP32_BYTES
-            // (BF16_BYTES * geometry.unit_elements)
-        )
+        """Byte offset of the STATE block at ``(slab, slot)``."""
+        return slab * self.geometry.slab_bytes + slot * self.geometry.state_bytes
 
     def read_states(self, starts: np.ndarray) -> LinearState:
-        """Copy the STATE blocks starting at units ``starts``, one row each."""
-
+        """Restore each layer's FP32 recurrent state and BF16 convolution tail."""
         geometry = self.geometry
         count = len(starts)
         layers = geometry.recurrent_shape[0]
-        per_layer = self._recurrent_units
-        recurrent_shape = (count, *geometry.recurrent_shape[1:])
-        storage = self._read()
+        layer_bytes = math.prod(geometry.recurrent_shape[1:]) * mx.float32.size
+        unit_bytes = self.page.nbytes
         recurrent = []
         for layer in range(layers):
-            units = starts[:, None] + layer * per_layer + np.arange(per_layer)
-            recurrent.append(
-                mx.take(storage, mx.array(units.reshape(-1).astype(np.int32)), 0)
-                .view(mx.float32)
-                .reshape(recurrent_shape)
+            values = self.gather_units(
+                starts + layer * layer_bytes,
+                layer_bytes // unit_bytes,
+                unit_bytes,
+                mx.float32,
             )
-        # Every layer's convolution tail follows the recurrent states.
-        tail_units = geometry.state_units - layers * per_layer
-        units = starts[:, None] + layers * per_layer + np.arange(tail_units)
-        tails = mx.take(storage, mx.array(units.reshape(-1).astype(np.int32)), 0)
+            recurrent.append(values.reshape(count, *geometry.recurrent_shape[1:]))
+        tail_start = layers * layer_bytes
+        tails = self.gather_units(
+            starts + tail_start,
+            (geometry.state_bytes - tail_start) // unit_bytes,
+            unit_bytes,
+            mx.bfloat16,
+        )
         tails = tails.reshape(count, -1)[:, : geometry.convolution_elements]
         tails = tails.reshape(count, layers, *geometry.convolution_shape[1:])
         convolution = [tails[:, layer] for layer in range(layers)]
@@ -312,30 +268,18 @@ class CacheArena:
         its slot in the layer's contiguous within-slab page range.
         """
 
-        group = plan.groups[KV_GROUP]
-        slab = group.append_slab_ids[tokens]
-        slot = group.append_slotnums[tokens].astype(np.int64)
-        offset = group.append_block_offsets[tokens].astype(np.int64)
-        layers = self.geometry.full_layers
-        count = len(tokens)
-        units = self._unit(
-            slab[:, None],
-            slot[:, None] + np.arange(layers) * self.geometry.kv_blocks_per_slab,
+        self.page.write(
+            self,
+            plan.groups[KV_GROUP],
+            keys,
+            values,
+            tokens,
+            slab_units=self.geometry.slab_units,
+            layer_stride=self.geometry.kv_blocks_per_slab,
         )
-        # Each (token, layer) writes its key row and value row in one unit.
-        rows = np.arange(2)[None, None, :] * PAGE_TOKENS + offset[:, None, None]
-        update = pack_key_values(keys, values, count, self.geometry.kv_width)
-        indices = units[:, :, None] * (2 * PAGE_TOKENS) + rows
-        self._epoch = self._storage.scatter_rows(
-            self._epoch,
-            mx.array(indices.reshape(-1).astype(np.int32)),
-            update.reshape(-1, self.geometry.kv_width).astype(mx.bfloat16),
-            after=self._readers,
-        )
-        self._readers.clear()
 
     def write_states(self, starts: Sequence[int], state: LinearState) -> None:
-        """Store row ``i`` of ``state`` in the STATE block starting at ``starts[i]``.
+        """Store row ``i`` of ``state`` in the STATE block at byte offset ``starts[i]``.
 
         Writes are contiguous slice updates per row and layer: on an M4 Max at
         batch 16 this moves 1 GB in 12 ms, against 13 ms when rows are first
@@ -345,37 +289,21 @@ class CacheArena:
 
         geometry = self.geometry
         count = len(starts)
-        unit_shape = (2 * PAGE_TOKENS, geometry.kv_width)
-        per_layer = self._recurrent_units
+        layer_bytes = math.prod(geometry.recurrent_shape[1:]) * mx.float32.size
         for layer, value in enumerate(state.recurrent):
-            units = value.astype(mx.float32).view(mx.bfloat16)
-            units = units.reshape(count, per_layer, *unit_shape)
-            first = layer * per_layer
+            values = value.astype(mx.float32)
             for index, start in enumerate(starts):
-                self._epoch = self._storage.write_slice(
-                    self._epoch,
-                    (start + first) * geometry.unit_elements,
-                    units[index],
-                    after=self._readers,
-                )
-                self._readers.clear()
-        layers = geometry.recurrent_shape[0]
-        tail_units = geometry.state_units - layers * per_layer
+                self.write_slice(start + layer * layer_bytes, values[index])
+        tail_start = geometry.recurrent_shape[0] * layer_bytes
         tails = [
             value.astype(mx.bfloat16).reshape(count, -1) for value in state.convolution
         ]
-        padding = tail_units * geometry.unit_elements - geometry.convolution_elements
+        tail_elements = (geometry.state_bytes - tail_start) // mx.bfloat16.size
+        padding = tail_elements - geometry.convolution_elements
         tails.append(mx.zeros((count, padding), dtype=mx.bfloat16))
-        tails = mx.concatenate(tails, axis=1).reshape(count, tail_units, *unit_shape)
-        first = layers * per_layer
+        packed_tails = mx.concatenate(tails, axis=1)
         for index, start in enumerate(starts):
-            self._epoch = self._storage.write_slice(
-                self._epoch,
-                (start + first) * geometry.unit_elements,
-                tails[index],
-                after=self._readers,
-            )
-            self._readers.clear()
+            self.write_slice(start + tail_start, packed_tails[index])
 
 
 @dataclass(frozen=True, slots=True)

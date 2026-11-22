@@ -27,19 +27,19 @@ constexpr int kEpochElements = 8;
 
 enum class Kind { Read, Rows, Slice };
 
-mx::array allocate_arena(const std::vector<int>& dimensions, mx::Dtype dtype) {
+mx::array allocate_arena(const std::vector<int>& dimensions) {
   mx::Shape shape(dimensions.begin(), dimensions.end());
-  if (shape.empty() || (dtype != mx::bfloat16 && dtype != mx::float32)) {
-    throw std::invalid_argument("CacheStorage requires nonempty shape and BF16/F32 dtype");
+  if (shape.empty()) {
+    throw std::invalid_argument("CacheStorage requires a nonempty byte shape");
   }
-  size_t bytes = dtype.size();
+  size_t bytes = 1;
   for (auto dimension : shape) {
     if (dimension < 1 || bytes > std::numeric_limits<size_t>::max() / size_t(dimension)) {
       throw std::invalid_argument("CacheStorage shape must be positive and fit size_t indexing");
     }
     bytes *= size_t(dimension);
   }
-  return mx::zeros(shape, dtype, checked_stream());
+  return mx::zeros(shape, mx::uint8, checked_stream());
 }
 
 void check_epoch(const mx::array& epoch) {
@@ -51,8 +51,9 @@ void check_epoch(const mx::array& epoch) {
 class CacheOperation : public mx::Primitive {
  public:
   CacheOperation(mx::Stream stream, std::shared_ptr<mx::array> storage, Kind kind,
-                 uint64_t start = 0)
-      : Primitive(stream), storage_(std::move(storage)), kind_(kind), start_(start) {}
+                 uint64_t byte_start, uint64_t row_bytes)
+      : Primitive(stream), storage_(std::move(storage)), kind_(kind),
+        byte_start_(byte_start), row_bytes_(row_bytes) {}
 
   const char* name() const override { return "ResinPrivateCache"; }
   // Primitive defaults to is_equivalent=false. These resource operations must
@@ -74,9 +75,14 @@ class CacheOperation : public mx::Primitive {
     output.set_data(mx::allocator::malloc(output.nbytes()));
     auto& device = mx::metal::device(stream().device);
     auto library = device.get_library(MLX_METAL_LIBRARY_NAME, library_directory());
-    auto suffix = storage_->dtype() == mx::bfloat16 ? "_b2" : "_b4";
+    const auto& updates = inputs[kind_ == Kind::Rows ? 2 : 1];
+    // Sliced contiguous inputs can have a nonzero buffer offset. Use word
+    // copies only when both source and destination are aligned for every row.
+    const bool aligned = updates.offset() % 4 == 0 && updates.nbytes() % 4 == 0 &&
+                         byte_start_ % 4 == 0 && row_bytes_ % 4 == 0;
+    const uint64_t word_bytes = aligned ? 4 : 1;
     std::string kernel_name = kind_ == Kind::Rows ? "resin_cache_rows" : "resin_cache_slice";
-    kernel_name += suffix;
+    kernel_name += aligned ? "_b4" : "_b1";
     if (kind_ == Kind::Rows) {
       kernel_name += inputs[1].dtype() == mx::int32 ? "_i4" : "_i8";
     }
@@ -94,21 +100,21 @@ class CacheOperation : public mx::Primitive {
     encoder.set_output_array(arena, 0);
     encoder.set_input_array(inputs[0], 1);
     encoder.set_output_array(output, 2);
-    uint64_t work = inputs[1].size();
+    uint64_t work = updates.nbytes() / word_bytes;
     if (kind_ == Kind::Rows) {
       encoder.set_input_array(inputs[1], 3);
       encoder.set_input_array(inputs[2], 4);
-      uint64_t width = storage_->shape(-1);
+      uint64_t width = row_bytes_ / word_bytes;
       uint64_t count = inputs[1].size();
-      uint64_t total_rows = storage_->size() / width;
+      uint64_t total_rows = storage_->nbytes() / row_bytes_;
       encoder.set_bytes(width, 5);
       encoder.set_bytes(count, 6);
       encoder.set_bytes(total_rows, 7);
     } else {
       encoder.set_input_array(inputs[1], 3);
-      uint64_t count = inputs[1].size();
-      encoder.set_bytes(start_, 4);
-      encoder.set_bytes(count, 5);
+      uint64_t start = byte_start_ / word_bytes;
+      encoder.set_bytes(start, 4);
+      encoder.set_bytes(work, 5);
     }
     // arena is a resource captured by the primitive, not an ordinary input or
     // output array. Keep its Data alive explicitly until the GPU completes.
@@ -116,10 +122,10 @@ class CacheOperation : public mx::Primitive {
     encoder.get_command_buffer()->addCompletedHandler(
         [keep = arena.data_shared_ptr()](MTL::CommandBuffer*) {});
     auto threads = std::min<size_t>(256, kernel->maxTotalThreadsPerThreadgroup());
-    // Width and rank-one index count are MLX int dimensions: both grid axes
-    // fit uint32. Byte addresses remain 64-bit for large arenas.
+    // Row byte width and rank-one index count fit the grid axes. The
+    // shader uses 64-bit addresses for arenas larger than 4 GiB.
     if (kind_ == Kind::Rows) {
-      const uint64_t width = storage_->shape(-1);
+      const uint64_t width = row_bytes_ / word_bytes;
       const uint64_t count = inputs[1].size();
       const uint64_t columns = count ? std::max<uint64_t>(width, 8) : 8;
       encoder.dispatch_threads(MTL::Size(columns, std::max<uint64_t>(count, 1), 1),
@@ -142,23 +148,24 @@ class CacheOperation : public mx::Primitive {
  private:
   std::shared_ptr<mx::array> storage_;
   Kind kind_;
-  uint64_t start_;
+  uint64_t byte_start_;
+  uint64_t row_bytes_;
 };
 
 class CacheStorage {
  public:
-  CacheStorage(const std::vector<int>& shape, mx::Dtype dtype)
-      : storage_(std::make_shared<mx::array>(allocate_arena(shape, dtype))),
+  explicit CacheStorage(const std::vector<int>& byte_shape)
+      : storage_(std::make_shared<mx::array>(allocate_arena(byte_shape))),
         initial_(mx::zeros({kEpochElements}, mx::uint32, checked_stream())) {
     // Materialize on the creating thread; serving may use another MLX stream.
     mx::eval(*storage_, initial_);
     auto& device = mx::metal::device(checked_stream().device);
     auto library = device.get_library(MLX_METAL_LIBRARY_NAME, library_directory());
-    auto suffix = dtype == mx::bfloat16 ? "_b2" : "_b4";
-    // Request rows and context lengths never select another pipeline.
-    device.get_kernel(std::string("resin_cache_slice") + suffix, library);
-    device.get_kernel(std::string("resin_cache_rows") + suffix + "_i4", library);
-    device.get_kernel(std::string("resin_cache_rows") + suffix + "_i8", library);
+    for (const auto* suffix : {"_b1", "_b4"}) {
+      device.get_kernel(std::string("resin_cache_slice") + suffix, library);
+      device.get_kernel(std::string("resin_cache_rows") + suffix + "_i4", library);
+      device.get_kernel(std::string("resin_cache_rows") + suffix + "_i8", library);
+    }
   }
 
   mx::array initial_epoch() { return initial_; }
@@ -167,39 +174,39 @@ class CacheStorage {
     return operation(Kind::Read, {epoch});
   }
   mx::array scatter_rows(const mx::array& epoch, const mx::array& indices,
-                         const mx::array& updates, const std::vector<mx::array>& after) {
+                         const mx::array& updates, int row_bytes,
+                         const std::vector<mx::array>& after) {
     check_epoch(epoch);
     if (indices.ndim() != 1 || (indices.dtype() != mx::int32 && indices.dtype() != mx::int64)) {
       throw std::invalid_argument("CacheStorage row indices must be rank-one int32/int64");
     }
-    if (updates.dtype() != storage_->dtype() || indices.size() > std::numeric_limits<size_t>::max() / size_t(storage_->shape(-1))
-        || updates.size() != indices.size() * size_t(storage_->shape(-1))) {
-      throw std::invalid_argument("CacheStorage row updates must match dtype and row payload size");
+    if (row_bytes <= 0 || indices.size() > std::numeric_limits<size_t>::max() / size_t(row_bytes) ||
+        updates.nbytes() != indices.size() * size_t(row_bytes)) {
+      throw std::invalid_argument("CacheStorage row updates must supply row_bytes bytes per index");
     }
-    return operation(Kind::Rows, {epoch, mx::contiguous(indices), mx::contiguous(mx::reshape(updates, {-1}))}, 0, after);
+    return operation(Kind::Rows, {epoch, mx::contiguous(indices), mx::contiguous(updates)},
+                     0, row_bytes, after);
   }
-  mx::array write_slice(const mx::array& epoch, int64_t start,
+  mx::array write_slice(const mx::array& epoch, int64_t byte_start,
                         const mx::array& updates, const std::vector<mx::array>& after) {
     check_epoch(epoch);
-    if (start < 0 || uint64_t(start) > storage_->size() || updates.size() > storage_->size() - uint64_t(start)) {
+    if (byte_start < 0 || uint64_t(byte_start) > storage_->nbytes() ||
+        updates.nbytes() > storage_->nbytes() - uint64_t(byte_start)) {
       throw std::invalid_argument("CacheStorage slice is outside the allocation");
     }
-    if (updates.dtype() != storage_->dtype()) {
-      throw std::invalid_argument("CacheStorage slice updates must match storage dtype");
-    }
-    return operation(Kind::Slice, {epoch, mx::contiguous(mx::reshape(updates, {-1}))}, start, after);
+    return operation(Kind::Slice, {epoch, mx::contiguous(updates)}, byte_start, 0, after);
   }
   size_t nbytes() const { return storage_->nbytes(); }
   uintptr_t buffer_identity() const { return reinterpret_cast<uintptr_t>(storage_->buffer().ptr()); }
 
  private:
-  mx::array operation(Kind kind, std::vector<mx::array> inputs, uint64_t start = 0,
-                      const std::vector<mx::array>& after = {}) {
+  mx::array operation(Kind kind, std::vector<mx::array> inputs, uint64_t byte_start = 0,
+                      uint64_t row_bytes = 0, const std::vector<mx::array>& after = {}) {
     inputs.insert(inputs.end(), after.begin(), after.end());
     const bool read = kind == Kind::Read;
     return mx::array(read ? storage_->shape() : mx::Shape{kEpochElements},
                      read ? storage_->dtype() : mx::uint32,
-                     std::make_shared<CacheOperation>(checked_stream(), storage_, kind, start), inputs);
+                     std::make_shared<CacheOperation>(checked_stream(), storage_, kind, byte_start, row_bytes), inputs);
   }
   std::shared_ptr<mx::array> storage_;
   mx::array initial_;
@@ -209,12 +216,12 @@ class CacheStorage {
 NB_MODULE(MLX_EXTENSION_NAME, module) {
   resin_models_mlx::native::bind_paged_attention(module);
   nb::class_<CacheStorage>(module, "CacheStorage")
-      .def(nb::init<const std::vector<int>&, mx::Dtype>(), "shape"_a, "dtype"_a)
+      .def(nb::init<const std::vector<int>&>(), "byte_shape"_a)
       .def("initial_epoch", &CacheStorage::initial_epoch)
       .def("read_epoch", &CacheStorage::read_epoch, "epoch"_a)
       .def("scatter_rows", &CacheStorage::scatter_rows, "epoch"_a, "row_indices"_a, "updates"_a,
-           nb::kw_only(), "after"_a = std::vector<mx::array>{})
-      .def("write_slice", &CacheStorage::write_slice, "epoch"_a, "flat_start"_a, "updates"_a,
+           nb::kw_only(), "row_bytes"_a, "after"_a = std::vector<mx::array>{})
+      .def("write_slice", &CacheStorage::write_slice, "epoch"_a, "byte_start"_a, "updates"_a,
            nb::kw_only(), "after"_a = std::vector<mx::array>{})
       .def_prop_ro("nbytes", &CacheStorage::nbytes)
       .def_prop_ro("buffer_identity", &CacheStorage::buffer_identity);

@@ -440,6 +440,44 @@ def test_first_inference_after_preparation_can_run_on_a_fresh_thread():
         assert actual == _generate(engine, prompts, 8)
 
 
+def test_state_snapshots_restore_fp32_and_bf16_bits_across_slots():
+    from resin_models_mlx.qwen3_5.cache import CacheArena, CacheGeometry
+    from resin_models_mlx.qwen3_5.model import LinearState
+
+    values = _text_config()
+    values["layer_types"] = ["linear_attention"] * 2 + ["full_attention"] * 6
+    geometry = CacheGeometry.from_config(Qwen35Config.from_hugging_face(values))
+    assert geometry.state_blocks_per_slab >= 2
+    arena = CacheArena(geometry.layout(2), geometry)
+    addresses = [(1, 0), (1, 1), (2, 0)]
+    starts = [arena.state_start(slab, slot) for slab, slot in addresses]
+    rows = len(starts)
+    rng = np.random.default_rng(57)
+
+    def layer_bits(shape, dtype):
+        layers, *dimensions = shape
+        return rng.integers(
+            0, np.iinfo(dtype).max, size=(layers, rows, *dimensions), dtype=dtype
+        )
+
+    recurrent = layer_bits(geometry.recurrent_shape, np.uint32)
+    convolution = layer_bits(geometry.convolution_shape, np.uint16)
+    state = LinearState(
+        tuple(mx.array(layer).view(mx.float32) for layer in recurrent),
+        tuple(mx.array(layer).view(mx.bfloat16) for layer in convolution),
+    )
+    arena.write_states(starts, state)
+    restored = arena.read_states(np.array(starts[::-1]))
+    for actual, expected in zip(restored.recurrent, recurrent, strict=True):
+        np.testing.assert_array_equal(
+            np.asarray(actual.view(mx.uint32)), expected[::-1]
+        )
+    for actual, expected in zip(restored.convolution, convolution, strict=True):
+        np.testing.assert_array_equal(
+            np.asarray(actual.view(mx.uint16)), expected[::-1]
+        )
+
+
 @pytest.mark.parametrize("dense", [False, True], ids=["moe", "dense"])
 def test_incremental_state_matches_full_forward_exactly(dense: bool) -> None:
     # FP32 isolates state and history plumbing from BF16 rounding.
