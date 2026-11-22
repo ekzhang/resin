@@ -17,9 +17,8 @@ uv run scripts/mlx_serve.py --model inkling2-mini-mlx --checkpoint "$INKLING_CHE
 ```
 
 The preset loads the language model and vision tower from the target checkpoint.
-It uses 8,192-token prefill chunks. The context limit defaults to 32,768 tokens
-and the batch limit to eight concurrent requests. Override them with
-`--context-length` and `--max-batch-size`.
+It uses 8,192-token prefill chunks and defaults to eight concurrent requests.
+Set the context and batch limits with `--context-length` and `--max-batch-size`.
 
 ## Precision
 
