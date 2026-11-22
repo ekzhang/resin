@@ -1,3 +1,7 @@
+# Copyright 2026 SGLang contributors. Licensed under Apache-2.0.
+# Adapted from sgl-project/sglang e62ac6279646c686d3b328f58d9b5c2c2d5927dc,
+# python/sglang/kernels/ops/inkling2/{nvfp4,moe}.py, as
+# resin_models_cuda/inkling2/expert_quantization.py is.
 """Inkling 2 expert activation quantization, emitted as exact dequantized values.
 
 The checkpoint requires NVFP4 or MXFP8 activations before each expert GEMM.

@@ -62,11 +62,26 @@ def dense_attention(
             hi = min(length, first_query + stop - first_key)
             if window is not None:
                 lo = max(0, first_query + start - (window - 1) - first_key)
-        keys_block, values_block = k32[:, lo:hi], v32[:, lo:hi]
-        block_positions, block_valid = key_positions[:, lo:hi], key_valid[:, lo:hi]
-        width = hi - lo
+        # Contiguous global keys more than ``extent`` behind every query of the
+        # block carry no bias and are all visible: score them with a plain dot
+        # product, and gather bias and masks only for the recent remainder.
+        split = lo
+        if contiguous is not None and window is None:
+            first_key, first_query = contiguous
+            split = min(hi, max(lo, first_query + start - (extent - 1) - first_key))
+        values_block = v32[:, lo:hi]
         query = q[:, start:stop].astype(F32).reshape(batch, span, kv_heads, groups, dim)
-        logits = mx.einsum("btkgd,blkd->btkgl", query, keys_block).reshape(
+        parts = []
+        if split > lo:
+            distant = mx.einsum("btkgd,blkd->btkgl", query, k32[:, lo:split])
+            parts.append(distant.reshape(batch, span, heads, split - lo) * scale)
+        recent_keys = k32[:, split:hi]
+        block_positions, block_valid = (
+            key_positions[:, split:hi],
+            key_valid[:, split:hi],
+        )
+        width = hi - split
+        logits = mx.einsum("btkgd,blkd->btkgl", query, recent_keys).reshape(
             batch, span, heads, width
         )
         logits = logits * scale
@@ -83,6 +98,9 @@ def dense_attention(
         if window is not None:
             mask = mask & (distance <= window - 1)
         logits = mx.where(mask[:, :, None, :], logits, -mx.inf)
+        if parts:
+            logits = mx.concatenate([*parts, logits], axis=-1)
+        width = hi - lo
         lse = mx.logsumexp(logits, axis=-1)
         probabilities = mx.exp(logits - lse[..., None])
         output = mx.einsum(

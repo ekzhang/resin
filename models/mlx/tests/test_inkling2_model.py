@@ -495,7 +495,9 @@ def _to_mlx(value) -> mx.array:
     return mx.array(value.float().numpy()).astype(mx.bfloat16)
 
 
-@pytest.mark.parametrize("prompt_length", [5, 20])
+# At 40 tokens (640 routes) the threshold is lowered so the segmented prefill
+# experts run; the shorter prompts keep the gathered quantized GEMM.
+@pytest.mark.parametrize("prompt_length", [5, 20, 40])
 def test_tiny_model_matches_cuda_reference(tmp_path, monkeypatch, prompt_length):
     """Teacher-forced: each visit's mixing, attention and experts against the reference.
 
@@ -507,6 +509,9 @@ def test_tiny_model_matches_cuda_reference(tmp_path, monkeypatch, prompt_length)
     reference's outputs, so differences cannot compound.
     """
     from resin_models_mlx.inkling2 import model as mlx_model
+
+    if prompt_length == 40:
+        monkeypatch.setattr(mlx_model, "SEGMENTED_ROUTES", 512)
 
     config = tiny_config()
     write_checkpoint(tmp_path, config)

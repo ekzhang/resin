@@ -250,6 +250,7 @@ hardware, and serving limits.
 
 Model runners are not tied to CUDA. `resin_models_mlx` runs
 [dense and MoE Qwen3.5 models](models/mlx/resin_models_mlx/qwen3_5/README.md)
+and [Inkling 2 Mini text](models/mlx/resin_models_mlx/inkling2/README.md)
 on Apple Silicon with MLX, on the same core engine. For a small local model:
 
 ```bash

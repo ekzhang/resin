@@ -217,6 +217,22 @@ MLX is licensed under the MIT License. The notice is retained in the model
 directory's LICENSE. The adaptation preserves FP32 product/reduction boundaries
 and BF16 output rounding.
 
+The Inkling 2 MLX runner in models/mlx/resin_models_mlx/inkling2 follows the
+arithmetic of models/cuda/resin_models_cuda/inkling2. Its NVFP4/MXFP8 activation
+quantizer (quantization.py) adapts SGLang's Apache-2.0 Inkling 2 activation
+quantization, as that CUDA module does:
+
+  https://github.com/sgl-project/sglang/tree/e62ac6279646c686d3b328f58d9b5c2c2d5927dc
+
+Its fused routing and expert-activation kernels (kernels.py) reuse MLX v0.32.4's
+sigmoid formula from mlx/backend/metal/kernels/unary_ops.h:
+
+  Copyright 2023-2024 Apple Inc.
+  https://github.com/ml-explore/mlx/tree/v0.32.4/mlx/backend/metal/kernels
+
+MLX is licensed under the MIT License. The notice is retained in that model
+directory's LICENSE.
+
 The Qwen3.5 MLX vision adapter in
 models/mlx/resin_models_mlx/qwen3_5/vision.py reuses MLX-VLM 0.7.11's Qwen3.5
 and Qwen3-VL vision modules, including their geometry and encoder blocks:

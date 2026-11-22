@@ -225,18 +225,26 @@ def load_weights(root: Path, config: Inkling2Config) -> Inkling2Weights:
         controllers = None
         if loop is not None and loop.core_start <= i < loop.core_end:
             controllers = {
+                # Gain and forget projections run in FP32; cast them once.
                 stream: Controller(
                     down=get(prefix + f"controllers.{stream}.down_weight"),
-                    gain=get(prefix + f"controllers.{stream}.gain_weight"),
-                    forget=get(prefix + f"controllers.{stream}.forget_weight"),
+                    gain=get(prefix + f"controllers.{stream}.gain_weight").astype(
+                        mx.float32
+                    ),
+                    forget=get(prefix + f"controllers.{stream}.forget_weight").astype(
+                        mx.float32
+                    ),
                 )
                 for stream in ("attn", "k", "v", "mlp")
             }
         layers.append(
             Layer(
                 local=local,
-                norms=tuple(get(prefix + name + ".weight") for name in norms),
-                mlp_norm=get(prefix + "mlp_norm.weight"),
+                # Norms compute in FP32; keep their weights in FP32 too.
+                norms=tuple(
+                    get(prefix + name + ".weight").astype(mx.float32) for name in norms
+                ),
+                mlp_norm=get(prefix + "mlp_norm.weight").astype(mx.float32),
                 projection=projection,
                 k_projection=k_projection,
                 v_projection=v_projection,
@@ -267,8 +275,8 @@ def load_weights(root: Path, config: Inkling2Config) -> Inkling2Weights:
         )
     weights = Inkling2Weights(
         embed=get("embed.weight"),
-        embed_norm=get("embed_norm.weight"),
-        norm=get("norm.weight"),
+        embed_norm=get("embed_norm.weight").astype(mx.float32),
+        norm=get("norm.weight").astype(mx.float32),
         unembed=get("unembed.weight"),
         attn_queries=[
             get(f"attn_res.attn_queries.{i}").astype(mx.float32)

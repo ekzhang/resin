@@ -19,11 +19,10 @@ from functools import cache, partial
 
 import mlx.core as mx
 
+from resin_models_mlx.inkling2.kernels import constant, pad_to_device
+
 PARTITION_TOKENS = 256
 SIMDGROUPS = 4
-# MLX 0.32.4 binds arrays under this size as constants, a different kernel ABI;
-# padding keeps one compiled variant for every batch size and context.
-_MIN_DEVICE_ELEMENTS = 8
 
 _HEADER = r"""
 template <int GROUP, int LANE_DIMS>
@@ -232,8 +231,8 @@ def decode_attention(
     if dim % 32 or heads % kv_heads:
         raise ValueError("unsupported Inkling 2 decode attention geometry")
     partitions = max(1, -(-longest // PARTITION_TOKENS))
-    pages = _pad_rows(pages)
-    meta = _pad_rows(meta)
+    pages = pad_to_device(pages)
+    meta = pad_to_device(meta)
     outputs, maxima, sums = _kernel()(
         inputs=[
             queries,
@@ -243,11 +242,8 @@ def decode_attention(
             pages,
             meta,
             bias,
-            mx.array(
-                [pages.shape[1], partitions, layer, bias.shape[-1], 0, 0, 0, 0],
-                dtype=mx.int32,
-            ),
-            mx.full((_MIN_DEVICE_ELEMENTS,), scale, dtype=mx.float32),
+            constant((pages.shape[1], partitions, layer, bias.shape[-1]), "int32"),
+            constant((float(scale),) * 8, "float32"),
         ],
         template=[
             ("D", dim),
@@ -269,15 +265,6 @@ def decode_attention(
         output_dtypes=[mx.float32, mx.float32, mx.float32],
     )
     return _merge(outputs, maxima, sums)
-
-
-def _pad_rows(values: mx.array) -> mx.array:
-    rows, width = values.shape
-    needed = -(-_MIN_DEVICE_ELEMENTS // max(1, width))
-    if rows * width >= _MIN_DEVICE_ELEMENTS:
-        return values
-    padding = mx.zeros((needed - rows, width), dtype=values.dtype)
-    return mx.concatenate([values, padding])
 
 
 __all__ = ["PARTITION_TOKENS", "decode_attention"]

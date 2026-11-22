@@ -42,7 +42,6 @@ def _runner(weights, slabs: int = 256) -> Inkling2MlxRunner:
         max_seq_len=CONTEXT,
         prefill_chunk_size=CHUNK,
         workspace_bytes=64 << 20,
-        unembed_f32=False,
     )
 
 
@@ -277,3 +276,153 @@ def test_cancel_releases_state_and_context_limit_is_enforced(weights):
         assert len(_generate(engine, [long_prompt], 4)[0]) == 4
         with pytest.raises(ValueError, match="context"):
             _generate(engine, [long_prompt], 5)
+
+
+def test_serving_thread_can_use_weights_loaded_on_another_thread(tmp_path):
+    from concurrent.futures import ThreadPoolExecutor
+
+    # The HTTP server steps the Engine on its own actor thread; lazily loaded
+    # safetensors arrays would need the loading thread's CPU stream there.
+    write_checkpoint(tmp_path, tiny_config())
+    weights = load_model(tmp_path)
+    runner = _runner(weights)
+    with Engine(runner, context_length=CONTEXT) as engine:
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            outputs = executor.submit(_generate, engine, [_prompt(20, seed=50)], 4)
+            assert len(outputs.result(timeout=120)[0]) == 4
+
+
+@pytest.mark.parametrize("window,extent", [(300, 200), (200, 300)])
+def test_multi_page_window_and_extent(tmp_path, monkeypatch, window, extent):
+    from dataclasses import replace
+
+    # Windows and bias extents spanning several pages, unequal to each other,
+    # with chunks larger than a page and a prefix hit inside the window.
+    config = replace(tiny_config(), sliding_window_size=window, rel_extent=extent)
+    write_checkpoint(tmp_path, config)
+    weights = load_model(tmp_path)
+    shared = _prompt(700, seed=60)
+    prompts = [_prompt(n, seed) for seed, n in enumerate((5, 257, 640), start=61)]
+    prompts += [shared + _prompt(30, seed=64), shared + _prompt(90, seed=65)]
+    runner = Inkling2MlxRunner(
+        weights,
+        cache_slab_capacity=512,
+        max_seq_len=2048,
+        prefill_chunk_size=256,
+        workspace_bytes=64 << 20,
+    )
+    mirror = _Mirror(prompts, window)
+    _instrument(monkeypatch, runner, mirror)
+    with Engine(
+        runner, context_length=2048, enable_overlap=False, prefix_cache=True
+    ) as engine:
+        assert all(len(output) == 24 for output in _generate(engine, prompts[:4], 24))
+        _generate(engine, prompts[4:], 24)
+    assert mirror.attention_checks > 400
+
+
+def test_padded_vocabulary_ids_and_small_caches_are_rejected(weights):
+    config = weights[0]
+    runner = _runner(weights)
+    # Embedding rows past the unpadded vocabulary are padding with no logits.
+    assert runner.vocab_size == config.unpadded_vocab_size < config.vocab_size
+    with Engine(runner, context_length=CONTEXT) as engine:
+        padded = [1, 2, config.unpadded_vocab_size, 3]
+        params = SamplingParams(max_output_tokens=2, temperature=0.0)
+        # Rejected while validating the plan, before any cache write.
+        with pytest.raises(ValueError, match="out of range"):
+            engine.submit(padded, sampling_params=params)
+            while engine.has_work():
+                engine.step()
+        assert len(runner._states) == 0
+    with pytest.raises(ValueError, match="fewer than one"):
+        Inkling2MlxRunner(
+            weights,
+            cache_slab_capacity=2,
+            max_seq_len=CONTEXT,
+            prefill_chunk_size=CHUNK,
+            workspace_bytes=64 << 20,
+        )
+
+
+def test_unseen_lengths_and_sampling_reuse_compiled_kernels(weights, monkeypatch):
+    from resin_models_mlx.inkling2 import decode_attention, kernels, quantization
+
+    # Record every custom Metal kernel variant: its factory, template and dtypes.
+    variants: set = set()
+    for module in (kernels, quantization, decode_attention):
+        for name in dir(module):
+            factory = getattr(module, name)
+            if not (
+                name.startswith("_") and name.endswith("_kernel") and callable(factory)
+            ):
+                continue
+
+            def recording(*args, factory=factory, name=name, **options):
+                kernel = factory(*args, **options)
+
+                def call(**launch):
+                    dtypes = tuple(str(x.dtype) for x in launch["inputs"])
+                    variants.add(
+                        (name, args, tuple(launch.get("template", ())), dtypes)
+                    )
+                    return kernel(**launch)
+
+                return call
+
+            monkeypatch.setattr(module, name, recording)
+
+    def run(engine, lengths, params):
+        requests = [
+            engine.submit(_prompt(n, seed), sampling_params=params)
+            for seed, n in enumerate(lengths, start=80)
+        ]
+        while engine.has_work():
+            engine.step()
+        for request in requests:
+            request.take_result()
+
+    greedy = SamplingParams(max_output_tokens=6, temperature=0.0)
+    with Engine(
+        _runner(weights), context_length=CONTEXT, max_running_requests=4
+    ) as engine:
+        # Warm the bounded regimes: prefill, decode at each batch size, sampling.
+        for batch in range(1, 5):
+            run(engine, [40 + 9 * i for i in range(batch)], greedy)
+        run(
+            engine,
+            [50],
+            SamplingParams(max_output_tokens=6, temperature=0.7, top_p=0.9, seed=1),
+        )
+        run(
+            engine,
+            [50],
+            SamplingParams(max_output_tokens=6, temperature=0.7, top_k=5, seed=2),
+        )
+        warm = set(variants)
+        # Unseen prompt and chunk lengths, contexts past the window and page,
+        # batch mixes and sampling values.
+        run(engine, [173, 3, 301], greedy)
+        run(
+            engine,
+            [77, 129],
+            SamplingParams(max_output_tokens=9, temperature=1.3, top_k=3, seed=4),
+        )
+        run(
+            engine,
+            [250],
+            SamplingParams(max_output_tokens=20, temperature=0.31, top_p=0.6, seed=5),
+        )
+    # Every kernel ran during warmup (the GEMV needs widths of 256 or more).
+    assert {variant[0] for variant in warm} == {
+        "_activate_kernel",
+        "_combine_kernel",
+        "_convolution_kernel",
+        "_kernel",
+        "_mix_kernel",
+        "_mxfp8_kernel",
+        "_norm_kernel",
+        "_nvfp4_kernel",
+        "_route_kernel",
+    }
+    assert variants == warm, sorted(map(str, variants - warm))

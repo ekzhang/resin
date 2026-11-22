@@ -214,12 +214,9 @@ class CacheArena:
     def _read(self) -> mx.array:
         return self._storage.read_epoch(self._epoch)
 
-    def _units(self) -> mx.array:
-        return self._read().reshape(-1, 2, PAGE_TOKENS, self.geometry.kv_width)
-
     def units(self) -> mx.array:
         """The arena as ``[units, 2, page, kv_width]``, ordered after prior writes."""
-        return self._units()
+        return self._read().reshape(-1, 2, PAGE_TOKENS, self.geometry.kv_width)
 
     # Reads ---------------------------------------------------------------
 
@@ -259,7 +256,7 @@ class CacheArena:
         for index, table in enumerate(tables):
             bases[index, : len(table)] = table
         return History(
-            self._units(),
+            self.units(),
             bases,
             starts,
             contexts.astype(np.int64),

@@ -218,6 +218,7 @@ class _Completion:
     def result(self) -> ForwardOutput:
         if self._result is None:
             if self._launch.receipts is None:
+                # No continuation followed, so this step still owns its writes.
                 if self._runner._pending is not self._launch:
                     raise RuntimeError("MLX step lost its pending cache writes")
                 self._runner._write_pending()
@@ -246,7 +247,6 @@ class Inkling2MlxRunner:
         max_batch_size: int = 8,
         prefill_chunk_size: int = 8192,
         workspace_bytes: int = _WORKSPACE_BYTES,
-        unembed_f32: bool = True,
     ) -> None:
         if workspace_bytes < 0:
             raise ValueError("workspace_bytes must be non-negative")
@@ -256,11 +256,6 @@ class Inkling2MlxRunner:
         else:
             self.model_path = Path(model)
             config, weights = load_model(self.model_path)
-        if unembed_f32 and weights.unembed_f32 is None:
-            # The CUDA runner computes logits in FP32. Keeping an FP32 copy
-            # avoids re-casting 0.9 GB of BF16 weights on every step.
-            weights.unembed_f32 = weights.unembed.astype(mx.float32)
-            mx.eval(weights.unembed_f32)
         self.config = config
         self._model = Inkling2Model(config, weights)
         limit_positions = config.max_position_embeddings
@@ -273,10 +268,13 @@ class Inkling2MlxRunner:
         self.benchmark_metadata = {
             "quant": "checkpoint-nvfp4-mxfp8-experts",
             "weight_source": "prequantized_checkpoint",
+            # Prefill chunks of 512 or more tokens instead run exactly
+            # dequantized FP32 GEMMs per expert segment (model.SEGMENTED_ROUTES).
             "expert_backend": "mlx-gather-qmm",
             "graphs": {"prefill": "disabled", "decode": "disabled"},
         }
-        self.vocab_size = config.vocab_size
+        # Logits cover the real vocabulary; embedding rows beyond it are padding.
+        self.vocab_size = config.unpadded_vocab_size
         self.eos_token_id = config.eos_token_id
         self.cache_geometry = CacheGeometry.from_config(config, prefill_chunk_size)
         geometry = self.cache_geometry
@@ -300,6 +298,11 @@ class Inkling2MlxRunner:
         )
         if cache_slab_capacity is not None:
             slab_capacity = min(slab_capacity, cache_slab_capacity)
+        if slab_capacity < geometry.sequence_slabs(self.max_seq_len):
+            raise ValueError(
+                f"the Inkling 2 cache holds {slab_capacity} slabs, fewer than one "
+                f"{self.max_seq_len}-token request needs; lower max_seq_len"
+            )
         self.cache_layout = geometry.layout(slab_capacity)
         self._cache = CacheArena(self.cache_layout, geometry)
         self.runner_config = RunnerConfig(
@@ -316,6 +319,7 @@ class Inkling2MlxRunner:
         self._cache.binding.bind_resources(resources)
 
     def release(self, sequence_ids: list[int]) -> None:
+        # A pending step would hold the released rows' state again.
         self._write_pending()
         self._states.release(sequence_ids)
 
@@ -336,8 +340,6 @@ class Inkling2MlxRunner:
     ) -> _Launch:
         """Build the step for ``tokens``, flattened plan indices ``[len(rows), width]``."""
         batch = plan.batch
-        if any(batch._plan.media[int(row)] is not None for row in rows):
-            raise ValueError("the Inkling 2 MLX runner serves text only")
         contexts = batch.context_lengths[rows].astype(np.int64)
         if token_ids is None:
             token_ids = mx.array(batch.token_ids[tokens].astype(np.int32))
@@ -383,10 +385,13 @@ class Inkling2MlxRunner:
         )
 
     def _write_pending(self) -> None:
+        """Drain pending cache work before a terminal/ownership transition."""
         launch, self._pending = self._pending, None
         if launch is None:
             return
         self._write(launch)
+        # No continuation retains the lease here: wait for snapshots and KV
+        # writes, not only the sampled-token event.
         mx.eval(self._cache.epoch)
 
     def forward(self, plan: BatchPlan) -> ForwardOutput:
@@ -422,6 +427,8 @@ class Inkling2MlxRunner:
                 )
                 if scores is not None:
                     prompt_rows.append(scores)
+        # A synchronous result can release the lease immediately: wait for
+        # every issued cache write, not just the sampled-token event.
         combined = (
             last_logits[0] if len(last_logits) == 1 else mx.concatenate(last_logits)
         )
@@ -437,6 +444,9 @@ class Inkling2MlxRunner:
 
     def _cache_plan(self, plan: BatchPlan) -> PagedCachePlan:
         cache_plan = PagedCachePlan.from_plan(plan, self.cache_layout)
+        # Validate before any cache write: rejected plans must leave no state.
+        if any(media is not None for media in plan.media):
+            raise ValueError("the Inkling 2 MLX runner serves text only")
         if np.any(cache_plan.token_ids >= self.vocab_size):
             raise ValueError("token id is out of range for Inkling 2")
         if int(np.max(cache_plan.batch.post_lengths)) > self.max_seq_len:
@@ -458,6 +468,8 @@ class Inkling2MlxRunner:
         rows = np.arange(cache_plan.batch.num_sequences)
         with record_function("resin.mlx.enqueue"):
             if previous is not None:
+                # Epoch dependencies order previous reads -> writes -> new
+                # reads without waiting for the GPU on the calling thread.
                 self._write(previous)
             launch = self._launch(cache_plan, rows, rows[:, None], feedback)
             sampled = self._sampler.tokens(launch.last, plan)

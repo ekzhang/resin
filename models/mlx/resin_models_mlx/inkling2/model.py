@@ -8,16 +8,21 @@ the same forward pass runs over a dense test cache or the Engine's paged arena.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
+from functools import update_wrapper
 from typing import Protocol
 
 import mlx.core as mx
 import numpy as np
 
 from resin.models.inkling2.config import Inkling2Config
+from resin_models_mlx.inkling2.kernels import depth_mix as fused_depth_mix
 from resin_models_mlx.inkling2.kernels import (
     expert_activation,
     expert_combine,
+    gemv_f32,
+    pad_to_device,
+    rms_norm,
     route_experts,
     short_convolution,
 )
@@ -37,22 +42,9 @@ def _decode_compiled(function):
     compiled = mx.compile(function)
 
     def call(first, *args):
-        tokens = (first[0] if isinstance(first, list) else first).shape[1]
-        return (compiled if tokens == 1 else function)(first, *args)
+        return (compiled if first.shape[1] == 1 else function)(first, *args)
 
-    call.__wrapped__ = function  # type: ignore[attr-defined]
-    call.__doc__ = function.__doc__
-    return call
-
-
-class _DecodeCompiled:
-    """``function`` eagerly, or compiled when the caller states it is decoding."""
-
-    def __init__(self, function) -> None:
-        self.function, self.compiled = function, mx.compile(function)
-
-    def __call__(self, decode: bool, *args):
-        return (self.compiled if decode else self.function)(*args)
+    return update_wrapper(call, function)
 
 
 class AttentionStore(Protocol):
@@ -151,13 +143,6 @@ class Inkling2Weights:
     layers: list[Layer]
     # Loop message queries, stacked [core layers, 4, H]: q, k, v and MLP streams.
     loop_queries: mx.array | None = None
-    unembed_f32: mx.array | None = field(default=None, repr=False)
-
-
-def rms_norm(x: mx.array, weight: mx.array | None, eps: float, dtype=BF16) -> mx.array:
-    """FP32 RMS normalization (and weight), rounded once to ``dtype``."""
-    scale = None if weight is None else weight.astype(F32)
-    return mx.fast.rms_norm(x.astype(F32), scale, eps).astype(dtype)
 
 
 def linear(x: mx.array, weight: mx.array) -> mx.array:
@@ -166,29 +151,24 @@ def linear(x: mx.array, weight: mx.array) -> mx.array:
 
 
 def linear_f32(x: mx.array, weight: mx.array) -> mx.array:
-    return x.astype(F32) @ weight.astype(F32).T
+    """FP32 GEMM against a weight stored in FP32 at load."""
+    return x.astype(F32) @ weight.T
 
 
-@_decode_compiled
 def depth_mix(
     sources: list[mx.array],
     query: mx.array,
     addend: mx.array | None = None,
 ) -> list[mx.array]:
     """Attend over residual blocks with normalized values; FP32 outputs per query row."""
-    values = mx.stack([x.astype(F32) for x in sources], axis=-2)
-    if addend is not None:
-        last = values[..., -1, :] + addend.astype(F32)
-        values = mx.concatenate([values[..., :-1, :], last[..., None, :]], axis=-2)
-    width = values.shape[-1]
-    normalized = values * mx.rsqrt(
-        mx.mean(values * values, axis=-1, keepdims=True) + 1e-6
+    shape = sources[0].shape
+    width = shape[-1]
+    mixed = fused_depth_mix(
+        [x.reshape(-1, width) for x in sources],
+        query,
+        None if addend is None else addend.reshape(-1, width),
     )
-    queries = query.astype(F32).reshape(-1, width)
-    scores = (normalized @ queries.T) * (width**-0.5)
-    probabilities = mx.softmax(scores, axis=-2, precise=True)
-    output = mx.swapaxes(probabilities, -1, -2) @ normalized
-    return [output[..., row, :] for row in range(output.shape[-2])]
+    return [mixed[:, row].reshape(shape) for row in range(mixed.shape[1])]
 
 
 @_decode_compiled
@@ -209,10 +189,12 @@ def log_scaling_tau(positions: mx.array, n_floor: int, alpha: float) -> mx.array
     return 1.0 + alpha * mx.log(mx.maximum(effective / float(n_floor), 1.0))
 
 
-# From this many routes, prefill runs one dense FP32 GEMM per expert over its
-# sorted segment: MLX's gathered quantized GEMM reaches about 2.6 TFLOPS for
-# NVFP4 and 1.4 for MXFP8 at 16K routes, against 7-8 for the segments.
-SEGMENTED_ROUTES = 512
+# From this many routes (512 tokens), prefill runs one dense FP32 GEMM per
+# expert over its sorted segment of exactly dequantized weights. On an M4 Max
+# the two paths tie at 512 tokens; at 2,048 tokens (16K routes) the segments are
+# 2.3x (NVFP4) to 3.5x (MXFP8) faster, dequantization included. Below the
+# threshold, dequantizing every expert costs more than the gathered GEMM saves.
+SEGMENTED_ROUTES = 4096
 
 
 def _expert_matmul(
@@ -263,10 +245,8 @@ def _expert_matmul(
             )
             parts.append(routed[start:stop] @ dense.T)
         output = mx.concatenate(parts) if len(parts) > 1 else parts[0]
-    if activation_amax is not None and activation_amax.size < 8:
-        # Keep the scale kernels' arguments in device memory at every batch size.
-        padding = mx.zeros((8 - activation_amax.size,), dtype=F32)
-        activation_amax = mx.concatenate([activation_amax, padding])
+    if activation_amax is not None:
+        activation_amax = pad_to_device(activation_amax)
     return output, activation_amax
 
 
@@ -280,15 +260,14 @@ def _segments(sorted_ids: mx.array, experts: int) -> list[tuple[int, int, int]]:
     ]
 
 
+@_decode_compiled
 def _sort_routes(ids, weights, top_k: int):
+    """Order routes by expert; ``ids``/``weights`` are ``[B, T, top_k]``."""
     flat_ids = ids.reshape(-1)
     order = mx.argsort(flat_ids)
     source_rows = (order // top_k).astype(mx.uint32)
     inverse = mx.argsort(order).astype(mx.uint32)
     return flat_ids[order], source_rows, weights.reshape(-1)[order], inverse
-
-
-_SORT_ROUTES = _DecodeCompiled(_sort_routes)
 
 
 def sparse_mlp(x: mx.array, layer: Layer, config: Inkling2Config) -> mx.array:
@@ -299,8 +278,8 @@ def sparse_mlp(x: mx.array, layer: Layer, config: Inkling2Config) -> mx.array:
     ids, weights = route_experts(
         flat.astype(F32) @ layer.router.T, layer.router_bias, top_k, config.route_scale
     )
-    sorted_ids, source_rows, gamma, inverse = _SORT_ROUTES(
-        shape[1] == 1, ids, weights, top_k
+    sorted_ids, source_rows, gamma, inverse = _sort_routes(
+        ids.reshape(*shape[:2], top_k), weights.reshape(*shape[:2], top_k), top_k
     )
     experts = layer.experts
     nvfp4 = experts.mode == "nvfp4"
@@ -363,13 +342,10 @@ def controller(dest: mx.array, message: mx.array, weights: Controller) -> mx.arr
 def logits(
     hidden: mx.array, weights: Inkling2Weights, config: Inkling2Config
 ) -> mx.array:
-    unembed = weights.unembed_f32
-    values = (
-        hidden.astype(F32) @ unembed.T
-        if unembed is not None
-        else linear_f32(hidden, weights.unembed)
-    )
-    values = values[..., : config.unpadded_vocab_size]
+    """FP32 logits from BF16 weights, sliced to the real vocabulary and softcapped."""
+    shape = hidden.shape
+    values = gemv_f32(hidden.reshape(-1, shape[-1]), weights.unembed)
+    values = values.reshape(*shape[:-1], -1)[..., : config.unpadded_vocab_size]
     cap = config.final_logit_softcapping
     return cap * mx.tanh(values * (1.0 / cap))
 
@@ -382,6 +358,8 @@ class Inkling2Model:
     """
 
     def __init__(self, config: Inkling2Config, weights: Inkling2Weights) -> None:
+        if not config.attn_res_normalize_values:
+            raise ValueError("the Inkling 2 MLX depth mix requires normalized values")
         self.config, self.weights = config, weights
         order = config.layer_order
         slots = {}
@@ -623,8 +601,5 @@ __all__ = [
     "l2_clip",
     "log_scaling_tau",
     "logits",
-    "rms_norm",
-    "route_experts",
-    "short_convolution",
     "sparse_mlp",
 ]
