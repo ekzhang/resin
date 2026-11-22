@@ -56,9 +56,11 @@ but Resin's captured regions and model coverage are its own.
 
 When `cuda_graph_decode_shapes` is omitted, a shared batch bucket catalog uses
 the runner's physical history capacity. Larger buckets can serve smaller
-batches; inactive rows use reserved cache storage. Speculative decode uses
-denser batch buckets to limit repeated verification work. Attention still reads
-the live sequence lengths rather than doing work through the history capacity.
+batches, with inactive rows using reserved cache storage. Ordinary decode
+captures powers of two and 1.5× intermediate sizes such as 3, 6, 48, and 192,
+with additional buckets at 640 and 896. Speculative decode uses denser small
+batch buckets to limit repeated verification work. Attention still reads the
+live sequence lengths rather than doing work through the history capacity.
 
 An explicit shape list overrides the catalog. An explicit empty tuple preserves
 the older decode opt-out; it does not disable prefill. A nonempty list with

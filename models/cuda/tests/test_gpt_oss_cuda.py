@@ -291,7 +291,7 @@ class TestGptOssCudaNativePlan:
             np.testing.assert_array_equal(inputs[f"{name}_page_table"], 0)
             np.testing.assert_array_equal(inputs[f"{name}_append_slots"], [0, 1])
 
-    @pytest.mark.parametrize("rows,expected_bucket", [(3, 4), (4, 4), (6, 8)])
+    @pytest.mark.parametrize("rows,expected_bucket", [(3, 3), (5, 6), (7, 8)])
     def test_decode_graph_buckets_preserve_live_rows_and_isolate_padding(
         self, rows, expected_bucket
     ) -> None:

@@ -442,6 +442,31 @@ class TestCudaGraph:
                 batches[0] == 1 and batches[-1] == DEFAULT_DECODE_GRAPH_MAX_BATCH_SIZE
             )
             assert all(width == 4096 for _, width in shapes)
+            if not speculative:
+                assert batches == (
+                    1,
+                    2,
+                    3,
+                    4,
+                    6,
+                    8,
+                    12,
+                    16,
+                    24,
+                    32,
+                    48,
+                    64,
+                    96,
+                    128,
+                    192,
+                    256,
+                    384,
+                    512,
+                    640,
+                    768,
+                    896,
+                    1024,
+                )
             capped = default_decode_graph_shapes(
                 128, speculative=speculative, max_batch_size=17
             )

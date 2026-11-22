@@ -28,11 +28,19 @@ _SPECULATIVE_DECODE_BATCH_SIZES = (
 _DECODE_BATCH_SIZES = (
     1,
     2,
+    3,
     4,
+    6,
     8,
-    *range(12, 17, 4),
-    *range(24, 33, 8),
-    *range(64, 129, 32),
+    12,
+    16,
+    24,
+    32,
+    48,
+    64,
+    96,
+    128,
+    192,
     *range(256, 1025, 128),
 )
 
@@ -108,8 +116,9 @@ def default_decode_graph_shapes(
 ) -> tuple[GraphShape, ...]:
     """Return shared decode graph buckets with one dynamic-history capacity.
 
-    Speculative decode uses denser batch buckets because padding repeats the
-    whole draft-and-verify path. Ordinary decode uses coarser batch buckets.
+    Ordinary decode includes powers of two and their 1.5x intermediates.
+    Speculative decode uses denser small-batch buckets because padding repeats
+    the whole draft-and-verify path.
     The shared catalog extends through 1024 rows. Deployments should cap it at
     their scheduler's maximum number of sequences so every admitted decode
     batch has a compatible graph bucket.

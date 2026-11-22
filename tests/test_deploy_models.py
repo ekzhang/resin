@@ -289,7 +289,11 @@ def test_gpt_gpu_override_preserves_sm90_kernel_architecture(gpu):
 
 @pytest.mark.parametrize(
     "maximum,expected",
-    [(3, (1, 2, 3)), (8, (1, 2, 4, 8)), (17, (1, 2, 4, 8, 12, 16, 17))],
+    [
+        (3, (1, 2, 3)),
+        (8, (1, 2, 3, 4, 6, 8)),
+        (17, (1, 2, 3, 4, 6, 8, 12, 16, 17)),
+    ],
 )
 def test_glm_default_target_and_mtp_catalogs_match_physical_batches(
     monkeypatch, maximum, expected
