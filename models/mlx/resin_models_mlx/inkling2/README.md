@@ -1,9 +1,8 @@
 # Inkling 2 Mini on Apple Silicon
 
-`Inkling2MlxRunner` serves **Inkling 2 Mini** text through Resin's Engine on one
-Apple Silicon GPU. It supports paged global and sliding-window attention, chunked
-prefill, prefix reuse and overlapped decode. DSpark speculative decoding and
-image input are not supported yet; image requests are rejected by the recipe.
+`Inkling2MlxRunner` serves **Inkling 2 Mini** text and image prompts on one
+Apple Silicon GPU. It supports paged global and sliding-window attention,
+chunked prefill, prefix reuse and overlapped decode.
 
 ## Run locally
 
@@ -17,10 +16,9 @@ INKLING_CHECKPOINT="$(uv run hf download thinkingmachines/Inkling-2-Mini \
 uv run scripts/mlx_serve.py --model inkling2-mini-mlx --checkpoint "$INKLING_CHECKPOINT"
 ```
 
-The 18.2 GiB target file loads as stored; `mtp.safetensors` (DSpark) and the
-vision tower are not loaded. The preset uses a 32,768-token context, at most
-eight requests and 8,192-token prefill chunks; `--context-length` and
-`--max-batch-size` override those limits.
+The preset loads the language model and vision tower from the target checkpoint.
+It uses 8,192-token prefill chunks and defaults to eight concurrent requests.
+Set the context and batch limits with `--context-length` and `--max-batch-size`.
 
 ## Precision
 
@@ -101,11 +99,15 @@ tests' independent NVFP4/MXFP8 arithmetic.
   that every runner attention call matches an unsliced dense reference,
   including windows and bias extents spanning several pages; that a
   cached continuation equals a fresh one; and that overlapped decode equals
-  synchronous decode.
+  synchronous decode. Image tests exercise a checkpoint-backed request and
+  verify embedding placement across chunks and prefix-cache hits.
+- On a rectangular synthetic image and Mini's published vision weights, MLX
+  projector output matched the PyTorch CPU reference to 0.99% relative L2
+  error (cosine similarity 0.99995).
 - `scripts/check_server.py --stress` passes chat, logprobs, concurrency, prefix
   reuse, stress, robustness and recovery, and context checks up to 2,048 tokens.
   The original runner took 15 seconds on the 8,192-token check, exceeding its
-  default 10-second TTFT limit. Image requests are rejected at admission.
+  default 10-second TTFT limit. These measurements used text prompts.
 - On 100 MMLU questions (`cais/mmlu` revision `c30699e8`, 50 subjects × 2,
   seed 1017; default reasoning, 4,096-token cap, eight concurrent), 86 answers
   are correct. Of the 14 others, 4 are wrong, 2 reached the token cap and 8
@@ -121,13 +123,21 @@ unqualified.
 ```bash
 uv run pytest models/mlx/tests/test_inkling2_model.py \
   models/mlx/tests/test_inkling2_engine.py models/mlx/tests/test_inkling2_attention.py \
-  tests/test_deploy_models.py
+  models/mlx/tests/test_inkling2_vision.py tests/test_deploy_models.py
 # Real checkpoint against the CPU reference (about 50 GB of memory, under a minute):
 RESIN_TEST_CHECKPOINT="$INKLING_CHECKPOINT" \
   uv run pytest models/mlx/tests/test_inkling2_checkpoint.py
 ```
 
 ## Measured performance
+
+### Image encoding on M1 Pro
+
+With the pinned Mini vision weights and MLX 0.32.4, one synthetic normalized
+RGB image took 77 ms at 320 × 320, 253 ms at 640 × 640, and 639 ms at 960 × 960
+(median of three runs after warmup). These times include patch packing and
+projection but exclude preprocessing, language prefill, and HTTP overhead.
+Cached feature lookup took about 4–5 µs.
 
 ### Prefill attention on M1 Pro
 
@@ -137,12 +147,12 @@ on the same 16 GiB M1 Pro with MLX 0.32.4, identical synthetic BF16 inputs and
 Mini's head geometry. Each time is the median of three calls after warmup.
 
 | Prior tokens | New tokens | Global, dense → paged (ms) | Local, dense → paged (ms) |
-| -----------: | ---------: | ------------------------: | -----------------------: |
-|            0 |        128 |               0.96 → 0.73 |              0.68 → 0.70 |
-|            0 |      2,048 |             56.83 → 14.75 |            42.18 → 11.60 |
-|        8,193 |        128 |              16.64 → 7.36 |              3.46 → 1.29 |
-|            0 |      8,192 |         1,093.39 → 208.42 |           236.09 → 53.31 |
-|        8,192 |      8,192 |         3,039.08 → 637.95 |           224.47 → 57.32 |
+| -----------: | ---------: | -------------------------: | ------------------------: |
+|            0 |        128 |                0.96 → 0.73 |               0.68 → 0.70 |
+|            0 |      2,048 |              56.83 → 14.75 |             42.18 → 11.60 |
+|        8,193 |        128 |               16.64 → 7.36 |               3.46 → 1.29 |
+|            0 |      8,192 |          1,093.39 → 208.42 |            236.09 → 53.31 |
+|        8,192 |      8,192 |          3,039.08 → 637.95 |            224.47 → 57.32 |
 
 Dense timings include gathering retained KV. For 8,192-token chunks, the
 benchmark synchronized after each dense query block to bound memory. Paged
@@ -198,10 +208,10 @@ load). Metal offload and flash attention are enabled. Q4_K_M stores most
 weights, attention included, in about 4.5 bits, where Resin keeps BF16 attention
 and the checkpoint's NVFP4/MXFP8 experts.
 
-| llama.cpp, 8K context      | Batch 1 | Batch 2 | Batch 4 | Batch 8 |
-| -------------------------- | ------: | ------: | ------: | ------: |
-| Output tokens/s            |    32.2 |    47.1 |    64.8 |    81.9 |
-| Resin speedup              |  ~1.1×  |   1.29× |   1.51× |   1.58× |
+| llama.cpp, 8K context | Batch 1 | Batch 2 | Batch 4 | Batch 8 |
+| --------------------- | ------: | ------: | ------: | ------: |
+| Output tokens/s       |    32.2 |    47.1 |    64.8 |    81.9 |
+| Resin speedup         |   ~1.1× |   1.29× |   1.51× |   1.58× |
 
 `llama-batched-bench -npp 8192 -ntg 64` measured those rates; `llama-bench`
 (`tg128 @ d8192`) reports 28.0 tokens/s at batch one. Resin's rates are median
@@ -222,7 +232,6 @@ remaining gap is the dispatch of many small per-visit operations.
   PR is scoped to the target model; speculation needs the bundled draft model's
   own cache groups, block verification and rollback, and is left for a
   follow-up, so the speculative-decoding step of the model checklist is open.
-- No image input.
 - One GPU; no tensor or expert parallelism.
 - Prefill expert GEMMs reach about 7.8 TFLOPS (versus 13.5 for one dense GEMM)
   because each expert sees about 128 rows per 2,048 tokens.

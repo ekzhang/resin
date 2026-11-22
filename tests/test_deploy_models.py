@@ -2,6 +2,7 @@
 
 import importlib
 import json
+import sys
 from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
@@ -43,19 +44,27 @@ def test_runtime_prepares_persistent_cute_cache(tmp_path, name):
     assert Path(env["CUTE_DSL_CACHE_DIR"]).is_dir()
 
 
-@pytest.mark.parametrize("name", ["ornith-1.0-35b", "qwen3.5-0.8b-mlx"])
-def test_mlx_factory_constructs_single_device_runner(monkeypatch, tmp_path, name):
-    pytest.importorskip("mlx.core")
+@pytest.mark.parametrize(
+    "name,module_name,runner_name",
+    [
+        ("ornith-1.0-35b", "qwen3_5", "Qwen35MlxRunner"),
+        ("qwen3.5-0.8b-mlx", "qwen3_5", "Qwen35MlxRunner"),
+        ("inkling2-mini-mlx", "inkling2", "Inkling2MlxRunner"),
+    ],
+)
+def test_mlx_factory_constructs_single_device_runner(
+    monkeypatch, tmp_path, name, module_name, runner_name
+):
     spec = get_model(name)
-    module = importlib.import_module("resin_models_mlx.qwen3_5")
     calls = []
-    monkeypatch.setattr(
-        module,
-        "Qwen35MlxRunner",
-        lambda *args, **kwargs: calls.append((args, kwargs)),
-    )
 
-    def create(**overrides):
+    def record(*args, **kwargs):
+        calls.append((args, kwargs))
+
+    module = SimpleNamespace(**{runner_name: record})
+    monkeypatch.setitem(sys.modules, f"resin_models_mlx.{module_name}", module)
+
+    def create(model=spec, **overrides):
         options: dict[str, Any] = dict(
             device="mps",
             context_length=8192,
@@ -63,7 +72,7 @@ def test_mlx_factory_constructs_single_device_runner(monkeypatch, tmp_path, name
             prefill_chunk_size=spec.prefill_chunk_size,
             draft_tokens=0,
         )
-        return create_runner(spec, checkpoint, **(options | overrides))
+        return create_runner(model, checkpoint, **(options | overrides))
 
     checkpoint = tmp_path / spec.name
     create()
@@ -79,6 +88,8 @@ def test_mlx_factory_constructs_single_device_runner(monkeypatch, tmp_path, name
             },
         )
     ]
+    create(model=replace(spec, text_only=True))
+    assert calls[-1][1]["include_vision"] is False
     with pytest.raises(ValueError, match="use draft_tokens=0"):
         create(draft_tokens=4)
     with pytest.raises(ValueError, match="use draft_tokens=0"):
@@ -99,75 +110,6 @@ def test_mlx_factory_constructs_single_device_runner(monkeypatch, tmp_path, name
             prefill_chunk_size=spec.prefill_chunk_size,
             draft_tokens=0,
         )
-
-
-def test_inkling2_mlx_factory_constructs_text_runner(monkeypatch, tmp_path):
-    pytest.importorskip("mlx.core")
-    spec = get_model("inkling2-mini-mlx")
-    module = importlib.import_module("resin_models_mlx.inkling2")
-    calls = []
-    monkeypatch.setattr(
-        module,
-        "Inkling2MlxRunner",
-        lambda *args, **kwargs: calls.append((args, kwargs)),
-    )
-
-    def create(**overrides):
-        options: dict[str, Any] = dict(
-            device="mps",
-            context_length=8192,
-            max_batch_size=4,
-            prefill_chunk_size=spec.prefill_chunk_size,
-            draft_tokens=0,
-        )
-        return create_runner(spec, checkpoint, **(options | overrides))
-
-    checkpoint = tmp_path / spec.name
-    create()
-    assert calls == [
-        (
-            (checkpoint,),
-            {
-                "memory_utilization": spec.gpu_memory_utilization,
-                "max_seq_len": 8192,
-                "max_batch_size": 4,
-                "prefill_chunk_size": 8192,
-            },
-        )
-    ]
-    with pytest.raises(ValueError, match="use draft_tokens=0"):
-        create(draft_tokens=7)
-    with pytest.raises(ValueError, match="one Apple Silicon device"):
-        create(groups=object())
-
-
-def test_inkling2_mlx_recipe_is_text_only(tmp_path):
-    from tokenizers import Tokenizer
-    from tokenizers.models import WordLevel
-
-    tokenizer = Tokenizer(WordLevel({"[UNK]": 0}, unk_token="[UNK]"))
-    tokenizer.add_special_tokens(
-        [
-            "<|message_system|>",
-            "<|message_user|>",
-            "<|message_model|>",
-            "<|content_text|>",
-            "<|content_image|>",
-            "<|content_thinking|>",
-            "<|content_model_end_sampling|>",
-            "<|end_message|>",
-            "<|unused_200054|>",
-        ]
-    )
-    tokenizer.save(str(tmp_path / "tokenizer.json"))
-    (tmp_path / "processor_config.json").write_text(
-        json.dumps({"image_processor": {"size": {"height": 8, "width": 8}}})
-    )
-    assert create_recipe("inkling2-mini-mlx", tmp_path).input_modalities == ["text"]
-    assert create_recipe("inkling2-mini", tmp_path).input_modalities == [
-        "text",
-        "image",
-    ]
 
 
 @pytest.mark.parametrize(
@@ -301,7 +243,10 @@ def test_inkling2_factory_enables_qualified_attention_prologue(monkeypatch):
     assert options["expert_backend"] == "cute-dsl"
 
 
-def test_inkling2_recipe_uses_checkpoint_tokenizer_and_image_settings(tmp_path):
+@pytest.mark.parametrize(
+    "name", ["inkling2-small", "inkling2-mini", "inkling2-mini-mlx"]
+)
+def test_inkling2_recipe_uses_checkpoint_tokenizer_and_image_settings(tmp_path, name):
     import numpy as np
     from tokenizers import Tokenizer
     from tokenizers.models import WordLevel
@@ -327,13 +272,20 @@ def test_inkling2_recipe_uses_checkpoint_tokenizer_and_image_settings(tmp_path):
         json.dumps({"image_processor": {"size": {"height": 8, "width": 8}}})
     )
 
-    recipe = create_recipe("inkling2-small", tmp_path)
+    recipe = create_recipe(name, tmp_path)
+    assert recipe.input_modalities == ["text", "image"]
     image = Image.from_rgb(np.zeros((9, 2, 3), dtype=np.float32))
     prompt = recipe.render([Message(Role.USER, [image, Text("Describe this.")])])
     image_token = tokenizer.token_to_id("<|unused_200054|>")
     assert prompt.token_ids.tolist().count(image_token) == 2
     assert len(prompt.media) == 1
     assert prompt.media[0].image.shape == (16, 8, 3)
+    if name == "inkling2-mini-mlx":
+        text_only = create_recipe(replace(get_model(name), text_only=True), tmp_path)
+        assert text_only.input_modalities == ["text"]
+        text_only.render([Message(Role.USER, [Text("hello")])])
+        with pytest.raises(ValueError, match="does not support media"):
+            text_only.render([Message(Role.USER, [image])])
 
 
 @pytest.mark.parametrize(

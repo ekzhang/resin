@@ -218,9 +218,9 @@ directory's LICENSE. The adaptation preserves FP32 product/reduction boundaries
 and BF16 output rounding.
 
 The Inkling 2 MLX runner in models/mlx/resin_models_mlx/inkling2 follows the
-arithmetic of models/cuda/resin_models_cuda/inkling2. Its NVFP4/MXFP8 activation
-quantizer (quantization.py) adapts SGLang's Apache-2.0 Inkling 2 activation
-quantization, as that CUDA module does:
+arithmetic of models/cuda/resin_models_cuda/inkling2. Its vision tower (vision.py)
+and NVFP4/MXFP8 activation quantizer (quantization.py) adapt SGLang's Apache-2.0
+Inkling 2 vision model and activation quantization, as the CUDA modules do:
 
   https://github.com/sgl-project/sglang/tree/e62ac6279646c686d3b328f58d9b5c2c2d5927dc
 

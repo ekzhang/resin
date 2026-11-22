@@ -364,7 +364,7 @@ MODEL_SPECS.update(
                     "processor_config.json",
                 ),
             ),
-            # Target-only text on Apple Silicon; experts stay NVFP4/MXFP8.
+            # Target model and vision tower on Apple Silicon; experts stay NVFP4/MXFP8.
             backend="mlx",
             gpu="Apple-Silicon",
             label="inkling2-mini-mlx",
@@ -372,7 +372,6 @@ MODEL_SPECS.update(
             context_length=32_768,
             max_batch_size=8,
             gpu_memory_utilization=0.70,
-            text_only=True,
         ),
         "inkling2-small": ModelSpec(
             name="inkling2-small",
@@ -693,19 +692,15 @@ def create_runner(
             raise ValueError(f"{spec.name} uses expert_backend={spec.expert_backend!r}")
         # MLX has no CUDA graphs or graph batch catalog; graph options and
         # decode_batch_sizes do not apply. The batch limit sizes live state.
-        if spec.family == "inkling2":
-            from resin_models_mlx.inkling2 import Inkling2MlxRunner
+        match spec.family:
+            case "inkling2":
+                from resin_models_mlx.inkling2 import Inkling2MlxRunner as MlxRunner
+            case "qwen3_5" | "qwen3_5_moe":
+                from resin_models_mlx.qwen3_5 import Qwen35MlxRunner as MlxRunner
+            case _:
+                raise ValueError(f"unsupported MLX model family: {spec.family}")
 
-            return Inkling2MlxRunner(
-                checkpoint,
-                memory_utilization=memory,
-                max_seq_len=context_length,
-                max_batch_size=max_batch_size,
-                prefill_chunk_size=prefill_chunk_size,
-            )
-        from resin_models_mlx.qwen3_5 import Qwen35MlxRunner
-
-        return Qwen35MlxRunner(
+        return MlxRunner(
             checkpoint,
             memory_utilization=memory,
             max_seq_len=context_length,

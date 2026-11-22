@@ -9,6 +9,8 @@ that perform identical arithmetic produce identical tokens.
 
 from __future__ import annotations
 
+import json
+
 import mlx.core as mx
 import numpy as np
 import pytest
@@ -17,8 +19,14 @@ pytest.importorskip("torch")
 
 from _attention_pages import dense_reference  # noqa: E402
 from test_inkling2_model import tiny_config, write_checkpoint  # noqa: E402
+from test_inkling2_vision import (  # noqa: E402
+    tiny_vision_config,
+    write_vision_checkpoint,
+)
 
 from resin import Engine, SamplingParams  # noqa: E402
+from resin.recipe import Media  # noqa: E402
+from resin_models_mlx.inkling2 import model as model_module  # noqa: E402
 from resin_models_mlx.inkling2 import runner as runner_module  # noqa: E402
 from resin_models_mlx.inkling2.cache import (  # noqa: E402
     GLOBAL_GROUP,
@@ -27,6 +35,7 @@ from resin_models_mlx.inkling2.cache import (  # noqa: E402
 )
 from resin_models_mlx.inkling2.checkpoint import load_model  # noqa: E402
 from resin_models_mlx.inkling2.runner import Inkling2MlxRunner  # noqa: E402
+from resin_models_mlx.media import ImageEncoder  # noqa: E402
 
 CHUNK = 128
 CONTEXT = 1024
@@ -225,6 +234,123 @@ def test_prefix_hit_reads_restored_history_exactly(weights, monkeypatch):
     # The second prompt restored a snapshot inside the shared prefix.
     assert 0 < contexts[0] <= len(shared) and contexts[0] % CHUNK == 0
     assert mirror.checked > 1_000
+
+
+def test_image_prompt_with_vision_checkpoint(tmp_path):
+    config = tiny_config()
+    write_checkpoint(tmp_path, config)
+    write_vision_checkpoint(tmp_path, config.hidden_size)
+    config_path = tmp_path / "config.json"
+    raw_config = json.loads(config_path.read_text())
+    config_path.write_text(
+        json.dumps({**raw_config, "vision_config": tiny_vision_config()})
+    )
+
+    text_runner = Inkling2MlxRunner(
+        tmp_path,
+        max_seq_len=CHUNK,
+        max_batch_size=1,
+        prefill_chunk_size=CHUNK,
+        cache_slab_capacity=8,
+        workspace_bytes=64 << 20,
+        include_vision=False,
+    )
+    assert text_runner._media is None
+    runner = Inkling2MlxRunner(
+        tmp_path,
+        max_seq_len=CHUNK,
+        max_batch_size=1,
+        prefill_chunk_size=CHUNK,
+        cache_slab_capacity=8,
+        workspace_bytes=64 << 20,
+    )
+    assert runner._media is not None
+    image = np.ones((4, 8, 3), dtype=np.float32)
+    prompt = _prompt(8, seed=14)
+    params = SamplingParams(max_output_tokens=1, temperature=0.0)
+    with Engine(runner, context_length=CHUNK, enable_overlap=False) as engine:
+        request = engine.submit(
+            prompt, media=(Media((2, 2), image=image),), sampling_params=params
+        )
+        while engine.has_work():
+            engine.step()
+        assert len(request.take_result()) == 1
+    assert runner._media.size_bytes == 2 * config.hidden_size * 2
+
+
+def test_image_embeddings_across_chunks_and_prefix_hits(weights, monkeypatch):
+    runner = _runner(weights)
+    hidden_size = weights[0].hidden_size
+    encoded = []
+
+    def visual(patches, grid):
+        encoded.append(grid.tolist())
+        return mx.broadcast_to(patches[:, 0, 0, :1], (len(patches), hidden_size))
+
+    encoder = ImageEncoder(
+        visual,
+        hidden_size,
+        patch_size=1,
+        merge_size=1,
+        temporal_patch_size=1,
+        channels_last=True,
+    )
+    monkeypatch.setattr(runner, "_media", encoder)
+    # Observe the actual input to the first transformer layer, after embed_norm.
+    layer_inputs = []
+    first_norm = weights[1].layers[0].norms[0]
+    rms_norm = model_module.rms_norm
+
+    def record_input(x, scale, eps, **kwargs):
+        if scale is first_norm:
+            layer_inputs.append(np.array(x[0].astype(mx.float32)))
+        return rms_norm(x, scale, eps, **kwargs)
+
+    def unexpected_features(media):
+        raise AssertionError("decode requested vision features")
+
+    monkeypatch.setattr(model_module, "rms_norm", record_input)
+    prompt = _prompt(CHUNK + 1, seed=52)
+    text = np.array(runner._model.embed(mx.array(prompt)).astype(mx.float32))
+    start = CHUNK - 2
+    params = SamplingParams(max_output_tokens=2, temperature=0.0)
+    with Engine(
+        runner,
+        context_length=CONTEXT,
+        prefix_cache=True,
+        state_tracking_interval=CHUNK,
+        enable_overlap=False,
+    ) as engine:
+        # The image's third token is an entire prefill step, including after a hit.
+        for factor, cached, encodings in [(1, 0, 1), (1, CHUNK, 1), (2, 0, 2)]:
+            values = factor * np.arange(1, 4, dtype=np.float32)
+            image = np.broadcast_to(values[None, :, None], (1, 3, 3)).copy()
+            media = (Media((start, len(values)), image=image),)
+            layer_inputs.clear()
+            request = engine.submit(prompt, media=media, sampling_params=params)
+            assert request.cached_tokens == cached
+            if not cached:
+                engine.step()
+            engine.step()
+            with monkeypatch.context() as decode:
+                decode.setattr(encoder, "features", unexpected_features)
+                engine.step()
+            assert request.done
+            expected = text.copy()
+            expected[start:] = values[:, None]
+            np.testing.assert_array_equal(
+                np.concatenate(layer_inputs[:-1]), expected[cached:]
+            )
+            assert [len(chunk) for chunk in layer_inputs] == (
+                [1, 1] if cached else [CHUNK, 1, 1]
+            )
+            # The first sampled token is ordinary text on the decode step.
+            sampled = request.take_result()
+            np.testing.assert_array_equal(
+                layer_inputs[-1],
+                np.array(runner._model.embed(mx.array(sampled[:1])).astype(mx.float32)),
+            )
+            assert encoded == [[[1, 1, 3]]] * encodings
 
 
 def test_cached_continuation_matches_fresh_and_overlap_matches_sync(weights):

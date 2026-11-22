@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from functools import partial
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -9,6 +10,7 @@ from typing import TYPE_CHECKING
 import mlx.core as mx
 import numpy as np
 
+from resin import BatchPhase
 from resin.backend.plans import PagedCachePlan
 from resin.models.inkling2.config import Inkling2Config
 from resin_models_mlx.cache_arena import KVHistory
@@ -20,9 +22,10 @@ from resin_models_mlx.inkling2.cache import (
     CacheArena,
     CacheGeometry,
 )
-from resin_models_mlx.inkling2.checkpoint import load_model
+from resin_models_mlx.inkling2.checkpoint import load_model, load_vision_model
 from resin_models_mlx.inkling2.model import Inkling2Model, Inkling2Weights, logits
 from resin_models_mlx.live_state import LiveStates
+from resin_models_mlx.media import ImageEncoder
 from resin_models_mlx.metal import device_array
 from resin_models_mlx.runner import (
     DEFAULT_WORKSPACE_BYTES,
@@ -132,15 +135,31 @@ class Inkling2MlxRunner(MlxRunner[CacheArena]):
         max_batch_size: int = 8,
         prefill_chunk_size: int = 8192,
         workspace_bytes: int = DEFAULT_WORKSPACE_BYTES,
+        include_vision: bool = True,
     ) -> None:
+        self._media: ImageEncoder | None = None
         if workspace_bytes < 0:
             raise ValueError("workspace_bytes must be non-negative")
         if isinstance(model, tuple):
             config, weights = model
             self.model_path = None
         else:
-            self.model_path = Path(model)
+            self.model_path = Path(model).expanduser().resolve()
             config, weights = load_model(self.model_path)
+            if include_vision:
+                raw_config = json.loads((self.model_path / "config.json").read_text())
+                if vision_config := raw_config.get("vision_config"):
+                    visual = load_vision_model(
+                        self.model_path, vision_config, config.hidden_size
+                    )
+                    self._media = ImageEncoder(
+                        visual,
+                        config.hidden_size,
+                        patch_size=visual.patch_size * visual.merge_size,
+                        merge_size=1,
+                        temporal_patch_size=1,
+                        channels_last=True,
+                    )
         self.config = config
         self._model = Inkling2Model(config, weights)
         self.max_seq_len = context_limit(max_seq_len, config.max_position_embeddings)
@@ -196,17 +215,26 @@ class Inkling2MlxRunner(MlxRunner[CacheArena]):
             contexts,
             self.config.sliding_window_size,
         )
+        batch = plan.batch
+        embeddings = self._model.embed(token_ids)
+        if self._media is not None and batch.phase == BatchPhase.PREFILL:
+            media_by_row = batch._plan.media
+            for selected, row in enumerate(rows):
+                if media := media_by_row[int(row)]:
+                    embeddings = self._media.insert(
+                        embeddings, media, int(contexts[selected]), row=selected
+                    )
         hidden, state = self._model.hidden(
-            token_ids,
-            mx.array(plan.batch.positions[tokens].astype(np.int32)),
+            embeddings,
+            mx.array(batch.positions[tokens].astype(np.int32)),
             self._states.gather(plan, rows),
             store,
         )
         return ModelStep(hidden, state, store.writes)
 
     def _cache_plan(self, plan: BatchPlan) -> PagedCachePlan:
-        if any(media is not None for media in plan.media):
-            raise ValueError("the Inkling 2 MLX runner serves text only")
+        if self._media is None and any(media is not None for media in plan.media):
+            raise ValueError("this Inkling 2 MLX runner did not load a vision tower")
         return super()._cache_plan(plan)
 
 

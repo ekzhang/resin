@@ -2,11 +2,11 @@
 # Adapted from SGLang e62ac6279646c686d3b328f58d9b5c2c2d5927dc.
 """Inkling2 ViT with native normalized image patches and packed FA4 attention."""
 
-import math
-
 import torch
 import torch.nn.functional as F
 from torch import nn
+
+from resin.models.inkling2.config import validate_vision_config
 
 
 def _position_embeddings(grid, y, x, heights, widths):
@@ -192,44 +192,7 @@ class Inkling2VisionBackbone(nn.Module):
 class Inkling2VisionEncoder(nn.Module):
     def __init__(self, vision_config: dict, text_hidden_size: int):
         super().__init__()
-        for key in (
-            "temporal_patch_size",
-            "native_patch_size",
-            "adapter_merge_size",
-            "projection_hidden_dim",
-            "hidden_size",
-            "num_hidden_layers",
-            "num_attention_heads",
-            "posemb_grid_size",
-        ):
-            value = vision_config[key]
-            if type(value) is not int or value <= 0:
-                raise ValueError(f"vision_config.{key} must be a positive integer")
-        if type(text_hidden_size) is not int or text_hidden_size <= 0:
-            raise ValueError("text_hidden_size must be a positive integer")
-        for key in ("mlp_ratio", "layer_norm_eps"):
-            value = vision_config[key]
-            if (
-                type(value) not in (float, int)
-                or not math.isfinite(value)
-                or value <= 0
-            ):
-                raise ValueError(f"vision_config.{key} must be finite and positive")
-        width, heads = (
-            vision_config["hidden_size"],
-            vision_config["num_attention_heads"],
-        )
-        if width % heads or width // heads not in (4, 8, 16, 32, 64, 128):
-            raise ValueError(
-                "Vision head dimension must be one of 4, 8, 16, 32, 64, 128"
-            )
-        intermediate_size = width * vision_config["mlp_ratio"]
-        if not math.isfinite(intermediate_size) or intermediate_size != int(
-            intermediate_size
-        ):
-            raise ValueError("Vision MLP intermediate size must be an integer")
-        if type(vision_config["projector_bias"]) is not bool:
-            raise ValueError("vision_config.projector_bias must be a boolean")
+        validate_vision_config(vision_config, text_hidden_size)
         self.config = vision_config
         self.patch_size = vision_config["native_patch_size"]
         self.merge_size = vision_config["adapter_merge_size"]
