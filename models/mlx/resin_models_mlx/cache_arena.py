@@ -194,12 +194,33 @@ class ByteArena(Generic[_Geometry]):
             + np.arange(2) * geometry.page_tokens
         )
         rows += table.append_block_offsets[tokens, None, None]
+        index_dtype = np.int64 if self.kv_rows_need_i64 else np.int32
+        self.scatter_kv(
+            mx.array(rows.reshape(-1).astype(index_dtype)), keys, values, len(tokens)
+        )
+
+    @property
+    def kv_rows_need_i64(self) -> bool:
+        return (
+            self.nbytes // (self.geometry.kv_width * self.geometry.kv_dtype.size)
+            > 2**31
+        )
+
+    def scatter_kv(
+        self,
+        rows: mx.array,
+        keys: Sequence[mx.array],
+        values: Sequence[mx.array],
+        count: int,
+    ) -> None:
+        """Write K/V to precomputed, leased physical row indices."""
+        geometry = self.geometry
         row_bytes = geometry.kv_width * geometry.kv_dtype.size
-        index_dtype = np.int64 if self.nbytes // row_bytes > 2**31 else np.int32
-        packed = pack_key_values(keys, values, len(tokens), geometry.kv_width)
+        index_dtype = mx.int64 if self.kv_rows_need_i64 else mx.int32
+        packed = pack_key_values(keys, values, count, geometry.kv_width)
         self._epoch = self._storage.scatter_rows(
             self._epoch,
-            mx.array(rows.reshape(-1).astype(index_dtype)),
+            rows.reshape(-1).astype(index_dtype),
             packed.astype(geometry.kv_dtype),
             row_bytes=row_bytes,
             after=self._readers,

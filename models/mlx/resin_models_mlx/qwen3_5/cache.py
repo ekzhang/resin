@@ -39,6 +39,7 @@ from resin_models_mlx.qwen3_5.model import (
 STATE_BLOCK_TOKENS = 4096
 KV_GROUP = 0
 STATE_GROUP = 1
+MTP_GROUP = 2
 
 
 @dataclass(frozen=True, slots=True)
@@ -57,9 +58,12 @@ class CacheGeometry(SlabGeometry):
     convolution_shape: tuple[int, int, int]
     slab_units: int
     state_units: int
+    include_mtp: bool = False
 
     @classmethod
-    def from_config(cls, config: Qwen35Config) -> CacheGeometry:
+    def from_config(
+        cls, config: Qwen35Config, *, include_mtp: bool = False
+    ) -> CacheGeometry:
         recurrent_shape = (
             config.linear_layer_count,
             config.linear_num_value_heads,
@@ -93,6 +97,7 @@ class CacheGeometry(SlabGeometry):
             convolution_shape=convolution_shape,
             slab_units=math.ceil(state_units / layers) * layers,
             state_units=state_units,
+            include_mtp=include_mtp,
         )
 
     @property
@@ -108,16 +113,22 @@ class CacheGeometry(SlabGeometry):
         return math.prod(self.recurrent_shape[1:]) * mx.float32.size
 
     def layout(self, slab_capacity: int) -> CacheLayout:
+        groups = [
+            CacheGroupLayout(PAGE_TOKENS, blocks_per_slab=self.kv_blocks_per_slab),
+            CacheGroupLayout(
+                STATE_BLOCK_TOKENS,
+                blocks_per_slab=self.state_blocks_per_slab,
+                family=CacheGroupFamily.STATE,
+            ),
+        ]
+        if self.include_mtp:
+            groups.append(
+                CacheGroupLayout(PAGE_TOKENS, blocks_per_slab=self.slab_units)
+            )
         return CacheLayout(
             parent_capacity=slab_capacity,
-            groups=[
-                CacheGroupLayout(PAGE_TOKENS, blocks_per_slab=self.kv_blocks_per_slab),
-                CacheGroupLayout(
-                    STATE_BLOCK_TOKENS,
-                    blocks_per_slab=self.state_blocks_per_slab,
-                    family=CacheGroupFamily.STATE,
-                ),
-            ],
+            groups=groups,
+            decode_write_extra_tokens=int(self.include_mtp),
         )
 
 
@@ -129,6 +140,97 @@ class CacheArena(ByteArena[CacheGeometry]):
     """
 
     resource = "Qwen3.5 MLX cache"
+
+    def __init__(self, layout: CacheLayout, geometry: CacheGeometry) -> None:
+        super().__init__(layout, geometry)
+        self._lease_plan: PagedCachePlan | None = None
+        self._leased_pages: dict[tuple[int, bytes], tuple[mx.array, np.ndarray]] = {}
+
+    def _lease_tables(
+        self, plan: PagedCachePlan, rows: np.ndarray, group: int
+    ) -> tuple[mx.array, np.ndarray]:
+        if self._lease_plan is not plan:
+            self._lease_plan = plan
+            self._leased_pages.clear()
+        key = (group, rows.tobytes())
+        if key not in self._leased_pages:
+            table = plan.groups[group]
+            if np.any(table.block_table_start_indices[rows] != 0):
+                raise ValueError("Qwen full-context lease must start at page zero")
+            counts = table.block_indptr[rows + 1] - table.block_indptr[rows]
+            bases = np.zeros((len(rows), int(counts.max(initial=1))), np.int32)
+            for i, row in enumerate(rows.tolist()):
+                bases[i, : counts[i]] = table.block_slabs(
+                    row
+                ) * self.geometry.slab_units + table.block_slots(row)
+            self._leased_pages[key] = device_array(bases), counts
+        return self._leased_pages[key]
+
+    def leased_history(
+        self,
+        plan: PagedCachePlan,
+        rows: np.ndarray,
+        lengths: mx.array,
+        group: int = KV_GROUP,
+        skip: int = 0,
+    ) -> PagedHistory:
+        pages, _ = self._lease_tables(plan, rows, group)
+        geometry = self.geometry
+        units = self.view(geometry.kv_dtype, (-1, 2, PAGE_TOKENS, geometry.kv_width))
+        padding = max(0, 8 - lengths.size)
+        if padding:
+            lengths = mx.concatenate([lengths, mx.zeros((padding,), mx.int32)])
+        return PagedHistory(
+            units, pages, lengths, plan.groups[group].blocks_per_slab, skip
+        )
+
+    def write_leased(
+        self,
+        plan: PagedCachePlan,
+        rows: np.ndarray,
+        positions: mx.array,
+        limits: np.ndarray,
+        keys: Sequence[mx.array],
+        values: Sequence[mx.array],
+        group: int = KV_GROUP,
+    ) -> None:
+        """Resolve GPU positions against each row's validated full-context lease."""
+        pages, counts = self._lease_tables(plan, rows, group)
+        if np.any(limits >= counts.astype(np.int64) * PAGE_TOKENS):
+            raise ValueError("KV write is not leased")
+        bases = mx.take_along_axis(pages[: len(rows)], positions // PAGE_TOKENS, axis=1)
+        layer_units = (
+            bases.reshape(-1, 1)
+            + mx.arange(len(keys)) * plan.groups[group].blocks_per_slab
+        )
+        # Convert before multiplying: big arenas may need 64-bit row offsets.
+        if self.kv_rows_need_i64:
+            layer_units = layer_units.astype(mx.int64)
+        addressed = (
+            layer_units[:, :, None] * (2 * PAGE_TOKENS)
+            + (positions % PAGE_TOKENS).reshape(-1, 1, 1)
+            + mx.arange(2) * PAGE_TOKENS
+        )
+        self.scatter_kv(addressed, keys, values, positions.size)
+
+    def write_positions(
+        self,
+        plan: PagedCachePlan,
+        rows: np.ndarray,
+        positions: np.ndarray,
+        keys: Sequence[mx.array],
+        values: Sequence[mx.array],
+        group: int = KV_GROUP,
+    ) -> None:
+        self.write_leased(
+            plan,
+            rows,
+            mx.array(positions.astype(np.int32)),
+            positions.max(axis=1),
+            keys,
+            values,
+            group,
+        )
 
     def snapshot(self) -> mx.array:
         """Return an independent, immutable copy, ordered before later writes."""

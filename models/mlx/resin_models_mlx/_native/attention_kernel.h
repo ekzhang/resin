@@ -5,7 +5,8 @@
     const uint lane = thread_index_in_simdgroup;
     const uint group = simdgroup_index_in_threadgroup;
     const uint tid = thread_position_in_threadgroup.x;
-    // Runtime geometry: page-table width, partition count and layer offset.
+    // Runtime geometry: page-table width, partition count, layer offset,
+    // and either relative-bias extent or the first readable history position.
     const int PAGES = geometry[0];
     const int PARTITIONS = geometry[1];
     const int layer = geometry[2];
@@ -25,11 +26,13 @@
     const int first_position = lengths[3 * row + 1];
     const int first_block = lengths[3 * row + 2];
     const int extent = geometry[3];
+    constexpr int skip = 0;
     const auto head_bias = bias + ((row * HEADS) + first_head) * extent;
 #else
     constexpr bool biased = false;
     const int history = lengths[row];
     constexpr int first_position = 0, first_block = 0, extent = 0;
+    const int skip = geometry[3];
     const auto head_bias = units;  // Unused in the unbiased specialization.
 #endif
     const int total = history + 1;
@@ -59,7 +62,7 @@
     const int first = start + int(group) * run;
     const int last = min(first + run, stop);
     const int cached = min(last, history);
-    int p = first;
+    int p = max(first, skip);
     while (p < cached) {
         const int page_end = min(cached, (p / PAGE + 1) * PAGE);
         const long unit = long(pages[row * PAGES + (p / PAGE - first_block)]) + layer;

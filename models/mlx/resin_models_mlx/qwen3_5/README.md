@@ -2,8 +2,8 @@
 
 `Qwen35MlxRunner` serves dense and MoE Qwen3.5 checkpoints through Resin's
 Engine on one Apple Silicon GPU. It supports tied embeddings, paged attention,
-chunked prefill, prefix reuse, overlapping decode and image input. Speculative
-and MTP decoding are not supported.
+chunked prefill, prefix reuse, overlapping decode, image input, and optional
+speculation with the checkpoint's bundled MTP head.
 
 ## Run locally
 
@@ -57,6 +57,30 @@ The runner compiles the per-frame encoder by default; pass
 and frame slicing stay outside compilation. Upstream Split operations need
 concrete sizes, so compiled functions cache by shape; this does not promise one
 trace across image sizes. Startup warms one canonical grid with zero patches.
+
+## Optional MTP speculation
+
+`qwen3.5-0.8b-mtp-mlx` uses the original Qwen 0.8B checkpoint, including its
+MTP weights, and defaults to one draft. `qwen3.8-27b-mlx` uses the original
+27B checkpoint and defaults to two drafts; loading its BF16 checkpoint and
+serving the 8-bit weights require substantially more unified memory. Override
+with `--draft-tokens`, or use `--draft-tokens 0` for target-only decoding.
+The existing 0.8B prequantized preset stays target-only and doesn't include
+MTP weights.
+
+```bash
+QWEN_MTP="$(uv run hf download Qwen/Qwen3.5-0.8B \
+  --revision 2fc06364715b967f1860aea9cf38778875588b17 --quiet)"
+uv run scripts/mlx_serve.py --model qwen3.5-0.8b-mtp-mlx --checkpoint "$QWEN_MTP"
+```
+
+MLX verifies the anchor and drafts in one target forward, and reconstructs
+DeltaNet state for the accepted prefix without repeating the projections or
+MLP. Overlapped text decode keeps the next anchor and its position on the GPU;
+image rows, requested logprobs, and state checkpoint steps run synchronously.
+FP32 tests match greedy and seeded target-only outputs. In BF16, different
+GEMM shapes can round near-ties differently. Throughput depends on the model,
+context, and draft acceptance; MTP is not necessarily faster on the 0.8B.
 
 ## Runtime
 
