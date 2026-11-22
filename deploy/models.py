@@ -349,6 +349,31 @@ MODEL_SPECS.update(
             recipe="ornith",
             text_only=True,
         ),
+        "inkling2-mini-mlx": ModelSpec(
+            name="inkling2-mini-mlx",
+            family="inkling2",
+            checkpoint=Checkpoint(
+                repo_id="thinkingmachines/Inkling-2-Mini",
+                revision="ed40e7da625f594fc9c4990f5f66be24873c22d7",
+                directory="",
+                required_files=(
+                    "config.json",
+                    "model.safetensors.index.json",
+                    "hf_quant_config.json",
+                    "tokenizer.json",
+                    "processor_config.json",
+                ),
+            ),
+            # Target-only text on Apple Silicon; experts stay NVFP4/MXFP8.
+            backend="mlx",
+            gpu="Apple-Silicon",
+            label="inkling2-mini-mlx",
+            expert_backend="mlx-gather-qmm",
+            context_length=32_768,
+            max_batch_size=8,
+            gpu_memory_utilization=0.70,
+            text_only=True,
+        ),
         "inkling2-small": ModelSpec(
             name="inkling2-small",
             family="inkling2",
@@ -659,17 +684,27 @@ def create_runner(
     if spec.backend == "mlx":
         if draft_tokens:
             raise ValueError(
-                "this MLX Qwen3.5 runner does not support draft decoding; "
+                f"the MLX {spec.family} runner does not support draft decoding; "
                 "use draft_tokens=0"
             )
-        from resin_models_mlx.qwen3_5 import Qwen35MlxRunner
-
         if groups is not None:
             raise ValueError("the MLX runner executes on one Apple Silicon device")
         if expert_backend not in (None, spec.expert_backend):
             raise ValueError(f"{spec.name} uses expert_backend={spec.expert_backend!r}")
         # MLX has no CUDA graphs or graph batch catalog; graph options and
         # decode_batch_sizes do not apply. The batch limit sizes live state.
+        if spec.family == "inkling2":
+            from resin_models_mlx.inkling2 import Inkling2MlxRunner
+
+            return Inkling2MlxRunner(
+                checkpoint,
+                memory_utilization=memory,
+                max_seq_len=context_length,
+                max_batch_size=max_batch_size,
+                prefill_chunk_size=prefill_chunk_size,
+            )
+        from resin_models_mlx.qwen3_5 import Qwen35MlxRunner
+
         return Qwen35MlxRunner(
             checkpoint,
             memory_utilization=memory,
@@ -815,10 +850,12 @@ def create_recipe(
 
         # The native recipe takes the checkpoint's image settings directly.
         processor_config = path / "processor_config.json"
-        options = {}
+        options: dict[str, Any] = {}
         if processor_config.is_file():
             config = json.loads(processor_config.read_text())
             options["media_config"] = config["image_processor"]
+        if spec.text_only:
+            options["text_only"] = True
         return get_native_recipe(
             spec.family,
             Tokenizer.from_file(str(path / "tokenizer.json")),

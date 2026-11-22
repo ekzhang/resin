@@ -235,13 +235,20 @@ impl crate::Recipe for Inkling2Recipe {
         Ok(vec![encoder.special_id("<|content_model_end_sampling|>")?])
     }
     fn input_modalities(&self) -> &'static [&'static str] {
-        &["text", "image"]
+        if self.text_only {
+            &["text"]
+        } else {
+            &["text", "image"]
+        }
     }
     fn prepare_media(
         &self,
         sources: Vec<crate::media::Source>,
         encoder: &dyn crate::Encoder,
     ) -> Result<crate::media::Prepared, Error> {
+        if self.text_only {
+            return Err(Error::new("this recipe does not support media"));
+        }
         self.media_config.prepare(sources, encoder)
     }
 }

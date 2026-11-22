@@ -101,6 +101,75 @@ def test_mlx_factory_constructs_single_device_runner(monkeypatch, tmp_path, name
         )
 
 
+def test_inkling2_mlx_factory_constructs_text_runner(monkeypatch, tmp_path):
+    pytest.importorskip("mlx.core")
+    spec = get_model("inkling2-mini-mlx")
+    module = importlib.import_module("resin_models_mlx.inkling2")
+    calls = []
+    monkeypatch.setattr(
+        module,
+        "Inkling2MlxRunner",
+        lambda *args, **kwargs: calls.append((args, kwargs)),
+    )
+
+    def create(**overrides):
+        options: dict[str, Any] = dict(
+            device="mps",
+            context_length=8192,
+            max_batch_size=4,
+            prefill_chunk_size=spec.prefill_chunk_size,
+            draft_tokens=0,
+        )
+        return create_runner(spec, checkpoint, **(options | overrides))
+
+    checkpoint = tmp_path / spec.name
+    create()
+    assert calls == [
+        (
+            (checkpoint,),
+            {
+                "memory_utilization": spec.gpu_memory_utilization,
+                "max_seq_len": 8192,
+                "max_batch_size": 4,
+                "prefill_chunk_size": 8192,
+            },
+        )
+    ]
+    with pytest.raises(ValueError, match="use draft_tokens=0"):
+        create(draft_tokens=7)
+    with pytest.raises(ValueError, match="one Apple Silicon device"):
+        create(groups=object())
+
+
+def test_inkling2_mlx_recipe_is_text_only(tmp_path):
+    from tokenizers import Tokenizer
+    from tokenizers.models import WordLevel
+
+    tokenizer = Tokenizer(WordLevel({"[UNK]": 0}, unk_token="[UNK]"))
+    tokenizer.add_special_tokens(
+        [
+            "<|message_system|>",
+            "<|message_user|>",
+            "<|message_model|>",
+            "<|content_text|>",
+            "<|content_image|>",
+            "<|content_thinking|>",
+            "<|content_model_end_sampling|>",
+            "<|end_message|>",
+            "<|unused_200054|>",
+        ]
+    )
+    tokenizer.save(str(tmp_path / "tokenizer.json"))
+    (tmp_path / "processor_config.json").write_text(
+        json.dumps({"image_processor": {"size": {"height": 8, "width": 8}}})
+    )
+    assert create_recipe("inkling2-mini-mlx", tmp_path).input_modalities == ["text"]
+    assert create_recipe("inkling2-mini", tmp_path).input_modalities == [
+        "text",
+        "image",
+    ]
+
+
 @pytest.mark.parametrize(
     "name,expected_recipe",
     [("ornith-1.0-35b", "ornith"), ("qwen3.5-0.8b-mlx", "qwen3_5")],
@@ -446,7 +515,9 @@ def test_glm_serving_checkpoints_allow_real_engine_prefix_reuse(
         assert second.take_result() == [len(prompt)]
 
 
-@pytest.mark.parametrize("name", ["ornith-1.0-35b", "qwen3.5-0.8b-mlx"])
+@pytest.mark.parametrize(
+    "name", ["ornith-1.0-35b", "qwen3.5-0.8b-mlx", "inkling2-mini-mlx"]
+)
 def test_local_presets_require_an_explicit_checkpoint(tmp_path, name):
     spec = get_model(name)
     with pytest.raises(ValueError, match="runs locally"):

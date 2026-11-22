@@ -168,6 +168,21 @@ mod tests {
         );
     }
     #[test]
+    fn text_only_recipe_refuses_media() {
+        use crate::{Recipe, inkling2::Inkling2Recipe};
+
+        assert!(
+            Inkling2Recipe::default()
+                .prepare_media(vec![], &Encoder)
+                .is_ok()
+        );
+        let text_only = Inkling2Recipe {
+            text_only: true,
+            ..Default::default()
+        };
+        assert!(text_only.prepare_media(vec![], &Encoder).is_err());
+    }
+    #[test]
     fn padding_is_negative_one_on_the_byte_scale() {
         let config = Config {
             size: Size {

@@ -42,4 +42,6 @@ resin_models_mlx = [
   "_native/LICENSE*",
   "qwen3_5/README.md",
   "qwen3_5/LICENSE",
+  "inkling2/README.md",
+  "inkling2/LICENSE",
 ]
