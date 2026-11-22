@@ -131,32 +131,25 @@ RESIN_TEST_CHECKPOINT="$INKLING_CHECKPOINT" \
 
 ### Prefill attention on M1 Pro
 
-The table times one attention visit on a 16 GiB M1 Pro using MLX 0.32.4 and
-synthetic BF16 inputs with Mini's head geometry. Each time is the median of
-three synchronized calls after warmup. The dense baseline includes gathering
-retained KV. Across all six cases the maximum absolute differences were
-2.62 × 10⁻⁶ for the output and 1.91 × 10⁻⁶ for log-sum-exp.
+Each cell shows the time for one attention visit, from the old dense path to
+the integrated paged kernel. The two implementations ran in separate sessions
+on the same 16 GiB M1 Pro with MLX 0.32.4, identical synthetic BF16 inputs and
+Mini's head geometry. Each time is the median of three calls after warmup.
 
-| Prior tokens | New tokens | Attention | Dense, ms | Paged, ms | Speedup |
-| -----------: | ---------: | --------- | --------: | --------: | ------: |
-|            0 |        128 | Global    |      0.96 |      0.62 |   1.55× |
-|            0 |        128 | Local     |      0.68 |      0.42 |   1.62× |
-|            0 |      2,048 | Global    |     56.83 |     15.18 |   3.75× |
-|            0 |      2,048 | Local     |     42.18 |     12.19 |   3.46× |
-|        8,193 |        128 | Global    |     16.64 |      6.90 |   2.41× |
-|        8,193 |        128 | Local     |      3.46 |      1.33 |   2.60× |
+| Prior tokens | New tokens | Global, dense → paged (ms) | Local, dense → paged (ms) |
+| -----------: | ---------: | ------------------------: | -----------------------: |
+|            0 |        128 |               0.96 → 0.73 |              0.68 → 0.70 |
+|            0 |      2,048 |             56.83 → 14.75 |            42.18 → 11.60 |
+|        8,193 |        128 |              16.64 → 7.36 |              3.46 → 1.29 |
+|            0 |      8,192 |         1,093.39 → 208.42 |           236.09 → 53.31 |
+|        8,192 |      8,192 |         3,039.08 → 637.95 |           224.47 → 57.32 |
 
-With the runner's full 8,192-token chunk, the benchmark synchronized after each
-dense query block to bound memory on this machine. Paged attention used one
-dispatch per visit. All four cases passed with maximum absolute errors of
-3.34 × 10⁻⁶ for the output and 2.86 × 10⁻⁶ for log-sum-exp.
-
-| Prior tokens | Attention | Dense, ms | Paged, ms | Speedup |
-| -----------: | --------- | --------: | --------: | ------: |
-|            0 | Global    |   1093.39 |    212.59 |   5.14× |
-|            0 | Local     |    236.09 |     56.74 |   4.16× |
-|        8,192 | Global    |   3039.08 |    604.84 |   5.02× |
-|        8,192 | Local     |    224.47 |     58.96 |   3.81× |
+Dense timings include gathering retained KV. For 8,192-token chunks, the
+benchmark synchronized after each dense query block to bound memory. Paged
+attention used one dispatch per visit. In all ten cases the integrated
+kernel matched the prototype bit for bit. Compared with the dense reference,
+the maximum absolute error was 3.34 × 10⁻⁶ for the output and 2.86 × 10⁻⁶
+for log-sum-exp.
 
 ### Historical full-model throughput on M4 Max
 
