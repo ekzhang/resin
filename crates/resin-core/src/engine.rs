@@ -210,7 +210,7 @@ struct RequestLeaseState {
     done: bool,
     cancelled: bool,
     cached_tokens: u32,
-    result: Option<Vec<u32>>,
+    result: Option<Result<Vec<u32>>>,
     prompt_logprobs: Option<Vec<Option<TokenLogprobs>>>,
 }
 #[derive(Clone, Debug)]
@@ -251,6 +251,14 @@ impl RequestHandle {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .cached_tokens
     }
+    pub fn failure(&self) -> Option<Error> {
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .result
+            .as_ref()
+            .and_then(|result| result.as_ref().err().cloned())
+    }
     pub fn take_result(&self) -> Result<Vec<u32>> {
         let mut state = self
             .state
@@ -262,12 +270,12 @@ impl RequestHandle {
         state
             .result
             .take()
-            .ok_or_else(|| Error::internal("request result has already been consumed"))
+            .ok_or_else(|| Error::internal("request result has already been consumed"))?
     }
 }
 fn complete_request_lease(
     state: &Arc<Mutex<RequestLeaseState>>,
-    result: Vec<u32>,
+    result: Result<Vec<u32>>,
     cancelled: bool,
 ) {
     let mut state = state
@@ -1477,7 +1485,7 @@ impl<P: Clone> EngineCore<P> {
             // failure releases access and discards uncommitted cold allocations;
             // resident/replay state stays owned by its request for the next attempt.
             let mut acquired_kv = None;
-            let mut capacity_miss = false;
+            let mut capacity_miss = None;
             let plan = (|| {
                 if let Some(resources) = self.kv_resources.as_mut() {
                     if decode_reservation_lookahead > self.runner_config.decode_write_lookahead() {
@@ -1519,8 +1527,9 @@ impl<P: Clone> EngineCore<P> {
                                 context,
                             )
                             .map_err(|error| {
-                                capacity_miss =
-                                    matches!(error, CachePoolError::InsufficientCapacity { .. });
+                                if matches!(error, CachePoolError::InsufficientCapacity { .. }) {
+                                    capacity_miss = Some(request.id);
+                                }
                                 Error::from(error)
                             })?;
                     }
@@ -1578,11 +1587,19 @@ impl<P: Clone> EngineCore<P> {
                     });
                     self.scheduler.restore_rejected(scheduled);
                     rollback?;
-                    if capacity_miss && self.storage_pending() {
+                    if let Some(request_id) = capacity_miss {
+                        if self.storage_pending() {
+                            return Ok(None);
+                        }
+                        if self.retract_one(runner)? {
+                            continue;
+                        }
+                        // No other owner can make room. Retire only the request
+                        // whose growth failed, not the inference loop.
+                        let failure = Error::memory(format!("not enough KV cache: {error}"));
+                        let retired = self.abort_scheduled(runner, request_id, Some(failure))?;
+                        debug_assert!(retired, "failed allocation belongs to a ready request");
                         return Ok(None);
-                    }
-                    if capacity_miss && self.retract_one(runner)? {
-                        continue;
                     }
                     return Err(error);
                 }
@@ -1906,7 +1923,7 @@ impl<P: Clone> EngineCore<P> {
                 if retire {
                     complete_request_lease(
                         &row.request.lease,
-                        std::mem::take(&mut row.request.generated),
+                        Ok(std::mem::take(&mut row.request.generated)),
                         false,
                     );
                     row.terminal = true;
@@ -1930,7 +1947,7 @@ impl<P: Clone> EngineCore<P> {
                 let request = row.request;
                 if retire {
                     if !row.terminal {
-                        complete_request_lease(&request.lease, request.generated, false);
+                        complete_request_lease(&request.lease, Ok(request.generated), false);
                     }
                 } else {
                     survivors.push(request);
@@ -1962,6 +1979,15 @@ impl<P: Clone> EngineCore<P> {
             self.scheduler
                 .restore_rejected(vec![self.storage_waiting.swap_remove(index)]);
         }
+        self.abort_scheduled(runner, request_id, None)
+    }
+
+    fn abort_scheduled(
+        &mut self,
+        runner: &mut impl Runner<P>,
+        request_id: u64,
+        failure: Option<Error>,
+    ) -> Result<bool> {
         if let Some(index) = self.scheduler.position(|request| request.id == request_id) {
             let mut request = self.scheduler.remove(index);
             if let Err(error) = self.validate_request_cache(&request) {
@@ -1982,8 +2008,9 @@ impl<P: Clone> EngineCore<P> {
                 );
                 return Err(error);
             }
-            let generated = std::mem::take(&mut request.generated);
-            complete_request_lease(&request.lease, generated, true);
+            let cancelled = failure.is_none();
+            let result = failure.map_or_else(|| Ok(request.generated), Err);
+            complete_request_lease(&request.lease, result, cancelled);
             let idle = !self.has_work();
             if let Some(metrics) = &mut self.metrics {
                 metrics.abort();
@@ -2285,8 +2312,7 @@ impl<P: Clone> EngineCore<P> {
                 );
                 return Err(error);
             }
-            let generated = std::mem::take(&mut request.generated);
-            complete_request_lease(&request.lease, generated, true);
+            complete_request_lease(&request.lease, Ok(request.generated), true);
             if let Some(metrics) = &mut self.metrics {
                 metrics.abort();
             }

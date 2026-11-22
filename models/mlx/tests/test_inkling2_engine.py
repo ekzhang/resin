@@ -439,7 +439,7 @@ def test_multi_page_window_and_extent(tmp_path, monkeypatch, window, extent):
     assert mirror.attention_checks > 400
 
 
-def test_padded_vocabulary_ids_and_small_caches_are_rejected(weights):
+def test_padded_vocabulary_ids_are_rejected(weights):
     config = weights[0]
     runner = _runner(weights)
     # Embedding rows past the unpadded vocabulary are padding with no logits.
@@ -453,14 +453,22 @@ def test_padded_vocabulary_ids_and_small_caches_are_rejected(weights):
             while engine.has_work():
                 engine.step()
         assert len(runner._states) == 0
-    with pytest.raises(ValueError, match="fewer than one"):
-        Inkling2MlxRunner(
-            weights,
-            cache_slab_capacity=2,
-            max_seq_len=CONTEXT,
-            prefill_chunk_size=CHUNK,
-            workspace_bytes=64 << 20,
-        )
+
+
+def test_cache_can_be_smaller_than_context_ceiling(weights):
+    ceiling = weights[0].max_position_embeddings
+    runner = Inkling2MlxRunner(
+        weights,
+        cache_slab_capacity=3,
+        max_seq_len=ceiling,
+        prefill_chunk_size=CHUNK,
+        workspace_bytes=64 << 20,
+    )
+    assert runner.cache_layout.parent_capacity < runner.cache_geometry.sequence_slabs(
+        ceiling
+    )
+    with Engine(runner, context_length=ceiling) as engine:
+        assert len(_generate(engine, [[1, 2, 3]], 2)[0]) == 2
 
 
 def test_unseen_lengths_and_sampling_reuse_compiled_kernels(weights, monkeypatch):

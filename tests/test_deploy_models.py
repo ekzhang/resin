@@ -479,3 +479,15 @@ def test_local_presets_require_an_explicit_checkpoint(tmp_path, name):
     checkpoint = tmp_path / name
     make_checkpoint(checkpoint, spec.checkpoint.required_files)
     assert require_checkpoint(spec, checkpoint=checkpoint) == checkpoint
+
+
+@pytest.mark.parametrize(
+    "name,ceiling",
+    [
+        ("ornith-1.0-35b", 262_144),
+        ("qwen3.5-0.8b-mlx", 262_144),
+        ("inkling2-mini-mlx", 1_048_576),
+    ],
+)
+def test_mlx_presets_use_checkpoint_context_ceiling(name, ceiling):
+    assert get_model(name).context_length == ceiling

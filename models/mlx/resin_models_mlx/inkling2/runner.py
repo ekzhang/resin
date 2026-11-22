@@ -187,11 +187,6 @@ class Inkling2MlxRunner(MlxRunner[CacheArena]):
         # for reusable prefixes; beyond that, memory is better left unwired.
         wanted = 2 * max_batch_size * geometry.sequence_slabs(self.max_seq_len) + 16
         slab_capacity = min(slab_capacity, wanted)
-        if slab_capacity < geometry.sequence_slabs(self.max_seq_len):
-            raise ValueError(
-                f"the Inkling 2 cache holds {slab_capacity} slabs, fewer than one "
-                f"{self.max_seq_len}-token request needs; lower max_seq_len"
-            )
         cache = CacheArena(geometry.layout(slab_capacity), geometry)
         super().__init__(
             cache,

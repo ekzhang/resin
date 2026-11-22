@@ -1927,6 +1927,28 @@ fn bounded_reservation_engine(capacity: u32, context: u32) -> EngineCore<&'stati
 }
 
 #[test]
+fn cache_exhaustion_fails_only_the_request_and_releases_its_pages() {
+    let mut engine = bounded_reservation_engine(1, 128);
+    let mut model = Model::default();
+    let oversized = engine.submit(input(vec![1; 4], 2)).unwrap();
+    let short = engine.submit(input(vec![3], 1)).unwrap();
+    assert_eq!(engine.step(&mut model).unwrap().len(), 1);
+    assert_eq!(engine.cache_free_parent_count(), Some(0));
+    assert!(engine.step(&mut model).unwrap().is_empty());
+    assert!(oversized.done());
+    assert!(!oversized.cancelled());
+    let error = oversized.take_result().unwrap_err();
+    assert_eq!(error.kind, ErrorKind::Memory);
+    assert!(error.to_string().contains("not enough KV cache"));
+    assert_eq!(model.released, [oversized.id()]);
+    assert_eq!(engine.cache_free_parent_count(), Some(1));
+
+    assert_eq!(engine.step(&mut model).unwrap().len(), 1);
+    assert_eq!(short.take_result().unwrap(), [4]);
+    assert_eq!(engine.cache_free_parent_count(), Some(1));
+}
+
+#[test]
 fn only_overlap_admission_reserves_an_engine_sized_bounded_envelope() {
     for (overlap, prompt, output, context, pages) in [
         (false, 3, 40, 256, 2),

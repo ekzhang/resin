@@ -488,24 +488,36 @@ impl Session {
             .map_err(|error| format_python_error("request cancellation failed", error))
     }
     pub fn process(&mut self, token_events: Vec<TokenEvent>) -> Result<(), String> {
-        let mut grouped = HashMap::<u64, Vec<crate::TokenEvent>>::new();
+        let mut grouped = HashMap::<u64, (Vec<TokenEvent>, Option<String>)>::new();
         for event in token_events {
-            grouped.entry(event.request_id).or_default().push(event);
+            grouped.entry(event.request_id).or_default().0.push(event);
         }
         Python::attach(|py| {
             for (&id, request) in self.active.iter() {
-                if request.lease.bind(py).borrow().done() {
-                    grouped.entry(id).or_default();
+                let lease = request.lease.bind(py).borrow();
+                if lease.done() {
+                    grouped.entry(id).or_default().1 =
+                        lease.inner.failure().map(|error| error.to_string());
                 }
             }
         });
         if grouped.is_empty() {
             return Ok(());
         }
-        for (request_id, tokens) in grouped {
+        for (request_id, (tokens, failure)) in grouped {
             let Some(request) = self.active.get_mut(&request_id) else {
                 continue;
             };
+            if let Some(message) = failure {
+                send_event(
+                    request.sender.as_ref(),
+                    &mut self.packet,
+                    &request.http_id,
+                    GenerationEvent::Error { message },
+                );
+                self.active.remove(&request_id);
+                continue;
+            }
             let first_token = !tokens.is_empty() && request.first_token_at.is_none();
             if first_token {
                 request.first_token_at = Some(Instant::now());

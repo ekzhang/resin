@@ -37,7 +37,10 @@ request = engine.submit(
 defaults to 32768 and rejects requests whose requested sequence would exceed
 that bound. If `SamplingParams.max_output_tokens` is `None` (the default), generation
 may use the remaining model context. The value is always a terminal generation
-cap; Resin never reserves that entire lifetime at submission.
+cap; Resin never reserves that entire lifetime at submission. If the Engine
+cannot allocate the next step's KV pages after reclaiming cache and retrying,
+only that request fails. `RequestLease.take_result()` raises `MemoryError` for
+that request, and HTTP returns a request error without stopping the server.
 
 `prefill_chunk_size` defaults to 8192 tokens and is the scheduler's execution
 unit for prompt or replay work. A runner may declare a smaller hard
