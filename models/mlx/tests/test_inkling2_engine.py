@@ -338,12 +338,12 @@ def test_padded_vocabulary_ids_and_small_caches_are_rejected(weights):
 
 
 def test_unseen_lengths_and_sampling_reuse_compiled_kernels(weights, monkeypatch):
-    from resin_models_mlx import paged_attention
+    from resin_models_mlx import fused_norm, paged_attention
     from resin_models_mlx.inkling2 import kernels, quantization
 
     # Record every custom Metal kernel variant: its factory, template and dtypes.
     variants: set = set()
-    for module in (kernels, quantization, paged_attention):
+    for module in (kernels, quantization, paged_attention, fused_norm):
         for name in dir(module):
             factory = getattr(module, name)
             if not (
@@ -355,7 +355,9 @@ def test_unseen_lengths_and_sampling_reuse_compiled_kernels(weights, monkeypatch
                 kernel = factory(*args, **options)
 
                 def call(**launch):
-                    dtypes = tuple(str(x.dtype) for x in launch["inputs"])
+                    dtypes = tuple(
+                        str(getattr(x, "dtype", type(x))) for x in launch["inputs"]
+                    )
                     variants.add(
                         (name, args, tuple(launch.get("template", ())), dtypes)
                     )
@@ -414,7 +416,7 @@ def test_unseen_lengths_and_sampling_reuse_compiled_kernels(weights, monkeypatch
         "_kernel",
         "_mix_kernel",
         "_mxfp8_kernel",
-        "_norm_kernel",
+        "_rms_kernel",
         "_nvfp4_kernel",
         "_route_kernel",
     }

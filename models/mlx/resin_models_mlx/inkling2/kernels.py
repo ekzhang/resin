@@ -499,8 +499,6 @@ def depth_mix(
     """
     rows, width = sources[0].shape
     queries = queries.reshape(-1, width)
-    if queries.dtype != mx.float32:
-        queries = queries.astype(mx.float32)
     inputs = [*sources, *([addend] if addend is not None else []), queries]
     return _mix_kernel(len(sources), addend is not None)(
         inputs=inputs,
@@ -514,72 +512,6 @@ def depth_mix(
         threadgroup=(_THREADS, 1, 1),
         output_shapes=[(rows, queries.shape[0], width)],
         output_dtypes=[mx.float32],
-    )[0]
-
-
-_NORM_SOURCE = r"""
-    // One threadgroup per row: FP32 sum of squares, then one rounding to the output.
-    constexpr int PER = (H + THREADS - 1) / THREADS;
-    constexpr int SIMDS = THREADS / 32;
-    const uint row = threadgroup_position_in_grid.x;
-    const uint tid = thread_position_in_threadgroup.x;
-    const uint lane = thread_index_in_simdgroup;
-    const uint simd = simdgroup_index_in_threadgroup;
-    threadgroup float partial_sums[SIMDS];
-    threadgroup float total;
-    float values[PER];
-    float sum = 0.0f;
-    for (int k = 0; k < PER; ++k) {
-        const uint c = tid + k * THREADS;
-        values[k] = c < H ? float(x[ulong(row) * H + c]) : 0.0f;
-        sum += values[k] * values[k];
-    }
-    sum = simd_sum(sum);
-    if (lane == 0) partial_sums[simd] = sum;
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    if (tid == 0) {
-        float value = 0.0f;
-        for (int g = 0; g < SIMDS; ++g) value += partial_sums[g];
-        total = value;
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    const float inverse = metal::precise::rsqrt(total / float(H) + eps[0]);
-    for (int k = 0; k < PER; ++k) {
-        const uint c = tid + k * THREADS;
-        if (c >= H) continue;
-        float value = values[k] * inverse;
-        if (WEIGHTED) value *= float(weight[c]);
-        output[ulong(row) * H + c] = bfloat(value);
-    }
-"""
-
-
-@cache
-def _norm_kernel():
-    return mx.fast.metal_kernel(
-        name="resin_inkling2_rms_norm",
-        input_names=["x", "weight", "eps"],
-        output_names=["output"],
-        source=_NORM_SOURCE,
-    )
-
-
-def rms_norm(x: mx.array, weight: mx.array | None, eps: float) -> mx.array:
-    """FP32 RMS normalization times an optional FP32 weight, rounded once to BF16."""
-    width = x.shape[-1]
-    rows = x.size // width
-    threads = 256 if width >= 256 else max(32, -(-width // 32) * 32)
-    return _norm_kernel()(
-        inputs=[
-            x,
-            weight if weight is not None else constant((), "float32"),
-            constant((float(eps),) * 8, "float32"),
-        ],
-        template=[("H", width), ("THREADS", threads), ("WEIGHTED", weight is not None)],
-        grid=(rows * threads, 1, 1),
-        threadgroup=(threads, 1, 1),
-        output_shapes=[x.shape],
-        output_dtypes=[mx.bfloat16],
     )[0]
 
 
@@ -678,7 +610,6 @@ def gemv_f32(x: mx.array, weight: mx.array) -> mx.array:
 __all__ = [
     "constant",
     "gemv_f32",
-    "rms_norm",
     "depth_mix",
     "expert_activation",
     "expert_combine",

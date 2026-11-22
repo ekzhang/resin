@@ -1,4 +1,4 @@
-"""Exact BF16 RMS and rounded residual+RMS with FP32 effective scales.
+"""FP32 RMS and optional rounded residual addition, with one final BF16 store.
 
 Reduction adapted from MLX v0.32.4 rms_norm.metal (Apple Inc., 2024, MIT).
 The native four-values-per-thread reduction and BF16 boundaries are retained.
@@ -7,6 +7,8 @@ The native four-values-per-thread reduction and BF16 boundaries are retained.
 from functools import cache
 
 import mlx.core as mx
+
+from resin_models_mlx.metal import constant
 
 _HEADER = """
 inline long resin_row_offset(uint row, constant const int* shape,
@@ -82,14 +84,14 @@ _ROW_SOURCE = r"""
 
 
 @cache
-def _kernel(residual: bool):
+def _rms_kernel(residual: bool):
     load = "float(x[base + (lid * N_READS + i) * stride])"
     setup = ""
     inputs, outputs = ["x", "scale", "eps"], ["out"]
     store = """
         float normalized = thread_x[i] * inv_mean;
-        out[long(gid) * D + column] =
-            bfloat16_t(scale[column * scale_strides[0]] * normalized);
+        if constexpr (WEIGHTED) normalized *= float(scale[column * scale_strides[0]]);
+        out[long(gid) * D + column] = bfloat16_t(normalized);
     """
     if residual:
         inputs, outputs = ["x", "residual", "scale", "eps"], ["summed", "out"]
@@ -108,7 +110,7 @@ def _kernel(residual: bool):
         .replace("$STORE$", store)
     )
     return mx.fast.metal_kernel(
-        name="resin_qwen35_" + ("residual" if residual else "mixed") + "_rms",
+        name="resin_" + ("residual" if residual else "mixed") + "_rms",
         input_names=inputs,
         output_names=outputs,
         source=source,
@@ -120,12 +122,15 @@ def _kernel(residual: bool):
 
 def _supported(x, scale):
     return (
-        scale is not None
-        and x.dtype == mx.bfloat16
-        and scale.dtype == mx.float32
+        x.dtype in (mx.bfloat16, mx.float32)
         and x.ndim > 0
-        and scale.ndim == 1
-        and scale.size == x.shape[-1]
+        and (
+            scale is None
+            or (
+                scale.shape == (x.shape[-1],)
+                and scale.dtype in (mx.bfloat16, mx.float32)
+            )
+        )
         and 8 <= x.shape[-1] <= 4096
         and x.size > 0
         and x.size // x.shape[-1] <= 0xFFFF_FFFF
@@ -134,28 +139,31 @@ def _supported(x, scale):
     )
 
 
-def _launch(x, inputs, residual=False):
+def _launch(x, scale, eps, residual=None):
     threads = -(-x.shape[-1] // 128) * 32
-    return _kernel(residual)(
-        inputs=inputs,
-        template=[("D", x.shape[-1])],
+    inputs = [x] if residual is None else [x, residual]
+    return _rms_kernel(residual is not None)(
+        inputs=[*inputs, scale if scale is not None else constant((), "float32"), eps],
+        template=[("D", x.shape[-1]), ("WEIGHTED", scale is not None)],
         grid=(threads * (x.size // x.shape[-1]), 1, 1),
         threadgroup=(threads, 1, 1),
-        output_shapes=[x.shape] * (2 if residual else 1),
-        output_dtypes=[mx.bfloat16] * (2 if residual else 1),
+        output_shapes=[x.shape] * len(inputs),
+        output_dtypes=[mx.bfloat16] * len(inputs),
     )
 
 
-def mixed_rms_norm(x, scale, eps):
-    if not _supported(x, scale):
-        return mx.fast.rms_norm(x, scale, eps).astype(x.dtype)
-    return _launch(x, [x, scale, eps])[0]
+def rms_norm(x, scale, eps, *, dtype=mx.bfloat16):
+    """Normalize and scale in FP32, rounding once to the requested output dtype."""
+    if dtype == mx.bfloat16 and _supported(x, scale):
+        return _launch(x, scale, eps)[0]
+    # MLX rounds the normalized value to its promoted dtype before scaling.
+    return mx.fast.rms_norm(x.astype(mx.float32), scale, eps).astype(dtype)
 
 
 def residual_rms_norm(x, residual, scale, eps):
     if x.dtype == residual.dtype == mx.bfloat16:
         left, right = mx.broadcast_arrays(x, residual)
         if _supported(left, scale):
-            return tuple(_launch(left, [left, right, scale, eps], residual=True))
+            return tuple(_launch(left, scale, eps, right))
     summed = x + residual
-    return summed, mx.fast.rms_norm(summed, scale, eps).astype(summed.dtype)
+    return summed, rms_norm(summed, scale, eps, dtype=summed.dtype)

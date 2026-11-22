@@ -62,7 +62,7 @@ def dense_attention(
         distance = mx.arange(history + start, hi)[:, None] - mx.arange(split, hi)
         index = mx.clip(distance, 0, extent - 1)
         gathered = mx.take_along_axis(
-            bias[:, start:stop].astype(F32),
+            bias[:, start:stop],
             mx.broadcast_to(index[None, :, None], (batch, span, heads, hi - split)),
             axis=-1,
         )

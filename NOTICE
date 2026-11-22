@@ -195,7 +195,7 @@ directory's LICENSE. The adaptation preserves BF16 convolution and sigmoid
 rounding while returning Q/K/V and the next carry in the same dispatch.
 
 The mixed-precision RMS and rounded residual-RMS kernels in
-models/mlx/resin_models_mlx/qwen3_5/fused_norm.py adapt the four-values-per-thread
+models/mlx/resin_models_mlx/fused_norm.py adapt the four-values-per-thread
 reduction from MLX v0.32.4's mlx/backend/metal/kernels/rms_norm.metal:
 
   Copyright 2024 Apple Inc.

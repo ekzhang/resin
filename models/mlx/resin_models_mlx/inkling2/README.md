@@ -33,8 +33,9 @@ kernel does, rather than through MLX's global scale.
 
 The checkpoint requires quantized expert activations. A Metal kernel reproduces
 the CUDA quantizer bit for bit (NVFP4's four-or-six block scale chosen by summed
-reconstruction error; MXFP8's power-of-two scale) and emits the dequantized
-codes, which are exact in BF16. The one exception is an MXFP8 block whose
+reconstruction error and MXFP8's power-of-two scale) and emits FP32 inputs
+for the expert GEMMs. The NVFP4 row maximum stays in the activation dtype
+until the FP32 output scaling step. The one exception to quantizer parity is an MXFP8 block whose
 largest value is below 448 · 2⁻¹²⁷, which becomes zero where CUDA keeps
 denormals. The packed GEMM therefore forms the same products as CUDA's
 W4A4/W8A8 MMA, up to FP32 summation order. Attention and dense projection
@@ -65,7 +66,8 @@ query blocks, reads only each block's window band or causal prefix, and skips
 bias work for global keys more than 1,024 positions back.
 
 Decode overlaps through the Engine's enqueue contract. Fused Metal kernels cover
-short convolutions, depth mixes, RMS norms, expert routing, the capped SwiGLU
+four-tap convolutions over independent 16-token tiles, depth mixes, RMS norms,
+expert routing, the capped SwiGLU
 with its output scale, the route combine and the BF16 vocabulary projection
 with FP32 output. Decode also compiles small FP32 helpers with `mx.compile`;
 their shapes depend only on the batch size. Prefill runs uncompiled, and chunks
@@ -128,8 +130,9 @@ RESIN_TEST_CHECKPOINT="$INKLING_CHECKPOINT" \
 
 ## Measured performance
 
-November 22, 2026, 14-inch MacBook Pro with M4 Max and 128 GiB, MLX 0.32.4,
-ShareGPT prompts tokenized for Inkling and greedy sampling. Prefill figures are
+The original runner (`e2f020b`) was benchmarked on November 22, 2026 on a
+14-inch MacBook Pro with M4 Max and 128 GiB, using MLX 0.32.4, ShareGPT
+prompts tokenized for Inkling and greedy sampling. Prefill figures are
 medians of three cohorts; decode figures are medians of 20 overlapped steps after
 five warmup steps. This laptop throttles under sustained load.
 

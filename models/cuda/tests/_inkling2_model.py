@@ -47,8 +47,8 @@ def tiny_config() -> Inkling2Config:
 
 
 class DenseCache:
-    def __init__(self, config, batch):
-        self.page_tokens, self.slab_units = 128, 1
+    def __init__(self, config, batch, capacity=128):
+        self.page_tokens, self.slab_units = capacity, 1
         self.counts = {
             0: config.execution_global_layer_count,
             1: config.execution_local_layer_count,

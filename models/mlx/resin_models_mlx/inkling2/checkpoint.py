@@ -151,8 +151,8 @@ def _experts(tensors: dict[str, mx.array], prefix: str, mode: str) -> Experts:
         mode=mode,
     )
     if mode == "nvfp4":
-        experts.w13_amax = tensors[prefix + "w13_weight_amax"].astype(mx.float32)
-        experts.w2_amax = tensors[prefix + "w2_weight_amax"].astype(mx.float32)
+        experts.w13_amax = tensors[prefix + "w13_weight_amax"]
+        experts.w2_amax = tensors[prefix + "w2_weight_amax"]
         experts.w13_denominator = tensors[prefix + "w13_weight_outer_scale_denominator"]
         experts.w2_denominator = tensors[prefix + "w2_weight_outer_scale_denominator"]
     return experts
@@ -213,8 +213,8 @@ def load_weights(root: Path, config: Inkling2Config) -> Inkling2Weights:
             )
             k_projection = v_projection = None
         else:
-            k_conv = get(prefix + "attn.k_sconv.static_w").astype(mx.float32)
-            v_conv = get(prefix + "attn.v_sconv.static_w").astype(mx.float32)
+            k_conv = get(prefix + "attn.k_sconv.static_w")
+            v_conv = get(prefix + "attn.v_sconv.static_w")
             projection = mx.concatenate(query)
             k_projection = mx.concatenate(
                 [attention["wk_dv"], get(prefix + "attn.k_sconv.weight_proj")]
@@ -240,11 +240,8 @@ def load_weights(root: Path, config: Inkling2Config) -> Inkling2Weights:
         layers.append(
             Layer(
                 local=local,
-                # Norms compute in FP32; keep their weights in FP32 too.
-                norms=tuple(
-                    get(prefix + name + ".weight").astype(mx.float32) for name in norms
-                ),
-                mlp_norm=get(prefix + "mlp_norm.weight").astype(mx.float32),
+                norms=tuple(get(prefix + name + ".weight") for name in norms),
+                mlp_norm=get(prefix + "mlp_norm.weight"),
                 projection=projection,
                 k_projection=k_projection,
                 v_projection=v_projection,
@@ -258,7 +255,7 @@ def load_weights(root: Path, config: Inkling2Config) -> Inkling2Weights:
                 mlp_conv=get(prefix + "mlp_sconv.weight").reshape(-1, 4),
                 # The router runs in FP32; keep one FP32 copy rather than casting per step.
                 router=get(prefix + "mlp.gate.weight").astype(mx.float32),
-                router_bias=get(prefix + "mlp.gate.bias").astype(mx.float32),
+                router_bias=get(prefix + "mlp.gate.bias"),
                 experts=_experts(
                     tensors, PREFIX + prefix + "mlp.experts.", modes.pop()
                 ),
@@ -267,26 +264,25 @@ def load_weights(root: Path, config: Inkling2Config) -> Inkling2Weights:
         )
     loop_queries = None
     if loop is not None:
-        queries = get("middle_cycle_cross_pass_queries").astype(mx.float32)
-        kv_queries = get("middle_cycle_cross_pass_kv_queries").astype(mx.float32)
+        queries = get("middle_cycle_cross_pass_queries")
+        kv_queries = get("middle_cycle_cross_pass_kv_queries")
         # Per core layer: query stream, key stream, value stream, MLP.
         loop_queries = mx.stack(
             [queries[0::2], kv_queries[0::2], kv_queries[1::2], queries[1::2]], axis=1
         )
     weights = Inkling2Weights(
         embed=get("embed.weight"),
-        embed_norm=get("embed_norm.weight").astype(mx.float32),
-        norm=get("norm.weight").astype(mx.float32),
+        embed_norm=get("embed_norm.weight"),
+        norm=get("norm.weight"),
         unembed=get("unembed.weight"),
         attn_queries=[
-            get(f"attn_res.attn_queries.{i}").astype(mx.float32)
+            get(f"attn_res.attn_queries.{i}")
             for i in range(config.num_hidden_layers - 1)
         ],
         mlp_queries=[
-            get(f"attn_res.mlp_queries.{i}").astype(mx.float32)
-            for i in range(config.num_hidden_layers)
+            get(f"attn_res.mlp_queries.{i}") for i in range(config.num_hidden_layers)
         ],
-        output_query=get("attn_res.output_query").astype(mx.float32),
+        output_query=get("attn_res.output_query"),
         layers=layers,
         loop_queries=loop_queries,
     )

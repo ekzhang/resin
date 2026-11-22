@@ -24,8 +24,8 @@ from mlx_lm.models.qwen3_next import Qwen3NextMLP as _FeedForward
 from mlx_lm.models.qwen3_next import Qwen3NextSparseMoeBlock as _SparseMoe
 
 from resin.models.qwen3_5.config import Qwen35Config
+from resin_models_mlx.fused_norm import residual_rms_norm, rms_norm
 from resin_models_mlx.qwen3_5.fused_conv import conv4_silu_qkv
-from resin_models_mlx.qwen3_5.fused_norm import mixed_rms_norm, residual_rms_norm
 from resin_models_mlx.qwen3_5.gated_delta import gated_delta_update
 from resin_models_mlx.qwen3_5.normalization import normalize_qk
 
@@ -176,7 +176,7 @@ class OffsetRMSNorm(nn.Module):
         return self._scale[1]
 
     def __call__(self, hidden: mx.array) -> mx.array:
-        return mixed_rms_norm(hidden, self._effective_scale(), self.eps)
+        return rms_norm(hidden, self._effective_scale(), self.eps, dtype=hidden.dtype)
 
     def add_and_normalize(
         self, hidden: mx.array, residual: mx.array

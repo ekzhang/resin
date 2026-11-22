@@ -8,8 +8,8 @@ The checkpoint requires NVFP4 or MXFP8 activations before each expert GEMM.
 This follows the CUDA quantizer (adapted from SGLang e62ac627, Apache-2.0):
 NVFP4 picks the four- or six-level block scale with lower pairwise-summed
 reconstruction error, under a per-row outer scale; MXFP8 uses a power-of-two
-block scale. A code times its block scale is exact in BF16, so the kernel
-writes those products and leaves the per-row outer scale to the GEMM output.
+block scale. The kernels reconstruct the scaled codes in FP32 and leave any
+per-row outer scale for the GEMM output.
 """
 
 from functools import cache
@@ -80,7 +80,7 @@ _NVFP4_SOURCE = r"""
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
     const float amax = row_amax[0];
-    if (lid == 0) row_amax_out[row] = amax;
+    if (lid == 0) row_amax_out[row] = T(amax);
     if (!active) return;
     const float encoder = metal::min(metal::precise::divide(1536.0f, amax), FLOAT_MAX);
     const float decoder = metal::precise::divide(1.0f, encoder);
@@ -157,46 +157,32 @@ def _mxfp8_kernel():
     )
 
 
-def _threads(blocks: int) -> int:
-    return max(32, (blocks + 31) // 32 * 32)
-
-
 def quantize_activations(x: mx.array, mode: str) -> tuple[mx.array, mx.array | None]:
-    """Return FP32 dequantized activations without the outer scale, and row amax.
+    """Reconstruct FP32 GEMM inputs from a contiguous BF16 [rows, K] matrix.
 
-    ``x`` is a contiguous BF16 ``[rows, K]`` matrix. NVFP4 values exclude the
-    per-row outer scale ``amax / 1536``; the returned ``amax`` lets the GEMM
-    apply it with the weight's scale. MXFP8 has no outer scale and returns ``None``.
+    NVFP4 also returns each row's absolute maximum in the input dtype. The
+    expert epilogue applies its outer scale in FP32 before rounding the product.
     """
-
+    if mode not in ("nvfp4", "mxfp8"):
+        raise ValueError(f"unsupported Inkling 2 activation precision {mode!r}")
+    nvfp4 = mode == "nvfp4"
+    block = 16 if nvfp4 else 32
     rows, width = x.shape
-    if mode == "nvfp4":
-        if width % 16 or width // 16 > 1024:
-            raise ValueError("NVFP4 activations need a width divisible by 16")
-        threads = _threads(width // 16)
-        y, amax = _nvfp4_kernel()(
-            inputs=[x],
-            template=[("K", width)],
-            grid=(rows * threads, 1, 1),
-            threadgroup=(threads, 1, 1),
-            output_shapes=[(rows, width), (rows,)],
-            output_dtypes=[mx.float32, mx.float32],
+    if width % block or width // block > 1024:
+        raise ValueError(
+            f"{mode.upper()} activations need a width divisible by {block} and at most {1024 * block}"
         )
-        return y, amax
-    if mode == "mxfp8":
-        if width % 32 or width // 32 > 1024:
-            raise ValueError("MXFP8 activations need a width divisible by 32")
-        threads = _threads(width // 32)
-        (y,) = _mxfp8_kernel()(
-            inputs=[x],
-            template=[("K", width)],
-            grid=(rows * threads, 1, 1),
-            threadgroup=(threads, 1, 1),
-            output_shapes=[(rows, width)],
-            output_dtypes=[mx.float32],
-        )
-        return y, None
-    raise ValueError(f"unsupported Inkling 2 activation precision {mode!r}")
+    threads = max(32, (width // block + 31) // 32 * 32)
+    kernel = _nvfp4_kernel() if nvfp4 else _mxfp8_kernel()
+    outputs = kernel(
+        inputs=[x],
+        template=[("K", width), ("T", x.dtype)],
+        grid=(rows * threads, 1, 1),
+        threadgroup=(threads, 1, 1),
+        output_shapes=[x.shape, (rows,)] if nvfp4 else [x.shape],
+        output_dtypes=[mx.float32, x.dtype] if nvfp4 else [mx.float32],
+    )
+    return outputs[0], outputs[1] if nvfp4 else None
 
 
 __all__ = ["quantize_activations"]

@@ -18,6 +18,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "cuda" / "tests"))
 from _inkling2_expert_reference import dequant, nvfp4_reference  # noqa: E402
 
 from resin_models_cuda.inkling2 import kernels as reference  # noqa: E402
+from resin_models_mlx.fused_norm import rms_norm  # noqa: E402
 from resin_models_mlx.inkling2 import kernels  # noqa: E402
 from resin_models_mlx.inkling2.quantization import quantize_activations  # noqa: E402
 
@@ -53,7 +54,7 @@ def test_rms_norm(generator, dtype):
     x = (torch.randn(7, HIDDEN, generator=generator) * 3).to(dtype)
     weight = 1 + 0.2 * torch.randn(HIDDEN, generator=generator)
     for scale in (weight, None):
-        actual = kernels.rms_norm(_mx(x), None if scale is None else _mx(scale), 1e-6)
+        actual = rms_norm(_mx(x), None if scale is None else _mx(scale), 1e-6)
         expected = reference.rms_norm(x, scale, 1e-6, dtype=torch.bfloat16)
         _within_bf16_step(_torch(actual), expected)
 
@@ -127,7 +128,8 @@ def test_activation_quantization(generator, width):
     x[3] = 0
     packed, scales, amax = nvfp4_reference(x)
     values, row_amax = quantize_activations(_mx(x), "nvfp4")
-    assert row_amax is not None
+    assert values.dtype == mx.float32 and row_amax is not None
+    assert row_amax.dtype == mx.bfloat16
     assert torch.equal(
         _torch(values).abs(), dequant(packed, scales, torch.ones_like(amax), 1.0).abs()
     )
@@ -144,6 +146,20 @@ def test_activation_quantization(generator, width):
     values, row_amax = quantize_activations(_mx(x), "mxfp8")
     assert row_amax is None
     assert torch.equal(_torch(values), (codes * scale[..., None]).flatten(1))
+
+
+def test_nvfp4_row_max_precision():
+    # BF16 zero, subnormals, normal exponent boundaries and largest finite value.
+    bits = np.array([0, 1, 0x7F, 0x80, 0x81, 0x3F80, 0x7F7F], np.uint16)
+    x = mx.array(np.broadcast_to(bits[:, None] | 0x8000, (len(bits), 16)).copy()).view(
+        mx.bfloat16
+    )
+    _, compact = quantize_activations(x, "nvfp4")
+    _, wide = quantize_activations(x.astype(mx.float32), "nvfp4")
+    assert compact is not None and wide is not None
+    assert compact.dtype == mx.bfloat16 and wide.dtype == mx.float32
+    compact_bits = np.array(compact.view(mx.uint16)).astype(np.uint32) << 16
+    np.testing.assert_array_equal(compact_bits, np.array(wide.view(mx.uint32)))
 
 
 @pytest.mark.parametrize("rows", [1, 3, 4, 8, 9])
