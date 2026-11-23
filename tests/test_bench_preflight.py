@@ -27,7 +27,7 @@ def test_persistent_progress_survives_worker_failure(tmp_path, monkeypatch, fail
 
     def run():
         return bench.run_benchmark(
-            "glm-5.3-flash",
+            "glm53-flash",
             "unused",
             [{"phase": "decode", "context_length": 128, "batch_size": 1}],
             parallelism=Parallelism(world_size=4, attn_dp=4, ep=4),

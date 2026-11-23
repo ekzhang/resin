@@ -2,6 +2,7 @@
 
 import importlib
 import json
+import re
 import sys
 from dataclasses import replace
 from pathlib import Path
@@ -23,6 +24,12 @@ from deploy.models import (
 )
 
 
+def test_model_preset_names_are_hyphenated_identifiers():
+    for key, spec in MODEL_SPECS.items():
+        assert key == spec.name
+        assert re.fullmatch(r"[a-z0-9]+(?:-[a-z0-9]+)*", key), key
+
+
 @pytest.mark.parametrize("spec", MODEL_SPECS.values(), ids=lambda spec: spec.name)
 def test_cuda_scorer_cache_is_persisted_for_every_deployment(spec):
     env = image_environment(spec)
@@ -35,7 +42,7 @@ def test_cuda_scorer_cache_is_persisted_for_every_deployment(spec):
         assert Path(env[key]).is_relative_to(spec.kernel_mount)
 
 
-@pytest.mark.parametrize("name", ["gemma4", "gemma4-e2b", "deepseek-v41"])
+@pytest.mark.parametrize("name", ["gemma4-31b", "gemma4-e2b", "deepseek-v41"])
 def test_runtime_prepares_persistent_cute_cache(tmp_path, name):
     spec = replace(get_model(name), kernel_mount=str(tmp_path))
     prepare_runtime(spec)
@@ -47,10 +54,10 @@ def test_runtime_prepares_persistent_cute_cache(tmp_path, name):
 @pytest.mark.parametrize(
     "name,module_name,runner_name",
     [
-        ("ornith-1.0-35b", "qwen3_5", "Qwen35MlxRunner"),
-        ("qwen3.5-0.8b-mlx", "qwen3_5", "Qwen35MlxRunner"),
-        ("qwen3.5-0.8b-mtp-mlx", "qwen3_5", "Qwen35MlxRunner"),
-        ("qwen3.8-27b-mlx", "qwen3_5", "Qwen35MlxRunner"),
+        ("ornith10-35b", "qwen3_5", "Qwen35MlxRunner"),
+        ("qwen35-08b-mlx", "qwen3_5", "Qwen35MlxRunner"),
+        ("qwen35-08b-mtp-mlx", "qwen3_5", "Qwen35MlxRunner"),
+        ("qwen38-27b-mlx", "qwen3_5", "Qwen35MlxRunner"),
         ("inkling2-mini-mlx", "inkling2", "Inkling2MlxRunner"),
     ],
 )
@@ -126,7 +133,7 @@ def test_mlx_factory_constructs_single_device_runner(
 
 @pytest.mark.parametrize(
     "name,expected_recipe",
-    [("ornith-1.0-35b", "ornith"), ("qwen3.5-0.8b-mlx", "qwen3_5")],
+    [("ornith10-35b", "ornith"), ("qwen35-08b-mlx", "qwen3_5")],
 )
 def test_mlx_presets_use_matching_media_capabilities(
     monkeypatch, tmp_path, name, expected_recipe
@@ -303,8 +310,8 @@ def test_inkling2_recipe_uses_checkpoint_tokenizer_and_image_settings(tmp_path, 
 @pytest.mark.parametrize(
     "model,gpu",
     [
-        ("gemma4", "B200"),
-        ("qwen3_5", "B300"),
+        ("gemma4-31b", "B200"),
+        ("qwen38-27b", "B300"),
         ("inkling2-small", "H200"),
         ("deepseek-v41", "H100"),
     ],
@@ -341,7 +348,7 @@ def test_glm_default_target_and_mtp_catalogs_match_physical_batches(
     monkeypatch.setattr(module, "Glm53FlashCudaRunner", Runner)
     for drafts in (0, 1, 3, 7):
         create_runner(
-            "glm-5.3-flash",
+            "glm53-flash",
             device="cuda:0",
             context_length=4096,
             max_batch_size=maximum,
@@ -383,7 +390,7 @@ def test_glm_explicit_catalog_and_disabled_override_remain_authoritative(
     monkeypatch.setattr(module, "Glm53FlashCudaRunner", Runner)
     for drafts in (0, 3):
         create_runner(
-            "glm-5.3-flash",
+            "glm53-flash",
             device="cuda:0",
             context_length=4096,
             max_batch_size=8,
@@ -411,7 +418,7 @@ def test_glm_serving_checkpoints_allow_real_engine_prefix_reuse(
     from resin.models.glm5_3_flash.config import Glm53Config
     from resin_models_cuda.glm5_3_flash.cache import CacheGeometry
 
-    spec = get_model("glm-5.3-flash")
+    spec = get_model("glm53-flash")
     chunk = spec.prefill_chunk_size if checkpoint == "serving" else spec.context_length
     geometry = CacheGeometry.from_config(
         Glm53Config(), state_tokens=chunk, include_mtp=include_mtp
@@ -480,7 +487,7 @@ def test_glm_serving_checkpoints_allow_real_engine_prefix_reuse(
 
 
 @pytest.mark.parametrize(
-    "name", ["ornith-1.0-35b", "qwen3.5-0.8b-mlx", "inkling2-mini-mlx"]
+    "name", ["ornith10-35b", "qwen35-08b-mlx", "inkling2-mini-mlx"]
 )
 def test_local_presets_require_an_explicit_checkpoint(tmp_path, name):
     spec = get_model(name)
@@ -496,8 +503,8 @@ def test_local_presets_require_an_explicit_checkpoint(tmp_path, name):
 @pytest.mark.parametrize(
     "name,ceiling",
     [
-        ("ornith-1.0-35b", 262_144),
-        ("qwen3.5-0.8b-mlx", 262_144),
+        ("ornith10-35b", 262_144),
+        ("qwen35-08b-mlx", 262_144),
         ("inkling2-mini-mlx", 1_048_576),
     ],
 )

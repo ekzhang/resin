@@ -43,13 +43,11 @@ class ModelSpec:
     family: str
     checkpoint: Checkpoint
     gpu: str
-    label: str
     # "cuda" presets run on Modal or local NVIDIA GPUs; "mlx" presets run
     # locally on Apple Silicon from an explicit checkpoint directory.
     backend: str = "cuda"
     model_mount: str | None = None
     model_volume: str | None = None
-    app_name: str | None = None
     model_volume_version: int = 1
     kernel_mount: str | None = None
     kernel_volume: str | None = None
@@ -123,7 +121,6 @@ MODEL_SPECS = {
         gpu="H200",
         world_size=world_size,
         attn_tp=world_size,
-        label=f"gpt-oss-{size}",
         gpu_memory_utilization=0.95,
     )
     for size, revision, world_size in (
@@ -158,15 +155,14 @@ MODEL_SPECS.update(
             kernel_mount="/cache/resin-gemma4-e2b",
             kernel_volume="resin-gemma4-e2b-kernels-v1",
             gpu="A100-80GB",
-            label="gemma4-e2b-bf16",
             context_length=131072,
             max_batch_size=256,
             draft_tokens=3,
             gpu_memory_utilization=0.90,
             memory=128 * 1024,
         ),
-        "glm-5.3-flash": ModelSpec(
-            name="glm-5.3-flash",
+        "glm53-flash": ModelSpec(
+            name="glm53-flash",
             family="glm5_3_flash",
             checkpoint=Checkpoint(
                 repo_id="nvidia/GLM-5.3-Flash-NVFP4",
@@ -185,7 +181,6 @@ MODEL_SPECS.update(
             kernel_mount="/kernel-cache/resin-glm5-3-flash",
             kernel_volume="resin-glm5-3-flash-kernels-v1",
             gpu="B200",
-            label="glm-5.3-flash-nvfp4",
             world_size=4,
             attn_dp=4,
             ep=4,
@@ -221,7 +216,6 @@ MODEL_SPECS.update(
             world_size=4,
             attn_dp=4,
             ep=4,
-            label="deepseek-v41",
             context_length=1_048_576,
             max_batch_size=32,
             draft_tokens=3,
@@ -229,8 +223,8 @@ MODEL_SPECS.update(
             image_warmup=True,
             expert_backend="deepgemm",
         ),
-        "gemma4": ModelSpec(
-            name="gemma4",
+        "gemma4-31b": ModelSpec(
+            name="gemma4-31b",
             family="gemma4",
             checkpoint=Checkpoint(
                 repo_id="nvidia/Gemma-4-31B-IT-NVFP4",
@@ -258,16 +252,14 @@ MODEL_SPECS.update(
             kernel_mount="/cache/resin-gemma4",
             kernel_volume="resin-gemma4-kernels-v1",
             gpu="RTX-PRO-6000",
-            label="gemma4-31b",
-            app_name="resin-gemma4-nvfp4",
             context_length=262_144,
             draft_tokens=3,
             gpu_memory_utilization=0.95,
             memory=128 * 1024,
             image_warmup=True,
         ),
-        "qwen3_5": ModelSpec(
-            name="qwen3_5",
+        "qwen38-27b": ModelSpec(
+            name="qwen38-27b",
             family="qwen3_5",
             checkpoint=Checkpoint(
                 repo_id="RadixArk/Qwen3.8-27B-NVFP4",
@@ -288,7 +280,6 @@ MODEL_SPECS.update(
             kernel_mount="/kernel-cache/resin-qwen3-5",
             kernel_volume="resin-qwen3-5-kernels-v2",
             gpu="B200",
-            label="qwen3-8-27b",
             context_length=32_768,
             max_batch_size=32,
             draft_tokens=2,
@@ -296,8 +287,8 @@ MODEL_SPECS.update(
             memory=128 * 1024,
             image_warmup=True,
         ),
-        "qwen3.5-0.8b-mlx": ModelSpec(
-            name="qwen3.5-0.8b-mlx",
+        "qwen35-08b-mlx": ModelSpec(
+            name="qwen35-08b-mlx",
             family="qwen3_5",
             checkpoint=Checkpoint(
                 repo_id="mlx-community/Qwen3.5-0.8B-8bit",
@@ -315,15 +306,14 @@ MODEL_SPECS.update(
             ),
             backend="mlx",
             gpu="Apple-Silicon",
-            label="qwen3.5-0.8b-mlx",
             expert_backend="none",
             context_length=262_144,
             max_batch_size=4,
             gpu_memory_utilization=0.60,
             recipe="qwen3_5",
         ),
-        "qwen3.5-0.8b-mtp-mlx": ModelSpec(
-            name="qwen3.5-0.8b-mtp-mlx",
+        "qwen35-08b-mtp-mlx": ModelSpec(
+            name="qwen35-08b-mtp-mlx",
             family="qwen3_5",
             checkpoint=Checkpoint(
                 repo_id="Qwen/Qwen3.5-0.8B",
@@ -340,7 +330,6 @@ MODEL_SPECS.update(
             ),
             backend="mlx",
             gpu="Apple-Silicon",
-            label="qwen3.5-0.8b-mtp-mlx",
             expert_backend="none",
             context_length=262_144,
             max_batch_size=4,
@@ -348,8 +337,8 @@ MODEL_SPECS.update(
             gpu_memory_utilization=0.60,
             recipe="qwen3_5",
         ),
-        "qwen3.8-27b-mlx": ModelSpec(
-            name="qwen3.8-27b-mlx",
+        "qwen38-27b-mlx": ModelSpec(
+            name="qwen38-27b-mlx",
             family="qwen3_5",
             checkpoint=Checkpoint(
                 repo_id="Qwen/Qwen3.8-27B",
@@ -366,7 +355,6 @@ MODEL_SPECS.update(
             ),
             backend="mlx",
             gpu="M4-Max",
-            label="qwen3.8-27b-mlx",
             expert_backend="none",
             context_length=262_144,
             max_batch_size=16,
@@ -374,8 +362,8 @@ MODEL_SPECS.update(
             gpu_memory_utilization=0.70,
             recipe="qwen3_5",
         ),
-        "ornith-1.0-35b": ModelSpec(
-            name="ornith-1.0-35b",
+        "ornith10-35b": ModelSpec(
+            name="ornith10-35b",
             family="qwen3_5_moe",
             checkpoint=Checkpoint(
                 repo_id="ornith-ai/Ornith-1.0-35B",
@@ -392,7 +380,6 @@ MODEL_SPECS.update(
             # Apple Silicon (MLX) runner: BF16 weights quantized to 8-bit at load.
             backend="mlx",
             gpu="M4-Max",
-            label="ornith-1.0-35b-mlx",
             expert_backend="mlx-gather-qmm",
             context_length=262_144,
             max_batch_size=32,
@@ -419,7 +406,6 @@ MODEL_SPECS.update(
             # Target model and vision tower on Apple Silicon; experts stay NVFP4/MXFP8.
             backend="mlx",
             gpu="Apple-Silicon",
-            label="inkling2-mini-mlx",
             expert_backend="mlx-gather-qmm",
             context_length=1_048_576,
             max_batch_size=8,
@@ -457,7 +443,6 @@ MODEL_SPECS.update(
             world_size=2,
             attn_tp=2,
             ep=2,
-            label="inkling2-small",
             expert_backend="cute-dsl",
             context_length=1_048_576,
             max_batch_size=256,
@@ -486,7 +471,6 @@ MODEL_SPECS.update(
             kernel_mount="/kernel-cache/resin-inkling2",
             kernel_volume="resin-inkling2-kernels-v1",
             gpu="B300",
-            label="inkling2-mini",
             expert_backend="cute-dsl",
             context_length=1_048_576,
             max_batch_size=256,

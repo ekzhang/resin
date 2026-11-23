@@ -200,7 +200,7 @@ def test_phase_specific_sweeps_override_shared_values():
     args = bench.argument_parser().parse_args(
         [
             "--model",
-            "glm-5.3-flash",
+            "glm53-flash",
             "--context-lengths",
             "2048",
             "--batch-sizes",
@@ -231,7 +231,7 @@ def test_shared_sweep_options_remain_compatible():
     args = bench.argument_parser().parse_args(
         [
             "--model",
-            "glm-5.3-flash",
+            "glm53-flash",
             "--context-lengths",
             "1024,2048",
             "--batch-sizes",
@@ -255,7 +255,7 @@ def test_shared_sweep_options_remain_compatible():
 @pytest.mark.parametrize("ep,expert_tp", [(4, 1), (2, 2), (1, 4)])
 def test_glm_expert_tp_keeps_all_four_attention_replicas(ep, expert_tp):
     args = bench.argument_parser().parse_args(
-        ["--model", "glm-5.3-flash", "--ep", str(ep), "--attn-dp", "4"]
+        ["--model", "glm53-flash", "--ep", str(ep), "--attn-dp", "4"]
     )
     _, _, topology, _ = bench._configuration(args)
     assert topology.attn_dp == topology.world_size == 4
@@ -265,7 +265,7 @@ def test_glm_expert_tp_keeps_all_four_attention_replicas(ep, expert_tp):
 
 def test_glm_rejects_attention_replication_without_four_independent_drivers():
     args = bench.argument_parser().parse_args(
-        ["--model", "glm-5.3-flash", "--ep", "1", "--attn-dp", "2"]
+        ["--model", "glm53-flash", "--ep", "1", "--attn-dp", "2"]
     )
     with pytest.raises(ValueError, match="attention-DP=world size"):
         bench._configuration(args)
@@ -311,14 +311,14 @@ def test_invalid_options_fail_before_remote_dispatch(arguments, fragment, capsys
 @pytest.mark.parametrize("action", ["--download-only", "--publish-only"])
 def test_local_presets_have_no_modal_checkpoint_actions(action, capsys):
     with pytest.raises(SystemExit) as error:
-        bench.main(["--model", "ornith-1.0-35b", "--backend", "modal", action])
+        bench.main(["--model", "ornith10-35b", "--backend", "modal", action])
     assert error.value.code == 2
     assert "runs locally" in capsys.readouterr().err
 
 
 def test_local_preset_allows_explicit_prefill_chunk():
     args = bench.argument_parser().parse_args(
-        ["--model", "ornith-1.0-35b", "--prefill-chunk-size", "4096"]
+        ["--model", "ornith10-35b", "--prefill-chunk-size", "4096"]
     )
     _, _, _, options = bench._configuration(args)
     assert options["prefill_chunk_size"] == 4096
@@ -467,9 +467,9 @@ def test_modal_download_is_cpu_only_and_uses_shared_registry(monkeypatch, capsys
         raise AssertionError("download cannot allocate a benchmark")
 
     monkeypatch.setattr(bench, "_configuration", cannot_allocate)
-    bench.main(["--model", "gemma4", "--backend", "modal", "--publish-only"])
+    bench.main(["--model", "gemma4-31b", "--backend", "modal", "--publish-only"])
     assert json.loads(capsys.readouterr().out) == {
-        "model": "gemma4",
+        "model": "gemma4-31b",
         "metadata_only": True,
     }
 
@@ -481,7 +481,7 @@ def test_modal_download_is_cpu_only_and_uses_shared_registry(monkeypatch, capsys
             ["--model", "inkling2-small", "--balanced-experts"],
             "balanced expert routing",
         ),
-        (["--model", "qwen3_5", "--gpu", "B300"], "GPU-specific kernel"),
+        (["--model", "qwen38-27b", "--gpu", "B300"], "GPU-specific kernel"),
     ],
 )
 def test_unsupported_model_options_fail_before_remote_allocation(
@@ -493,7 +493,7 @@ def test_unsupported_model_options_fail_before_remote_allocation(
     assert fragment in capsys.readouterr().err
 
 
-@pytest.mark.parametrize("name", ["gpt-oss-20b", "gemma4"])
+@pytest.mark.parametrize("name", ["gpt-oss-20b", "gemma4-31b"])
 def test_model_graph_capacity_is_checked_before_remote_allocation(name, capsys):
     with pytest.raises(SystemExit) as error:
         bench.main(

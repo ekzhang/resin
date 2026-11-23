@@ -118,9 +118,9 @@ than distributed communication, cache mapping, or graph execution.
 The dedicated dense-parallel checkpoint validator has been retired. Raw
 checkpoint and control records remain under `artifacts/cuda-model-improvements/`
 as historical evidence. Current performance runs use `scripts/bench.py` with
-`--model gemma4` or `--model qwen3_5` and explicit topology options; local speculative
-Gemma runs also need `--assistant-checkpoint`. The regular tests retain
-distributed transport, cache, and model contracts.
+`--model gemma4-31b` or `--model qwen38-27b` and explicit topology options.
+Local speculative Gemma runs also need `--assistant-checkpoint`. The regular
+tests retain distributed transport, cache, and model contracts.
 
 ## CUDA graphs across ranks
 

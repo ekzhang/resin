@@ -21,8 +21,7 @@ same checkpoint validation contract for serving and benchmarking.
 Run `uv run scripts/bench.py --help` to see the current model keys. Serving and
 benchmarking both read [`MODEL_SPECS`](models.py), which defines each key's pinned
 checkpoint, hardware, parallelism, and serving limits. Each selection gets its
-own Modal app/endpoint; adding a model requires registry configuration and a
-runner adapter.
+own Modal app (`resin-<preset>`) and endpoint label (`<preset>`).
 
 ## Benchmark a model
 

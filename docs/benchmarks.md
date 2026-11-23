@@ -95,9 +95,9 @@ prefill curve and the 8K decode curve separately when a larger sparse-index or
 graph capacity would change decode cost:
 
 ```bash
-uv run scripts/bench.py --model glm-5.3-flash --backend modal \
+uv run scripts/bench.py --model glm53-flash --backend modal \
   --phases prefill --prefill-chunk-size 8192 --output bench/glm-prefill.jsonl --plot
-uv run scripts/bench.py --model glm-5.3-flash --backend modal \
+uv run scripts/bench.py --model glm53-flash --backend modal \
   --phases decode --output bench/glm-decode.jsonl --plot
 ```
 

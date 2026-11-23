@@ -53,7 +53,7 @@ image = build_modal_image(
 ).add_local_file(
     ROOT / "deploy/modal_serve.py", "/root/deploy/modal_serve.py", copy=True
 )
-app = modal.App(MODEL.app_name or f"resin-{MODEL.label}", image=image, volumes=volumes)
+app = modal.App(f"resin-{MODEL.name}", image=image, volumes=volumes)
 _http_server_processes: list[object] = []
 
 
@@ -242,7 +242,7 @@ def _monitor_process_context(process_context: Any, label: str) -> None:
 )
 @modal.concurrent(max_inputs=256, target_inputs=64)
 @modal.web_server(
-    8000, startup_timeout=60 * 60, label=MODEL.label, requires_proxy_auth=False
+    8000, startup_timeout=60 * 60, label=MODEL.name, requires_proxy_auth=False
 )
 def serve() -> None:
     import resin

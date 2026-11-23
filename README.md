@@ -255,7 +255,7 @@ on Apple Silicon with MLX, on the same core engine. For a small local model:
 
 ```bash
 CHECKPOINT="$(uv run hf download mlx-community/Qwen3.5-0.8B-8bit --quiet)"
-uv run scripts/mlx_serve.py --model qwen3.5-0.8b-mlx --checkpoint "$CHECKPOINT"
+uv run scripts/mlx_serve.py --model qwen35-08b-mlx --checkpoint "$CHECKPOINT"
 ```
 
 For Inkling 2 Mini:

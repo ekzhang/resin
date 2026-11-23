@@ -14,7 +14,7 @@ checkpoint, pinned to revision `87e768fbfa03994095f3d14527c80c5ae70c5758`:
 ```bash
 QWEN_CHECKPOINT="$(uv run hf download mlx-community/Qwen3.5-0.8B-8bit \
   --revision 87e768fbfa03994095f3d14527c80c5ae70c5758 --quiet)"
-uv run scripts/mlx_serve.py --model qwen3.5-0.8b-mlx --checkpoint "$QWEN_CHECKPOINT"
+uv run scripts/mlx_serve.py --model qwen35-08b-mlx --checkpoint "$QWEN_CHECKPOINT"
 ```
 
 This uses Hugging Face's normal cache, respecting `HF_HOME` and `HF_HUB_CACHE`.
@@ -28,7 +28,7 @@ per-expert or fused MoE tensors, and quantizes language weights to 8-bit affine
 weights with group size 64. For
 [`ornith-ai/Ornith-1.0-35B`](https://huggingface.co/ornith-ai/Ornith-1.0-35B),
 use revision `5df2ed3f675c7beaa490328cc70bb573b65fb660` and the
-`ornith-1.0-35b` preset. That preset serves text only and requires substantially
+`ornith10-35b` preset. That preset serves text only and requires substantially
 more memory than the 0.8B model.
 
 Both presets default to the checkpoint's 262,144-token context ceiling;
@@ -60,8 +60,8 @@ trace across image sizes. Startup warms one canonical grid with zero patches.
 
 ## Optional MTP speculation
 
-`qwen3.5-0.8b-mtp-mlx` uses the original Qwen 0.8B checkpoint, including its
-MTP weights, and defaults to one draft. `qwen3.8-27b-mlx` uses the original
+`qwen35-08b-mtp-mlx` uses the original Qwen 0.8B checkpoint, including its
+MTP weights, and defaults to one draft. `qwen38-27b-mlx` uses the original
 27B checkpoint and defaults to two drafts; loading its BF16 checkpoint and
 serving the 8-bit weights require substantially more unified memory. Override
 with `--draft-tokens`, or use `--draft-tokens 0` for target-only decoding.
@@ -71,7 +71,7 @@ MTP weights.
 ```bash
 QWEN_MTP="$(uv run hf download Qwen/Qwen3.5-0.8B \
   --revision 2fc06364715b967f1860aea9cf38778875588b17 --quiet)"
-uv run scripts/mlx_serve.py --model qwen3.5-0.8b-mtp-mlx --checkpoint "$QWEN_MTP"
+uv run scripts/mlx_serve.py --model qwen35-08b-mtp-mlx --checkpoint "$QWEN_MTP"
 ```
 
 MLX verifies the anchor and drafts in one target forward, and reconstructs
@@ -164,7 +164,7 @@ Use the shared benchmark entry point for local Engine curves, following the
 [benchmark guide](../../../../docs/benchmarks.md):
 
 ```bash
-uv run scripts/bench.py --model qwen3.5-0.8b-mlx --backend local \
+uv run scripts/bench.py --model qwen35-08b-mlx --backend local \
   --checkpoint "$QWEN_CHECKPOINT" --context-lengths 4096,8192 \
   --decode-batch-sizes 1,2,4 --output artifacts/qwen35.jsonl --plot
 ```

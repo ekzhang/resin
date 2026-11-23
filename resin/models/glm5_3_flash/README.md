@@ -1,7 +1,7 @@
 # GLM-5.3-Flash NVFP4
 
 Resin runs the native hybrid KDA/sparse-MLA model on **four B200s with EP4 and
-attention DP4**. The shared registry key is `glm-5.3-flash`; the native recipe is
+attention DP4**. The shared registry key is `glm53-flash`; the native recipe is
 `glm5_3_flash`. The integration includes reasoning, tools, still images, full
 decode CUDA graphs, completion overlap, and optional native NextN/MTP decoding.
 Attention TP and context parallelism are unsupported. EP1 with expert TP4 and
@@ -41,13 +41,13 @@ groups, with prefix reuse and copy-on-write ownership handled by the Engine.
 Download the pinned Modal checkpoint without allocating GPUs:
 
 ```sh
-uv run scripts/bench.py --model glm-5.3-flash --backend modal --download-only
+uv run scripts/bench.py --model glm53-flash --backend modal --download-only
 ```
 
 Generate target-only 8K prefill/decode curves and separate untimed Perfetto traces:
 
 ```sh
-uv run scripts/bench.py --model glm-5.3-flash --backend modal \
+uv run scripts/bench.py --model glm53-flash --backend modal \
   --gpu B200 --world-size 4 --attn-dp 4 --attn-tp 1 --cp 1 --ep 4 \
   --draft-tokens 0 --prefill-context-lengths 8192 \
   --decode-context-lengths 8192 --prefill-batch-sizes 1 \
@@ -93,7 +93,7 @@ without an acceptance projection.
 The parameterized serving app uses the same registry:
 
 ```sh
-RESIN_MODEL=glm-5.3-flash uv run modal deploy deploy/modal_serve.py
+RESIN_MODEL=glm53-flash uv run modal deploy deploy/modal_serve.py
 uv run scripts/check_server.py "$ENDPOINT" --model nvidia/GLM-5.3-Flash-NVFP4 \
   --output artifacts/glm53/server-check.json --image --stress --dp-size 4 \
   --prefix-cache-repeats 2112 \

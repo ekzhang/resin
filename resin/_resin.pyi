@@ -124,7 +124,7 @@ class BatchPlan:
     @property
     def phase(self, /) -> BatchPhase:
         """
-        Whether this is a prefill or decode batch. Mixed-chunk is not supported.
+        Whether this is a prefill or decode batch.
         """
     @property
     def positions(self, /) -> npt.NDArray[np.uint32]:
