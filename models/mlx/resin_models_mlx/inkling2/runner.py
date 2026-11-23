@@ -166,8 +166,6 @@ class Inkling2MlxRunner(MlxRunner[CacheArena]):
         self.benchmark_metadata = {
             "quant": "checkpoint-nvfp4-mxfp8-experts",
             "weight_source": "prequantized_checkpoint",
-            # Prefill chunks of 512 or more tokens instead run exactly
-            # dequantized FP32 GEMMs per expert segment (model.SEGMENTED_ROUTES).
             "expert_backend": "mlx-gather-qmm",
             "graphs": {"prefill": "disabled", "decode": "disabled"},
         }

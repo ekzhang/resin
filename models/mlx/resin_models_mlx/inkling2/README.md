@@ -67,10 +67,10 @@ four-tap convolutions over independent 16-token tiles, depth mixes, RMS norms,
 expert routing, the capped SwiGLU
 with its output scale, the route combine and the BF16 vocabulary projection
 with FP32 output. Decode also compiles small FP32 helpers with `mx.compile`;
-their shapes depend only on the batch size. Prefill runs uncompiled, and chunks
-of 512 or more tokens run one dense FP32 GEMM per expert segment over exactly
-dequantized weights; shorter chunks keep the gathered quantized GEMM. At 2,048 tokens (16K routes) that is 2.3× (NVFP4) to 3.5× (MXFP8)
-faster than MLX's gathered quantized GEMM, dequantization included.
+their shapes depend only on the batch size. Prefill runs uncompiled. Experts
+run as one sorted `gather_qmm` per projection over rows gathered into route
+order. MLX ignores `sorted_indices` when given `lhs_indices`, so passing the row
+map that way keeps prefill off its grouped kernel.
 
 ## Validation
 
@@ -82,15 +82,18 @@ tests' independent NVFP4/MXFP8 arithmetic.
 - On a tiny looped checkpoint with both expert formats, every visit's mixing,
   attention and experts match the reference within about one BF16 rounding step
   over a prefill and six decode steps, including prefill chunks large enough for
-  the per-expert GEMMs (teacher-forced: random tiny models with FP4 activations
+  MLX's grouped expert GEMM (teacher-forced: random tiny models with FP4 activations
   amplify one rounding step into different logits).
-- On the real checkpoint, the opt-in test (a 24-token prompt from the model
-  card, then three greedy decode steps) finds each visit's attention and
-  experts within 0.53% relative, teacher-forced logits within about 1×10⁻⁵, and
-  the same top-1 token at every step. Ad hoc runs of the same comparison on
-  16-, 1,100- and 2,100-token prompts with four decode steps each also agreed on
-  all 15 top-1 tokens; mean absolute logit differences were 0.25–1.05 (logits
-  are capped at ±30). Moving 40 values by one BF16 step at the first visit moves
+- On the real checkpoint, the opt-in test (an 80-token prompt from the model
+  card, long enough for MLX's grouped expert GEMM, then three greedy decode
+  steps) finds each visit's attention within 0.56% relative and experts within
+  0.31%, teacher-forced logits within about 5×10⁻⁵, and the same top-1 token at
+  every step. Three of the 3,840 token visits route through an FP32 tie (eighth
+  and ninth biased scores within 10⁻⁵) and are excluded from the expert bound;
+  one picks a different expert than the reference. Ad hoc runs of the same
+  comparison on 16-, 1,100- and 2,100-token prompts with four decode steps each
+  also agreed on all 15 top-1 tokens; mean absolute logit differences were
+  0.21–0.91 (logits are capped at ±30). Moving 40 values by one BF16 step at the first visit moves
   the reference's own logits by a mean of 0.64. The same amplification means greedy output can change with
   the prefill chunk size or the batch a request runs in, whose different GEMM
   shapes round differently; it is reproducible for a fixed configuration.
@@ -124,7 +127,7 @@ unqualified.
 uv run pytest models/mlx/tests/test_inkling2_model.py \
   models/mlx/tests/test_inkling2_engine.py models/mlx/tests/test_inkling2_attention.py \
   models/mlx/tests/test_inkling2_vision.py tests/test_deploy_models.py
-# Real checkpoint against the CPU reference (about 50 GB of memory, under a minute):
+# Real checkpoint against the CPU reference (about 50 GB of memory, about a minute):
 RESIN_TEST_CHECKPOINT="$INKLING_CHECKPOINT" \
   uv run pytest models/mlx/tests/test_inkling2_checkpoint.py
 ```
@@ -160,6 +163,21 @@ attention used one dispatch per visit. In all ten cases the integrated
 kernel matched the prototype bit for bit. Compared with the dense reference,
 the maximum absolute error was 3.34 × 10⁻⁶ for the output and 2.86 × 10⁻⁶
 for log-sum-exp.
+
+### Full-model throughput on M4 Max
+
+Measured on November 23, 2026 on the same laptop, MLX 0.32.4 and prompt
+artifact as the historical table below, with the shared benchmark command shown
+there.
+
+| Complete prefill | 4K prompt | 8K prompt | 16K prompt | 32K prompt |
+| ---------------- | --------: | --------: | ---------: | ---------: |
+| Seconds          |      4.66 |     10.28 |      22.13 |      52.48 |
+| Input tokens/s   |       880 |       797 |        740 |        624 |
+
+Runs of the same code differ by up to about 10% as the laptop heats; 32K
+prefill ranged from 624 to 703 tokens/s. Same-session decode at batch 1–8 was
+within 4% of the previous expert path.
 
 ### Historical full-model throughput on M4 Max
 
@@ -233,8 +251,8 @@ remaining gap is the dispatch of many small per-visit operations.
   own cache groups, block verification and rollback, and is left for a
   follow-up, so the speculative-decoding step of the model checklist is open.
 - One GPU; no tensor or expert parallelism.
-- Prefill expert GEMMs reach about 7.8 TFLOPS (versus 13.5 for one dense GEMM)
-  because each expert sees about 128 rows per 2,048 tokens.
+- With 4,096 tokens routed uniformly, the gate/up NVFP4 expert projection
+  reaches about 11 TFLOPS, versus 12–13 for FP32 dense GEMMs of the same size.
 - Prompt logprobs project 128 prompt rows in about 60 ms (four rows per GEMV
   launch), adding about 4 seconds per 8,192-token chunk when requested.
 

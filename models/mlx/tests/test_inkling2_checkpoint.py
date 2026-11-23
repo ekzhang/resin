@@ -2,7 +2,7 @@
 
 Set ``RESIN_TEST_CHECKPOINT`` to a local thinkingmachines/Inkling-2-Mini
 snapshot (revision ed40e7da625f594fc9c4990f5f66be24873c22d7). Both models load
-(about 50 GB of memory); the run takes under a minute on an M4 Max.
+(about 50 GB of memory); the run takes about a minute on an M4 Max.
 """
 
 from __future__ import annotations
@@ -104,7 +104,8 @@ def test_real_checkpoint_matches_cpu_reference(monkeypatch):
         )
     model = Inkling2Model(config, weights)
     text = (root / "README.md").read_text()
-    prompt = Tokenizer.from_file(str(root / "tokenizer.json")).encode(text).ids[:24]
+    # 80 tokens (640 routes, five per expert) take MLX's grouped expert GEMM.
+    prompt = Tokenizer.from_file(str(root / "tokenizer.json")).encode(text).ids[:80]
 
     # Teacher-forced: each visit's attention and experts from the reference's inputs.
     records = _record(target)
@@ -123,14 +124,29 @@ def test_real_checkpoint_matches_cpu_reference(monkeypatch):
         errors["attention"] = max(errors["attention"], _relative(output, expected))
         return _to_mlx(expected), k_history, v_history
 
+    route_ties = []
+
     def forced_mlp(x, layer, config):
         index = cursor["mlp"]
         cursor["mlp"] += 1
-        output = sparse(
-            _to_mlx(records["mlp_input"][index]).reshape(x.shape), layer, config
-        )
+        forced = _to_mlx(records["mlp_input"][index]).reshape(x.shape)
+        output = sparse(forced, layer, config)
         expected = records["mlp"][index]
-        errors["mlp"] = max(errors["mlp"], _relative(output, expected))
+        # A token whose eighth and ninth biased router scores tie in FP32 may
+        # pick the other expert under a different summation order.
+        rows = forced.reshape(-1, x.shape[-1]).astype(mx.float32)
+        scores = np.array(mx.sigmoid(rows @ layer.router.T) + layer.router_bias)
+        ranked = -np.sort(-scores, axis=-1)
+        top_k = config.experts_per_token
+        tied = ranked[:, top_k - 1] - ranked[:, top_k] < 1e-5
+        route_ties.extend((index, int(row)) for row in np.flatnonzero(tied))
+        keep = np.flatnonzero(~tied)
+        width = expected.shape[-1]
+        kept = _relative(
+            output.reshape(-1, width)[mx.array(keep)],
+            expected.reshape(-1, width)[torch.from_numpy(keep)],
+        )
+        errors["mlp"] = max(errors["mlp"], kept)
         return _to_mlx(expected).reshape(x.shape)
 
     tokens = torch.tensor([prompt])
@@ -142,7 +158,7 @@ def test_real_checkpoint_matches_cpu_reference(monkeypatch):
         expected, _, _, _ = target(
             tokens,
             positions,
-            ReferenceCache(config, 1, 64),
+            ReferenceCache(config, 1, 128),
             state,
             positions[:, -1] + 1,
             len(prompt),
@@ -152,7 +168,7 @@ def test_real_checkpoint_matches_cpu_reference(monkeypatch):
     with monkeypatch.context() as patch:
         patch.setattr(Inkling2Model, "_attention", forced_attention)
         patch.setattr(mlx_model, "sparse_mlp", forced_mlp)
-        store = DenseStore(config, 1, 64)
+        store = DenseStore(config, 1, 128)
         store.positions = mx.array(positions.numpy())
         actual, _ = model(
             mx.array(tokens.numpy()),
@@ -163,10 +179,14 @@ def test_real_checkpoint_matches_cpu_reference(monkeypatch):
         )
     # Real-checkpoint visits agree within about one BF16 step (2^-8 relative).
     assert errors["attention"] < 1e-2 and errors["mlp"] < 1e-2, errors
+    # Three of the 3,840 token visits tie at this prompt.
+    assert len(route_ties) <= 0.002 * len(prompt) * config.execution_layer_count, (
+        route_ties
+    )
     assert _relative(actual, expected) < 1e-3
 
     # Free-running: prefill and three greedy decode steps choose the same tokens.
-    cache, store = ReferenceCache(config, 1, 64), DenseStore(config, 1, 64)
+    cache, store = ReferenceCache(config, 1, 128), DenseStore(config, 1, 128)
     reference_state = state
     mlx_state = model.initial_state(1)
     current, start = tokens, 0
