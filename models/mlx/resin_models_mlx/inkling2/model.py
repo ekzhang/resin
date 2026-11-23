@@ -10,11 +10,9 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from functools import update_wrapper
-from itertools import pairwise
 from typing import Protocol
 
 import mlx.core as mx
-import numpy as np
 
 from resin.models.inkling2.config import Inkling2Config
 from resin_models_mlx.fused_norm import rms_norm
@@ -191,14 +189,6 @@ def log_scaling_tau(positions: mx.array, n_floor: int, alpha: float) -> mx.array
     return 1.0 + alpha * mx.log(mx.maximum(effective / float(n_floor), 1.0))
 
 
-# From this many routes (512 tokens), prefill runs one dense FP32 GEMM per
-# expert over its sorted segment of exactly dequantized weights. On an M4 Max
-# the two paths tie at 512 tokens; at 2,048 tokens (16K routes) the segments are
-# 2.3x (NVFP4) to 3.5x (MXFP8) faster, dequantization included. Below the
-# threshold, dequantizing every expert costs more than the gathered GEMM saves.
-SEGMENTED_ROUTES = 4096
-
-
 def _expert_matmul(
     x: mx.array,
     weight: mx.array,
@@ -206,62 +196,34 @@ def _expert_matmul(
     experts: Experts,
     rows: mx.array | None,
     ids: mx.array,
-    segments: list[tuple[int, int, int]] | None = None,
 ) -> tuple[mx.array, mx.array | None]:
     """Quantize activations as the checkpoint requires, then run the packed GEMM.
 
     Returns the FP32 product of dequantized codes, one row per route in ``ids``
     order (sorted by expert), and the NVFP4 activation amax per row of ``x``;
     the output scale is applied with the next rounding. ``rows`` maps each route
-    to its row of ``x``; ``None`` means one row per route. ``segments`` lists
-    ``(expert, start, stop)`` route ranges; given, each expert's weights are
-    dequantized to FP32 (exactly) for a dense GEMM.
+    to its row of ``x``; ``None`` means one row per route. Rows are gathered
+    before the GEMM because MLX ignores ``sorted_indices`` when given
+    ``lhs_indices``, which keeps prefill off its grouped kernel.
     """
     values, activation_amax = quantize_activations(x, experts.mode)
-    if segments is None:
-        output = mx.gather_qmm(
-            values[:, None, :],
-            weight,
-            scales,
-            None,
-            lhs_indices=rows,
-            rhs_indices=ids,
-            transpose=True,
-            group_size=experts.group_size,
-            bits=experts.bits,
-            mode=experts.mode,
-            sorted_indices=True,
-        )[:, 0, :]
-    else:
-        routed = values if rows is None else values[rows]
-        parts = []
-        for expert, start, stop in segments:
-            dense = mx.dequantize(
-                weight[expert],
-                scales[expert],
-                None,
-                group_size=experts.group_size,
-                bits=experts.bits,
-                mode=experts.mode,
-                dtype=F32,
-            )
-            parts.append(routed[start:stop] @ dense.T)
-        output = mx.concatenate(parts) if len(parts) > 1 else parts[0]
+    routed = values if rows is None else values[rows]
+    output = mx.gather_qmm(
+        routed[:, None, :],
+        weight,
+        scales,
+        None,
+        rhs_indices=ids,
+        transpose=True,
+        group_size=experts.group_size,
+        bits=experts.bits,
+        mode=experts.mode,
+        sorted_indices=True,
+    )[:, 0, :]
     if activation_amax is not None and activation_amax.size < 8:
         # Keep the Metal device-array binding even at batch one.
         activation_amax = mx.pad(activation_amax, (0, 8 - activation_amax.size))
     return output, activation_amax
-
-
-def _segments(sorted_ids: mx.array, experts: int) -> list[tuple[int, int, int]]:
-    """Route ranges per expert; reading the routing back waits for the router."""
-    ids = np.asarray(sorted_ids)
-    bounds = np.searchsorted(ids, np.arange(experts + 1, dtype=ids.dtype)).tolist()
-    return [
-        (expert, start, stop)
-        for expert, (start, stop) in enumerate(pairwise(bounds))
-        if start < stop
-    ]
 
 
 @_decode_compiled
@@ -287,11 +249,6 @@ def sparse_mlp(x: mx.array, layer: Layer, config: Inkling2Config) -> mx.array:
     )
     experts = layer.experts
     nvfp4 = experts.mode == "nvfp4"
-    segments = (
-        _segments(sorted_ids, experts.w13.shape[0])
-        if sorted_ids.size >= SEGMENTED_ROUTES
-        else None
-    )
     gate_up, gate_up_amax = _expert_matmul(
         flat,
         experts.w13,
@@ -299,7 +256,6 @@ def sparse_mlp(x: mx.array, layer: Layer, config: Inkling2Config) -> mx.array:
         experts,
         source_rows,
         sorted_ids,
-        segments,
     )
     activated = expert_activation(
         gate_up,
@@ -313,7 +269,7 @@ def sparse_mlp(x: mx.array, layer: Layer, config: Inkling2Config) -> mx.array:
         experts.w13_denominator,
     )
     down, down_amax = _expert_matmul(
-        activated, experts.w2, experts.w2_scales, experts, None, sorted_ids, segments
+        activated, experts.w2, experts.w2_scales, experts, None, sorted_ids
     )
     return expert_combine(
         down,
