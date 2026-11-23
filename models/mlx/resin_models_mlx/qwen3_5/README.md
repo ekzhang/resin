@@ -28,7 +28,7 @@ per-expert or fused MoE tensors, and quantizes language weights to 8-bit affine
 weights with group size 64. For
 [`ornith-ai/Ornith-1.0-35B`](https://huggingface.co/ornith-ai/Ornith-1.0-35B),
 use revision `5df2ed3f675c7beaa490328cc70bb573b65fb660` and the
-`ornith10-35b` preset. That preset serves text only and requires substantially
+`ornith10-35b-mlx` preset. That preset serves text only and requires substantially
 more memory than the 0.8B model.
 
 Both presets default to the checkpoint's 262,144-token context ceiling;

@@ -54,7 +54,7 @@ def test_runtime_prepares_persistent_cute_cache(tmp_path, name):
 @pytest.mark.parametrize(
     "name,module_name,runner_name",
     [
-        ("ornith10-35b", "qwen3_5", "Qwen35MlxRunner"),
+        ("ornith10-35b-mlx", "qwen3_5", "Qwen35MlxRunner"),
         ("qwen35-08b-mlx", "qwen3_5", "Qwen35MlxRunner"),
         ("qwen35-08b-mtp-mlx", "qwen3_5", "Qwen35MlxRunner"),
         ("qwen38-27b-mlx", "qwen3_5", "Qwen35MlxRunner"),
@@ -133,7 +133,7 @@ def test_mlx_factory_constructs_single_device_runner(
 
 @pytest.mark.parametrize(
     "name,expected_recipe",
-    [("ornith10-35b", "ornith"), ("qwen35-08b-mlx", "qwen3_5")],
+    [("ornith10-35b-mlx", "ornith"), ("qwen35-08b-mlx", "qwen3_5")],
 )
 def test_mlx_presets_use_matching_media_capabilities(
     monkeypatch, tmp_path, name, expected_recipe
@@ -487,7 +487,7 @@ def test_glm_serving_checkpoints_allow_real_engine_prefix_reuse(
 
 
 @pytest.mark.parametrize(
-    "name", ["ornith10-35b", "qwen35-08b-mlx", "inkling2-mini-mlx"]
+    "name", ["ornith10-35b-mlx", "qwen35-08b-mlx", "inkling2-mini-mlx"]
 )
 def test_local_presets_require_an_explicit_checkpoint(tmp_path, name):
     spec = get_model(name)
@@ -503,7 +503,7 @@ def test_local_presets_require_an_explicit_checkpoint(tmp_path, name):
 @pytest.mark.parametrize(
     "name,ceiling",
     [
-        ("ornith10-35b", 262_144),
+        ("ornith10-35b-mlx", 262_144),
         ("qwen35-08b-mlx", 262_144),
         ("inkling2-mini-mlx", 1_048_576),
     ],

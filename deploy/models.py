@@ -362,8 +362,8 @@ MODEL_SPECS.update(
             gpu_memory_utilization=0.95,
             recipe="qwen3_5",
         ),
-        "ornith10-35b": ModelSpec(
-            name="ornith10-35b",
+        "ornith10-35b-mlx": ModelSpec(
+            name="ornith10-35b-mlx",
             family="qwen3_5_moe",
             checkpoint=Checkpoint(
                 repo_id="ornith-ai/Ornith-1.0-35B",

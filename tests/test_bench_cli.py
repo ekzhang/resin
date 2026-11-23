@@ -311,14 +311,14 @@ def test_invalid_options_fail_before_remote_dispatch(arguments, fragment, capsys
 @pytest.mark.parametrize("action", ["--download-only", "--publish-only"])
 def test_local_presets_have_no_modal_checkpoint_actions(action, capsys):
     with pytest.raises(SystemExit) as error:
-        bench.main(["--model", "ornith10-35b", "--backend", "modal", action])
+        bench.main(["--model", "ornith10-35b-mlx", "--backend", "modal", action])
     assert error.value.code == 2
     assert "runs locally" in capsys.readouterr().err
 
 
 def test_local_preset_allows_explicit_prefill_chunk():
     args = bench.argument_parser().parse_args(
-        ["--model", "ornith10-35b", "--prefill-chunk-size", "4096"]
+        ["--model", "ornith10-35b-mlx", "--prefill-chunk-size", "4096"]
     )
     _, _, _, options = bench._configuration(args)
     assert options["prefill_chunk_size"] == 4096
