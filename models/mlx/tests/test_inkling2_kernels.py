@@ -150,16 +150,23 @@ def test_activation_quantization(generator, width):
 
 def test_nvfp4_row_max_precision():
     # BF16 zero, subnormals, normal exponent boundaries and largest finite value.
-    bits = np.array([0, 1, 0x7F, 0x80, 0x81, 0x3F80, 0x7F7F], np.uint16)
-    x = mx.array(np.broadcast_to(bits[:, None] | 0x8000, (len(bits), 16)).copy()).view(
-        mx.bfloat16
-    )
+    bits = np.array([0, 1, 0x7F, 0x80, 0x81, 0x3F80, 0x7F7F], np.uint32)
+    signed_bits = np.broadcast_to(bits[:, None] | 0x8000, (len(bits), 16))
+    # Construct both inputs as bits so a dtype conversion cannot flush subnormals.
+    x = mx.array(signed_bits.astype(np.uint16)).view(mx.bfloat16)
+    x_wide = mx.array(signed_bits << 16).view(mx.float32)
     _, compact = quantize_activations(x, "nvfp4")
-    _, wide = quantize_activations(x.astype(mx.float32), "nvfp4")
+    _, wide = quantize_activations(x_wide, "nvfp4")
     assert compact is not None and wide is not None
     assert compact.dtype == mx.bfloat16 and wide.dtype == mx.float32
     compact_bits = np.array(compact.view(mx.uint16)).astype(np.uint32) << 16
-    np.testing.assert_array_equal(compact_bits, np.array(wide.view(mx.uint32)))
+    wide_bits = np.array(wide.view(mx.uint32))
+    expected = bits << 16
+    subnormal = (bits > 0) & (bits < 0x80)
+    # Metal can flush subnormal row maxima to positive zero in either dtype.
+    for actual in (compact_bits, wide_bits):
+        flushed = subnormal & (actual == 0)
+        np.testing.assert_array_equal(actual, np.where(flushed, 0, expected))
 
 
 @pytest.mark.parametrize("rows", [1, 3, 4, 8, 9])
