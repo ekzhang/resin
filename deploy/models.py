@@ -359,7 +359,7 @@ MODEL_SPECS.update(
             context_length=262_144,
             max_batch_size=16,
             draft_tokens=2,
-            gpu_memory_utilization=0.70,
+            gpu_memory_utilization=0.95,
             recipe="qwen3_5",
         ),
         "ornith10-35b": ModelSpec(
@@ -383,8 +383,7 @@ MODEL_SPECS.update(
             expert_backend="mlx-gather-qmm",
             context_length=262_144,
             max_batch_size=32,
-            # Unified memory is shared with the OS and other applications.
-            gpu_memory_utilization=0.70,
+            gpu_memory_utilization=0.95,
             recipe="ornith",
             text_only=True,
         ),
@@ -409,7 +408,7 @@ MODEL_SPECS.update(
             expert_backend="mlx-gather-qmm",
             context_length=1_048_576,
             max_batch_size=8,
-            gpu_memory_utilization=0.70,
+            gpu_memory_utilization=0.95,
         ),
         "inkling2-small": ModelSpec(
             name="inkling2-small",
